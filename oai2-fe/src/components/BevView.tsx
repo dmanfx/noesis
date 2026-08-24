@@ -15,6 +15,10 @@ import {
   pruneTrailCollection,
   upsertTrailSample,
 } from '../lib/bevTrails';
+import {
+  resolveBevDisplayBounds,
+  resolveBevMetricPoint,
+} from '../lib/bevDisplayGeometry';
 
 export type BevMeta = {
   type?: string;
@@ -33,6 +37,7 @@ export type BevMeta = {
     frame_id?: number;
     observed_at_us?: number;
     tracking_publication_sequence?: number;
+    tracking_outbound_submission_id?: number;
   };
   frame?: string;
   world_frame?: string;
@@ -59,10 +64,13 @@ export type BevMeta = {
     method: string;
     stableId?: number | null;
     trackerId?: number | null;
+    trackerLifecycleGeneration?: number | null;
     anchorSource?: string | null;
     anchorQuality?: string | null;
     anchorReason?: string | null;
     displaySource?: string | null;
+    canonicalWorld?: boolean;
+    worldAdmission?: 'accepted' | 'predicted' | 'held' | null;
     rawX?: number;
     rawY?: number;
     alignmentDebug?: {
@@ -78,6 +86,8 @@ export type BevMeta = {
   trails?: Array<{
     stableId?: number | null;
     trackerId?: number | null;
+    trackerLifecycleGeneration?: number | null;
+    canonicalWorld?: boolean;
     points?: Array<{
       x: number;
       y: number;
@@ -135,8 +145,11 @@ export type BevMeta = {
     coverageRegion?: string | null;
     stableId?: number | null;
     trackerId?: number | null;
+    trackerLifecycleGeneration?: number | null;
+    trailSegmentId?: number | null;
     reason?: string;
   }>;
+  droppedFootpointCount?: number;
   trail_smoothing_owner?: 'frontend' | 'backend' | 'none';
   bev_points_smoothed?: boolean;
   bev_world_points_smoothed?: boolean;
@@ -174,6 +187,7 @@ type NormalizedPayloadPoint = {
   floorplanInside?: boolean | null;
   coverageInside?: boolean | null;
   coverageRegion?: string | null;
+  canonicalWorld?: boolean;
 };
 type CoverageRegion = { id: string; polygonXZ: Array<[number, number]> };
 type CoverageEnvelope = {
@@ -226,7 +240,6 @@ const DEFAULT_HEIGHT_RENDER_TUNING: HeightRenderTuning = {
 const BEV_WALKABLE_MASK_THRESHOLD = 1e-6;
 const BEV_UNKNOWN_CELL_COLOR: [number, number, number, number] = [16, 22, 32, 255];
 const BEV_UNKNOWN_CELL_ALT_COLOR: [number, number, number, number] = [20, 28, 39, 255];
-const BEV_DISPLAY_SAFETY_PADDING_M = 1.0;
 const BEV_PLANAR_FLOOR_EXPANSION_CELLS = 2;
 
 const clampNumber = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
@@ -354,16 +367,6 @@ const rawFloorplanBounds = (floorplan: FloorplanResponse | undefined): MetricBou
   return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
 };
 
-const expandMetricBounds = (bounds: MetricBounds, paddingM: number): MetricBounds => {
-  const padding = Math.max(0, Number(paddingM) || 0);
-  return {
-    min_x: bounds.min_x - padding,
-    max_x: bounds.max_x + padding,
-    min_z: bounds.min_z - padding,
-    max_z: bounds.max_z + padding,
-  };
-};
-
 const rawPayloadBounds = (meta: BevMeta | undefined): MetricBounds | null => {
   const minX = Number(meta?.xMin);
   const maxX = Number(meta?.xMax);
@@ -440,58 +443,6 @@ const parseCoverageEnvelope = (meta: BevMeta | undefined): CoverageEnvelope | nu
     regions.push({ id, polygonXZ });
   }
   return { cameraId, boundaryToleranceM, bounds, regions };
-};
-
-const pointSegmentDistance = (
-  x: number,
-  z: number,
-  ax: number,
-  az: number,
-  bx: number,
-  bz: number
-): number => {
-  const dx = bx - ax;
-  const dz = bz - az;
-  const denom = (dx * dx) + (dz * dz);
-  if (denom <= 1e-18) return Math.hypot(x - ax, z - az);
-  const t = clampNumber((((x - ax) * dx) + ((z - az) * dz)) / denom, 0, 1);
-  return Math.hypot(x - (ax + (t * dx)), z - (az + (t * dz)));
-};
-
-const pointInCoverageRegion = (
-  x: number,
-  z: number,
-  region: CoverageRegion,
-  boundaryToleranceM: number
-): boolean => {
-  const tolerance = Math.max(0, boundaryToleranceM);
-  let inside = false;
-  let previous = region.polygonXZ[region.polygonXZ.length - 1];
-  for (const current of region.polygonXZ) {
-    if (
-      pointSegmentDistance(x, z, previous[0], previous[1], current[0], current[1]) <= Math.max(1e-9, tolerance)
-    ) {
-      return true;
-    }
-    const crosses = (current[1] > z) !== (previous[1] > z);
-    if (crosses) {
-      const intersectionX = current[0] + (((z - current[1]) * (previous[0] - current[0])) / (previous[1] - current[1]));
-      if (x < intersectionX) inside = !inside;
-    }
-    previous = current;
-  }
-  return inside;
-};
-
-const coverageRegionForPoint = (
-  coverage: CoverageEnvelope,
-  x: number,
-  z: number
-): string | null => {
-  for (const region of coverage.regions) {
-    if (pointInCoverageRegion(x, z, region, coverage.boundaryToleranceM)) return region.id;
-  }
-  return null;
 };
 
 const boundsNearlyEqual = (a: MetricBounds | null, b: MetricBounds | null, eps = 1e-3): boolean => {
@@ -590,16 +541,27 @@ export const BevView: React.FC<BevViewProps> = ({
   const [heightRenderTuning, setHeightRenderTuning] = useState<HeightRenderTuning>(DEFAULT_HEIGHT_RENDER_TUNING);
   const [floorPlaneEnabled, setFloorPlaneEnabled] = useState(true);
 
-  const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number }>>(new Map());
+  const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number; worldAdmission?: string }>>(new Map());
   const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
   const animationFrameRef = useRef<number>();
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const bgKeyRef = useRef<string>('');
   const bgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const bgContentRectRef = useRef<ContentRect | null>(null);
-  const historyKeyForPoint = (stableId?: number | null, trackerId?: number | null): string | null => {
+  const historyKeyForPoint = (
+    stableId?: number | null,
+    trackerId?: number | null,
+    trackerLifecycleGeneration?: number | null
+  ): string | null => {
     const trackerNum = typeof trackerId === 'number' && Number.isFinite(trackerId) ? trackerId : null;
-    if (trackerNum !== null && trackerNum >= 0) return `t:${trackerNum}`;
+    const generationNum = typeof trackerLifecycleGeneration === 'number' && Number.isFinite(trackerLifecycleGeneration)
+      ? trackerLifecycleGeneration
+      : null;
+    if (trackerNum !== null && trackerNum >= 0) {
+      return generationNum !== null && generationNum >= 0
+        ? `t:${trackerNum}:g:${generationNum}`
+        : `t:${trackerNum}`;
+    }
     const stableNum = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
     if (stableNum !== null && stableNum > 0) return `s:${stableNum}`;
     return null;
@@ -650,49 +612,19 @@ export const BevView: React.FC<BevViewProps> = ({
   const displayBounds = useMemo(
     () => {
       const floorplanBounds = floorplanBoundsForMode(displayFloorplan, coordMode);
-      const paddedFloorplanBounds = floorplanBounds && displayFloorplan?.scene_prior_only === true
-        && displayFloorplan?.display_source === 'pcf'
-        ? expandMetricBounds(floorplanBounds, BEV_DISPLAY_SAFETY_PADDING_M)
-        : floorplanBounds;
-      if (!coverageEnvelope) return paddedFloorplanBounds;
-      const tolerance = coverageEnvelope.boundaryToleranceM;
-      const expected: MetricBounds = {
-        min_x: Math.min(
-          paddedFloorplanBounds?.min_x ?? Number.POSITIVE_INFINITY,
-          coverageEnvelope.bounds.min_x - tolerance
-        ),
-        max_x: Math.max(
-          paddedFloorplanBounds?.max_x ?? Number.NEGATIVE_INFINITY,
-          coverageEnvelope.bounds.max_x + tolerance
-        ),
-        min_z: Math.min(
-          paddedFloorplanBounds?.min_z ?? Number.POSITIVE_INFINITY,
-          coverageEnvelope.bounds.min_z - tolerance
-        ),
-        max_z: Math.max(
-          paddedFloorplanBounds?.max_z ?? Number.NEGATIVE_INFINITY,
-          coverageEnvelope.bounds.max_z + tolerance
-        ),
-      };
       const advertised = parseMetricBounds(meta?.displayBounds) ?? rawPayloadBounds(meta);
-      if (
-        advertised &&
-        advertised.min_x <= expected.min_x + 1e-6 &&
-        advertised.max_x >= expected.max_x - 1e-6 &&
-        advertised.min_z <= expected.min_z + 1e-6 &&
-        advertised.max_z >= expected.max_z - 1e-6
-      ) {
-        return advertised;
-      }
-      return expected;
+      return resolveBevDisplayBounds({
+        floorplanBounds,
+        advertisedBounds: advertised,
+        coverageBounds: coverageEnvelope?.bounds,
+        coverageToleranceM: coverageEnvelope?.boundaryToleranceM,
+      });
     },
     [
       coordMode,
       coverageEnvelope,
       displayFloorplan?.frame,
       displayFloorplan?.units,
-      displayFloorplan?.scene_prior_only,
-      displayFloorplan?.display_source,
       displayFloorplan?.bounds?.min_x,
       displayFloorplan?.bounds?.max_x,
       displayFloorplan?.bounds?.min_z,
@@ -731,34 +663,17 @@ export const BevView: React.FC<BevViewProps> = ({
   );
 
   const resolvePayloadPoint = useCallback((pt: NormalizedPayloadPoint | null | undefined): ResolvedMetricPoint | null => {
-    if (!pt) return null;
-    if (coverageEnvelope) {
-      const x = Number(pt.x);
-      const y = Number(pt.y);
-      if (!Number.isFinite(x) || !Number.isFinite(y) || pt.coverageInside === false) {
-        return null;
-      }
-      if (!coverageRegionForPoint(coverageEnvelope, x, y)) return null;
-      return resolveDisplayPoint(x, y);
-    }
-    const normX = Number(pt.normX);
-    const normY = Number(pt.normY);
-    if (normalizedPayloadBounds && Number.isFinite(normX) && Number.isFinite(normY)) {
-      if (pt.floorplanInside === false || normX < 0 || normX > 1 || normY < 0 || normY > 1) {
-        return null;
-      }
-      const spanX = normalizedPayloadBounds.max_x - normalizedPayloadBounds.min_x;
-      const spanZ = normalizedPayloadBounds.max_z - normalizedPayloadBounds.min_z;
-      if (!Number.isFinite(spanX) || !Number.isFinite(spanZ) || spanX <= 0 || spanZ <= 0) {
-        return null;
-      }
-      const x = normalizedPayloadBounds.min_x + (normX * spanX);
-      const y = normalizedPayloadBounds.max_z - (normY * spanZ);
-      const resolved = resolveDisplayPoint(x, y);
-      return resolved ? { ...resolved, mapped: true } : null;
-    }
-    return resolveDisplayPoint(Number(pt.x), Number(pt.y));
-  }, [coverageEnvelope, normalizedPayloadBounds, resolveDisplayPoint]);
+    const resolved = resolveBevMetricPoint({
+      point: pt,
+      displayBounds,
+      normalizedBounds: normalizedPayloadBounds,
+      coverage: coverageEnvelope,
+    });
+    if (!resolved) return null;
+    return resolveDisplayPoint(resolved.x, resolved.y)
+      ? resolved
+      : null;
+  }, [coverageEnvelope, displayBounds, normalizedPayloadBounds, resolveDisplayPoint]);
 
   useEffect(() => {
     metaRef.current = meta;
@@ -868,10 +783,20 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     const points = Array.isArray(meta?.footpoints) ? meta.footpoints : [];
+    const purgePriorTrackerGenerations = (trackerId: number | null, keepKey: string) => {
+      if (trackerId === null || trackerId < 0) return;
+      const prefix = `t:${trackerId}:g:`;
+      for (const key of state.keys()) {
+        if (key !== keepKey && key.startsWith(prefix)) state.delete(key);
+      }
+      for (const key of trails.keys()) {
+        if (key !== keepKey && key.startsWith(prefix)) trails.delete(key);
+      }
+    };
     const dropUnresolvedPoint = (pt: typeof points[number]) => {
       const stableNum = typeof pt?.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
       const trackerNum = typeof pt?.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-      const historyKey = historyKeyForPoint(stableNum, trackerNum);
+      const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
       if (historyKey === null) return;
       state.delete(historyKey);
       trails.delete(historyKey);
@@ -888,9 +813,10 @@ export const BevView: React.FC<BevViewProps> = ({
         }
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-        const historyKey = historyKeyForPoint(stableNum, trackerNum);
+        const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
         const displayId = displayIdForPoint(stableNum, trackerNum);
         if (historyKey === null || displayId === null) return;
+        purgePriorTrackerGenerations(trackerNum, historyKey);
         seenIds.add(historyKey);
         state.set(historyKey, {
           x: resolved.x,
@@ -898,6 +824,7 @@ export const BevView: React.FC<BevViewProps> = ({
           lastSeen: arrivalNow,
           stableId: `${displayId}`,
           colorId: colorIdForPerson(cam, displayId),
+          worldAdmission: typeof pt.worldAdmission === 'string' ? pt.worldAdmission : undefined,
         });
       });
       for (const [id, data] of state.entries()) {
@@ -924,9 +851,10 @@ export const BevView: React.FC<BevViewProps> = ({
 
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-        const historyKey = historyKeyForPoint(stableNum, trackerNum);
+        const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
         const displayId = displayIdForPoint(stableNum, trackerNum);
         if (historyKey === null || displayId === null) return;
+        purgePriorTrackerGenerations(trackerNum, historyKey);
         const colorId = colorIdForPerson(cam, displayId);
         const labelText = `${displayId}`;
 
@@ -946,6 +874,7 @@ export const BevView: React.FC<BevViewProps> = ({
           lastSeen: arrivalNow,
           stableId: `${displayId}`,
           colorId,
+          worldAdmission: typeof pt.worldAdmission === 'string' ? pt.worldAdmission : undefined,
         });
 
         entry.label = labelText;
@@ -1650,6 +1579,16 @@ export const BevView: React.FC<BevViewProps> = ({
       }
 
       if (trailCfg.enabled) {
+        const canonicalTrailKeys = new Set(
+          (Array.isArray(metaNow?.footpoints) ? metaNow.footpoints : [])
+            .filter((point) => point?.canonicalWorld === true)
+            .map((point) => historyKeyForPoint(
+              typeof point?.stableId === 'number' && Number.isFinite(point.stableId) ? point.stableId : null,
+              typeof point?.trackerId === 'number' && Number.isFinite(point.trackerId) ? point.trackerId : null,
+              point?.trackerLifecycleGeneration,
+            ))
+            .filter((key): key is string => key !== null),
+        );
         const backendTracks = !frontendOwnsTrailSmoothing && Array.isArray(metaNow?.trails)
           ? metaNow.trails
             .map((tr) => {
@@ -1657,6 +1596,15 @@ export const BevView: React.FC<BevViewProps> = ({
               const trackerNum = typeof tr?.trackerId === 'number' && Number.isFinite(tr.trackerId) ? tr.trackerId : null;
               const displayId = displayIdForPoint(stableNum, trackerNum);
               if (displayId === null || !Array.isArray(tr?.points)) return null;
+              const hasExplicitCanonicalMarker = typeof tr?.canonicalWorld === 'boolean';
+              const legacyCanonicalKey = historyKeyForPoint(
+                stableNum,
+                trackerNum,
+                tr?.trackerLifecycleGeneration,
+              );
+              const canonicalWorld = hasExplicitCanonicalMarker
+                ? tr.canonicalWorld === true
+                : legacyCanonicalKey !== null && canonicalTrailKeys.has(legacyCanonicalKey);
               const points = tr.points
                 .map((p) => ({
                   x: Number(p?.x),
@@ -1667,6 +1615,7 @@ export const BevView: React.FC<BevViewProps> = ({
                   floorplanInside: p?.floorplanInside,
                   coverageInside: p?.coverageInside,
                   coverageRegion: p?.coverageRegion,
+                  canonicalWorld,
                 }))
                 .map((p) => {
                   if (!Number.isFinite(p.t)) return null;
@@ -1689,7 +1638,7 @@ export const BevView: React.FC<BevViewProps> = ({
             .filter((tr): tr is TrailTrack => tr !== null)
           : null;
         const tracksToDraw = backendTracks ?? Array.from(trailsRef.current.values());
-        const headByLabel = new Map<string, { x: number; y: number; colorId: number; lastSeen: number }>();
+        const headByLabel = new Map<string, { x: number; y: number; colorId: number; lastSeen: number; worldAdmission?: string }>();
         for (const [, data] of smoothState.current.entries()) {
           if (!data.stableId) continue;
           headByLabel.set(String(data.stableId), {
@@ -1697,11 +1646,12 @@ export const BevView: React.FC<BevViewProps> = ({
             y: data.y,
             colorId: data.colorId,
             lastSeen: data.lastSeen,
+            worldAdmission: data.worldAdmission,
           });
         }
         const drawnHeadLabels = new Set<string>();
 
-        const drawTrailHead = (label: string, colorId: number, head: { x: number; y: number; lastSeen: number }, lastDrawn: TrailPoint | null) => {
+        const drawTrailHead = (label: string, colorId: number, head: { x: number; y: number; lastSeen: number; worldAdmission?: string }, lastDrawn: TrailPoint | null) => {
           const headResolved = resolveForDraw(head.x, head.y);
           if (!headResolved) return;
           const headAlpha = computeTrailAgeAlpha(now, head.lastSeen, trailWindowMs, trailCfg.min_alpha);
@@ -1714,7 +1664,9 @@ export const BevView: React.FC<BevViewProps> = ({
           const px = drawX(headResolved.x);
           const py = drawY(headResolved.y);
 
-          if (lastDrawn) {
+          const held = head.worldAdmission === 'held';
+          const predicted = head.worldAdmission === 'predicted';
+          if (lastDrawn && !held) {
             const tailPx = drawX(lastDrawn.x);
             const tailPy = drawY(lastDrawn.y);
             const gapPx = Math.hypot(px - tailPx, py - tailPy);
@@ -1728,13 +1680,21 @@ export const BevView: React.FC<BevViewProps> = ({
             }
           }
 
-          ctx.fillStyle = hsla(colorId, Math.min(1, (headAlpha * blink) + 0.25));
-          ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
-          ctx.lineWidth = 1.5;
+          ctx.fillStyle = held
+            ? 'rgba(255, 193, 7, 0.18)'
+            : hsla(colorId, Math.min(1, (headAlpha * blink) + (predicted ? 0.08 : 0.25)));
+          ctx.strokeStyle = held
+            ? 'rgba(255, 193, 7, 0.95)'
+            : predicted
+              ? hsla(colorId, Math.min(1, headAlpha * 0.95))
+              : 'rgba(0, 0, 0, 0.65)';
+          ctx.lineWidth = held ? 2.25 : predicted ? 2.0 : 1.5;
+          ctx.setLineDash(held ? [3, 2] : predicted ? [2, 2] : []);
           ctx.beginPath();
-          ctx.arc(px, py, TRAIL_HEAD_RADIUS, 0, 2 * Math.PI);
+          ctx.arc(px, py, held ? TRAIL_HEAD_RADIUS + 1.5 : TRAIL_HEAD_RADIUS, 0, 2 * Math.PI);
           ctx.fill();
           ctx.stroke();
+          ctx.setLineDash([]);
           drawnHeadLabels.add(label);
         };
 

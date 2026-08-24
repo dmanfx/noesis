@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +43,33 @@ extern "C" cudaError_t noesis_sample_roi_values_cuda(
     int sampled_area,
     float* out_values,
     float* out_center,
+    cudaStream_t stream);
+
+extern "C" cudaError_t noesis_sample_pose_capsule_values_cuda(
+    const float* depth,
+    int frame_w,
+    int frame_h,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    int capsule_count,
+    float c0_ax,
+    float c0_ay,
+    float c0_bx,
+    float c0_by,
+    float c0_line_radius,
+    float c0_ankle_radius,
+    float c1_ax,
+    float c1_ay,
+    float c1_bx,
+    float c1_by,
+    float c1_line_radius,
+    float c1_ankle_radius,
+    float* out_values,
     cudaStream_t stream);
 
 extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
@@ -973,6 +1001,210 @@ class AlignedDepthFrameDevice {
     return out;
   }
 
+  py::dict sample_pose_capsule_stats(py::sequence capsules, int max_samples) const {
+    if (storage_ == nullptr || storage_->get() == nullptr) {
+      throw std::runtime_error("Aligned depth frame device buffer is unavailable");
+    }
+    const size_t requested_count = py::len(capsules);
+    if (requested_count == 0U) {
+      throw std::runtime_error("sample_pose_capsule_stats requires at least one capsule");
+    }
+    if (requested_count > 2U) {
+      throw std::runtime_error("sample_pose_capsule_stats supports at most two capsules");
+    }
+
+    // Each compound contact is [ax, ay, bx, by, line_radius, ankle_radius] in
+    // aligned frame pixels.  It is the union of a thin lower-leg capsule and
+    // an ankle disk.  The Python caller supplies only these scalars; no
+    // image-sized host data is copied into the native path.
+    std::array<std::array<float, 6>, 2> geometry{};
+    float min_x = std::numeric_limits<float>::infinity();
+    float min_y = std::numeric_limits<float>::infinity();
+    float max_x = -std::numeric_limits<float>::infinity();
+    float max_y = -std::numeric_limits<float>::infinity();
+    for (size_t capsule_index = 0U; capsule_index < requested_count; ++capsule_index) {
+      py::sequence capsule = capsules[py::int_(capsule_index)].cast<py::sequence>();
+      if (py::len(capsule) != 6U) {
+        throw std::runtime_error(
+            "sample_pose_capsule_stats capsules must contain ax, ay, bx, by, line_radius, ankle_radius");
+      }
+      for (size_t field = 0U; field < 6U; ++field) {
+        const float value = capsule[py::int_(field)].cast<float>();
+        if (!std::isfinite(value)) {
+          throw std::runtime_error("sample_pose_capsule_stats geometry must be finite");
+        }
+        geometry[capsule_index][field] = value;
+      }
+      const float line_radius = geometry[capsule_index][4];
+      const float ankle_radius = geometry[capsule_index][5];
+      if (!(line_radius > 0.0F) || !(ankle_radius > 0.0F)) {
+        throw std::runtime_error(
+            "sample_pose_capsule_stats contact radii must be positive");
+      }
+      const float support_radius = std::max(line_radius, ankle_radius);
+      min_x = std::min(min_x, std::min(geometry[capsule_index][0], geometry[capsule_index][2]) - support_radius);
+      min_y = std::min(min_y, std::min(geometry[capsule_index][1], geometry[capsule_index][3]) - support_radius);
+      max_x = std::max(max_x, std::max(geometry[capsule_index][0], geometry[capsule_index][2]) + support_radius);
+      max_y = std::max(max_y, std::max(geometry[capsule_index][1], geometry[capsule_index][3]) + support_radius);
+    }
+
+    const int x0 = std::max(0, std::min(frame_w_ - 1, static_cast<int>(std::floor(min_x))));
+    const int y0 = std::max(0, std::min(frame_h_ - 1, static_cast<int>(std::floor(min_y))));
+    const int x1 = std::max(x0 + 1, std::min(frame_w_, static_cast<int>(std::ceil(max_x)) + 1));
+    const int y1 = std::max(y0 + 1, std::min(frame_h_, static_cast<int>(std::ceil(max_y)) + 1));
+    const int roi_w = x1 - x0;
+    const int roi_h = y1 - y0;
+    if (roi_w <= 0 || roi_h <= 0) {
+      throw std::runtime_error("sample_pose_capsule_stats resolved an empty ROI");
+    }
+
+    const int sample_cap = std::max(128, max_samples);
+    const double total_px = static_cast<double>(roi_w) * static_cast<double>(roi_h);
+    const int stride = std::max(
+        1,
+        static_cast<int>(std::ceil(std::sqrt(total_px / static_cast<double>(sample_cap)))));
+    const int sampled_rows = static_cast<int>((roi_h + stride - 1) / stride);
+    const int sampled_cols = static_cast<int>((roi_w + stride - 1) / stride);
+    const int sampled_area = std::max(1, sampled_rows * sampled_cols);
+
+    auto host_point_in_contact = [](float point_x, float point_y, const std::array<float, 6>& capsule) {
+      const float dx = capsule[2] - capsule[0];
+      const float dy = capsule[3] - capsule[1];
+      const float length_sq = (dx * dx) + (dy * dy);
+      float t = 0.0F;
+      if (length_sq > 1.0e-6F) {
+        t = (((point_x - capsule[0]) * dx) + ((point_y - capsule[1]) * dy)) / length_sq;
+        t = std::max(0.0F, std::min(1.0F, t));
+      }
+      const float nearest_x = capsule[0] + (t * dx);
+      const float nearest_y = capsule[1] + (t * dy);
+      const float delta_x = point_x - nearest_x;
+      const float delta_y = point_y - nearest_y;
+      const bool in_line =
+          (delta_x * delta_x) + (delta_y * delta_y) <=
+          (capsule[4] * capsule[4]);
+      if (in_line) return true;
+      const float ankle_dx = point_x - capsule[2];
+      const float ankle_dy = point_y - capsule[3];
+      return (ankle_dx * ankle_dx) + (ankle_dy * ankle_dy) <=
+          (capsule[5] * capsule[5]);
+    };
+    int sampled_capsule_area = 0;
+    for (int index = 0; index < sampled_area; ++index) {
+      const int sample_y = index / sampled_cols;
+      const int sample_x = index - (sample_y * sampled_cols);
+      const float point_x = static_cast<float>(x0 + std::min(sample_x * stride, roi_w - 1)) + 0.5F;
+      const float point_y = static_cast<float>(y0 + std::min(sample_y * stride, roi_h - 1)) + 0.5F;
+      bool active = false;
+      for (size_t capsule_index = 0U; capsule_index < requested_count; ++capsule_index) {
+        if (host_point_in_contact(point_x, point_y, geometry[capsule_index])) {
+          active = true;
+          break;
+        }
+      }
+      if (active) ++sampled_capsule_area;
+    }
+
+    const size_t sampled_count = static_cast<size_t>(sampled_area);
+    thread_local CudaRoiSamplerWorkspace roi_workspace;
+    {
+      py::gil_scoped_release release;
+      storage_->wait_ready();
+      CudaDeviceGuard device_guard(device_id());
+      roi_workspace.ensure_stream(device_id());
+      roi_workspace.sampled_device.ensure_capacity(sampled_count, device_id());
+      roi_workspace.sampled_host.ensure_capacity(sampled_count);
+      const auto& c0 = geometry[0];
+      const auto& c1 = geometry[requested_count > 1U ? 1U : 0U];
+      throw_on_cuda(
+          noesis_sample_pose_capsule_values_cuda(
+              storage_->get(),
+              frame_w_,
+              frame_h_,
+              x0,
+              y0,
+              roi_w,
+              roi_h,
+              stride,
+              sampled_cols,
+              sampled_area,
+              static_cast<int>(requested_count),
+              c0[0],
+              c0[1],
+              c0[2],
+              c0[3],
+              c0[4],
+              c0[5],
+              c1[0],
+              c1[1],
+              c1[2],
+              c1[3],
+              c1[4],
+              c1[5],
+              roi_workspace.sampled_device.get(),
+              roi_workspace.stream()),
+          "CUDA pose capsule sampler launch failed");
+      throw_on_cuda(
+          cudaMemcpyAsync(
+              roi_workspace.sampled_host.get(),
+              roi_workspace.sampled_device.get(),
+              sampled_count * sizeof(float),
+              cudaMemcpyDeviceToHost,
+              roi_workspace.stream()),
+          "cudaMemcpyAsync pose capsule compact samples failed");
+      roi_workspace.synchronize();
+    }
+
+    thread_local std::vector<float> values;
+    values.clear();
+    values.reserve(static_cast<size_t>(std::max(0, sampled_capsule_area)));
+    const float* sampled_host = roi_workspace.sampled_host.get();
+    for (int index = 0; index < sampled_area; ++index) {
+      const float value = sampled_host[static_cast<size_t>(index)];
+      if (std::isfinite(value)) values.push_back(value);
+    }
+
+    py::dict out;
+    out["roi_area_px"] = roi_w * roi_h;
+    out["capsule_count"] = static_cast<int>(requested_count);
+    out["sampled_area_px"] = sampled_area;
+    out["sampled_capsule_area_px"] = sampled_capsule_area;
+    out["sample_count"] = static_cast<int>(values.size());
+    out["valid_fraction"] = sampled_capsule_area > 0
+        ? static_cast<double>(values.size()) / static_cast<double>(sampled_capsule_area)
+        : 0.0;
+    out["depth_center"] = py::none();
+    if (values.empty()) {
+      out["depth_median"] = py::none();
+      out["depth_mean"] = py::none();
+      out["depth_p10"] = py::none();
+      out["depth_p90"] = py::none();
+      out["depth_min"] = py::none();
+      out["depth_max"] = py::none();
+      return out;
+    }
+
+    std::sort(values.begin(), values.end());
+    double sum = 0.0;
+    for (float value : values) sum += static_cast<double>(value);
+    auto percentile = [](const std::vector<float>& sorted_values, double p) -> double {
+      const double clamped = std::max(0.0, std::min(100.0, p));
+      const double pos = (clamped / 100.0) * static_cast<double>(sorted_values.size() - 1U);
+      const size_t lo = static_cast<size_t>(std::floor(pos));
+      const size_t hi = static_cast<size_t>(std::ceil(pos));
+      if (lo == hi) return static_cast<double>(sorted_values[lo]);
+      const double frac = pos - static_cast<double>(lo);
+      return (static_cast<double>(sorted_values[lo]) * (1.0 - frac)) + (static_cast<double>(sorted_values[hi]) * frac);
+    };
+    out["depth_median"] = percentile(values, 50.0);
+    out["depth_mean"] = sum / static_cast<double>(values.size());
+    out["depth_p10"] = percentile(values, 10.0);
+    out["depth_p90"] = percentile(values, 90.0);
+    out["depth_min"] = static_cast<double>(values.front());
+    out["depth_max"] = static_cast<double>(values.back());
+    return out;
+  }
+
   py::dict sample_masked_roi_stats(
       int left,
       int top,
@@ -1677,6 +1909,12 @@ PYBIND11_MODULE(noesis_depth_tracking_tensor_ext, m) {
           py::arg("width"),
           py::arg("height"),
           py::arg("max_samples") = 4096)
+      .def(
+          "sample_pose_capsule_stats",
+          &AlignedDepthFrameDevice::sample_pose_capsule_stats,
+          py::arg("capsules"),
+          py::arg("max_samples") = 4096,
+          "Sample the union of up to two [ax, ay, bx, by, line_radius, ankle_radius] pose contacts directly from the device depth frame.")
       .def(
           "sample_masked_roi_stats",
           &AlignedDepthFrameDevice::sample_masked_roi_stats,

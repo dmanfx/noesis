@@ -41,6 +41,119 @@ __global__ void sample_roi_center_kernel(
   *out_center = depth[(static_cast<size_t>(frame_y) * static_cast<size_t>(frame_w)) + static_cast<size_t>(frame_x)];
 }
 
+__device__ bool point_in_capsule(
+    float point_x,
+    float point_y,
+    float ax,
+    float ay,
+    float bx,
+    float by,
+    float radius) {
+  const float dx = bx - ax;
+  const float dy = by - ay;
+  const float length_sq = (dx * dx) + (dy * dy);
+  float t = 0.0F;
+  if (length_sq > 1.0e-6F) {
+    t = (((point_x - ax) * dx) + ((point_y - ay) * dy)) / length_sq;
+    t = fminf(1.0F, fmaxf(0.0F, t));
+  }
+  const float nearest_x = ax + (t * dx);
+  const float nearest_y = ay + (t * dy);
+  const float delta_x = point_x - nearest_x;
+  const float delta_y = point_y - nearest_y;
+  return (delta_x * delta_x) + (delta_y * delta_y) <= (radius * radius);
+}
+
+__device__ bool point_in_pose_contact(
+    float point_x,
+    float point_y,
+    float ax,
+    float ay,
+    float bx,
+    float by,
+    float line_radius,
+    float ankle_radius) {
+  if (point_in_capsule(
+          point_x, point_y, ax, ay, bx, by, line_radius)) {
+    return true;
+  }
+  const float ankle_dx = point_x - bx;
+  const float ankle_dy = point_y - by;
+  return (ankle_dx * ankle_dx) + (ankle_dy * ankle_dy) <=
+      (ankle_radius * ankle_radius);
+}
+
+// The pose-contact path passes at most two lower-leg capsules as kernel
+// parameters.  This deliberately keeps the geometry scalar and avoids a
+// host mask upload or a per-call device geometry allocation.
+__global__ void sample_pose_capsule_values_kernel(
+    const float* __restrict__ depth,
+    int frame_w,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    int capsule_count,
+    float c0_ax,
+    float c0_ay,
+    float c0_bx,
+    float c0_by,
+    float c0_line_radius,
+    float c0_ankle_radius,
+    float c1_ax,
+    float c1_ay,
+    float c1_bx,
+    float c1_by,
+    float c1_line_radius,
+    float c1_ankle_radius,
+    float* __restrict__ out_values) {
+  const int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (idx >= sampled_area) {
+    return;
+  }
+
+  const int sample_y = idx / sampled_cols;
+  const int sample_x = idx - (sample_y * sampled_cols);
+  const int local_x = min(sample_x * stride, roi_w - 1);
+  const int local_y = min(sample_y * stride, roi_h - 1);
+  const float point_x = static_cast<float>(x0 + local_x) + 0.5F;
+  const float point_y = static_cast<float>(y0 + local_y) + 0.5F;
+  bool active = false;
+  if (capsule_count > 0) {
+    active = point_in_pose_contact(
+        point_x,
+        point_y,
+        c0_ax,
+        c0_ay,
+        c0_bx,
+        c0_by,
+        c0_line_radius,
+        c0_ankle_radius);
+  }
+  if (!active && capsule_count > 1) {
+    active = point_in_pose_contact(
+        point_x,
+        point_y,
+        c1_ax,
+        c1_ay,
+        c1_bx,
+        c1_by,
+        c1_line_radius,
+        c1_ankle_radius);
+  }
+  if (!active) {
+    out_values[idx] = CUDART_NAN_F;
+    return;
+  }
+
+  const int frame_x = x0 + local_x;
+  const int frame_y = y0 + local_y;
+  out_values[idx] = depth[(static_cast<size_t>(frame_y) * static_cast<size_t>(frame_w)) + static_cast<size_t>(frame_x)];
+}
+
 __global__ void sample_masked_roi_values_kernel(
     const float* __restrict__ depth,
     const float* __restrict__ mask,
@@ -207,6 +320,71 @@ extern "C" cudaError_t noesis_sample_roi_values_cuda(
       sampled_area,
       out_values);
   sample_roi_center_kernel<<<1, 1, 0, stream>>>(depth, frame_w, x0, y0, roi_w, roi_h, out_center);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t noesis_sample_pose_capsule_values_cuda(
+    const float* depth,
+    int frame_w,
+    int frame_h,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    int capsule_count,
+    float c0_ax,
+    float c0_ay,
+    float c0_bx,
+    float c0_by,
+    float c0_line_radius,
+    float c0_ankle_radius,
+    float c1_ax,
+    float c1_ay,
+    float c1_bx,
+    float c1_by,
+    float c1_line_radius,
+    float c1_ankle_radius,
+    float* out_values,
+    cudaStream_t stream) {
+  if (!depth || !out_values) {
+    return cudaErrorInvalidValue;
+  }
+  if (frame_w <= 0 || frame_h <= 0 || roi_w <= 0 || roi_h <= 0 || stride <= 0 ||
+      sampled_cols <= 0 || sampled_area <= 0 || capsule_count <= 0 || capsule_count > 2) {
+    return cudaErrorInvalidValue;
+  }
+  if (x0 < 0 || y0 < 0 || x0 + roi_w > frame_w || y0 + roi_h > frame_h) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kBlockSize = 256;
+  const int blocks = (sampled_area + kBlockSize - 1) / kBlockSize;
+  sample_pose_capsule_values_kernel<<<blocks, kBlockSize, 0, stream>>>(
+      depth,
+      frame_w,
+      x0,
+      y0,
+      roi_w,
+      roi_h,
+      stride,
+      sampled_cols,
+      sampled_area,
+      capsule_count,
+      c0_ax,
+      c0_ay,
+      c0_bx,
+      c0_by,
+      c0_line_radius,
+      c0_ankle_radius,
+      c1_ax,
+      c1_ay,
+      c1_bx,
+      c1_by,
+      c1_line_radius,
+      c1_ankle_radius,
+      out_values);
   return cudaGetLastError();
 }
 

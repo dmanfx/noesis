@@ -1905,6 +1905,7 @@ def test_cancelled_gated_batch_is_not_releasable_and_releases_bytes() -> None:
         ("world_snapshot", "admit_broadcast_batch_sync"),
         ("world_event", "admit_broadcast_batch_sync"),
         ("bev-frame", "broadcast_bev_sync"),
+        ("bev-status", "broadcast_bev_sync"),
     ],
 )
 def test_canonical_message_routing_table_rejects_generic_paths(
@@ -2029,6 +2030,43 @@ def test_dedicated_bev_route_returns_typed_admission_and_is_noncoalesced() -> No
             "trackingPublicationSequence": 7,
         }
     ]
+
+
+def test_dedicated_bev_status_route_preserves_type_and_response_timing() -> None:
+    async def _run() -> tuple[object, list[dict[str, object]]]:
+        ws = WebSocketServer(stats_callback=None)
+        ws.event_loop = asyncio.get_running_loop()
+        ws._json_coalesce_interval_by_type["bev-status"] = 0.01
+        client = _FakeSocket()
+        ws.connected_clients.add(client)
+        receipt = ws.broadcast_bev_sync(
+            _timed_payload(
+                ws,
+                lambda: {
+                    "type": "bev-status",
+                    "cameraId": "kitchen",
+                    "sourceId": 1,
+                    "frameId": 5,
+                    "observedAtUs": 1_000_005,
+                    "trackingPublicationSequence": 4,
+                    "trackingOutboundSubmissionId": 9,
+                    "cohort": {
+                        "source_id": 1,
+                        "frame_id": 5,
+                        "observed_at_us": 1_000_005,
+                        "tracking_publication_sequence": 4,
+                    },
+                    "error": "homography_failed",
+                },
+            )
+        )
+        await ws.quiesce_outbound_submissions(timeout_s=1.0)
+        return receipt, [json.loads(str(item)) for item in client.sent]
+
+    receipt, sent = asyncio.run(_run())
+    assert receipt.message_count == 1
+    assert sent[0]["type"] == "bev-status"
+    assert sent[0]["trackingOutboundSubmissionId"] == 9
 
 
 def test_authority_gated_batch_rejects_mixed_or_drifted_cohorts() -> None:

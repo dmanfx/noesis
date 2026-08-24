@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, Tuple
 
+import numpy as np
+
 from .models import (
     CandidateEvidence,
     HardConstraint,
@@ -173,6 +175,16 @@ class IdentityV2Runtime:
         self._clock = clock
         self._lock = threading.RLock()
         self._hot_subjects: Tuple[_HotSubject, ...] = ()
+        # ReID embeddings have already crossed the explicit metadata boundary
+        # before they reach this runtime.  Keep one immutable, contiguous
+        # gallery matrix so a frame is scored with a single native BLAS call
+        # instead of millions of Python float multiplications on the media
+        # callback.  The spans remain aligned with ``_hot_subjects``.
+        self._hot_reference_matrix = np.empty(
+            (0, self.embedding_dim), dtype=np.float64
+        )
+        self._hot_reference_matrix.setflags(write=False)
+        self._hot_reference_spans: Tuple[Tuple[int, int], ...] = ()
         self._subject_index: dict[str, SubjectDescriptor] = {}
         self._refreshed_at = 0.0
         self._observation_cache_ttl_s = cache_ttl
@@ -527,15 +539,43 @@ class IdentityV2Runtime:
                         )
                     )
             self._assert_hot_gallery_authority_locked(hot)
-            self._hot_subjects = tuple(
-                sorted(hot, key=lambda item: item.descriptor.subject_id)
-            )
-            self._subject_index = {
-                item.descriptor.subject_id: item.descriptor
-                for item in self._hot_subjects
-            }
+            self._install_hot_subjects_locked(hot)
             self._refreshed_at = timestamp
             return tuple(item.descriptor for item in self._hot_subjects)
+
+    def _install_hot_subjects_locked(
+        self,
+        subjects: Sequence[_HotSubject],
+    ) -> None:
+        """Atomically install tuple and vectorized views of one gallery."""
+
+        ordered = tuple(sorted(subjects, key=lambda item: item.descriptor.subject_id))
+        spans: list[Tuple[int, int]] = []
+        matrices: list[np.ndarray] = []
+        offset = 0
+        for subject in ordered:
+            matrix = np.asarray(subject.normalized_vectors, dtype=np.float64)
+            if matrix.ndim != 2 or matrix.shape[1:] != (self.embedding_dim,):
+                raise ModelProfileMismatch(
+                    "hot identity gallery contains an invalid normalized matrix"
+                )
+            end = offset + int(matrix.shape[0])
+            spans.append((offset, end))
+            matrices.append(matrix)
+            offset = end
+        if matrices:
+            references = np.ascontiguousarray(
+                np.concatenate(matrices, axis=0), dtype=np.float64
+            )
+        else:
+            references = np.empty((0, self.embedding_dim), dtype=np.float64)
+        references.setflags(write=False)
+        self._hot_subjects = ordered
+        self._hot_reference_matrix = references
+        self._hot_reference_spans = tuple(spans)
+        self._subject_index = {
+            item.descriptor.subject_id: item.descriptor for item in ordered
+        }
 
     def _refresh_visitor_subject_locked(
         self,
@@ -589,13 +629,7 @@ class IdentityV2Runtime:
         if replacement is not None:
             updated.append(replacement)
         self._assert_hot_gallery_authority_locked(updated)
-        self._hot_subjects = tuple(
-            sorted(updated, key=lambda item: item.descriptor.subject_id)
-        )
-        self._subject_index = {
-            item.descriptor.subject_id: item.descriptor
-            for item in self._hot_subjects
-        }
+        self._install_hot_subjects_locked(updated)
         self._refreshed_at = now
 
     def hot_subjects(
@@ -609,6 +643,61 @@ class IdentityV2Runtime:
                 if item.descriptor.expires_at is None
                 or item.descriptor.expires_at > timestamp
             )
+
+    def _active_hot_gallery_snapshot_locked(
+        self,
+        timestamp: float,
+    ) -> Tuple[
+        Tuple[Tuple[int, _HotSubject], ...],
+        np.ndarray,
+        Tuple[Tuple[int, int], ...],
+    ]:
+        active = tuple(
+            (index, item)
+            for index, item in enumerate(self._hot_subjects)
+            if item.descriptor.expires_at is None
+            or item.descriptor.expires_at > timestamp
+        )
+        return active, self._hot_reference_matrix, self._hot_reference_spans
+
+    def _batched_gallery_similarities(
+        self,
+        observations: Sequence[RuntimeObservation],
+        active_subjects: Sequence[Tuple[int, _HotSubject]],
+        references: np.ndarray,
+        spans: Sequence[Tuple[int, int]],
+    ) -> Tuple[Tuple[float, ...], ...]:
+        """Return one max cosine score per observation and active subject."""
+
+        rows = tuple(observations)
+        normalized = tuple(
+            self._normalize_vector(
+                observation.embedding,
+                subject=f"observation {observation.key.observation_id}",
+            )
+            for observation in rows
+        )
+        if not rows or not active_subjects:
+            return tuple(() for _ in rows)
+        query_matrix = np.ascontiguousarray(normalized, dtype=np.float64)
+        if references.ndim != 2 or references.shape[1:] != (self.embedding_dim,):
+            raise RuntimeError("hot identity gallery matrix is inconsistent")
+        similarities = np.matmul(query_matrix, references.T)
+        np.clip(similarities, -1.0, 1.0, out=similarities)
+        return tuple(
+            tuple(
+                float(
+                    np.max(
+                        similarities[
+                            row_index,
+                            spans[subject_index][0] : spans[subject_index][1],
+                        ]
+                    )
+                )
+                for subject_index, _subject in active_subjects
+            )
+            for row_index in range(len(rows))
+        )
 
     def active_visitor_sessions(
         self,
@@ -639,29 +728,27 @@ class IdentityV2Runtime:
                 "a calibration batch may contain only one observation per exact tracklet"
             )
         with self._lock:
-            snapshot = tuple(
-                item
-                for item in self._hot_subjects
-                if item.descriptor.expires_at is None
-                or item.descriptor.expires_at > timestamp
+            active_subjects, references, spans = (
+                self._active_hot_gallery_snapshot_locked(timestamp)
             )
+        similarities = self._batched_gallery_similarities(
+            rows,
+            active_subjects,
+            references,
+            spans,
+        )
         out = []
-        for observation in rows:
-            query = self._normalize_vector(
-                observation.embedding,
-                subject=f"observation {observation.key.observation_id}",
-            )
+        for observation_index, observation in enumerate(rows):
             candidates = []
-            for subject in snapshot:
+            for subject_offset, (_subject_index, subject) in enumerate(
+                active_subjects
+            ):
                 descriptor = subject.descriptor
                 candidates.append(
                     CandidateEvidence(
                         identity_id=descriptor.subject_id,
                         identity_kind=descriptor.identity_kind,
-                        raw_similarity=max(
-                            self._dot(query, reference)
-                            for reference in subject.normalized_vectors
-                        ),
+                        raw_similarity=similarities[observation_index][subject_offset],
                         evidence=(
                             f"gallery_exemplars={len(subject.normalized_vectors)}",
                             f"compatibility_sid={descriptor.compatibility_sid}",
@@ -694,29 +781,29 @@ class IdentityV2Runtime:
                 "a batch may contain only one observation per exact tracklet"
             )
         with self._lock:
-            snapshot = tuple(
-                item
-                for item in self._hot_subjects
-                if item.descriptor.expires_at is None
-                or item.descriptor.expires_at > timestamp
+            active_subjects, references, spans = (
+                self._active_hot_gallery_snapshot_locked(timestamp)
             )
             descriptors = {
-                item.descriptor.subject_id: item.descriptor for item in snapshot
+                item.descriptor.subject_id: item.descriptor
+                for _index, item in active_subjects
             }
+
+        similarities = self._batched_gallery_similarities(
+            observation_rows,
+            active_subjects,
+            references,
+            spans,
+        )
 
         resolver_observations = []
         key_by_tracklet = {}
-        for observation in observation_rows:
-            query = self._normalize_vector(
-                observation.embedding,
-                subject=f"observation {observation.key.observation_id}",
-            )
+        for observation_index, observation in enumerate(observation_rows):
             candidates = []
-            for subject in snapshot:
-                similarity = max(
-                    self._dot(query, reference)
-                    for reference in subject.normalized_vectors
-                )
+            for subject_offset, (_subject_index, subject) in enumerate(
+                active_subjects
+            ):
+                similarity = similarities[observation_index][subject_offset]
                 descriptor = subject.descriptor
                 candidates.append(
                     CandidateEvidence(

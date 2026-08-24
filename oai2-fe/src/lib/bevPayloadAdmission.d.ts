@@ -10,8 +10,13 @@ export function bevCohort(payload: unknown): {
   frameId: number;
   observedAtUs: number;
   sequence: number;
+  outboundSubmissionId: number;
 } | null;
 export function admitBevFrame<T extends Record<string, unknown>>(
+  previous: T | undefined,
+  incoming: T,
+): BevAdmissionResult<T>;
+export function admitBevStatus<T extends Record<string, unknown>>(
   previous: T | undefined,
   incoming: T,
 ): BevAdmissionResult<T>;

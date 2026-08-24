@@ -119,9 +119,9 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: fbcee2a132124a24ed6a51dafb3bda66486fe9bdfe05fffe0da81a85dfb6f333
-      output_sha256: 75b9be7220910e851b935bd637a20b2b6d2d72bf3395ee6dd3f1c6c13fd0e1df
-      built_at_utc: "2026-08-23T17:39:38Z"
+      source_sha256: 289beedba9e386464451a972182faab7210325d13bb1451cdcdc899489285319
+      output_sha256: 3017335eb9df37bc25e5b6dc5673f33e588f170831d415324371974cf31da6dd
+      built_at_utc: "2026-08-24T01:56:40Z"
       build_host: "TauntonMainframe (driver 595.71.05)"
       command: bash DS9/scripts/build_native_ext_ds9.sh noesis_depth_tracking_tensor_ext DS9/native/noesis_depth_tracking_tensor_ext.cpp cuda_npp
   - id: native.reid_meta

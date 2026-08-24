@@ -3664,6 +3664,30 @@ def _build_stats_callback(
                 "capture_event_fusion": capture_event_health,
                 "scene_prior": scene_prior_health,
                 "scene_fusion": scene_fusion_health,
+                "identity_v2_shadow": {
+                    "status": (
+                        "degraded"
+                        if getattr(pipeline, "identity_v2_shadow_last_error", None)
+                        else (
+                            "enabled"
+                            if getattr(pipeline, "identity_v2_service", None)
+                            is not None
+                            and not bool(
+                                getattr(
+                                    getattr(pipeline, "identity_v2_service", None),
+                                    "authoritative",
+                                    False,
+                                )
+                            )
+                            else "disabled"
+                        )
+                    ),
+                    "last_error": getattr(
+                        pipeline,
+                        "identity_v2_shadow_last_error",
+                        None,
+                    ),
+                },
                 "zero_copy_profile": str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "strict") or "strict"),
                 "zero_copy_core_enabled": True,
                 "zero_copy_violations": core_violations,
@@ -6066,6 +6090,24 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         shutdown_event.set()
 
     setattr(pipeline, "identity_v2_failure_callback", _identity_v2_failed)
+
+    def _identity_v2_shadow_degraded(error: BaseException) -> None:
+        """Expose optional shadow failure without stopping canonical media."""
+
+        message = f"identity_v2_shadow_degraded:{type(error).__name__}:{error}"
+        previous = getattr(pipeline, "identity_v2_shadow_last_error", None)
+        setattr(pipeline, "identity_v2_shadow_last_error", message)
+        if previous != message:
+            logger.error(
+                "Identity-v2 shadow lane degraded; canonical tracking/BEV remains active: %s",
+                message,
+            )
+
+    setattr(
+        pipeline,
+        "identity_v2_shadow_failure_callback",
+        _identity_v2_shadow_degraded,
+    )
     from noesis.server import reid_v2_api
 
     startup_transaction.bind(
@@ -6728,6 +6770,22 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     except Exception:
         runtime_state["pipeline_failed"] = True
         logger.exception("Failed to quiesce pipeline control timers")
+        while True:
+            signal.pause()
+
+    try:
+        analytics_processor = getattr(
+            pipeline,
+            "analytics_telemetry_processor",
+            None,
+        )
+        shutdown_tracking = getattr(analytics_processor, "shutdown", None)
+        if callable(shutdown_tracking):
+            shutdown_tracking(wait=True, timeout_s=5.0)
+            logger.info("Canonical tracking/BEV publication worker quiesced")
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("Canonical tracking/BEV publication worker shutdown failed")
         while True:
             signal.pause()
 

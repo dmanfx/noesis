@@ -93,6 +93,7 @@ from .store import (
     VisitorExemplarRecord,
     VisitorSession,
     VisitorSlotInUse,
+    identity_tracklet_id,
     normalize_display_name,
 )
 
@@ -166,6 +167,7 @@ __all__ = [
     "calibrate_dataset_files",
     "dataset_review",
     "inspect_legacy_identity",
+    "identity_tracklet_id",
     "load_and_validate_evidence",
     "load_calibration_dataset",
     "load_migration_review",

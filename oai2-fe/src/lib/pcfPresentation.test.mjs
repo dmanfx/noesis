@@ -132,10 +132,12 @@ test('inline BEV renders the PCF walkable map with inferno semantics', async () 
   assert.doesNotMatch(bev, /repairIsolatedMaskHoles: true/);
   assert.doesNotMatch(bev, /inferredWalkableColor: BEV_INFERRED_WALKABLE_COLOR/);
   assert.match(bev, /ctx\.imageSmoothingEnabled = true/);
-  assert.match(bev, /expandMetricBounds\(floorplanBounds, BEV_DISPLAY_SAFETY_PADDING_M\)/);
+  assert.match(bev, /resolveBevDisplayBounds\(/);
+  assert.match(bev, /advertisedBounds: advertised/);
+  assert.doesNotMatch(bev, /BEV_DISPLAY_SAFETY_PADDING_M/);
   assert.match(bev, /const cameraOrigin = resolveForDraw\(0, 0\)/);
   assert.match(bev, /const normalizedPayloadBounds = useMemo/);
-  assert.match(bev, /normalizedPayloadBounds\.min_x \+ \(normX \* spanX\)/);
+  assert.match(bev, /resolveBevMetricPoint\(/);
   assert.match(bev, /const smoothBaseImage = hasComposite \|\| baseKind === 'obstacle_height' \|\| isHeightVisual \|\| isWalkableVisual/);
   assert.doesNotMatch(bev, /baseKind === 'walkable' \? bwColor/);
 

@@ -19,6 +19,7 @@ from reid.identity_v2 import (
     ObservationEvidenceUnavailable,
     OpenSetPolicy,
     RuntimeObservation,
+    identity_tracklet_id,
     resident_subject_id,
     visitor_subject_id,
 )
@@ -96,6 +97,81 @@ def _enroll(
         now=11.0,
     )
     return proposal, confirmation
+
+
+def test_direct_tracklet_id_matches_observation_key_contract() -> None:
+    key = _key(
+        "observation",
+        run="run-direct",
+        camera="camera-direct",
+        tracker="tracker-direct",
+        frame=12,
+    )
+    assert identity_tracklet_id(
+        "run-direct", "camera-direct", "tracker-direct"
+    ) == key.tracklet_id
+    with pytest.raises(ValueError, match="tracker_id"):
+        identity_tracklet_id("run-direct", "camera-direct", "")
+
+
+def test_vectorized_gallery_similarity_matches_scalar_contract(tmp_path) -> None:
+    store, runtime = _runtime(tmp_path)
+    try:
+        _enroll(
+            runtime,
+            _observation("alice-anchor", vector=(0.6, 0.8, 0.0, 0.0)),
+            name="Alice",
+            sid=1,
+        )
+        _enroll(
+            runtime,
+            _observation(
+                "bob-anchor",
+                vector=(0.0, 0.0, 0.8, 0.6),
+                tracker="tracker-bob",
+                frame=200,
+            ),
+            name="Bob",
+            sid=2,
+        )
+        observations = (
+            _observation(
+                "query-a",
+                vector=(0.3, 0.4, 0.4, 0.3),
+                tracker="query-a",
+                frame=300,
+            ),
+            _observation(
+                "query-b",
+                vector=(-0.2, 0.1, 0.7, 0.4),
+                tracker="query-b",
+                frame=300,
+            ),
+        )
+        rows = runtime.calibration_candidate_observations(
+            observations,
+            now=20.0,
+        )
+        assert runtime._hot_reference_matrix.flags.writeable is False
+        for observation, row in zip(observations, rows):
+            query = runtime._normalize_vector(
+                observation.embedding,
+                subject="scalar parity query",
+            )
+            expected = {
+                subject.descriptor.subject_id: max(
+                    runtime._dot(query, reference)
+                    for reference in subject.normalized_vectors
+                )
+                for subject in runtime._hot_subjects
+            }
+            actual = {
+                candidate.identity_id: candidate.raw_similarity
+                for candidate in row.candidates
+            }
+            assert actual == pytest.approx(expected, abs=1e-12)
+    finally:
+        store.close()
 
 
 def test_exact_enrollment_is_stale_safe_replay_safe_and_restart_safe(tmp_path) -> None:

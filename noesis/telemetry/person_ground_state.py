@@ -13,9 +13,10 @@ Phases implemented here (shared by baseline and V3DT analytics hooks):
 from __future__ import annotations
 
 import math
+from copy import copy
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -94,6 +95,19 @@ class HumanGroundConfig:
     beta_scale: float = 0.22
     reacquire_samples: int = 3
     reacquire_max_gap_s: float = 0.75
+    # A rejected metric observation may advance the process model only for
+    # this short horizon.  After that, keep the process state at the bounded
+    # edge of the last-good window instead of integrating velocity forever.
+    rejected_prediction_horizon_s: float = 0.40
+
+    # Projective image-motion continuation is intentionally conservative. It
+    # may update the bounded process posterior for a missing/rejected metric
+    # observation, but never replaces a fresh floor/depth measurement as the
+    # accepted metric authority.
+    projective_max_bbox_step_px: float = 64.0
+    projective_max_bbox_speed_px_s: float = 1200.0
+    projective_max_scale_ratio: float = 1.45
+    projective_world_slack_m: float = 0.35
 
     # Phase 6 — path simplification
     path_min_step_m: float = 0.05
@@ -154,6 +168,31 @@ class HumanGroundConfig:
         object.__setattr__(self, "beta_scale", float(min(1.0, max(0.0, float(self.beta_scale)))))
         object.__setattr__(self, "reacquire_samples", max(2, int(self.reacquire_samples)))
         object.__setattr__(self, "reacquire_max_gap_s", max(0.0, float(self.reacquire_max_gap_s)))
+        object.__setattr__(
+            self,
+            "rejected_prediction_horizon_s",
+            max(0.0, float(self.rejected_prediction_horizon_s)),
+        )
+        object.__setattr__(
+            self,
+            "projective_max_bbox_step_px",
+            max(1.0, float(self.projective_max_bbox_step_px)),
+        )
+        object.__setattr__(
+            self,
+            "projective_max_bbox_speed_px_s",
+            max(1.0, float(self.projective_max_bbox_speed_px_s)),
+        )
+        object.__setattr__(
+            self,
+            "projective_max_scale_ratio",
+            max(1.01, float(self.projective_max_scale_ratio)),
+        )
+        object.__setattr__(
+            self,
+            "projective_world_slack_m",
+            max(0.0, float(self.projective_world_slack_m)),
+        )
         object.__setattr__(self, "path_min_step_m", max(0.0, float(self.path_min_step_m)))
         object.__setattr__(self, "path_simplify_epsilon_m", max(0.0, float(self.path_simplify_epsilon_m)))
         object.__setattr__(self, "path_max_points", max(2, int(self.path_max_points)))
@@ -187,6 +226,9 @@ class PoseAnchorCandidate:
     quality_reason: Optional[str] = None
     height_lock_eligible: bool = False
     score: float = 1.0
+    # Stable anatomical/evidence basis used to prove that consecutive image
+    # observations describe the same contact, not an ankle/source swap.
+    contact_basis: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +262,15 @@ class PersonGroundState:
     # < 0 means "never updated"; 0.0 is a valid timestamp.
     filtered_ts: float = -1.0
 
+    # Revisioned world-frame binding for the metric filter. A calibration
+    # reload can change the camera-to-world transform while a numeric tracker
+    # ID remains alive. Keeping this identity on the state makes it impossible
+    # for a rejected-frame hold or CV prediction from the previous world to be
+    # published under the new world's revision.
+    world_frame_id: Optional[str] = None
+    world_frame_revision: Optional[str] = None
+    world_transform_sha256: Optional[str] = None
+
     # Phase 1 / 3
     motion_mode: MotionMode = "unknown"
     posture: Posture = "unknown"
@@ -228,6 +279,32 @@ class PersonGroundState:
     locked_world: Optional[Tuple[float, float]] = None
     residual_m: Deque[float] = field(default_factory=lambda: deque(maxlen=12))
     image_foot_history: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=12))
+    # Exact-frame image evidence is deliberately separate from the smoothed
+    # history above.  It is used before the world filter to unlock a genuinely
+    # walking idle track and to authorize outlier reacquisition.
+    image_motion_frame_id: int = -1
+    image_motion_contact_basis: Optional[str] = None
+    image_motion_window: Deque[Tuple[int, str, float, float, float, float]] = field(
+        default_factory=lambda: deque(maxlen=3)
+    )
+    image_motion_streak: int = 0
+    image_motion_supported: bool = False
+    # Exact-frame detector-box continuity used only to gate a short stationary
+    # hold when a seated target has no current ground contact.  This is compact
+    # scalar state; it does not retain or copy image data.
+    bbox_motion_frame_id: int = -1
+    bbox_center_u: Optional[float] = None
+    bbox_bottom_v: Optional[float] = None
+    bbox_geometry: Optional[Tuple[float, float, float, float]] = None
+    bbox_stationary_streak: int = 0
+    bbox_stationary_supported: bool = False
+    # Last *physically accepted* image geometry.  These fields are deliberately
+    # distinct from the current image evidence and from bbox_stationarity: a
+    # rejected/missing frame must never become a new predictor origin.
+    last_accepted_image_foot: Optional[Tuple[float, float]] = None
+    last_accepted_bbox_geometry: Optional[Tuple[float, float, float, float]] = None
+    last_accepted_image_ts: float = -1.0
+    last_accepted_lifecycle_generation: Optional[int] = None
     last_full_body_ts: float = -1.0
     last_non_upright_ts: float = -1.0
     upright_bbox_height_px: Optional[float] = None
@@ -270,6 +347,7 @@ class PersonGroundState:
     reacquire_candidate_x: Optional[float] = None
     reacquire_candidate_z: Optional[float] = None
     reacquire_candidate_ts: float = -1.0
+    reacquire_candidate_basis: Optional[str] = None
     reacquire_count: int = 0
     reacquired: bool = False
     trail_break_required: bool = False
@@ -280,6 +358,14 @@ class PersonGroundState:
     pending_source_previous: Optional[
         Tuple[Optional[str], int, float, int, Optional[str], int]
     ] = None
+
+    # Internal process anchor for a run of rejected observations.  Runtime
+    # tracks normally have ``last_good_world``; this fallback also keeps the
+    # SDK-neutral filter bounded when it is used directly by a caller that has
+    # not mirrored the last-good publication fields yet.
+    rejection_anchor_x: Optional[float] = None
+    rejection_anchor_z: Optional[float] = None
+    rejection_anchor_ts: float = -1.0
 
     def as_public_fields(self) -> Dict[str, Any]:
         return {
@@ -319,6 +405,13 @@ class PersonGroundState:
             ),
             "world_reacquire_count": int(self.reacquire_count),
             "world_reacquired": bool(self.reacquired),
+            "world_contact_basis": (
+                str(self.image_motion_contact_basis)
+                if self.image_motion_contact_basis
+                else None
+            ),
+            "world_image_motion_supported": bool(self.image_motion_supported),
+            "world_image_motion_streak": int(self.image_motion_streak),
             "trail_break_required": bool(self.trail_break_required),
             "trail_segment_id": int(self.trail_segment_id),
         }
@@ -328,7 +421,156 @@ def _clear_reacquire_candidate(state: PersonGroundState) -> None:
     state.reacquire_candidate_x = None
     state.reacquire_candidate_z = None
     state.reacquire_candidate_ts = -1.0
+    state.reacquire_candidate_basis = None
     state.reacquire_count = 0
+
+
+def _clear_rejection_anchor(state: PersonGroundState) -> None:
+    state.rejection_anchor_x = None
+    state.rejection_anchor_z = None
+    state.rejection_anchor_ts = -1.0
+
+
+def world_frame_binding_from_calibration(
+    calibration: Any,
+    *,
+    default_frame_id: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract the immutable world identity from either calibration snapshot.
+
+    The native calibration manager exposes a ``WorldCalibrationSnapshot``;
+    SDK-neutral tests and older callers use the telemetry snapshot.  Keep this
+    adapter deliberately duck-typed so the filter does not import the runtime
+    calibration manager or retain a mutable provider object.
+    """
+
+    def _text(value: Any) -> Optional[str]:
+        try:
+            value = str(value).strip()
+        except Exception:
+            return None
+        return value or None
+
+    if calibration is None:
+        return _text(default_frame_id), None, None
+
+    contract = getattr(calibration, "frame_contract", None)
+    frame = getattr(calibration, "world_frame", None)
+    frame_id = _text(getattr(calibration, "world_frame_id", None))
+    revision = _text(getattr(calibration, "world_frame_revision", None))
+    if frame is not None:
+        if frame_id is None:
+            frame_id = _text(getattr(frame, "frame_id", None))
+        if revision is None:
+            revision = _text(getattr(frame, "revision", None))
+    if frame_id is None and contract is not None:
+        target_frame = getattr(contract, "target_frame", None)
+        if target_frame is not None:
+            frame_id = _text(getattr(target_frame, "frame_id", None))
+            if revision is None:
+                revision = _text(getattr(target_frame, "revision", None))
+    if frame_id is None:
+        frame_id = _text(default_frame_id)
+
+    transform = _text(getattr(calibration, "frame_transform_sha256", None))
+    if transform is None and contract is not None:
+        transform = _text(getattr(contract, "transform_sha256", None))
+    # The alignment hash is a useful conservative fallback for snapshot types
+    # that do not expose the transform digest. The explicit frame revision
+    # remains the primary identity when both are present.
+    if transform is None:
+        transform = _text(getattr(calibration, "world_alignment_sha256", None))
+    return frame_id, revision, transform
+
+
+def bind_world_frame(
+    state: PersonGroundState,
+    *,
+    world_frame_id: Optional[str],
+    world_frame_revision: Optional[str],
+    world_transform_sha256: Optional[str],
+) -> bool:
+    """Bind a filter state to one world revision, resetting on a change.
+
+    Returns ``True`` when the prior state belonged to a different frame or
+    transform. The reset is in-place so references held by the current
+    tracking callback remain safe, while all metric history, CV velocity,
+    seated lock, accepted image origin, and rejected-frame anchors are cleared.
+    Lifecycle identity is retained because a calibration change is not a
+    tracker-ID reuse; trails are explicitly broken through a new segment.
+    """
+
+    requested = (
+        str(world_frame_id).strip() if world_frame_id else None,
+        str(world_frame_revision).strip() if world_frame_revision else None,
+        str(world_transform_sha256).strip() if world_transform_sha256 else None,
+    )
+    current = (
+        str(state.world_frame_id).strip() if state.world_frame_id else None,
+        str(state.world_frame_revision).strip() if state.world_frame_revision else None,
+        str(state.world_transform_sha256).strip()
+        if state.world_transform_sha256
+        else None,
+    )
+    if current == (None, None, None):
+        state.world_frame_id, state.world_frame_revision, state.world_transform_sha256 = requested
+        return False
+    if current == requested:
+        return False
+
+    lifecycle_generation = getattr(state, "tracker_lifecycle_generation", None)
+    try:
+        prior_segment = int(state.trail_segment_id)
+    except Exception:
+        prior_segment = 0
+    state.__dict__.clear()
+    fresh = PersonGroundState(
+        world_frame_id=requested[0],
+        world_frame_revision=requested[1],
+        world_transform_sha256=requested[2],
+    )
+    state.__dict__.update(fresh.__dict__)
+    state.trail_break_required = True
+    state.trail_segment_id = max(0, prior_segment) + 1
+    if lifecycle_generation is not None:
+        setattr(state, "tracker_lifecycle_generation", lifecycle_generation)
+    return True
+
+
+def world_frame_matches_calibration(
+    track: Mapping[str, Any],
+    calibration: Any,
+    *,
+    default_frame_id: Optional[str] = None,
+) -> bool:
+    """Return whether a published world row belongs to the active snapshot.
+
+    Missing one side of an explicit revision is treated as a mismatch. This
+    is intentional at the OSD boundary: an unknown frame cannot safely be
+    reprojected with a known active transform.
+    """
+
+    expected = world_frame_binding_from_calibration(
+        calibration,
+        default_frame_id=default_frame_id,
+    )
+    observed = (
+        str(track.get("world_frame") or "").strip() or None,
+        str(track.get("world_frame_revision") or "").strip() or None,
+        str(track.get("world_transform_sha256") or "").strip() or None,
+    )
+    expected_frame, expected_revision, expected_transform = expected
+    observed_frame, observed_revision, observed_transform = observed
+    if expected_frame is not None and observed_frame != expected_frame:
+        return False
+    if expected_revision is not None and observed_revision != expected_revision:
+        return False
+    if observed_revision is not None and expected_revision is None:
+        return False
+    if expected_transform is not None and observed_transform is not None:
+        if observed_transform != expected_transform:
+            return False
+    return True
 
 
 def _begin_filter_measurement(state: PersonGroundState) -> None:
@@ -338,6 +580,162 @@ def _begin_filter_measurement(state: PersonGroundState) -> None:
     state.measurement_allowed_m = 0.0
     state.reacquired = False
     state.trail_break_required = False
+
+
+def mark_world_measurement_unavailable(
+    state: PersonGroundState,
+    *,
+    reason: str,
+) -> None:
+    """Record an honest no-measurement frame without advancing the filter."""
+
+    _begin_filter_measurement(state)
+    state.measurement_accepted = False
+    state.measurement_rejection_reason = str(reason or "measurement_unavailable")
+    state.measurement_innovation_m = math.nan
+    state.measurement_allowed_m = math.nan
+    _clear_reacquire_candidate(state)
+
+
+def advance_human_cv_prediction(
+    state: PersonGroundState,
+    *,
+    floor_y: float,
+    now_ts: float,
+    config: HumanGroundConfig,
+    reason: str = "world_measurement_unavailable",
+) -> Optional[np.ndarray]:
+    """Advance the one canonical ground state when no metric sample exists.
+
+    Missing/rejected observations still have a physical output: the bounded
+    constant-velocity process model.  Keeping that prediction in
+    ``PersonGroundState`` prevents the display path from switching to a
+    second, display-only point and then snapping back to the filter state when
+    metric evidence returns.  This function does not create a new metric
+    anchor and never starts a trail segment.
+    """
+
+    if state.world_x is None or state.world_z is None or float(state.filtered_ts) < 0.0:
+        return None
+    now_ts = float(now_ts)
+    previous_ts = float(state.filtered_ts)
+    if not math.isfinite(now_ts) or now_ts < previous_ts:
+        state.measurement_accepted = False
+        state.measurement_rejection_reason = "non_monotonic_timestamp"
+        state.trail_append_allowed = False
+        return np.array(
+            [float(state.world_x), float(floor_y), float(state.world_z)],
+            dtype=np.float64,
+        )
+    if now_ts == previous_ts:
+        state.measurement_accepted = False
+        state.measurement_rejection_reason = str(reason or "world_measurement_unavailable")
+        state.trail_append_allowed = False
+        return np.array(
+            [float(state.world_x), float(floor_y), float(state.world_z)],
+            dtype=np.float64,
+        )
+
+    gate_dt = float(now_ts - previous_ts)
+    if float(config.reset_after_s) > 0.0:
+        gate_dt = min(gate_dt, float(config.reset_after_s))
+    pred_x = float(state.world_x) + float(state.vel_world_x) * gate_dt
+    pred_z = float(state.world_z) + float(state.vel_world_z) * gate_dt
+    return _reject_with_cv_time_update(
+        state,
+        pred_x=pred_x,
+        pred_z=pred_z,
+        now_ts=now_ts,
+        floor_y=float(floor_y),
+        reason=str(reason or "world_measurement_unavailable"),
+        config=config,
+    )
+
+
+def integrate_projective_ground_observation(
+    state: PersonGroundState,
+    *,
+    measurement: np.ndarray,
+    floor_y: float,
+    now_ts: float,
+    config: HumanGroundConfig,
+) -> Optional[np.ndarray]:
+    """Integrate an admissible image-motion floor point into filter state.
+
+    The caller must apply the calibrated world-fusion policy before invoking
+    this function.  The point is still weak evidence: it is passed through
+    the exact physical CV admission and posterior-speed gate, does not update
+    ``last_good_world``/the accepted image origin, and is marked estimated for
+    telemetry.  A rejected projective point leaves the bounded process state
+    as-is and returns ``None``; it is never clamped into a plausible-looking
+    relocation.
+    """
+
+    try:
+        candidate = np.asarray(measurement, dtype=np.float64)
+        if candidate.shape[0] < 3 or not np.all(np.isfinite(candidate[:3])):
+            return None
+        if state.world_x is None or state.world_z is None or float(state.filtered_ts) < 0.0:
+            return None
+    except Exception:
+        return None
+
+    # A rejected metric candidate may already have advanced the process state
+    # to this exact frame timestamp.  Evaluate the independent image-motion
+    # candidate from the fixed rejection anchor in that case; otherwise the
+    # normal filter sees a zero dt and incorrectly reports a timestamp reject.
+    # The temporary state keeps the original bounded posterior untouched when
+    # the projective candidate fails the same physical gate.
+    evaluation_state = state
+    rewound_from_rejection = bool(
+        not bool(state.measurement_accepted)
+        and state.rejection_anchor_x is not None
+        and state.rejection_anchor_z is not None
+        and math.isfinite(float(state.rejection_anchor_ts))
+        and math.isfinite(float(state.filtered_ts))
+        and float(state.filtered_ts) == float(now_ts)
+        and float(state.rejection_anchor_ts) < float(now_ts)
+    )
+    if rewound_from_rejection:
+        evaluation_state = copy(state)
+        evaluation_state.world_x = float(evaluation_state.rejection_anchor_x)
+        evaluation_state.world_z = float(evaluation_state.rejection_anchor_z)
+        evaluation_state.filtered_ts = float(evaluation_state.rejection_anchor_ts)
+        evaluation_state.measurement_accepted = True
+        evaluation_state.measurement_rejection_reason = None
+        evaluation_state.measurement_innovation_m = 0.0
+        evaluation_state.measurement_allowed_m = 0.0
+        evaluation_state.reacquired = False
+        _clear_reacquire_candidate(evaluation_state)
+        _clear_rejection_anchor(evaluation_state)
+
+    result = update_human_cv_filter(
+        evaluation_state,
+        measurement=candidate,
+        floor_y=float(floor_y),
+        now_ts=float(now_ts),
+        quality="weak",
+        config=config,
+        force_accept=False,
+        contact_basis=None,
+        image_motion_supported=False,
+    )
+    if not bool(evaluation_state.measurement_accepted):
+        return None
+
+    if rewound_from_rejection:
+        state.__dict__.update(evaluation_state.__dict__)
+
+    # This posterior is physically admissible but not a fresh metric/depth
+    # measurement. Keep it out of the metric authority fields while making it
+    # the canonical process origin for the next frame.
+    state.measurement_accepted = False
+    state.measurement_rejection_reason = "projective_weak_observation"
+    state.trail_append_allowed = True
+    state.rejection_anchor_x = float(state.world_x)
+    state.rejection_anchor_z = float(state.world_z)
+    state.rejection_anchor_ts = float(state.filtered_ts)
+    return np.asarray(result, dtype=np.float64)
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -867,6 +1265,7 @@ def resolve_pose_floor_anchor(
             u=float(left_ankle[0] + right_ankle[0]) * 0.5,
             v=float(left_ankle[1] + right_ankle[1]) * 0.5,
             source="pose_ankle_floor",
+            contact_basis="pose:ankle_pair",
             quality="good",
             quality_reason=(
                 f"posture={effective_posture},observed_ankles"
@@ -878,11 +1277,13 @@ def resolve_pose_floor_anchor(
         )
     if left_ankle is not None or right_ankle is not None:
         ankle = left_ankle if left_ankle is not None else right_ankle
+        ankle_side = "left" if left_ankle is not None else "right"
         assert ankle is not None
         return PoseAnchorCandidate(
             u=float(ankle[0]),
             v=float(ankle[1]),
             source="pose_single_ankle_floor",
+            contact_basis=f"pose:{ankle_side}_ankle",
             quality="good",
             quality_reason=(
                 f"posture={effective_posture},observed_single_ankle"
@@ -899,22 +1300,25 @@ def resolve_pose_floor_anchor(
     if bent or effective_posture in ("sitting", "lying"):
         return None
 
-    estimates: List[Tuple[float, float]] = []
+    estimates: List[Tuple[str, float, float]] = []
     for side in ("left", "right"):
         ankle_est = estimate_ankle_from_leg(kpts_abs, side, conf_threshold=thr)
         if ankle_est is not None:
-            estimates.append((float(ankle_est[0]), float(ankle_est[1])))
+            estimates.append((str(side), float(ankle_est[0]), float(ankle_est[1])))
     if not estimates:
         return None
     if len(estimates) == 1:
-        u, v = estimates[0]
+        side, u, v = estimates[0]
+        contact_basis = f"pose:{side}_leg_extension"
     else:
-        u = float(sum(p[0] for p in estimates) / len(estimates))
-        v = float(sum(p[1] for p in estimates) / len(estimates))
+        u = float(sum(p[1] for p in estimates) / len(estimates))
+        v = float(sum(p[2] for p in estimates) / len(estimates))
+        contact_basis = "pose:leg_pair_extension"
     return PoseAnchorCandidate(
         u=float(u),
         v=float(v),
         source="pose_leg_floor",
+        contact_basis=contact_basis,
         quality="estimated",
         quality_reason="pose_leg_extension",
         height_lock_eligible=False,
@@ -947,6 +1351,8 @@ def source_score(
         "person_mask_floor": 0.80,
         "pose_leg_floor": 0.55,
         "gravity_drop": 0.40,
+        "cv_prediction": 0.35,
+        "image_motion_prediction": 0.35,
         "anchor_hold": 0.30,
     }.get(src, 0.50)
     if quality == "good":
@@ -1085,12 +1491,517 @@ def complete_source_admission(state: PersonGroundState, *, measurement_accepted:
     ) = previous
 
 
+def observe_coherent_image_motion(
+    state: PersonGroundState,
+    *,
+    frame_id: int,
+    image_foot_uv: Optional[Tuple[float, float]],
+    bbox: Optional[Sequence[float]],
+    contact_basis: Optional[str],
+    config: HumanGroundConfig,
+) -> bool:
+    """Observe one exact-frame, independently corroborated contact movement.
+
+    A moving ankle/contact alone is not evidence that the person moved: pose
+    swaps and hallucinations commonly move that point while the tracker box is
+    stationary.  This admission requires the current contact and the current
+    bbox bottom-center to both move, in a coherent direction, across a bounded
+    window of strictly consecutive frames and on one stable contact basis.
+
+    The returned boolean describes the *current* coherent observation.  Three
+    consecutive observations (``static_exit_frames``) pre-unlock an idle state
+    before the world filter runs.  This does not admit a world measurement;
+    the physical innovation gate remains authoritative.
+    """
+
+    try:
+        current_frame_id = int(frame_id)
+        basis = str(contact_basis or "").strip()
+        if current_frame_id < 0 or not basis or image_foot_uv is None:
+            raise ValueError
+        contact_u = float(image_foot_uv[0])
+        contact_v = float(image_foot_uv[1])
+        if bbox is None or len(bbox) < 4:
+            raise ValueError
+        left, top, width, height = (float(value) for value in bbox[:4])
+        bbox_u = left + width * 0.5
+        bbox_v = top + height
+        if width <= 0.0 or height <= 0.0:
+            raise ValueError
+        if not all(
+            math.isfinite(value)
+            for value in (contact_u, contact_v, bbox_u, bbox_v)
+        ):
+            raise ValueError
+    except Exception:
+        state.image_motion_frame_id = -1
+        state.image_motion_contact_basis = None
+        state.image_motion_window.clear()
+        state.image_motion_streak = 0
+        state.image_motion_supported = False
+        return False
+
+    required_observations = max(2, int(config.static_exit_frames))
+    if state.image_motion_window.maxlen != required_observations:
+        state.image_motion_window = deque(
+            list(state.image_motion_window)[-required_observations:],
+            maxlen=required_observations,
+        )
+    consecutive = current_frame_id == int(state.image_motion_frame_id) + 1
+    same_basis = basis == str(state.image_motion_contact_basis or "")
+    if not consecutive or not same_basis:
+        state.image_motion_window.clear()
+    state.image_motion_window.append(
+        (
+            int(current_frame_id),
+            str(basis),
+            float(contact_u),
+            float(contact_v),
+            float(bbox_u),
+            float(bbox_v),
+        )
+    )
+
+    coherent = False
+    if len(state.image_motion_window) == required_observations:
+        first = state.image_motion_window[0]
+        last = state.image_motion_window[-1]
+        contact_du = float(last[2]) - float(first[2])
+        contact_dv = float(last[3]) - float(first[3])
+        bbox_du = float(last[4]) - float(first[4])
+        bbox_dv = float(last[5]) - float(first[5])
+        contact_distance = math.hypot(contact_du, contact_dv)
+        bbox_distance = math.hypot(bbox_du, bbox_dv)
+        step_directions_coherent = True
+        for index in range(1, len(state.image_motion_window)):
+            previous = state.image_motion_window[index - 1]
+            current = state.image_motion_window[index]
+            step_dot = (
+                (float(current[2]) - float(previous[2]))
+                * (float(current[4]) - float(previous[4]))
+                + (float(current[3]) - float(previous[3]))
+                * (float(current[5]) - float(previous[5]))
+            )
+            if step_dot <= 0.0:
+                step_directions_coherent = False
+                break
+        coherent = bool(
+            contact_distance > float(config.static_px_threshold)
+            and bbox_distance > float(config.static_px_threshold)
+            and (contact_du * bbox_du + contact_dv * bbox_dv) > 0.0
+            and step_directions_coherent
+        )
+
+    state.image_motion_frame_id = int(current_frame_id)
+    state.image_motion_contact_basis = str(basis)
+    state.image_motion_streak = len(state.image_motion_window) if coherent else 0
+    state.image_motion_supported = bool(coherent)
+
+    if (
+        state.motion_mode == "idle"
+        and int(state.image_motion_streak) >= int(config.static_exit_frames)
+    ):
+        state.motion_mode = "walk"
+        state.locked_world = None
+        state.idle_since_ts = 0.0
+        state.exit_motion_frames = 0
+        state.trail_append_allowed = True
+    return bool(coherent)
+
+
+def observe_bbox_stationarity(
+    state: PersonGroundState,
+    *,
+    frame_id: int,
+    bbox: Optional[Sequence[float]],
+    config: HumanGroundConfig,
+) -> bool:
+    """Gate a short hold on exact-frame detector-box continuity.
+
+    This is deliberately weaker than metric admission: it can support only a
+    non-appending display hold for an already trusted point.  It never creates
+    a world measurement or authorizes a trail update.  Missing/non-consecutive
+    frame IDs and movement beyond a small detector-jitter tolerance reset the
+    streak.
+    """
+
+    try:
+        current_frame_id = int(frame_id)
+        if current_frame_id < 0 or bbox is None or len(bbox) < 4:
+            raise ValueError
+        left, _top, width, height = (float(value) for value in bbox[:4])
+        center_u = left + width * 0.5
+        bottom_v = float(_top) + height
+        if width <= 1.0 or height <= 1.0 or not all(
+            math.isfinite(value) for value in (center_u, bottom_v)
+        ):
+            raise ValueError
+    except Exception:
+        state.bbox_motion_frame_id = -1
+        state.bbox_center_u = None
+        state.bbox_bottom_v = None
+        state.bbox_geometry = None
+        state.bbox_stationary_streak = 0
+        state.bbox_stationary_supported = False
+        return False
+
+    consecutive = current_frame_id == int(state.bbox_motion_frame_id) + 1
+    tolerance = max(4.0, float(config.static_px_threshold) * 2.0)
+    if (
+        not consecutive
+        or state.bbox_center_u is None
+        or state.bbox_bottom_v is None
+        or abs(float(center_u) - float(state.bbox_center_u)) > tolerance
+        or abs(float(bottom_v) - float(state.bbox_bottom_v)) > tolerance
+    ):
+        state.bbox_stationary_streak = 1
+    else:
+        state.bbox_stationary_streak = int(state.bbox_stationary_streak) + 1
+    state.bbox_motion_frame_id = current_frame_id
+    state.bbox_center_u = float(center_u)
+    state.bbox_bottom_v = float(bottom_v)
+    state.bbox_geometry = (
+        float(left),
+        float(_top),
+        float(width),
+        float(height),
+    )
+    required = max(3, int(config.static_exit_frames))
+    state.bbox_stationary_supported = bool(
+        int(state.bbox_stationary_streak) >= required
+    )
+    return bool(state.bbox_stationary_supported)
+
+
+def record_accepted_image_geometry(
+    state: PersonGroundState,
+    *,
+    image_foot_uv: Optional[Tuple[float, float]],
+    bbox: Optional[Sequence[float]],
+    now_ts: float,
+    lifecycle_generation: Optional[int] = None,
+) -> bool:
+    """Record the image basis belonging to an accepted world observation.
+
+    ``bbox`` and ``image_foot_uv`` must be in the same image coordinate space
+    (the runtime uses the calibration raster).  Keeping this write behind the
+    physical world admission gate prevents rejected detections from teaching
+    the projective predictor a bad origin.
+    """
+
+    try:
+        if image_foot_uv is None or bbox is None or len(bbox) < 4:
+            raise ValueError
+        u, v = (float(image_foot_uv[0]), float(image_foot_uv[1]))
+        left, top, width, height = (float(value) for value in bbox[:4])
+        values = (u, v, left, top, width, height, float(now_ts))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError
+        if width <= 1.0 or height <= 1.0 or float(now_ts) < 0.0:
+            raise ValueError
+    except Exception:
+        return False
+    state.last_accepted_image_foot = (u, v)
+    state.last_accepted_bbox_geometry = (left, top, width, height)
+    state.last_accepted_image_ts = float(now_ts)
+    state.last_accepted_lifecycle_generation = (
+        int(lifecycle_generation) if lifecycle_generation is not None else None
+    )
+    return True
+
+
+def transport_accepted_image_foot(
+    state: PersonGroundState,
+    *,
+    bbox: Optional[Sequence[float]],
+    now_ts: float,
+    lifecycle_generation: Optional[int] = None,
+    ttl_s: float = 0.40,
+    config: Optional[HumanGroundConfig] = None,
+) -> Optional[Tuple[float, float, float, float, float, str]]:
+    """Transport the accepted foot through current bbox affine motion.
+
+    The returned tuple is ``(u, v, age_s, center_step_px, scale_ratio,
+    reason)``.  It is intentionally pure with respect to state: callers may
+    evaluate it every frame, but only ``record_accepted_image_geometry`` may
+    change the predictor origin.  The pixel transport is not yet metric; the
+    caller must project it through the active floor plane and apply its ray and
+    world-space gates.
+    """
+
+    cfg = config or HumanGroundConfig()
+    try:
+        prior_foot = state.last_accepted_image_foot
+        prior_bbox = state.last_accepted_bbox_geometry
+        accepted_ts = float(state.last_accepted_image_ts)
+        current_ts = float(now_ts)
+        if (
+            prior_foot is None
+            or prior_bbox is None
+            or accepted_ts < 0.0
+            or not math.isfinite(current_ts)
+        ):
+            return None
+        if (
+            lifecycle_generation is not None
+            and state.last_accepted_lifecycle_generation is not None
+            and int(lifecycle_generation)
+            != int(state.last_accepted_lifecycle_generation)
+        ):
+            return None
+        age_s = current_ts - accepted_ts
+        if age_s < 0.0 or age_s > max(0.0, float(ttl_s)):
+            return None
+        if bbox is None or len(bbox) < 4:
+            return None
+        left, top, width, height = (float(value) for value in bbox[:4])
+        prior_left, prior_top, prior_width, prior_height = prior_bbox
+        values = (
+            *prior_foot,
+            left,
+            top,
+            width,
+            height,
+            prior_left,
+            prior_top,
+            prior_width,
+            prior_height,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            return None
+        if min(width, height, prior_width, prior_height) <= 1.0:
+            return None
+        prior_center = (
+            float(prior_left) + float(prior_width) * 0.5,
+            float(prior_top) + float(prior_height) * 0.5,
+        )
+        current_center = (left + width * 0.5, top + height * 0.5)
+        center_step_px = math.hypot(
+            current_center[0] - prior_center[0],
+            current_center[1] - prior_center[1],
+        )
+        if center_step_px > float(cfg.projective_max_bbox_step_px):
+            return None
+        # Use at least a 30 FPS interval for the speed gate so a repeated
+        # timestamp cannot turn an ordinary one-frame displacement into an
+        # infinite speed.  The hard step gate above remains the fail-closed
+        # protection for implausible jumps.
+        speed_dt = max(age_s, 1.0 / 30.0)
+        if center_step_px / speed_dt > float(cfg.projective_max_bbox_speed_px_s):
+            return None
+        width_ratio = width / float(prior_width)
+        height_ratio = height / float(prior_height)
+        scale_ratio = max(width_ratio, height_ratio, 1.0 / width_ratio, 1.0 / height_ratio)
+        if scale_ratio > float(cfg.projective_max_scale_ratio):
+            return None
+        rel_u = (float(prior_foot[0]) - float(prior_left)) / float(prior_width)
+        rel_v = (float(prior_foot[1]) - float(prior_top)) / float(prior_height)
+        # A floor contact should stay in/near the tracked silhouette.  This
+        # rejects old corrupted image anchors without clipping them into the
+        # current box.
+        if not (-0.25 <= rel_u <= 1.25 and -0.25 <= rel_v <= 1.25):
+            return None
+        transported = (left + rel_u * width, top + rel_v * height)
+        if not all(math.isfinite(float(value)) for value in transported):
+            return None
+        return (
+            float(transported[0]),
+            float(transported[1]),
+            float(age_s),
+            float(center_step_px),
+            float(scale_ratio),
+            "bbox_affine",
+        )
+    except Exception:
+        return None
+
+
 def _clamp_speed(vx: float, vz: float, max_speed: float) -> Tuple[float, float]:
     speed = math.hypot(float(vx), float(vz))
     if max_speed <= 0.0 or speed <= max_speed or speed <= 1e-9:
         return float(vx), float(vz)
     scale = max_speed / speed
     return float(vx) * scale, float(vz) * scale
+
+
+def _reject_with_cv_time_update(
+    state: PersonGroundState,
+    *,
+    pred_x: float,
+    pred_z: float,
+    now_ts: float,
+    floor_y: float,
+    reason: str,
+    config: HumanGroundConfig,
+) -> np.ndarray:
+    """Advance only the process model after rejecting a metric observation.
+
+    A rejected world measurement is not a request to discard the track.  Keep
+    the already-bounded velocity, advance only within the configured
+    last-good horizon, and mark the current observation as unavailable.  The
+    ``last_good_*`` fields deliberately remain untouched; the caller decides
+    whether this bounded prediction is displayable during the existing hold
+    TTL.
+    """
+
+    # Keep one fixed origin for a run of rejected observations.  Reusing the
+    # already-predicted state here would integrate velocity on every rejected
+    # frame and eventually publish an unbounded point (even though the display
+    # hold has already expired).  Prefer the runtime's independently accepted
+    # point; the local anchor is a safe fallback for direct filter consumers
+    # that have not mirrored ``last_good_world`` yet.
+    if state.rejection_anchor_x is None or state.rejection_anchor_z is None:
+        anchor_x: Optional[float] = None
+        anchor_z: Optional[float] = None
+        anchor_ts: Optional[float] = None
+        if (
+            state.last_good_world is not None
+            and len(state.last_good_world) >= 3
+        ):
+            try:
+                candidate_x = float(state.last_good_world[0])
+                candidate_z = float(state.last_good_world[2])
+                candidate_ts = float(state.last_good_ts)
+            except Exception:
+                candidate_x = candidate_z = candidate_ts = math.nan
+            if (
+                math.isfinite(candidate_x)
+                and math.isfinite(candidate_z)
+                and math.isfinite(candidate_ts)
+            ):
+                anchor_x, anchor_z, anchor_ts = candidate_x, candidate_z, candidate_ts
+        if anchor_x is None or anchor_z is None or anchor_ts is None:
+            try:
+                candidate_x = float(state.world_x)
+                candidate_z = float(state.world_z)
+                candidate_ts = float(state.filtered_ts)
+            except Exception:
+                candidate_x = candidate_z = candidate_ts = math.nan
+            if (
+                math.isfinite(candidate_x)
+                and math.isfinite(candidate_z)
+                and math.isfinite(candidate_ts)
+            ):
+                anchor_x, anchor_z, anchor_ts = candidate_x, candidate_z, candidate_ts
+        if anchor_x is not None and anchor_z is not None and anchor_ts is not None:
+            state.rejection_anchor_x = float(anchor_x)
+            state.rejection_anchor_z = float(anchor_z)
+            state.rejection_anchor_ts = float(anchor_ts)
+
+    state.vel_world_x, state.vel_world_z = _clamp_speed(
+        float(state.vel_world_x),
+        float(state.vel_world_z),
+        float(config.max_speed_mps),
+    )
+    if state.rejection_anchor_x is not None and state.rejection_anchor_z is not None:
+        anchor_ts = float(state.rejection_anchor_ts)
+        age = max(0.0, float(now_ts) - anchor_ts)
+        age = min(age, float(config.rejected_prediction_horizon_s))
+        bounded_x = float(state.rejection_anchor_x) + float(state.vel_world_x) * age
+        bounded_z = float(state.rejection_anchor_z) + float(state.vel_world_z) * age
+    else:
+        # This is only reachable for a malformed/uninitialized state.  Keep
+        # the original prediction as the least surprising fallback, while all
+        # normal runtime states use the bounded anchor above.
+        bounded_x = float(pred_x)
+        bounded_z = float(pred_z)
+    state.world_x = float(bounded_x)
+    state.world_z = float(bounded_z)
+    state.filtered_ts = float(now_ts)
+    state.measurement_accepted = False
+    state.measurement_rejection_reason = str(reason or "physical_measurement_rejected")
+    state.trail_append_allowed = False
+    return np.array([float(bounded_x), float(floor_y), float(bounded_z)], dtype=np.float64)
+
+
+def _quarantine_or_reacquire_measurement(
+    state: PersonGroundState,
+    *,
+    measurement_x: float,
+    measurement_z: float,
+    pred_x: float,
+    pred_z: float,
+    now_ts: float,
+    floor_y: float,
+    reason: str,
+    config: HumanGroundConfig,
+    contact_basis: Optional[str],
+    image_motion_supported: bool,
+) -> np.ndarray:
+    """Quarantine one unreachable update or explicitly reanchor a track.
+
+    A same-lifecycle relocation is never smuggled through as a high-speed
+    continuous step.  Reanchoring requires a bounded run on one anatomical
+    contact basis plus independent exact-frame image motion, and always starts
+    a new trail segment.
+    """
+
+    mx = float(measurement_x)
+    mz = float(measurement_z)
+    admitted_basis = str(contact_basis or "").strip()
+    if not bool(image_motion_supported) or not admitted_basis:
+        _clear_reacquire_candidate(state)
+        return _reject_with_cv_time_update(
+            state,
+            pred_x=float(pred_x),
+            pred_z=float(pred_z),
+            now_ts=float(now_ts),
+            floor_y=float(floor_y),
+            reason=str(reason),
+            config=config,
+        )
+
+    candidate_consistent = False
+    candidate_dt = float(now_ts) - float(state.reacquire_candidate_ts)
+    if (
+        state.reacquire_candidate_x is not None
+        and state.reacquire_candidate_z is not None
+        and admitted_basis == str(state.reacquire_candidate_basis or "")
+        and candidate_dt > 0.0
+        and candidate_dt <= float(config.reacquire_max_gap_s)
+    ):
+        candidate_step = math.hypot(
+            mx - float(state.reacquire_candidate_x),
+            mz - float(state.reacquire_candidate_z),
+        )
+        candidate_allowed = (
+            float(config.max_jump_m)
+            + float(config.max_speed_mps) * candidate_dt
+        )
+        candidate_consistent = candidate_step <= candidate_allowed
+    state.reacquire_count = (
+        int(state.reacquire_count) + 1 if candidate_consistent else 1
+    )
+    state.reacquire_candidate_x = mx
+    state.reacquire_candidate_z = mz
+    state.reacquire_candidate_ts = float(now_ts)
+    state.reacquire_candidate_basis = admitted_basis
+
+    if int(state.reacquire_count) >= int(config.reacquire_samples):
+        state.world_x = mx
+        state.world_z = mz
+        state.vel_world_x = 0.0
+        state.vel_world_z = 0.0
+        state.filtered_ts = float(now_ts)
+        state.motion_mode = "unknown"
+        state.locked_world = None
+        state.exit_motion_frames = 0
+        state.reacquired = True
+        state.trail_break_required = True
+        state.trail_segment_id = int(state.trail_segment_id) + 1
+        _clear_reacquire_candidate(state)
+        _clear_rejection_anchor(state)
+        return np.array([mx, float(floor_y), mz], dtype=np.float64)
+
+    return _reject_with_cv_time_update(
+        state,
+        pred_x=float(pred_x),
+        pred_z=float(pred_z),
+        now_ts=float(now_ts),
+        floor_y=float(floor_y),
+        reason=str(reason),
+        config=config,
+    )
 
 
 def update_human_cv_filter(
@@ -1102,19 +2013,52 @@ def update_human_cv_filter(
     quality: str,
     config: HumanGroundConfig,
     force_accept: bool = False,
+    contact_basis: Optional[str] = None,
+    image_motion_supported: bool = False,
 ) -> np.ndarray:
     """Constant-velocity XZ filter with explicit physical admission.
 
     Impossible observations are quarantined instead of clipped into plausible-
     looking motion.  An existing tracker lifecycle may relocate only after a
-    bounded run of mutually consistent observations, at which point callers are
-    told to start a new trail segment.
+    bounded run of mutually consistent observations on one contact basis with
+    independent exact-frame image motion, at which point callers are told to
+    start a new trail segment.
     """
-    mx = float(measurement[0])
-    mz = float(measurement[2])
-    now_ts = float(now_ts)
-    floor_y = float(floor_y)
     _begin_filter_measurement(state)
+
+    # A filter cannot make a safe first state from malformed producer input.
+    # Validate the complete measurement, floor, and timestamp before touching
+    # any kinematic state. A bad frame is an honest unavailable observation,
+    # never a state advance or trail point.
+    try:
+        candidate = np.asarray(measurement, dtype=np.float64).reshape(-1)
+        mx = float(candidate[0])
+        mz = float(candidate[2])
+        now_ts = float(now_ts)
+        floor_y = float(floor_y)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        mx = mz = now_ts = floor_y = math.nan
+    if not all(math.isfinite(value) for value in (mx, mz, now_ts, floor_y)):
+        state.measurement_accepted = False
+        state.measurement_rejection_reason = "nonfinite_measurement"
+        state.measurement_innovation_m = math.nan
+        state.measurement_allowed_m = math.nan
+        state.trail_append_allowed = False
+        _clear_reacquire_candidate(state)
+        return np.array([math.nan, math.nan, math.nan], dtype=np.float64)
+
+    # The state is shared with the runtime's prediction/readout path.  A
+    # state restored from an older runtime, or populated by a direct caller,
+    # can carry a velocity above the active contract even though this filter
+    # clamps newly estimated velocities below.  Normalize it before forming
+    # the prior so every subsequent reader sees the same physically bounded
+    # process model; otherwise a hook that reads the prior immediately after
+    # this update could emit an unreachable same-segment step.
+    state.vel_world_x, state.vel_world_z = _clamp_speed(
+        float(state.vel_world_x),
+        float(state.vel_world_z),
+        float(config.max_speed_mps),
+    )
 
     if state.world_x is None or state.world_z is None or float(state.filtered_ts) < 0.0:
         state.world_x = mx
@@ -1123,6 +2067,7 @@ def update_human_cv_filter(
         state.vel_world_z = 0.0
         state.filtered_ts = now_ts
         _clear_reacquire_candidate(state)
+        _clear_rejection_anchor(state)
         return np.array([mx, floor_y, mz], dtype=np.float64)
 
     dt = now_ts - float(state.filtered_ts)
@@ -1148,57 +2093,19 @@ def update_human_cv_filter(
     state.measurement_innovation_m = float(innov_dist)
     state.measurement_allowed_m = float(allowed)
     if (not force_accept) and allowed > 0.0 and innov_dist > allowed and innov_dist > 1e-9:
-        candidate_consistent = False
-        candidate_dt = now_ts - float(state.reacquire_candidate_ts)
-        if (
-            state.reacquire_candidate_x is not None
-            and state.reacquire_candidate_z is not None
-            and candidate_dt > 0.0
-            and candidate_dt <= float(config.reacquire_max_gap_s)
-        ):
-            candidate_step = math.hypot(
-                mx - float(state.reacquire_candidate_x),
-                mz - float(state.reacquire_candidate_z),
-            )
-            candidate_allowed = (
-                float(config.max_jump_m)
-                + float(config.max_speed_mps) * candidate_dt
-            )
-            candidate_consistent = candidate_step <= candidate_allowed
-        state.reacquire_count = (
-            int(state.reacquire_count) + 1 if candidate_consistent else 1
+        return _quarantine_or_reacquire_measurement(
+            state,
+            measurement_x=mx,
+            measurement_z=mz,
+            pred_x=float(pred_x),
+            pred_z=float(pred_z),
+            now_ts=float(now_ts),
+            floor_y=float(floor_y),
+            reason="physical_innovation_exceeded",
+            config=config,
+            contact_basis=contact_basis,
+            image_motion_supported=bool(image_motion_supported),
         )
-        state.reacquire_candidate_x = float(mx)
-        state.reacquire_candidate_z = float(mz)
-        state.reacquire_candidate_ts = float(now_ts)
-
-        if int(state.reacquire_count) >= int(config.reacquire_samples):
-            state.world_x = float(mx)
-            state.world_z = float(mz)
-            state.vel_world_x = 0.0
-            state.vel_world_z = 0.0
-            state.filtered_ts = float(now_ts)
-            state.motion_mode = "unknown"
-            state.locked_world = None
-            state.exit_motion_frames = 0
-            state.reacquired = True
-            state.trail_break_required = True
-            state.trail_segment_id = int(state.trail_segment_id) + 1
-            _clear_reacquire_candidate(state)
-            return np.array([mx, floor_y, mz], dtype=np.float64)
-
-        state.measurement_accepted = False
-        state.measurement_rejection_reason = "physical_innovation_exceeded"
-        state.vel_world_x = 0.0
-        state.vel_world_z = 0.0
-        state.filtered_ts = float(now_ts)
-        state.trail_append_allowed = False
-        return np.array(
-            [float(state.world_x), floor_y, float(state.world_z)],
-            dtype=np.float64,
-        )
-
-    _clear_reacquire_candidate(state)
 
     posture = str(state.posture or "unknown")
     mode = str(state.motion_mode or "unknown")
@@ -1231,10 +2138,42 @@ def update_human_cv_filter(
         if state.locked_world is not None:
             state.world_x = float(state.locked_world[0])
             state.world_z = float(state.locked_world[1])
+        _clear_reacquire_candidate(state)
+        _clear_rejection_anchor(state)
         return np.array([float(state.world_x), floor_y, float(state.world_z)], dtype=np.float64)
 
     next_x = pred_x + alpha * innov_x
     next_z = pred_z + alpha * innov_z
+
+    # The innovation gate includes a measurement-noise allowance.  That
+    # allowance must not become an impossible same-segment output step.  A
+    # proposed posterior beyond the configured human speed is quarantined;
+    # only the explicit evidence-backed reanchor path above may relocate it.
+    proposed_step = math.hypot(
+        float(next_x) - float(state.world_x),
+        float(next_z) - float(state.world_z),
+    )
+    proposed_step_limit = float(config.max_speed_mps) * float(gate_dt)
+    if (
+        not force_accept
+        and float(config.max_speed_mps) > 0.0
+        and proposed_step > proposed_step_limit + 1e-9
+    ):
+        return _quarantine_or_reacquire_measurement(
+            state,
+            measurement_x=mx,
+            measurement_z=mz,
+            pred_x=float(pred_x),
+            pred_z=float(pred_z),
+            now_ts=float(now_ts),
+            floor_y=float(floor_y),
+            reason="physical_output_speed_exceeded",
+            config=config,
+            contact_basis=contact_basis,
+            image_motion_supported=bool(image_motion_supported),
+        )
+
+    _clear_reacquire_candidate(state)
 
     if dt >= float(config.min_dt_s):
         meas_vx = innov_x / dt
@@ -1263,6 +2202,7 @@ def update_human_cv_filter(
     state.vel_world_x = float(next_vx)
     state.vel_world_z = float(next_vz)
     state.filtered_ts = now_ts
+    _clear_rejection_anchor(state)
     return np.array([float(next_x), floor_y, float(next_z)], dtype=np.float64)
 
 
@@ -1566,18 +2506,26 @@ __all__ = [
     "PersonGroundState",
     "PersonGroundStateStore",
     "apply_source_hysteresis",
+    "advance_human_cv_prediction",
     "assess_lower_body_occlusion",
+    "bind_world_frame",
     "begin_source_admission",
     "classify_posture",
     "commit_image_path_point",
     "commit_path_point",
     "complete_source_admission",
     "estimate_ankle_from_leg",
+    "integrate_projective_ground_observation",
     "legs_are_bent",
+    "record_accepted_image_geometry",
+    "observe_bbox_stationarity",
     "pose_point",
     "rdp_simplify",
     "resolve_pose_floor_anchor",
     "source_score",
+    "transport_accepted_image_foot",
     "update_human_cv_filter",
     "update_motion_mode",
+    "world_frame_binding_from_calibration",
+    "world_frame_matches_calibration",
 ]

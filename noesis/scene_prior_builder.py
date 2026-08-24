@@ -572,11 +572,35 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
         raise ScenePriorBuildError("reference target floor alignment is missing")
     try:
         target_revision_id = str(target_metadata["revision_id"])
-        source_floor_normal = tuple(
-            float(value) for value in floor_alignment["source_floor_normal"]
-        )
-        source_floor_offset_m = float(floor_alignment["source_floor_offset"])
         target_floor_y_m = float(floor_alignment["target_floor_y"])
+        has_source_normal = "source_floor_normal" in floor_alignment
+        has_source_offset = "source_floor_offset" in floor_alignment
+        if has_source_normal != has_source_offset:
+            raise ValueError("source floor plane is partial")
+        if has_source_normal:
+            source_floor_normal = tuple(
+                float(value) for value in floor_alignment["source_floor_normal"]
+            )
+            source_floor_offset_m = float(
+                floor_alignment["source_floor_offset"]
+            )
+        else:
+            # Reference-locked targets historically omitted the redundant
+            # source plane.  Derive it from the explicit source->target edge:
+            # q_source = W^T q_target.  This keeps identity-aligned priors
+            # revision-bound without inventing a second floor convention.
+            target_plane = np.asarray(
+                [0.0, 1.0, 0.0, -float(target_floor_y_m)],
+                dtype=np.float64,
+            )
+            source_plane = world_correction.T @ target_plane
+            normal_norm = float(np.linalg.norm(source_plane[:3]))
+            if not math.isfinite(normal_norm) or normal_norm <= 1e-8:
+                raise ValueError("derived source floor normal is degenerate")
+            source_floor_normal = tuple(
+                float(value) / normal_norm for value in source_plane[:3]
+            )
+            source_floor_offset_m = float(source_plane[3]) / normal_norm
     except (KeyError, TypeError, ValueError) as exc:
         raise ScenePriorBuildError(
             "reference target floor-frame metadata is malformed"

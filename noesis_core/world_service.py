@@ -78,6 +78,21 @@ class PreparedWorldPublication:
     publication: WorldPublication
     _service_token: object = field(repr=False, compare=False)
     _candidate_id: int = field(repr=False, compare=False)
+    # The world candidate is model-dumped once while preparing the durable
+    # journal cohort.  Keep that exact JSON-native tuple on the owner-bound
+    # receipt so the canonical tracking publisher can reuse it instead of
+    # serializing the immutable models a second time before admission.
+    _serialized_payloads: tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def serialized_payloads(self) -> tuple[Mapping[str, Any], ...]:
+        """Return the prepared JSON payloads in journal cohort order."""
+
+        return self._serialized_payloads
 
 
 @dataclass
@@ -313,6 +328,7 @@ class CanonicalWorldService:
             publication=publication,
             _service_token=self._service_token,
             _candidate_id=candidate_id,
+            _serialized_payloads=journal_payloads,
         )
         state = _PreparedWorldState(
             publication=publication,

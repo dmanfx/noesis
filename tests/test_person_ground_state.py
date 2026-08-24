@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 import numpy as np
@@ -11,12 +12,16 @@ from noesis.telemetry.person_ground_state import (
     HumanGroundConfig,
     PersonGroundState,
     apply_source_hysteresis,
+    advance_human_cv_prediction,
     assess_lower_body_occlusion,
     begin_source_admission,
     classify_posture,
     commit_path_point,
     complete_source_admission,
     legs_are_bent,
+    observe_bbox_stationarity,
+    observe_coherent_image_motion,
+    integrate_projective_ground_observation,
     rdp_simplify,
     resolve_pose_floor_anchor,
     source_score,
@@ -541,8 +546,362 @@ def test_phase4_cv_filter_rejects_impossible_innovation_without_moving() -> None
     assert state.measurement_rejection_reason == "physical_innovation_exceeded"
     assert state.measurement_innovation_m == pytest.approx(10.0)
     assert state.measurement_allowed_m == pytest.approx(0.7)
-    assert state.reacquire_count == 1
+    assert state.reacquire_count == 0
     assert state.trail_append_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("measurement", "floor_y", "now_ts"),
+    (
+        (np.array([np.nan, 0.0, 2.0]), 0.0, 0.0),
+        (np.array([1.0, 0.0, np.inf]), 0.0, 0.0),
+        (np.array([1.0, 0.0, 2.0]), np.nan, 0.0),
+        (np.array([1.0, 0.0, 2.0]), 0.0, np.inf),
+    ),
+)
+def test_first_measurement_rejects_nonfinite_inputs_without_seeding(
+    measurement: np.ndarray,
+    floor_y: float,
+    now_ts: float,
+) -> None:
+    state = PersonGroundState()
+    output = update_human_cv_filter(
+        state,
+        measurement=measurement,
+        floor_y=floor_y,
+        now_ts=now_ts,
+        quality="good",
+        config=HumanGroundConfig(),
+    )
+
+    assert np.all(np.isnan(output))
+    assert state.world_x is None
+    assert state.world_z is None
+    assert state.filtered_ts == pytest.approx(-1.0)
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "nonfinite_measurement"
+    assert state.trail_append_allowed is False
+
+
+def test_phase4_same_segment_output_never_exceeds_human_speed() -> None:
+    cfg = HumanGroundConfig(
+        max_speed_mps=4.0,
+        max_jump_m=0.75,
+        alpha_good=0.45,
+        process_noise_walk=0.55,
+        meas_noise_good=0.08,
+    )
+    state = PersonGroundState()
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.motion_mode = "walk"
+
+    # This observation is just inside the legacy innovation gate
+    # (0.75 + 4/30 = 0.8833 m), but its proposed posterior would publish a
+    # roughly 17 m/s step. It must be quarantined, not visually slewed.
+    dt = 1.0 / 30.0
+    out = update_human_cv_filter(
+        state,
+        measurement=np.array([0.88, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=dt,
+        quality="good",
+        config=cfg,
+    )
+
+    assert math.hypot(float(out[0]), float(out[2])) <= cfg.max_speed_mps * dt + 1e-9
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "physical_output_speed_exceeded"
+    assert state.trail_append_allowed is False
+    assert state.trail_break_required is False
+
+
+def test_phase4_normalizes_restored_overspeed_velocity_before_prior() -> None:
+    """A direct reader cannot observe an over-speed CV prior after update."""
+
+    cfg = HumanGroundConfig(max_speed_mps=4.0, max_jump_m=0.75)
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        vel_world_x=12.0,
+        vel_world_z=0.0,
+        filtered_ts=10.0,
+        motion_mode="walk",
+    )
+
+    dt = 0.066789
+    output = update_human_cv_filter(
+        state,
+        measurement=np.array([10.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=10.0 + dt,
+        quality="good",
+        config=cfg,
+    )
+
+    assert math.hypot(float(state.vel_world_x), float(state.vel_world_z)) <= cfg.max_speed_mps
+    assert math.hypot(float(output[0]) - 0.0, float(output[2]) - 0.0) <= cfg.max_speed_mps * dt + 1e-9
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason in {
+        "physical_innovation_exceeded",
+        "physical_output_speed_exceeded",
+    }
+
+
+def test_missing_metric_frame_advances_the_canonical_cv_state() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, max_jump_m=0.75)
+    state = PersonGroundState(last_good_world=(0.0, 0.0, 0.0), last_good_ts=0.0)
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.motion_mode = "walk"
+    state.vel_world_x = 1.0
+
+    first = advance_human_cv_prediction(
+        state,
+        floor_y=0.0,
+        now_ts=0.1,
+        config=cfg,
+        reason="depth_measurement_not_current",
+    )
+    assert first is not None
+    assert first[0] == pytest.approx(0.1)
+    assert state.measurement_accepted is False
+    assert state.world_x == pytest.approx(0.1)
+
+    second = advance_human_cv_prediction(
+        state,
+        floor_y=0.0,
+        now_ts=0.2,
+        config=cfg,
+        reason="depth_measurement_not_current",
+    )
+    assert second is not None
+    assert second[0] == pytest.approx(0.2)
+    assert state.filtered_ts == pytest.approx(0.2)
+
+
+def test_projective_observation_updates_same_state_before_metric_return() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, max_jump_m=0.75)
+    state = PersonGroundState(last_good_world=(0.0, 0.0, 0.0), last_good_ts=0.0)
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.motion_mode = "walk"
+    state.vel_world_x = 1.0
+
+    projective = integrate_projective_ground_observation(
+        state,
+        measurement=np.array([0.30, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.1,
+        config=cfg,
+    )
+    assert projective is not None
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "projective_weak_observation"
+    assert state.world_x == pytest.approx(float(projective[0]))
+    assert state.world_x > 0.0
+    assert state.last_good_world == pytest.approx((0.0, 0.0, 0.0))
+
+    # Returning metric evidence is filtered from the projective posterior,
+    # rather than snapping from the old last-good point.
+    metric = update_human_cv_filter(
+        state,
+        measurement=np.array([0.40, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.2,
+        quality="good",
+        config=cfg,
+    )
+    assert metric[0] > float(projective[0])
+    assert metric[0] - float(projective[0]) <= cfg.max_speed_mps * 0.1 + 1e-9
+    assert state.measurement_accepted is True
+
+
+def test_phase4_output_speed_rejection_reanchors_only_with_trail_break() -> None:
+    cfg = HumanGroundConfig(
+        max_speed_mps=4.0,
+        max_jump_m=0.75,
+        reacquire_samples=3,
+        reacquire_max_gap_s=0.5,
+    )
+    state = PersonGroundState()
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.motion_mode = "walk"
+
+    for index, x in enumerate((0.88, 0.87), start=1):
+        out = update_human_cv_filter(
+            state,
+            measurement=np.array([x, 0.0, 0.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=index / 30.0,
+            quality="good",
+            config=cfg,
+            contact_basis="pose:ankle_pair",
+            image_motion_supported=True,
+        )
+        assert state.measurement_accepted is False
+        assert state.measurement_rejection_reason == "physical_output_speed_exceeded"
+        assert state.reacquire_count == index
+        assert state.trail_break_required is False
+        assert math.hypot(float(out[0]), float(out[2])) <= cfg.max_speed_mps * (index / 30.0) + 1e-9
+
+    out = update_human_cv_filter(
+        state,
+        measurement=np.array([0.86, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=3.0 / 30.0,
+        quality="good",
+        config=cfg,
+        contact_basis="pose:ankle_pair",
+        image_motion_supported=True,
+    )
+    assert out == pytest.approx([0.86, 0.0, 0.0])
+    assert state.measurement_accepted is True
+    assert state.reacquired is True
+    assert state.trail_break_required is True
+    assert state.trail_segment_id == 1
+
+
+def test_phase4_rejected_measurement_is_pure_cv_time_update() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=2.0, max_jump_m=0.5)
+    state = PersonGroundState()
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.last_good_world = (0.0, 0.0, 0.0)
+    state.last_good_ts = 0.0
+    state.vel_world_x = 1.25
+    state.vel_world_z = -0.50
+
+    out = update_human_cv_filter(
+        state,
+        measurement=np.array([10.0, 0.0, 10.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.2,
+        quality="good",
+        config=cfg,
+    )
+
+    assert out == pytest.approx([0.25, 0.0, -0.10])
+    assert state.world_x == pytest.approx(0.25)
+    assert state.world_z == pytest.approx(-0.10)
+    assert state.filtered_ts == pytest.approx(0.2)
+    assert state.vel_world_x == pytest.approx(1.25)
+    assert state.vel_world_z == pytest.approx(-0.50)
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "physical_innovation_exceeded"
+    assert state.last_good_world == pytest.approx((0.0, 0.0, 0.0))
+    assert state.last_good_ts == pytest.approx(0.0)
+
+
+def test_phase4_rejected_prediction_is_bounded_and_reacquirable() -> None:
+    cfg = HumanGroundConfig(
+        max_speed_mps=2.0,
+        max_jump_m=0.5,
+        rejected_prediction_horizon_s=0.40,
+        reacquire_samples=3,
+        reacquire_max_gap_s=0.5,
+    )
+    state = PersonGroundState()
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+    state.last_good_world = (0.0, 0.0, 0.0)
+    state.last_good_ts = 0.0
+    state.vel_world_x = 1.25
+    state.vel_world_z = -0.50
+
+    for now_ts, expected_x, expected_z in (
+        (0.2, 0.25, -0.10),
+        (0.8, 0.50, -0.20),
+        (1.4, 0.50, -0.20),
+    ):
+        out = update_human_cv_filter(
+            state,
+            measurement=np.array([10.0, 0.0, 10.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=now_ts,
+            quality="good",
+            config=cfg,
+        )
+        assert out[0] == pytest.approx(expected_x)
+        assert out[2] == pytest.approx(expected_z)
+        assert state.world_x == pytest.approx(expected_x)
+        assert state.world_z == pytest.approx(expected_z)
+        assert state.last_good_world == pytest.approx((0.0, 0.0, 0.0))
+
+    # Once exact-frame image evidence returns, a coherent run of observations
+    # can still relocate the process state instead of remaining pinned to the
+    # bounded horizon forever.
+    for now_ts, x, expected_count in (
+        (1.5, 5.0, 1),
+        (1.6, 5.1, 2),
+    ):
+        out = update_human_cv_filter(
+            state,
+            measurement=np.array([x, 0.0, 0.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=now_ts,
+            quality="good",
+            config=cfg,
+            contact_basis="pose:ankle_pair",
+            image_motion_supported=True,
+        )
+        assert out[0] == pytest.approx(0.50)
+        assert state.reacquire_count == expected_count
+        assert state.measurement_accepted is False
+
+    out = update_human_cv_filter(
+        state,
+        measurement=np.array([5.2, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=1.7,
+        quality="good",
+        config=cfg,
+        contact_basis="pose:ankle_pair",
+        image_motion_supported=True,
+    )
+    assert out[0] == pytest.approx(5.2)
+    assert state.world_x == pytest.approx(5.2)
+    assert state.reacquired is True
+    assert state.trail_break_required is True
+    assert state.rejection_anchor_x is None
+    assert state.rejection_anchor_z is None
 
 
 def test_phase4_gap_does_not_raw_reset_existing_lifecycle() -> None:
@@ -573,6 +932,7 @@ def test_phase4_gap_does_not_raw_reset_existing_lifecycle() -> None:
     assert state.measurement_accepted is False
     assert state.world_x == pytest.approx(0.0)
     assert state.world_z == pytest.approx(0.0)
+    assert state.reacquire_count == 0
 
 
 def test_phase4_reacquisition_requires_consistent_samples_and_breaks_trail() -> None:
@@ -600,6 +960,8 @@ def test_phase4_reacquisition_requires_consistent_samples_and_breaks_trail() -> 
             now_ts=ts,
             quality="good",
             config=cfg,
+            contact_basis="pose:ankle_pair",
+            image_motion_supported=True,
         )
         assert np.allclose(out, [0.0, 0.0, 0.0])
         assert state.measurement_accepted is False
@@ -612,6 +974,8 @@ def test_phase4_reacquisition_requires_consistent_samples_and_breaks_trail() -> 
         now_ts=2.2,
         quality="good",
         config=cfg,
+        contact_basis="pose:ankle_pair",
+        image_motion_supported=True,
     )
     assert np.allclose(out, [7.2, 0.0, 0.0])
     assert state.measurement_accepted is True
@@ -627,6 +991,8 @@ def test_phase4_reacquisition_requires_consistent_samples_and_breaks_trail() -> 
         now_ts=2.3,
         quality="good",
         config=cfg,
+        contact_basis="pose:ankle_pair",
+        image_motion_supported=True,
     )
     assert state.reacquired is False
     assert state.trail_break_required is False
@@ -658,10 +1024,201 @@ def test_phase4_inconsistent_reacquisition_restarts_confirmation() -> None:
             now_ts=ts,
             quality="good",
             config=cfg,
+            contact_basis="pose:ankle_pair",
+            image_motion_supported=True,
         )
     assert state.measurement_accepted is False
     assert state.reacquire_count == 1
     assert state.world_x == pytest.approx(0.0)
+
+
+def test_bbox_stationarity_requires_consecutive_exact_frames() -> None:
+    cfg = HumanGroundConfig(static_px_threshold=3.0, static_exit_frames=3)
+    state = PersonGroundState()
+
+    assert observe_bbox_stationarity(
+        state,
+        frame_id=10,
+        bbox=[100.0, 50.0, 80.0, 120.0],
+        config=cfg,
+    ) is False
+    assert observe_bbox_stationarity(
+        state,
+        frame_id=11,
+        bbox=[102.0, 50.0, 80.0, 120.0],
+        config=cfg,
+    ) is False
+    assert observe_bbox_stationarity(
+        state,
+        frame_id=12,
+        bbox=[103.0, 50.0, 80.0, 120.0],
+        config=cfg,
+    ) is True
+    assert state.bbox_stationary_streak == 3
+
+    # A frame gap or a real box displacement revokes the stationary evidence.
+    assert observe_bbox_stationarity(
+        state,
+        frame_id=14,
+        bbox=[103.0, 50.0, 80.0, 120.0],
+        config=cfg,
+    ) is False
+    assert observe_bbox_stationarity(
+        state,
+        frame_id=15,
+        bbox=[140.0, 50.0, 80.0, 120.0],
+        config=cfg,
+    ) is False
+    assert state.bbox_stationary_supported is False
+
+
+def test_idle_preunlock_uses_three_exact_slow_motion_observations() -> None:
+    cfg = HumanGroundConfig(
+        static_px_threshold=3.0,
+        static_exit_frames=3,
+        idle_deadzone_m=0.28,
+    )
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=0.0,
+        motion_mode="idle",
+        locked_world=(0.0, 0.0),
+    )
+
+    outputs = []
+    support = []
+    for frame_id, px, world_x in (
+        (10, 100.0, 0.00),
+        (11, 101.75, 0.12),
+        (12, 103.50, 0.24),
+    ):
+        supported = observe_coherent_image_motion(
+            state,
+            frame_id=frame_id,
+            image_foot_uv=(px, 200.0),
+            bbox=(px - 25.0, 100.0, 50.0, 100.0),
+            contact_basis="pose:ankle_pair",
+            config=cfg,
+        )
+        support.append(supported)
+        outputs.append(
+            update_human_cv_filter(
+                state,
+                measurement=np.array([world_x, 0.0, 0.0], dtype=np.float64),
+                floor_y=0.0,
+                now_ts=float(frame_id - 9) * 0.1,
+                quality="good",
+                config=cfg,
+                contact_basis="pose:ankle_pair",
+                image_motion_supported=supported,
+            )
+        )
+        update_motion_mode(
+            state,
+            now_ts=float(frame_id - 9) * 0.1,
+            image_foot_uv=(px, 200.0),
+            config=cfg,
+        )
+
+    assert support == [False, False, True]
+    assert state.motion_mode == "walk"
+    assert state.locked_world is None
+    assert outputs[0][0] == pytest.approx(0.0)
+    assert outputs[1][0] == pytest.approx(0.0)
+    assert outputs[2][0] > 0.0
+    assert state.reacquired is False
+    assert state.trail_break_required is False
+    assert state.trail_segment_id == 0
+
+
+def test_stationary_bbox_anchor_jump_cannot_unlock_or_reacquire() -> None:
+    cfg = HumanGroundConfig(
+        static_px_threshold=3.0,
+        static_exit_frames=3,
+        max_speed_mps=2.0,
+        max_jump_m=0.5,
+        reacquire_samples=3,
+    )
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=0.0,
+        motion_mode="idle",
+        locked_world=(0.0, 0.0),
+    )
+
+    for frame_id, contact_u, measurement_x in (
+        (20, 100.0, 8.0),
+        (21, 180.0, 8.1),
+        (22, 260.0, 8.2),
+        (23, 340.0, 8.3),
+    ):
+        supported = observe_coherent_image_motion(
+            state,
+            frame_id=frame_id,
+            image_foot_uv=(contact_u, 200.0),
+            bbox=(75.0, 100.0, 50.0, 100.0),
+            contact_basis="pose:left_ankle",
+            config=cfg,
+        )
+        assert supported is False
+        output = update_human_cv_filter(
+            state,
+            measurement=np.array([measurement_x, 0.0, 0.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=float(frame_id - 19) * 0.1,
+            quality="good",
+            config=cfg,
+            contact_basis="pose:left_ankle",
+            image_motion_supported=supported,
+        )
+        assert np.allclose(output, [0.0, 0.0, 0.0])
+
+    assert state.motion_mode == "idle"
+    assert state.locked_world == (0.0, 0.0)
+    assert state.reacquire_count == 0
+    assert state.reacquired is False
+    assert state.trail_segment_id == 0
+
+
+def test_reacquire_confirmation_cannot_cross_contact_basis() -> None:
+    cfg = HumanGroundConfig(
+        max_speed_mps=1.0,
+        max_jump_m=0.25,
+        reacquire_samples=3,
+        reacquire_max_gap_s=0.5,
+    )
+    state = PersonGroundState()
+    update_human_cv_filter(
+        state,
+        measurement=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.0,
+        quality="good",
+        config=cfg,
+    )
+
+    for index, basis in enumerate(
+        ("pose:ankle_pair", "gravity_drop", "pose:ankle_pair"),
+        start=1,
+    ):
+        output = update_human_cv_filter(
+            state,
+            measurement=np.array([5.0 + index * 0.1, 0.0, 0.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=float(index) * 0.1,
+            quality="good",
+            config=cfg,
+            contact_basis=basis,
+            image_motion_supported=True,
+        )
+        assert np.allclose(output, [0.0, 0.0, 0.0])
+        assert state.reacquire_count == 1
+
+    assert state.reacquired is False
+    assert state.trail_break_required is False
+    assert state.trail_segment_id == 0
 
 
 def test_phase6_rdp_and_commit_path_point() -> None:

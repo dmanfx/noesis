@@ -36,6 +36,7 @@ import {
 } from './lib/depthPanelWorkflow';
 import {
   admitBevFrame,
+  admitBevStatus,
   bevMatchesFloorplan,
   clearBevForStatus,
 } from './lib/bevPayloadAdmission.js';
@@ -1259,7 +1260,13 @@ function Dashboard() {
     const prevRaw = bevMetaRawRef.current[cam];
 
     if (payload.type === 'bev-status') {
-      const cleared = clearBevForStatus(prevRaw, payload) as BevMeta;
+      // Producer statuses carry the failed/current cohort.  Reject an older
+      // or unbound status once a canonical frame has been admitted so delayed
+      // renderer errors cannot clear newer dots/trails. Local transport
+      // resets are handled explicitly by the connection lifecycle below.
+      const statusAdmission = admitBevStatus(prevRaw, payload);
+      if (!statusAdmission.admitted || !statusAdmission.payload) return;
+      const cleared = statusAdmission.payload as BevMeta;
       bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: cleared };
       setBevMetaRaw((prev) => ({ ...prev, [cam]: cleared }));
       bevMetaRef.current = { ...bevMetaRef.current, [cam]: cleared };
@@ -1271,7 +1278,7 @@ function Dashboard() {
     if (!admission.admitted || !admission.payload) return;
     const admittedPayload = admission.payload as BevMeta;
     if (!bevMatchesFloorplan(admittedPayload, floorplanDataRef.current[cam])) {
-      const cleared = clearBevForStatus(prevRaw, {
+      const cleared = clearBevForStatus(admittedPayload, {
         type: 'bev-status',
         cameraId: cam,
         error: 'floorplan_revision_mismatch',

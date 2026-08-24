@@ -1349,6 +1349,43 @@ def test_authoritative_osd_cache_is_exact_bounded_and_never_guesses(tmp_path):
         service.close()
 
 
+def test_authoritative_osd_cache_uses_raw_public_tracker_after_epoch_scope(tmp_path):
+    service, _ = _service(
+        tmp_path,
+        mode="authoritative",
+        calibration=True,
+    )
+    try:
+        _enroll(service)
+        primitive = _primitive(tracker="7@source_epoch:1", frame=1)
+        primitive.public_track["tracker_id"] = 7
+        service.process_source_frame(
+            camera_id="camera-a",
+            frame_id=1,
+            primitives=(primitive,),
+            observed_at=11.0,
+        )
+
+        exact = service.lookup_osd_decision(
+            camera_id="camera-a",
+            frame_id=1,
+            tracker_id="7",
+        )
+        assert exact is not None
+        assert exact.tracker_id == "7"
+        assert exact.identity_state == primitive.public_track["identity_v2"]["state"]
+        assert (
+            service.lookup_osd_decision(
+                camera_id="camera-a",
+                frame_id=1,
+                tracker_id="7@source_epoch:1",
+            )
+            is None
+        )
+    finally:
+        service.close()
+
+
 def test_authoritative_missing_embedding_is_provisional_not_open_set_unknown(tmp_path):
     service, _ = _service(tmp_path, mode="authoritative", calibration=True)
     try:

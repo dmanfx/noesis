@@ -3,6 +3,52 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-23 — Revision-exact PCF tracking and trail projection
+
+- Bound Living Room and Kitchen, as well as Family Room, to their exact active
+  Scene Prior revisions. Living Room now consumes its recorded floor-leveling
+  edge; Kitchen records its identity edge explicitly.
+- Corrected BEV world projection to use horizontal camera-right/forward axes,
+  removing the camera-pitch/height offset from displayed dots.
+- Kept valid canonical holds visible with explicit provenance, stopped them
+  from extending trails, and added bounded `cv_prediction` continuation for a
+  missing, stale, or physically rejected current metric observation without
+  advancing last-good measurement state. Exposed bounded drop reasons for
+  genuinely unplaceable tracks.
+- Made the post-tiler OSD trail join exact-frame analytics, honor the track's
+  declared image basis, map into the configured source tile, and break on
+  lifecycle/basis changes. Missing or invalid floor anchors no longer fall back
+  or clamp to the bottom of the mosaic.
+- Removed stale cached depth from current-frame position authority and made
+  idle exit/reacquisition depend on coherent image motion as well as world
+  evidence, retaining the physical outlier gate.
+- Removed canonical filter/lock/velocity state from active authority on the
+  first exact tracker-row absence. A scalar-only quarantine restores it and
+  reuses the lifecycle generation only for a same-camera/tracker return within
+  350 ms whose bbox position and scale remain compatible; all other reused IDs
+  start cold with a new generation. The exact tombstone still breaks BEV/OSD
+  trails across either case. Bounded
+  reject-driven prediction to a fixed last-good anchor for 0.40 seconds
+  instead of integrating drift indefinitely.
+- Kept seated/lying people visible for at most 2.0 seconds only when exact-frame
+  detector boxes prove stationarity; these holds remain non-measurements and
+  never append trails. Added strict same-camera, same-tracker, sub-second bbox
+  continuity so a brief no-embedding gap does not replace a settled StableID
+- Added bounded `image_motion_prediction`: when a detector box moves while the
+  current metric/depth anchor is missing or rejected, transport the last
+  accepted image foot through the box affine change and project it through the
+  active corrected floor. The prediction is non-authoritative, does not move
+  filter state, and fails closed after an implausible bbox/ray/world-speed
+  change; BEV marks it as predicted and exposes its provenance.
+  with a provisional label.
+- Reduced pose-contact depth work to one GPU-resident union of at most two
+  compound contacts and one compact statistics read. Each contact uses a thin
+  lower-leg segment plus a full ankle disk; host and CUDA paths share the same
+  pixel-center predicate, so furniture beside the leg cannot enter through a
+  wider native-only capsule. Only endpoints and the two radii cross the native
+  boundary; frames without observed ankles fail closed before launching depth
+  work, and no full-frame or host-mask branch was added.
+
 ## 2026-08-23 — Canonical Family Room ground tracking and dashboard mapping
 
 - Bound the raw Family camera calibration to the active leveled room revision
@@ -32,6 +78,14 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   readbacks use private CUDA streams and pinned host buffers.
 - Moved identity evidence and gallery autosaves off the media callback and
   prewarmed the production StableID CUDA similarity shape at startup.
+- Isolated diagnostic Identity-v2 shadow resolution and visitor persistence
+  from the exact tracking/BEV publication worker after paced replay exposed
+  database-dominated tail latency and canonical queue overflow. The shadow
+  lane now retains only the newest pending compact snapshot per source and may
+  degrade its own freshness; canonical rows never wait for or accept mutation
+  from it. Authoritative identity remains synchronous, reconnects still start a
+  source-epoch-scoped identity tracklet, and runtime stats expose both workers'
+  backlog, completion/failure totals, and stage timings.
 - Set explicit eight-surface streammux and tiler pools so short bounded
   metadata work cannot exhaust the SDK defaults.
 - Replaced the world journal's per-publication 10,000-row retention scan with

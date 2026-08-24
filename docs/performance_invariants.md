@@ -56,6 +56,14 @@ and does not authorize host staging in an always-on path.
   observation without waiting on the frame path.
 - Optional evidence/persistence queues discard or coalesce stale work according
   to their explicit contract. They never grow without bound.
+- Diagnostic Identity-v2 shadow scoring and visitor persistence use one
+  isolated worker with at most one pending scalar snapshot per source and 64
+  pending sources. A newer pending cohort replaces the older one for that
+  source. Copy, capacity, scorer, or persistence failure drops/degrades only
+  shadow evidence; it cannot delay, mutate, reject, or stop canonical
+  tracking/world/BEV. No raw frame, surface, SDK object, diagnostic row, or
+  public embedding may enter this queue. Authoritative identity is not covered
+  by this optional policy because it owns same-frame public identity.
 - Canonical tracking/world/BEV cohorts do **not** use that policy. Their
   admission is all-or-none, ordered, revision-bound, and fail-closed. A client
   or transport may disconnect, but the producer cannot manufacture a mixed or
@@ -93,6 +101,17 @@ consumer and measure the layers the change can affect:
 - **Delivery:** authenticated WebRTC connection plus decoded frame count.
 - **Correctness:** detections, tracks, StableID, pose, depth, canonical world,
   BEV, and floorplan behavior affected by the change.
+
+For paced replay, inspect `tracking.publication_worker.pending_total`, its high
+watermark and overflow/failure/completion totals, plus
+`identity_v2.shadow.pending_sources`, its high watermark, in-flight state, and
+completed/coalesced/drop/failure totals. Stage timings
+`tracking.publication_worker_item`, `tracking.publish`,
+`tracking.publication_worker_queue_wait`, `bev.render_and_publish`,
+`identity_v2.shadow_process_source_frame`, and
+`identity_v2.shadow_queue_wait` identify processing time separately from
+backlog delay. A returned-to-zero queue gauge alone is not proof; the high
+watermark and monotonic totals must agree with source-frame progress.
 
 Use matched inputs/config/model realization and sufficient warm-up. Performance
 work must include a motion/occupancy-heavy recorded sample and, when practical,

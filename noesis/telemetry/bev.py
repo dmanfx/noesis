@@ -13,10 +13,57 @@ import math
 import threading
 
 from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
+from noesis_core.coordinate_frames import (
+    CameraGroundFrame,
+    camera_ground_frame_from_camera_to_world,
+)
 from noesis.telemetry.motion_smoothing import MotionGatedAlphaBetaSmoother, MotionSmoothingConfig
 from noesis.telemetry.person_ground_state import HumanGroundConfig, commit_path_point
 
 logger = logging.getLogger(__name__)
+
+
+def _camera_ground_frame_from_pose(
+    R_wc: np.ndarray,
+    C_world: np.ndarray,
+) -> CameraGroundFrame:
+    """Resolve the shared ground basis while tolerating legacy calibration storage.
+
+    Current calibrated poses use the validated coordinate-frame constructor.
+    A few historical test/telemetry snapshots carry the OpenCV Y reflection or
+    a non-affine padding row even though ``parse_extrinsics`` can still recover
+    a usable camera rotation/origin.  Preserve that established parser
+    behavior, but use the same horizontal-axis construction as
+    ``CameraGroundFrame`` for those snapshots instead of reverting to a
+    pitched ``R.T`` projection.
+    """
+    camera_to_world = np.eye(4, dtype=np.float64)
+    camera_to_world[:3, :3] = np.asarray(R_wc, dtype=np.float64).reshape(3, 3)
+    camera_to_world[:3, 3] = np.asarray(C_world, dtype=np.float64).reshape(3)
+    try:
+        return camera_ground_frame_from_camera_to_world(camera_to_world)
+    except ValueError:
+        # The parsed matrix may intentionally carry the OpenCV Y reflection.
+        # Reproduce only the shared helper's horizontal projection/Gram-Schmidt
+        # step; no pitch-dependent component is allowed into the result.
+        forward = np.asarray(R_wc, dtype=np.float64)[:, 2].copy()
+        forward[1] = 0.0
+        forward_norm = float(np.linalg.norm(forward))
+        if not math.isfinite(forward_norm) or forward_norm <= 1e-8:
+            raise ValueError("camera forward has no stable ground projection")
+        forward /= forward_norm
+        right = np.asarray(R_wc, dtype=np.float64)[:, 0].copy()
+        right[1] = 0.0
+        right -= float(np.dot(right, forward)) * forward
+        right_norm = float(np.linalg.norm(right))
+        if not math.isfinite(right_norm) or right_norm <= 1e-8:
+            raise ValueError("camera right has no stable ground projection")
+        right /= right_norm
+        return CameraGroundFrame(
+            camera_world_m=np.asarray(C_world, dtype=np.float64).reshape(3).copy(),
+            camera_right_world=right,
+            camera_forward_world=forward,
+        )
 
 
 def _broadcast_json_with_response_timing(
@@ -51,6 +98,13 @@ class CalibrationSnapshot:
     floor_y: float
     image_size: Tuple[int, int]
     unit_scale: float = 1.0
+    # Explicit identity of the world snapshot used for projection.  The
+    # native calibration manager supplies these fields; keeping them optional
+    # preserves SDK-neutral callers while allowing OSD/BEV to fail closed on
+    # a revision mismatch.
+    world_frame_id: Optional[str] = None
+    world_frame_revision: Optional[str] = None
+    frame_transform_sha256: Optional[str] = None
 
 
 @dataclass
@@ -194,11 +248,16 @@ class BevPublicationReceipt:
 
 @dataclass
 class Footpoint:
-    u: float
-    v: float
+    # Canonical world transport does not require an image contact.  Image-space
+    # coordinates remain useful diagnostics for ray/depth comparison, but they
+    # must not be an admission dependency once a revision-bound world point is
+    # already authoritative.
+    u: Optional[float] = None
+    v: Optional[float] = None
     method: str = "bbox"
     stable_id: Optional[int] = None
     tracker_id: Optional[int] = None
+    tracker_lifecycle_generation: Optional[int] = None
     world_x: Optional[float] = None
     world_z: Optional[float] = None
     depth_m: Optional[float] = None
@@ -312,6 +371,8 @@ class _BevTrailTrackState:
     last_seen_ts: float = 0.0
     stable_id: Optional[int] = None
     tracker_id: Optional[int] = None
+    tracker_lifecycle_generation: Optional[int] = None
+    canonical_world_required: bool = False
     display_key: Optional[int] = None
     ema_x: Optional[float] = None
     ema_z: Optional[float] = None
@@ -566,6 +627,94 @@ class BevRenderer:
             if isinstance(key, tuple) and key and key[0] == camera_id:
                 self._smoother.reset(key)
                 self._smoother_source_by_key.pop(key, None)
+
+    def _clear_identity_motion_state(
+        self,
+        camera_id: str,
+        *,
+        stable_id: Optional[int],
+        tracker_id: Optional[int],
+        tracker_lifecycle_generation: Optional[int],
+    ) -> None:
+        """Break BEV presentation history for one rejected canonical point.
+
+        A canonical world point can be rejected after a previous point for the
+        same tracker has already seeded the renderer's trail.  Leaving that
+        state alive makes a later same-generation return look continuous even
+        though the canonical stream explicitly had a gap.  Keep the identity
+        matching the producer's history key, and clear its smoother too, so a
+        return starts with a fresh segment.
+
+        This is deliberately limited to the rejected identity.  It does not
+        manufacture a new identity or alter any producer/world state.
+        """
+        try:
+            stable_value = int(stable_id) if stable_id is not None else None
+        except (TypeError, ValueError):
+            stable_value = None
+        if stable_value is not None and stable_value <= 0:
+            stable_value = None
+        try:
+            tracker_value = int(tracker_id) if tracker_id is not None else None
+        except (TypeError, ValueError):
+            tracker_value = None
+        if tracker_value is not None and tracker_value < 0:
+            tracker_value = None
+        try:
+            generation_value = (
+                int(tracker_lifecycle_generation)
+                if tracker_lifecycle_generation is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            generation_value = None
+        if generation_value is not None and generation_value < 0:
+            generation_value = None
+
+        with self._lock:
+            history_keys: set[Hashable] = set()
+            if tracker_value is not None:
+                if generation_value is None:
+                    # Without a generation, clear every retained incarnation
+                    # of this numeric tracker id; otherwise a legacy state
+                    # could be spliced into the return.
+                    cam_tracks = self._trail_tracks_by_cam.get(str(camera_id), {})
+                    history_keys.update(
+                        key
+                        for key in cam_tracks
+                        if (
+                            isinstance(key, tuple)
+                            and len(key) >= 2
+                            and key[0] == "tracker"
+                            and int(key[1]) == tracker_value
+                        )
+                    )
+                    history_keys.add(("tracker", tracker_value))
+                else:
+                    history_keys.add(("tracker", tracker_value, generation_value))
+                    # Older callers may have seeded a generation-less key for
+                    # the same numeric tracker.  It is the same presentation
+                    # identity until the producer supplies a lifecycle
+                    # generation.
+                    history_keys.add(("tracker", tracker_value))
+            elif stable_value is not None:
+                history_keys.add(("stable", stable_value))
+            if stable_value is not None and tracker_value is not None:
+                # A prior frame may have arrived before tracker metadata was
+                # available.  Remove only that same stable identity fallback.
+                history_keys.add(("stable", stable_value))
+            if not history_keys:
+                return
+            cam_tracks = self._trail_tracks_by_cam.get(str(camera_id))
+            if cam_tracks is not None:
+                for history_key in history_keys:
+                    cam_tracks.pop(history_key, None)
+                if not cam_tracks:
+                    self._trail_tracks_by_cam.pop(str(camera_id), None)
+            for history_key in history_keys:
+                smoother_key = (str(camera_id), *history_key)
+                self._smoother.reset(smoother_key)
+                self._smoother_source_by_key.pop(smoother_key, None)
 
     def _record_failure(
         self,
@@ -987,6 +1136,41 @@ class BevRenderer:
             return "world"
         return "camera_local"
 
+    @staticmethod
+    def _canonical_display_margin_m(
+        floorplan_space: Optional[FloorplanSpace],
+        coverage_envelope: Optional[CoverageEnvelope],
+    ) -> float:
+        """Return the bounded presentation-only PCF safety margin.
+
+        Canonical tracking remains authoritative in ``backend_world_m``.  The
+        active PCF is a static presentation raster and its bounds are not a
+        validity gate for a live person.  Keep a small, explicit margin around
+        that raster so a metric-preserving point just outside the PCF remains
+        visible and is tagged ``floorplanInside=false``.  Coverage envelopes
+        already declare their own display extent, so they do not receive this
+        extra padding.  This is intentionally bounded and never clamps or
+        moves a point.
+        """
+        if floorplan_space is None or coverage_envelope is not None:
+            return 0.0
+        try:
+            margin_m = float(
+                os.environ.get(
+                    "NOESIS_BEV_CANONICAL_DISPLAY_MARGIN_M",
+                    "4.0",
+                )
+            )
+        except (TypeError, ValueError):
+            margin_m = 1.0
+        if not math.isfinite(margin_m):
+            margin_m = 1.0
+        # This is a fixed presentation/sanity envelope, not auto-fit.  Permit
+        # a deliberately smaller value for diagnostics, but cap the runtime
+        # contract so an environment typo cannot turn it into an unbounded
+        # alternate world extent.
+        return min(4.0, max(0.0, margin_m))
+
     def _resolve_max_distance_scene(self, cfg: BevConfig, calib: CalibrationSnapshot) -> float:
         """Resolve distance guardrail in canonical meters."""
         limit = float(cfg.max_distance_m or 0.0)
@@ -1153,13 +1337,30 @@ class BevRenderer:
         world_z: float,
         R_wc: np.ndarray,
         C_world: np.ndarray,
+        camera_ground_frame: Optional[CameraGroundFrame] = None,
     ) -> Tuple[float, float]:
+        """Project backend-world positions onto the horizontal camera ground basis.
+
+        ``R_wc.T`` is the full OpenCV world-to-camera rotation.  Using its
+        horizontal components directly leaks camera pitch into the BEV X/Z
+        coordinates (a floor point directly below a pitched camera no longer
+        maps to the camera origin).  The canonical presentation frame is
+        defined by ``CameraGroundFrame``: the ground-projected camera-right and
+        camera-forward axes, both horizontal and expressed in backend world.
+        Keep the optional fallback for private callers/tests, but the render
+        path supplies the frame once per calibration so this remains a cheap
+        dot-product transform per point.
+        """
         delta = np.array(
             [float(world_x) - float(C_world[0]), float(world_y) - float(C_world[1]), float(world_z) - float(C_world[2])],
             dtype=np.float64,
         )
-        local = R_wc.T @ delta
-        return float(local[0]), float(local[2])
+        ground_frame = camera_ground_frame
+        if ground_frame is None:
+            ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
+        right = np.asarray(ground_frame.camera_right_world, dtype=np.float64)
+        forward = np.asarray(ground_frame.camera_forward_world, dtype=np.float64)
+        return float(np.dot(right, delta)), float(np.dot(forward, delta))
 
     @staticmethod
     def _image_to_world_ground(
@@ -1636,6 +1837,7 @@ class BevRenderer:
         H_img2plane: np.ndarray,
         R_wc: np.ndarray,
         C_world: np.ndarray,
+        camera_ground_frame: Optional[CameraGroundFrame] = None,
         x_range: Tuple[float, float],
         z_range: Tuple[float, float],
         width_px: int,
@@ -1669,6 +1871,7 @@ class BevRenderer:
                     float(iw_z),
                     R_wc,
                     C_world,
+                    camera_ground_frame,
                 )
                 aligned_x, aligned_z, alignment_applied = self._apply_floorplan_alignment(
                     floorplan_alignment,
@@ -1749,8 +1952,15 @@ class BevRenderer:
             candidates_out.append(item)
 
         registered_depth_anchor: Optional[Dict[str, Any]] = None
-        if fp.depth_m is not None:
-            depth_local = self._image_depth_to_camera_local(calib, float(fp.u), float(fp.v), float(fp.depth_m))
+        active_u = self._json_number(fp.u)
+        active_v = self._json_number(fp.v)
+        if fp.depth_m is not None and active_u is not None and active_v is not None:
+            depth_local = self._image_depth_to_camera_local(
+                calib,
+                float(active_u),
+                float(active_v),
+                float(fp.depth_m),
+            )
             if depth_local is not None:
                 depth_x, depth_z = depth_local
                 registered_depth_anchor = {
@@ -1810,7 +2020,15 @@ class BevRenderer:
         payload = {
             "enabled": True,
             "track": track_debug,
-            "activeAnchor": {"u": float(fp.u), "v": float(fp.v), "method": str(fp.method or "")},
+            "activeAnchor": (
+                {
+                    "u": float(active_u),
+                    "v": float(active_v),
+                    "method": str(fp.method or ""),
+                }
+                if active_u is not None and active_v is not None
+                else None
+            ),
             "bbox": list(fp.bbox) if fp.bbox is not None else None,
             "imageSize": list(fp.image_size) if fp.image_size is not None else list(calib.image_size),
             "frameId": int(fp.frame_id) if fp.frame_id is not None else None,
@@ -1845,6 +2063,7 @@ class BevRenderer:
         H_img2plane: np.ndarray,
         R_wc: np.ndarray,
         C_world: np.ndarray,
+        camera_ground_frame: Optional[CameraGroundFrame] = None,
         x_range: Tuple[float, float],
         z_range: Tuple[float, float],
         coverage_envelope: Optional[CoverageEnvelope],
@@ -1866,6 +2085,7 @@ class BevRenderer:
                 float(iw_z),
                 R_wc,
                 C_world,
+                camera_ground_frame,
             )
             if not math.isfinite(px) or not math.isfinite(pz):
                 continue
@@ -1907,6 +2127,8 @@ class BevRenderer:
             "pose_floor_only",
             "person_anchor_floor_only",
             "gravity_drop",
+            "cv_prediction",
+            "image_motion_prediction",
         }
 
     @staticmethod
@@ -1959,8 +2181,18 @@ class BevRenderer:
         *,
         stable_id: Optional[int],
         tracker_id: Optional[int],
-    ) -> Optional[Tuple[str, int]]:
+        tracker_lifecycle_generation: Optional[int] = None,
+    ) -> Optional[Tuple[Hashable, ...]]:
         if tracker_id is not None and int(tracker_id) >= 0:
+            if (
+                tracker_lifecycle_generation is not None
+                and int(tracker_lifecycle_generation) >= 0
+            ):
+                return (
+                    "tracker",
+                    int(tracker_id),
+                    int(tracker_lifecycle_generation),
+                )
             return ("tracker", int(tracker_id))
         if stable_id is not None and int(stable_id) > 0:
             return ("stable", int(stable_id))
@@ -2099,6 +2331,7 @@ class BevRenderer:
             return (-4.0, 4.0), (0.0, 12.0)
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        camera_ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
         plane = Plane.horizontal(float(calib.floor_y))
 
         xs = np.linspace(0, max(0.0, float(width - 1)), 8)
@@ -2120,7 +2353,14 @@ class BevRenderer:
                     dz *= scale_d
                 wx = float(C_world[0] + dx)
                 wz = float(C_world[2] + dz)
-                lx, lz = self._world_to_camera_local_ground(wx, float(calib.floor_y), wz, R_wc, C_world)
+                lx, lz = self._world_to_camera_local_ground(
+                    wx,
+                    float(calib.floor_y),
+                    wz,
+                    R_wc,
+                    C_world,
+                    camera_ground_frame,
+                )
                 hits_local.append((lx, lz))
 
         if len(hits_local) < 3:
@@ -2145,8 +2385,26 @@ class BevRenderer:
 
         return (x_min, x_max), (z_min, z_max)
 
-    def publish_status(self, camera_id: str, **fields: Any) -> None:
-        """Publish a lightweight BEV status/error message to clients."""
+    def publish_status(
+        self,
+        camera_id: str,
+        *,
+        source_id: Optional[int] = None,
+        frame_id: Optional[int] = None,
+        observed_at_us: Optional[int] = None,
+        tracking_publication_sequence: Optional[int] = None,
+        tracking_outbound_submission_id: Optional[int] = None,
+        **fields: Any,
+    ) -> None:
+        """Publish a lightweight, cohort-bound BEV status/error message.
+
+        Render failures happen outside the media callback and can arrive after
+        a later successful frame. When the failed attempt belongs to a
+        tracking cohort, carry that exact identity on the status so dashboard
+        admission can reject an older status without clearing a newer frame.
+        Standalone/startup statuses intentionally remain cohort-less and are
+        only safe to apply before a canonical frame has been admitted.
+        """
         response_model_started_ns = time.perf_counter_ns()
         try:
             payload: Dict[str, Any] = {
@@ -2154,6 +2412,40 @@ class BevRenderer:
                 "cameraId": str(camera_id),
                 "ts": int(time.time() * 1_000_000),
             }
+            cohort: Dict[str, Any] = {}
+            if source_id is not None:
+                payload["sourceId"] = int(source_id)
+                cohort["source_id"] = int(source_id)
+            if frame_id is not None:
+                payload["frameId"] = int(frame_id)
+                cohort["frame_id"] = int(frame_id)
+            if observed_at_us is not None:
+                payload["observedAtUs"] = int(observed_at_us)
+                cohort["observed_at_us"] = int(observed_at_us)
+            if tracking_publication_sequence is not None:
+                payload["trackingPublicationSequence"] = int(
+                    tracking_publication_sequence
+                )
+                cohort["tracking_publication_sequence"] = int(
+                    tracking_publication_sequence
+                )
+            if tracking_outbound_submission_id is not None:
+                payload["trackingOutboundSubmissionId"] = int(
+                    tracking_outbound_submission_id
+                )
+                cohort["tracking_outbound_submission_id"] = int(
+                    tracking_outbound_submission_id
+                )
+            if all(
+                key in cohort
+                for key in (
+                    "source_id",
+                    "frame_id",
+                    "observed_at_us",
+                    "tracking_publication_sequence",
+                )
+            ):
+                payload["cohort"] = dict(cohort)
             payload.update({k: v for k, v in fields.items() if k is not None})
             _broadcast_json_with_response_timing(
                 self.ws,
@@ -2206,6 +2498,9 @@ class BevRenderer:
         observed_at_us: Optional[int] = None,
         tracking_publication_sequence: Optional[int] = None,
         tracking_outbound_submission_id: Optional[int] = None,
+        tracker_lifecycle_tombstones: Optional[
+            Sequence[Mapping[str, Any]]
+        ] = None,
     ) -> BevPublicationReceipt:
         if timestamp_us <= 0:
             timestamp_us = int(time.time() * 1_000_000)
@@ -2218,6 +2513,43 @@ class BevRenderer:
         flip_u, flip_v = self._infer_image_flips(calib)
 
         with self._lock:
+            # A lifecycle tombstone is an exact ordered-cohort boundary, even
+            # when a short compatible reacquisition intentionally reuses the
+            # numeric generation.  Remove both presentation history and the
+            # point smoother state now so the next observation seeds a new
+            # segment instead of bridging the absence.
+            for tombstone in tracker_lifecycle_tombstones or ():
+                if not isinstance(tombstone, Mapping):
+                    continue
+                tombstone_camera = tombstone.get("camera_id")
+                if (
+                    tombstone_camera not in (None, "")
+                    and str(tombstone_camera) != str(camera_id)
+                ):
+                    continue
+                try:
+                    tracker_id = int(tombstone["tracker_id"])
+                    generation = int(
+                        tombstone["tracker_lifecycle_generation"]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if tracker_id < 0 or generation < 0:
+                    continue
+                history_key: Hashable = (
+                    "tracker",
+                    int(tracker_id),
+                    int(generation),
+                )
+                cam_tracks = self._trail_tracks_by_cam.get(camera_id)
+                if cam_tracks is not None:
+                    cam_tracks.pop(history_key, None)
+                    if not cam_tracks:
+                        self._trail_tracks_by_cam.pop(camera_id, None)
+                smoother_key = (camera_id, *history_key)
+                self._smoother.reset(smoother_key)
+                self._smoother_source_by_key.pop(smoother_key, None)
+
             # Prune fully expired trails for this camera so we can decide whether it's
             # worth publishing a frame when there are no current footpoints.
             trail_window = float(self._trail_cfg.window_s)
@@ -2258,6 +2590,15 @@ class BevRenderer:
                 )
                 self.publish_status(
                     camera_id,
+                    source_id=source_id,
+                    frame_id=frame_id,
+                    observed_at_us=observed_at_us,
+                    tracking_publication_sequence=(
+                        tracking_publication_sequence
+                    ),
+                    tracking_outbound_submission_id=(
+                        tracking_outbound_submission_id
+                    ),
                     error="active_floorplan_failed",
                     details=str(exc),
                 )
@@ -2302,6 +2643,15 @@ class BevRenderer:
                 )
                 self.publish_status(
                     camera_id,
+                    source_id=source_id,
+                    frame_id=frame_id,
+                    observed_at_us=observed_at_us,
+                    tracking_publication_sequence=(
+                        tracking_publication_sequence
+                    ),
+                    tracking_outbound_submission_id=(
+                        tracking_outbound_submission_id
+                    ),
                     error="active_floorplan_failed",
                     details=str(exc),
                 )
@@ -2350,6 +2700,26 @@ class BevRenderer:
                     ),
                 )
                 bounds_source = "active_floorplan_plus_coverage_envelope"
+            else:
+                # The PCF bounds remain the semantic floorplan extent exposed
+                # in ``floorplanBounds``.  Expand only the presentation canvas
+                # by the bounded safety margin so a live canonical world point
+                # just outside the static raster is not silently omitted.  The
+                # metric point is never clamped; its normalized fields will
+                # correctly report ``floorplanInside=false``.
+                display_margin_m = self._canonical_display_margin_m(
+                    active_floorplan_space,
+                    coverage_envelope,
+                )
+                if display_margin_m > 0.0:
+                    x_range = (
+                        float(x_range[0]) - display_margin_m,
+                        float(x_range[1]) + display_margin_m,
+                    )
+                    z_range = (
+                        float(z_range[0]) - display_margin_m,
+                        float(z_range[1]) + display_margin_m,
+                    )
         elif cfg.auto_fit_extents:
             bounds_source = "auto_extents"
             ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
@@ -2423,7 +2793,18 @@ class BevRenderer:
                 timestamp_us=int(timestamp_us),
                 cause=e,
             )
-            self.publish_status(camera_id, error="homography_failed", details=str(e))
+            self.publish_status(
+                camera_id,
+                source_id=source_id,
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_publication_sequence,
+                tracking_outbound_submission_id=(
+                    tracking_outbound_submission_id
+                ),
+                error="homography_failed",
+                details=str(e),
+            )
             return self._publication_receipt(
                 status="failed",
                 camera_id=camera_id,
@@ -2443,43 +2824,170 @@ class BevRenderer:
         dropped_footpoints: List[Dict[str, Any]] = []
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        camera_ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
         calibration_frame = getattr(calib, "calibration_frame", None)
-        expected_world_frame = str(
+        explicit_expected_world_frame = str(
             getattr(calib, "world_frame_id", "")
             or getattr(calibration_frame, "frame_id", "")
-            or "backend_world_m"
         ).strip()
+        expected_world_frame = explicit_expected_world_frame or "backend_world_m"
         expected_world_revision = str(
             getattr(calib, "world_frame_revision", "")
             or getattr(calibration_frame, "revision", "")
         ).strip()
         max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
+        # A disabled config distance is not permission to publish an
+        # unbounded projection.  With an active PCF, use the fixed display
+        # envelope (the raster plus its bounded presentation margin) as a
+        # sanity guard.  Without a PCF, retain a conservative indoor-camera
+        # radial guard so near-horizon/invalid transforms cannot create a
+        # 30-metre person in a room-scale BEV.
+        canonical_guard_x_range: Optional[Tuple[float, float]] = None
+        canonical_guard_z_range: Optional[Tuple[float, float]] = None
+        canonical_fallback_max_distance_m = 20.0
+        if active_floorplan_space is not None:
+            canonical_guard_x_range = (
+                float(x_range[0]),
+                float(x_range[1]),
+            )
+            canonical_guard_z_range = (
+                float(z_range[0]),
+                float(z_range[1]),
+            )
+        else:
+            try:
+                configured_fallback = float(
+                    os.environ.get(
+                        "NOESIS_BEV_CANONICAL_FALLBACK_MAX_DISTANCE_M",
+                        "20.0",
+                    )
+                )
+                if math.isfinite(configured_fallback) and configured_fallback > 0.0:
+                    canonical_fallback_max_distance_m = min(50.0, configured_fallback)
+            except (TypeError, ValueError):
+                pass
+
+        # Keep canonical admission failures visible in the normal BEV cohort.
+        # These records intentionally contain only bounded identity/reason
+        # fields plus the candidate position when one exists; alignment debug
+        # remains the place for the larger candidate diagnostics.
+        max_drop_records = 64
+
+        def _break_canonical_trail(fp: Footpoint) -> None:
+            """Break stale BEV history when an authoritative point is rejected.
+
+            A rejected canonical observation is an explicit absence boundary,
+            not an ordinary missing frame.  Remove the exact tracker
+            generation (or stable-id fallback) immediately so a same-generation
+            return cannot draw a straight segment from the last accepted point
+            through the rejected interval.
+            """
+            self._clear_identity_motion_state(
+                camera_id,
+                stable_id=fp.stable_id,
+                tracker_id=fp.tracker_id,
+                tracker_lifecycle_generation=fp.tracker_lifecycle_generation,
+            )
+
+        def _record_canonical_drop(
+            fp: Footpoint,
+            reason: str,
+            *,
+            x: Optional[float] = None,
+            z: Optional[float] = None,
+        ) -> None:
+            _break_canonical_trail(fp)
+            if len(dropped_footpoints) >= max_drop_records:
+                return
+            payload: Dict[str, Any] = {
+                "stableId": int(fp.stable_id) if fp.stable_id is not None else None,
+                "trackerId": int(fp.tracker_id) if fp.tracker_id is not None else None,
+                "trackerLifecycleGeneration": (
+                    int(fp.tracker_lifecycle_generation)
+                    if fp.tracker_lifecycle_generation is not None
+                    else None
+                ),
+                "reason": str(reason),
+                "canonicalWorld": True,
+                "anchorSource": (
+                    str(fp.anchor_source) if fp.anchor_source not in (None, "") else None
+                ),
+                "trailSegmentId": (
+                    int(fp.trail_segment_id)
+                    if fp.trail_segment_id is not None
+                    else None
+                ),
+            }
+            if x is not None and z is not None:
+                try:
+                    x_value = float(x)
+                    z_value = float(z)
+                except (TypeError, ValueError):
+                    x_value = z_value = float("nan")
+                if math.isfinite(x_value) and math.isfinite(z_value):
+                    payload["x"] = x_value
+                    payload["y"] = z_value
+                    payload.update(
+                        self._floorplan_point_fields(
+                            x_value,
+                            z_value,
+                            x_range,
+                            z_range,
+                            width_px,
+                            height_px,
+                            active_floorplan_space,
+                        )
+                    )
+                    payload.update(
+                        self._coverage_point_fields(
+                            coverage_envelope,
+                            x_value,
+                            z_value,
+                        )
+                    )
+            dropped_footpoints.append(payload)
+
         # In world mode the producer already owns the canonical filtered track.world state.
         # Do not low-pass filter those points again in the BEV renderer.
         apply_backend_smoothing = bool(self._smoother.enabled) and not use_world_frame
 
         for fp in footpoints:
             anchor_source = str(fp.anchor_source or "").strip().lower()
-            if anchor_source == "anchor_hold":
-                continue
             is_canonical_track = bool(fp.canonical_world_required)
-            if is_canonical_track:
+            image_u = self._json_number(fp.u)
+            image_v = self._json_number(fp.v)
+            has_image_anchor = image_u is not None and image_v is not None
+            # Legacy/non-canonical held anchors remain inadmissible.  A
+            # producer-owned canonical world hold is different: it is a valid
+            # last-good world position and is emitted below with provenance.
+            if anchor_source == "anchor_hold" and not is_canonical_track:
+                continue
+            if (
+                is_canonical_track
+                and fp.world_x is not None
+                and fp.world_z is not None
+            ):
                 observed_world_frame = str(fp.world_frame or "").strip()
                 observed_world_revision = str(
                     fp.world_frame_revision or ""
                 ).strip()
                 if (
-                    (observed_world_frame and observed_world_frame != expected_world_frame)
+                    (
+                        bool(explicit_expected_world_frame)
+                        and observed_world_frame != expected_world_frame
+                    )
                     or (
-                        observed_world_revision
-                        and expected_world_revision
+                        bool(expected_world_revision)
                         and observed_world_revision != expected_world_revision
                     )
                 ):
+                    _break_canonical_trail(fp)
                     dropped_footpoints.append(
                         {
                             "stableId": fp.stable_id,
                             "trackerId": fp.tracker_id,
+                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
+                            "trailSegmentId": fp.trail_segment_id,
                             "reason": "canonical_world_revision_mismatch",
                             "worldFrame": observed_world_frame or None,
                             "worldFrameRevision": observed_world_revision or None,
@@ -2506,8 +3014,12 @@ class BevRenderer:
                 # In world mode, use producer-owned track world coordinates only.
                 # Do not reintroduce a homography fallback path here.
                 if wx is None or wz is None:
+                    if is_canonical_track:
+                        _record_canonical_drop(fp, "canonical_world_missing")
                     continue
                 if not math.isfinite(wx) or not math.isfinite(wz):
+                    if is_canonical_track:
+                        _record_canonical_drop(fp, "canonical_world_nonfinite")
                     continue
 
                 dx = wx - C_world[0]
@@ -2515,6 +3027,13 @@ class BevRenderer:
                 if max_distance_m > 0.0 and math.hypot(dx, dz) > max_distance_m:
                     # Guardrail: discard near-horizon outliers so the UI doesn't draw
                     # teleporting streaks outside the floorplan extents.
+                    if is_canonical_track:
+                        _record_canonical_drop(
+                            fp,
+                            "canonical_world_outside_max_distance",
+                            x=wx,
+                            z=wz,
+                        )
                     continue
                 px = float(wx)
                 pz = float(wz)
@@ -2524,11 +3043,11 @@ class BevRenderer:
                 prefer_floor_contact = method_key in ("image_foot", "image_base", "pose_anchor", "person_anchor", "bbox")
                 px = pz = None
                 registered_depth_candidate: Optional[Dict[str, Any]] = None
-                if prefer_floor_contact and fp.depth_m is not None:
+                if prefer_floor_contact and fp.depth_m is not None and has_image_anchor:
                     depth_local = self._image_depth_to_camera_local(
                         calib,
-                        float(fp.u),
-                        float(fp.v),
+                        float(image_u),
+                        float(image_v),
                         float(fp.depth_m),
                     )
                     if depth_local is not None:
@@ -2562,6 +3081,7 @@ class BevRenderer:
                         H_img2plane=H_img2plane,
                         R_wc=R_wc,
                         C_world=C_world,
+                        camera_ground_frame=camera_ground_frame,
                         x_range=x_range,
                         z_range=z_range,
                         coverage_envelope=coverage_envelope,
@@ -2593,6 +3113,7 @@ class BevRenderer:
                         float(wz),
                         R_wc,
                         C_world,
+                        camera_ground_frame,
                     )
                     world_inside = self._point_in_admission_surface(
                         candidate_x,
@@ -2764,20 +3285,28 @@ class BevRenderer:
 
                 if px is None or pz is None:
                     depth_local = None
-                    if not prefer_floor_contact and fp.depth_m is not None:
+                    if (
+                        not prefer_floor_contact
+                        and fp.depth_m is not None
+                        and has_image_anchor
+                    ):
                         depth_local = self._image_depth_to_camera_local(
                             calib,
-                            float(fp.u),
-                            float(fp.v),
+                            float(image_u),
+                            float(image_v),
                             float(fp.depth_m),
                         )
                     if depth_local is not None:
                         px, pz = depth_local
                         display_source = "image_depth_anchor"
 
-                if prefer_image_anchor:
+                if prefer_image_anchor and has_image_anchor:
                     if px is None or pz is None:
-                        image_world = self._image_to_world_ground(H_img2plane, float(fp.u), float(fp.v))
+                        image_world = self._image_to_world_ground(
+                            H_img2plane,
+                            float(image_u),
+                            float(image_v),
+                        )
                         if image_world is not None:
                             iw_x, iw_z = image_world
                             px, pz = self._world_to_camera_local_ground(
@@ -2786,6 +3315,7 @@ class BevRenderer:
                                 float(iw_z),
                                 R_wc,
                                 C_world,
+                                camera_ground_frame,
                             )
                             display_source = "image_anchor"
 
@@ -2798,22 +3328,33 @@ class BevRenderer:
                                 float(wz),
                                 R_wc,
                                 C_world,
+                                camera_ground_frame,
                             )
                             display_source = "world_floor_fallback_to_camera_local"
 
                 if px is None or pz is None:
-                    image_world = self._image_to_world_ground(H_img2plane, float(fp.u), float(fp.v))
-                    if image_world is None:
-                        continue
-                    iw_x, iw_z = image_world
-                    px, pz = self._world_to_camera_local_ground(
-                        float(iw_x),
-                        float(calib.floor_y),
-                        float(iw_z),
-                        R_wc,
-                        C_world,
+                    image_world = (
+                        self._image_to_world_ground(
+                            H_img2plane,
+                            float(image_u),
+                            float(image_v),
+                        )
+                        if has_image_anchor
+                        else None
                     )
-                    display_source = "image_anchor"
+                    if image_world is None and not is_canonical_track:
+                        continue
+                    if image_world is not None:
+                        iw_x, iw_z = image_world
+                        px, pz = self._world_to_camera_local_ground(
+                            float(iw_x),
+                            float(calib.floor_y),
+                            float(iw_z),
+                            R_wc,
+                            C_world,
+                            camera_ground_frame,
+                        )
+                        display_source = "image_anchor"
 
                 # Live tracked people have exactly one spatial authority:
                 # the producer-owned, filtered ``track.world`` observation.
@@ -2821,10 +3362,17 @@ class BevRenderer:
                 # diagnostics; a renderer must never turn them into a second
                 # person-position estimator.
                 if is_canonical_track:
-                    if world_candidate is None or not bool(
-                        world_candidate.get("insideBounds", False)
-                    ):
+                    if world_candidate is None:
+                        _record_canonical_drop(fp, "canonical_world_missing")
                         continue
+                    # A revision-bound producer world point is already the
+                    # canonical live-world observation.  The active PCF (and
+                    # any bounded display margin around it) is presentation
+                    # metadata, not an admission surface for that point.  Do
+                    # not make a person disappear merely because the static
+                    # raster does not cover the current camera-local metric
+                    # coordinate.  Non-finite values and the independent
+                    # max-distance guard below remain fail-closed.
                     px = float(world_candidate["x"])
                     pz = float(world_candidate["z"])
                     display_source = "world_to_camera_local"
@@ -2837,13 +3385,48 @@ class BevRenderer:
                     }
 
                 if max_distance_m > 0.0 and math.hypot(float(px), float(pz)) > max_distance_m:
+                    if is_canonical_track:
+                        _record_canonical_drop(
+                            fp,
+                            "canonical_world_outside_max_distance",
+                            x=float(px),
+                            z=float(pz),
+                        )
                     continue
-                if prefer_floor_contact and not self._point_in_admission_surface(
+                if is_canonical_track:
+                    outside_display_guard = (
+                        canonical_guard_x_range is not None
+                        and canonical_guard_z_range is not None
+                        and not self._point_in_metric_bounds(
+                            float(px),
+                            float(pz),
+                            canonical_guard_x_range,
+                            canonical_guard_z_range,
+                        )
+                    )
+                    outside_fallback_guard = (
+                        canonical_guard_x_range is None
+                        and math.hypot(float(px), float(pz))
+                        > canonical_fallback_max_distance_m
+                    )
+                    if outside_display_guard or outside_fallback_guard:
+                        _record_canonical_drop(
+                            fp,
+                            "canonical_world_outside_display_guard",
+                            x=float(px),
+                            z=float(pz),
+                        )
+                        continue
+                if (
+                    prefer_floor_contact
+                    and not is_canonical_track
+                    and not self._point_in_admission_surface(
                     float(px),
                     float(pz),
                     x_range,
                     z_range,
                     coverage_envelope,
+                    )
                 ):
                     if self._alignment_debug_enabled:
                         dropped_payload: Dict[str, Any] = {
@@ -2898,6 +3481,7 @@ class BevRenderer:
                     H_img2plane=H_img2plane,
                     R_wc=R_wc,
                     C_world=C_world,
+                    camera_ground_frame=camera_ground_frame,
                     x_range=x_range,
                     z_range=z_range,
                     width_px=width_px,
@@ -2924,8 +3508,25 @@ class BevRenderer:
                 tracker_id = None
             if tracker_id is not None and tracker_id < 0:
                 tracker_id = None
+            try:
+                tracker_lifecycle_generation = (
+                    int(fp.tracker_lifecycle_generation)
+                    if fp.tracker_lifecycle_generation is not None
+                    else None
+                )
+            except Exception:
+                tracker_lifecycle_generation = None
+            if (
+                tracker_lifecycle_generation is not None
+                and tracker_lifecycle_generation < 0
+            ):
+                tracker_lifecycle_generation = None
 
-            history_key = self._history_identity(stable_id=stable_id, tracker_id=tracker_id)
+            history_key = self._history_identity(
+                stable_id=stable_id,
+                tracker_id=tracker_id,
+                tracker_lifecycle_generation=tracker_lifecycle_generation,
+            )
             display_key = self._display_color_key(stable_id=stable_id, tracker_id=tracker_id)
             if history_key is None or display_key is None:
                 continue
@@ -2939,11 +3540,22 @@ class BevRenderer:
                     "method": str(fp.method),
                     "stable_id": stable_id,
                     "tracker_id": tracker_id,
+                    "tracker_lifecycle_generation": tracker_lifecycle_generation,
                     "frame_id": int(fp.frame_id) if fp.frame_id is not None else None,
                     "anchor_source": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
                     "anchor_quality": str(fp.anchor_quality) if fp.anchor_quality not in (None, "") else None,
                     "anchor_reason": str(fp.anchor_reason) if fp.anchor_reason not in (None, "") else None,
                     "display_source": display_source,
+                    "world_admission": (
+                        "held"
+                        if is_canonical_track and anchor_source == "anchor_hold"
+                        else (
+                            "predicted"
+                            if is_canonical_track
+                            and anchor_source in ("cv_prediction", "image_motion_prediction")
+                            else ("accepted" if is_canonical_track else None)
+                        )
+                    ),
                     "alignment_debug": alignment_debug,
                     "motion_mode": str(fp.motion_mode) if fp.motion_mode not in (None, "") else None,
                     "posture": str(fp.posture) if fp.posture not in (None, "") else None,
@@ -3034,11 +3646,16 @@ class BevRenderer:
                     'method': method,
                     'stableId': int(stable_id) if stable_id is not None else None,
                     'trackerId': int(tracker_id) if tracker_id is not None else None,
+                    'trackerLifecycleGeneration': item.get(
+                        "tracker_lifecycle_generation"
+                    ),
                     'frameId': item.get("frame_id"),
                     'anchorSource': item.get("anchor_source"),
                     'anchorQuality': item.get("anchor_quality"),
                     'anchorReason': item.get("anchor_reason"),
                     'displaySource': item.get("display_source"),
+                    'canonicalWorld': bool(item.get("canonical_world_required")),
+                    'worldAdmission': item.get("world_admission"),
                     'motionMode': item.get("motion_mode"),
                     'posture': item.get("posture"),
                     'trailAppendAllowed': item.get("trail_append_allowed"),
@@ -3078,11 +3695,17 @@ class BevRenderer:
                     "z": float(lz),
                     "stable_id": int(stable_id) if stable_id is not None else None,
                     "tracker_id": int(tracker_id) if tracker_id is not None else None,
+                    "tracker_lifecycle_generation": item.get(
+                        "tracker_lifecycle_generation"
+                    ),
                     "display_key": int(display_key),
                     "trail_append_allowed": bool(item.get("trail_append_allowed", True)),
                     "trail_break_required": bool(item.get("trail_break_required", False)),
                     "trail_segment_id": item.get("trail_segment_id"),
                     "motion_mode": item.get("motion_mode"),
+                    "canonical_world_required": bool(
+                        item.get("canonical_world_required", False)
+                    ),
                 }
 
         # Update config to reflect the actual extents used
@@ -3121,7 +3744,26 @@ class BevRenderer:
                     lz = float(point_meta["z"])
                     stable_id = point_meta.get("stable_id")
                     tracker_id = point_meta.get("tracker_id")
+                    tracker_lifecycle_generation = point_meta.get(
+                        "tracker_lifecycle_generation"
+                    )
                     display_key = int(point_meta["display_key"])
+                    if (
+                        tracker_id is not None
+                        and tracker_lifecycle_generation is not None
+                    ):
+                        # A reused numeric NvDCF ID is a new physical
+                        # lifecycle.  Remove any older generation immediately
+                        # so it cannot remain visible or connect to this one.
+                        for prior_key in tuple(cam_tracks):
+                            if (
+                                prior_key != history_key
+                                and isinstance(prior_key, tuple)
+                                and len(prior_key) >= 2
+                                and prior_key[0] == "tracker"
+                                and prior_key[1] == int(tracker_id)
+                            ):
+                                cam_tracks.pop(prior_key, None)
                     state = cam_tracks.get(history_key)
                     if state is None:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
@@ -3129,6 +3771,14 @@ class BevRenderer:
                     state.last_seen_ts = float(now_s)
                     state.stable_id = int(stable_id) if stable_id is not None else None
                     state.tracker_id = int(tracker_id) if tracker_id is not None else None
+                    state.tracker_lifecycle_generation = (
+                        int(tracker_lifecycle_generation)
+                        if tracker_lifecycle_generation is not None
+                        else None
+                    )
+                    state.canonical_world_required = bool(
+                        point_meta.get("canonical_world_required", False)
+                    )
                     state.display_key = int(display_key)
 
                     segment_id = point_meta.get("trail_segment_id")
@@ -3277,6 +3927,21 @@ class BevRenderer:
                         {
                             "stableId": int(state.stable_id) if state.stable_id is not None else None,
                             "trackerId": int(state.tracker_id) if state.tracker_id is not None else None,
+                            "trackerLifecycleGeneration": (
+                                int(state.tracker_lifecycle_generation)
+                                if state.tracker_lifecycle_generation is not None
+                                else None
+                            ),
+                            # This marker belongs to the retained producer
+                            # trail, not only to the current footpoint cohort.
+                            # It lets consumers preserve canonical history
+                            # across a short current-footpoint gap.
+                            "canonicalWorld": bool(state.canonical_world_required),
+                            "trailSegmentId": (
+                                int(state.trail_segment_id)
+                                if state.trail_segment_id is not None
+                                else None
+                            ),
                             "points": trail_points,
                         }
                     )
@@ -3458,6 +4123,11 @@ class BevRenderer:
                         if tracking_publication_sequence is not None
                         else None
                     ),
+                    "tracking_outbound_submission_id": (
+                        int(tracking_outbound_submission_id)
+                        if tracking_outbound_submission_id is not None
+                        else None
+                    ),
                 },
                 "w": int(result.width_px),
                 "h": int(result.height_px),
@@ -3528,6 +4198,7 @@ class BevRenderer:
                 "fallbackTrackCount": int(len(fallback_points)),
                 "fallbackSources": (["ray_floor_fallback"] if fallback_points else []),
                 "fallbackReasonCounts": fallback_reasons,
+                "droppedFootpointCount": int(len(result.dropped_footpoints)),
             }
             if coverage_envelope_payload is not None:
                 status["coverageEnvelope"] = coverage_envelope_payload
@@ -3577,8 +4248,8 @@ class BevRenderer:
                     "chosenOutOfBounds": int(chosen_out_of_bounds),
                     "droppedFootpointCount": int(len(result.dropped_footpoints)),
                 }
-                if result.dropped_footpoints:
-                    status["droppedFootpoints"] = result.dropped_footpoints
+            if result.dropped_footpoints:
+                status["droppedFootpoints"] = result.dropped_footpoints
             outbound = _broadcast_json_with_response_timing(
                 self.ws,
                 status,

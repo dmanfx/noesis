@@ -1,5 +1,5 @@
 # Telemetry schema
-_Status: canonical native DS9.1 summary, updated 2026-08-15._
+_Status: canonical native DS9.1 summary, updated 2026-08-23._
 
 Canonical WebSocket payloads live in `docs/api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS9.1 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
 
@@ -189,7 +189,24 @@ with no partial visibility.
       "world_quality": "good"|"estimated"|"invalid",
       "world_quality_reason": "<string|null>",
       "world_frame": "backend_world_m"|null,
-      "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "world_frame_revision": "<revision|null>",
+      "world_source": "bbox3d"|"pose_depth_fused"|"pose_depth_only"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_depth_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
+      "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
+      "world_prediction_image_foot": [<float u>, <float v>]|null,
+      "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
+      "world_measurement_accepted": <bool|null>,
+      "world_rejection_reason": "<string|null>",
+      "world_contact_basis": "<string|null>",
+      "world_image_motion_supported": <bool|null>,
+      "world_image_motion_streak": <int|null>,
+      "world_state_continuity": "restored_short_ghost"|null,
+      "world_reacquire_count": <int|null>,
+      "world_reacquired": <bool|null>,
+      "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
+      "posture": "standing"|"sitting"|"lying"|"unknown"|null,
+      "trail_append_allowed": <bool|null>,
+      "trail_break_required": <bool|null>,
+      "trail_segment_id": <int|null>,
       "embedding_present": <bool|null>,
       "embedding_sequence": <int|null>,
       "embedding_model_sha256": "<lowercase sha256|null>",
@@ -228,18 +245,43 @@ with no partial visibility.
   durably appended. They are absent when evidence capture is off, append fails,
   or identity is only continuity-held. Partial triads are invalid, and no raw
   embedding vector is public.
-- Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame.
+- Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame. `world_frame_revision` identifies the exact active calibration/Scene Prior revision and must be preserved by every spatial consumer.
 - In the active baseline, `world` is produced by the shared
   `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`):
   posture-aware pose contact when available, otherwise the person mask/depth
   anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`, with human CV filtering and
   stationary lock. Tracks may also carry `motion_mode`, `posture`,
   `trail_append_allowed`, and `idle_jitter_m`.
+- `cv_prediction` is a bounded constant-velocity continuation of the
+  canonical filtered world point when the current metric observation is
+  missing, stale, or physically rejected. It is not a fresh measurement:
+  `world_measurement_accepted` is
+  false, `world_filter_prediction` records the displayed prediction, and the
+  last-good measurement state is not advanced. Reject-driven prediction uses
+  one fixed last-good rejection anchor and is capped at 0.40 seconds; repeated
+  rejects do not integrate drift. `anchor_hold` is a retained last-good point
+  after a missing or rejected measurement; it may remain visible in BEV with
+  `worldAdmission="held"`, but its trail must not grow. Its normal cap is 0.40
+  seconds. A seated/lying lifecycle may hold for at most 2.0 seconds only while
+  exact-frame bbox evidence remains stationary. A predicted point may extend a
+  trail only while `trail_append_allowed=true`.
+  `image_motion_prediction` is the stricter projective continuation for a
+  materially moving detector box when the current metric/depth anchor is
+  missing or rejected. It transports the last physically accepted image foot
+  through the current bbox affine change and projects that pixel through the
+  active corrected floor plane. It never updates the filter or prediction
+  origin; `world_prediction_image_foot` and
+  `world_prediction_provenance` expose its non-authoritative basis. If image,
+  ray, metric-speed, or TTL gates fail, the producer fails closed instead of
+  publishing a frozen point.
+- World/filter/lock state is discarded on the first exact processed frame that
+  omits a tracker key. A later reuse of the same numeric tracker ID starts a new
+  world lifecycle and cannot inherit the prior position or velocity.
 - `depth_used_m` is the DAv2 anchor depth that actually contributed to the fused baseline world update on that frame; `depth_anchor_m` remains the raw anchor carried by `NOESIS.OBJECT_DEPTH`.
 - `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2->MapAnything mapping for that camera; this is the value the estimator projects when registration is active.
 - `depth_registration_status` and `depth_registration_id` make the registration path observable on both tracks and active-tracks without changing the raw `NOESIS.OBJECT_DEPTH` payload semantics.
 - `depth_anchor_sample_count` and `depth_anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that drove the fused update; they are more authoritative than whole-mask support when diagnosing why a far-camera track fused depth or stayed floor-only.
-- `stats.payload.cameras[*].tracking.active_tracks[]` mirrors the same depth-registration fields for the current camera, and the runtime OSD `z=` label uses `depth_used_m` / registered depth rather than raw `depth_anchor_m`.
+- `stats.payload.cameras[*].tracking.active_tracks[]` mirrors the same depth-registration fields for the current camera, and the runtime OSD `depth=` label uses `depth_used_m` / registered depth rather than raw `depth_anchor_m`.
 - `observations[].payload.depth_present` is true only for `depth_status="ok"`,
   `depth_registration_status="ok"`, and a finite positive
   `depth_registered_m`. If `depth_used_m` is present it must match the
@@ -308,6 +350,7 @@ errors remain stable machine codes and never return a stale payload as success.
     "units": "meters",
     "cameraId": "<camera>",
     "boundaryToleranceM": <float>,
+    "bounds": {"min_x": <float>, "max_x": <float>, "min_z": <float>, "max_z": <float>},
     "regions": [{"id": "<semantic-region>", "polygonXZ": [[<float x>, <float z>], "..."]}]
   },
   "floorplanGridShape": [<rows>, <cols>] | null,
@@ -315,7 +358,9 @@ errors remain stable machine codes and never return a stale payload as success.
   "floorplanSnapshotTsUs": <int|null>,
   "floorplanTsUs": <int|null>,
   "overlay": <bool>,
-  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"registered_depth_anchor"|"floor_contact_ray", "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null, "posture": "standing"|"sitting"|"lying"|"unknown"|null, "trailAppendAllowed": <bool|null>, "idleJitterM": <float|null>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ],
+  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "frameId": <int>, "anchorSource": "<string|null>", "displaySource": "world"|"world_to_camera_local"|"world_floor_fallback_to_camera_local"|"image_anchor"|"image_depth_anchor"|"registered_depth_anchor"|"floor_contact_ray", "canonicalWorld": <bool>, "worldAdmission": "accepted"|"predicted"|"held"|null, "worldFrame": "backend_world_m"|null, "worldFrameRevision": "<revision>"|null, "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null, "posture": "standing"|"sitting"|"lying"|"unknown"|null, "trailAppendAllowed": <bool|null>, "idleJitterM": <float|null>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ],
+  "droppedFootpointCount": <int>,
+  "droppedFootpoints": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "trailSegmentId": <int|null>, "reason": "<canonical admission reason>", "canonicalWorld": true, "anchorSource": "<string|null>"} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
@@ -338,27 +383,60 @@ errors remain stable machine codes and never return a stale payload as success.
   rasters. Its bounds/grid/timestamps come only from the bounded active-floorplan
   registry. The separate strict observations and global world snapshot remain
   canonical `backend_world_m`; camera-local BEV does not redefine world state.
-- For cameras with `coverageEnvelope`, semantic polygon union owns point/trail
-  admission and `displayBounds` covers both that union and the active floorplan
-  raster. `floorplanBounds` remains the raster's exact metric footprint, so
-  `coverageInside=true` with `floorplanInside=false` is valid. The dashboard
-  renders those points from raw metric coordinates and leaves the area outside
-  the raster visibly unknown; it does not stretch the raster, clamp the point,
-  or add position smoothing. Cameras without an envelope retain the
-  active-floorplan rectangle gate.
+- For cameras with `coverageEnvelope`, the semantic polygon union is the
+  producer-side admission surface for legacy/noncanonical candidates and
+  `displayBounds` covers both that union and the active floorplan raster.
+  Canonical world points remain producer-authoritative: `coverageInside=false`
+  is diagnostic provenance and is not silently re-applied as a second
+  dashboard-only rejection gate. `floorplanBounds` remains the raster's exact
+  metric footprint, so a displayed point may have `floorplanInside=false`. The
+  dashboard renders admitted points from raw metric coordinates and leaves the
+  area outside the raster visibly unknown; it does not stretch the raster,
+  clamp the point, or add position smoothing. Without an envelope, the active
+  PCF rectangle remains the semantic `floorplanBounds`, while the producer
+  publishes the exact fixed, bounded display envelope for canonical live
+  points. A finite point inside that envelope is emitted unchanged; points
+  beyond it remain explicit bounded drops. The display envelope is a
+  presentation/sanity contract only and never makes PCF evidence live tracking
+  authority or auto-fits to tracks.
 - Calibration invalidation removes affected active records. The renderer resets
   camera history when its active-floorplan coordinate signature changes and
   does not reuse a previous homography after a current calibration/homography
   failure.
-- `displaySource=registered_depth_anchor` is the active floorplan placement when
-  a valid registered DAv2 person anchor is available. `image_depth_anchor` is a
-  legacy/non-person direct image-depth path; static MapAnything snapshots are
-  not live person-placement evidence. When registration rejects a sample, BEV
+- `displaySource=world_to_camera_local` is the only live canonical tracker
+  placement path in the active floorplan BEV: it is the revision-checked
+  horizontal projection of canonical `track.world`.
+  `world_floor_fallback_to_camera_local` is a legacy/noncanonical diagnostic
+  path retained for compatibility when a noncanonical world fallback is
+  projected into the camera-local view; it must never be used to place an
+  active canonical tracked person. Registered depth, floor-contact rays, and
+  image anchors are diagnostics only; static MapAnything snapshots are not
+  live person-placement evidence. When registration rejects a sample, BEV
   does not promote raw object depth onto the floorplan.
+- `camera_local_ground_m` uses horizontal camera-right and camera-forward axes
+  projected onto the gravity-aligned floor. Camera pitch and camera height do
+  not contribute to local X/Z; the floor point directly below the camera is
+  `(0, 0)`. Consumers must not reconstruct this transform from a raw or
+  differently revisioned calibration matrix.
 - In world mode, BEV head points are the canonical backend `track.world` positions and are not low-pass filtered a second time inside `BevRenderer`.
 - `trail_smoothing_owner="backend"` with `bev_world_points_smoothed=false` is valid and expected in the baseline world-mode path: the backend owns trail history, while `PersonGroundState` (human CV filter + stationary lock) owns the only track-position filtering stage.
 - When `trailAppendAllowed` is false, producer trails do not grow new path samples (person is idle/sit/lie locked).
-- World-mode BEV skips `anchor_hold` head points and trail samples so stale held positions do not render as drifting or out-of-bounds trails during brief occlusions.
+- World-mode BEV emits a canonical `anchor_hold` head with
+  `worldAdmission="held"` so a visible track does not disappear during a brief
+  occlusion or physical rejection; held points never append trail samples.
+  Canonical `cv_prediction` heads use `worldAdmission="predicted"` and may
+  extend the producer trail only when `trailAppendAllowed=true`. Unplaceable
+  canonical tracks beyond the bounded display margin are omitted and reported
+  through the bounded dropped-point fields rather than clamped to a raster
+  edge; points just outside the PCF remain visible with their exact metric
+  coordinates and `floorplanInside=false`.
+- The post-tiler OSD trail path joins the canonical analytics row on the exact
+  source/frame cohort, maps the declared source-image basis into the configured
+  mosaic tile, and resets on tracker lifecycle or basis changes. It does not use
+  last-seen joins, bbox-bottom fallback, or mosaic-edge clamping.
+- BEV trail history includes `trackerLifecycleGeneration`; numeric tracker-ID
+  reuse removes the older generation immediately rather than connecting or
+  retaining its path.
 
 ## Related Docs
 

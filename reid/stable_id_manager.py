@@ -270,6 +270,16 @@ class StableIDManager:
         self.max_active_ids_per_sensor = int(max_active_ids_per_sensor)
         self.new_id_confirm_frames_at_cap = int(new_id_confirm_frames_at_cap)
         self.active_evict_grace_s = float(active_evict_grace_s)
+        # A tracker-local ID can briefly disappear and reappear before the
+        # cadence-gated ReID SGIE supplies another embedding.  Keep that
+        # short-lived lifecycle handoff deliberately narrow: it is only used
+        # for the same camera/tracker ID, a near-identical bbox, and a
+        # sub-second gap.  This is a continuity aid, not a second identity
+        # matcher, and therefore does not add extraction or host-copy work.
+        self.tracker_continuity_hold_s = min(
+            max(0.0, float(max_ghost_age_s)),
+            0.75,
+        )
         self.xcam_handoff_window_s = float(xcam_handoff_window_s)
         self.xcam_handoff_margin = float(xcam_handoff_margin)
         self.early_reconcile_window_s = float(early_reconcile_window_s)
@@ -4136,8 +4146,36 @@ class StableIDManager:
             if is_new:
                 sid = None
                 identity_kind: Optional[str] = None
+                continuity_ghost: Optional[Dict[str, Any]] = None
+                continuity_embedding: Optional[np.ndarray] = None
+
+                # Preserve a settled identity through a very short tracker
+                # lifecycle gap when the current frame has no fresh embedding.
+                # The strict same-tracker/bbox gate prevents this from becoming
+                # a general appearance-free identity assignment.
+                if emb is None and not pose_valid:
+                    continuity_ghost = self._match_ghost_continuity(
+                        sensor_id=int(sensor_id),
+                        ds_obj_id=int(ds_obj_id),
+                        bbox=bbox_ltrbwh,
+                        ts=float(ts),
+                    )
+                    if continuity_ghost is not None:
+                        sid = int(continuity_ghost.get("stable_id"))
+                        if self.aliases_enabled:
+                            sid = self.canonical_sid(int(sid))
+                        identity_kind = str(
+                            continuity_ghost.get("identity_kind")
+                            or self._household_identity_kind(int(sid))
+                        )
+                        carried = continuity_ghost.get("emb")
+                        if isinstance(carried, np.ndarray) and carried.size > 0:
+                            continuity_embedding = carried
+                        diag_event = "match_ghost_continuity"
+                        diag_sid_candidate = int(sid)
+
                 # Prefer ghost match (same camera, recent disappearance)
-                if emb is not None or pose_valid:
+                if sid is None and (emb is not None or pose_valid):
                     sid = self._match_ghost(
                         sensor_id,
                         emb,
@@ -4476,8 +4514,18 @@ class StableIDManager:
                     "first_seen_ts": float(ts),
                     "bbox": bbox_ltrbwh,
                     "last_seen_ts": float(ts),
-                    "last_emb_ts": float(ts) if emb is not None else 0.0,
-                    "emb": emb,
+                    # A carried ghost embedding is retained as internal state
+                    # so the next cadence check remains bounded.  It is not
+                    # reported as current-frame embedding evidence: all
+                    # diagnostics below continue to use ``emb`` (fresh only).
+                    "last_emb_ts": (
+                        float(ts)
+                        if emb is not None
+                        else float(continuity_ghost.get("last_emb_ts", ts))
+                        if continuity_ghost is not None and continuity_embedding is not None
+                        else 0.0
+                    ),
+                    "emb": emb if emb is not None else continuity_embedding,
                     "pose_vec": pose_vec,
                     "last_pose_ts": float(ts) if pose_vec is not None else 0.0,
                     "early_emb_reconcile_attempts": 0,
@@ -4485,7 +4533,7 @@ class StableIDManager:
                     "id_diag": diag_payload,
                     "identity_quality": (
                         "strong"
-                        if emb is not None
+                        if emb is not None or continuity_embedding is not None
                         else ("pose_only" if pose_vec is not None else "weak_no_embedding")
                     ),
                 }
@@ -5027,8 +5075,11 @@ class StableIDManager:
                     ghost_sid = self.canonical_sid(sid) if self.aliases_enabled else sid
                     ghost_rec = {
                         "stable_id": ghost_sid,
+                        "tracker_id": int(ds_id),
                         "bbox": rec.get("bbox"),
                         "ts": float(ts),
+                        "last_emb_ts": rec.get("last_emb_ts", float(ts)),
+                        "identity_kind": rec.get("identity_kind"),
                     }
                     if emb_val is not None:
                         ghost_rec["emb"] = emb_val
@@ -5233,6 +5284,88 @@ class StableIDManager:
                 return {}
 
     # --------------- Internal ---------------
+    def _match_ghost_continuity(
+        self,
+        *,
+        sensor_id: int,
+        ds_obj_id: int,
+        bbox: BBox,
+        ts: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a recent same-tracker ghost for no-embedding continuity.
+
+        This path intentionally has no appearance matcher.  It is admitted only
+        for the exact camera/tracker key, within the bounded lifecycle hold,
+        and when the new box substantially overlaps the last box.  A caller can
+        carry the ghost embedding internally, but the current frame remains
+        ``embedding_present=false`` until SGIE actually provides a new tensor.
+        """
+        dq = self.ghosts.get(int(sensor_id))
+        if not dq or float(self.tracker_continuity_hold_s) <= 0.0:
+            return None
+        try:
+            x, y, w, h = (float(value) for value in bbox[:4])
+        except Exception:
+            return None
+        if w <= 1.0 or h <= 1.0:
+            return None
+
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        for ghost in reversed(dq):
+            try:
+                if int(ghost.get("tracker_id", -1)) != int(ds_obj_id):
+                    continue
+                age = float(ts) - float(ghost.get("ts", 0.0))
+            except Exception:
+                continue
+            if age < 0.0 or age > float(self.tracker_continuity_hold_s):
+                continue
+            try:
+                gx, gy, gw, gh = (float(value) for value in ghost.get("bbox", ()))
+            except Exception:
+                continue
+            if gw <= 1.0 or gh <= 1.0:
+                continue
+            inter_left = max(x, gx)
+            inter_top = max(y, gy)
+            inter_right = min(x + w, gx + gw)
+            inter_bottom = min(y + h, gy + gh)
+            inter_w = max(0.0, inter_right - inter_left)
+            inter_h = max(0.0, inter_bottom - inter_top)
+            inter = inter_w * inter_h
+            union = (w * h) + (gw * gh) - inter
+            iou = inter / union if union > 1e-6 else 0.0
+            cx = x + 0.5 * w
+            cy = y + 0.5 * h
+            gcx = gx + 0.5 * gw
+            gcy = gy + 0.5 * gh
+            diag = max(1.0, math.hypot(w, h), math.hypot(gw, gh))
+            center_ratio = math.hypot(cx - gcx, cy - gcy) / diag
+            area_ratio = max((w * h) / (gw * gh), (gw * gh) / (w * h))
+            # Same lifecycle restarts in the live graph are generally nearly
+            # identical boxes.  Requiring all three gates keeps an appearance-
+            # free handoff from claiming a different person at the same camera.
+            if iou < 0.75 or center_ratio > 0.25 or area_ratio > 1.75:
+                continue
+            sid = int(ghost.get("stable_id", -1))
+            if sid <= 0:
+                continue
+            sid = self.canonical_sid(sid) if self.aliases_enabled else sid
+            if self._sid_claimed_same_frame(
+                sensor_id=int(sensor_id),
+                sid=int(sid),
+                ts=float(ts),
+                exclude_key=(int(sensor_id), int(ds_obj_id)),
+            ):
+                continue
+            score = float(iou) - 0.05 * float(age / max(float(self.tracker_continuity_hold_s), 1e-6))
+            if score > best_score:
+                best = dict(ghost)
+                best["stable_id"] = int(sid)
+                best_score = score
+        return best
+
     def _match_ghost(
         self,
         sensor_id: int,

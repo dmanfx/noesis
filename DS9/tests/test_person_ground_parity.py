@@ -189,6 +189,7 @@ class PersonGroundParityTests(unittest.TestCase):
         self.assertIn("assess_lower_body_occlusion(", text)
         self.assertIn("begin_source_admission(", text)
         self.assertIn("complete_source_admission(", text)
+        self.assertIn("observe_coherent_image_motion(", text)
         self.assertNotIn("apply_source_hysteresis(", text)
         self.assertIn("update_motion_mode(", text)
 
@@ -215,24 +216,25 @@ class PersonGroundParityTests(unittest.TestCase):
             diagnostics["world_rejection_reason"],
             "physical_innovation_exceeded",
         )
-        self.assertEqual(diagnostics["world_reacquire_count"], 1)
+        self.assertEqual(diagnostics["world_reacquire_count"], 0)
         self.assertFalse(diagnostics["world_reacquired"])
         self.assertFalse(diagnostics["trail_break_required"])
 
-    def test_consistent_impossible_measurements_reacquire_on_third_sample(self) -> None:
+    def test_consistent_impossible_measurements_without_image_motion_do_not_reacquire(self) -> None:
         result = _characterize(DS9_ROOT)["reacquire"]
         self.assertEqual(
             result["outputs"],
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [10.2, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
         )
         first, second, third = result["diagnostics"]
-        self.assertEqual(first["world_reacquire_count"], 1)
-        self.assertEqual(second["world_reacquire_count"], 2)
+        self.assertEqual(first["world_reacquire_count"], 0)
+        self.assertEqual(second["world_reacquire_count"], 0)
+        self.assertEqual(third["world_reacquire_count"], 0)
         self.assertFalse(first["world_measurement_accepted"])
         self.assertFalse(second["world_measurement_accepted"])
-        self.assertTrue(third["world_measurement_accepted"])
-        self.assertTrue(third["world_reacquired"])
-        self.assertTrue(third["trail_break_required"])
+        self.assertFalse(third["world_measurement_accepted"])
+        self.assertFalse(third["world_reacquired"])
+        self.assertFalse(third["trail_break_required"])
 
     def test_public_filter_diagnostic_keys_are_exposed(self) -> None:
         public_keys = set(_characterize(DS9_ROOT)["public_keys"])
@@ -244,6 +246,9 @@ class PersonGroundParityTests(unittest.TestCase):
                 "world_innovation_limit_m",
                 "world_reacquire_count",
                 "world_reacquired",
+                "world_contact_basis",
+                "world_image_motion_supported",
+                "world_image_motion_streak",
                 "trail_break_required",
                 "lower_body_occluded",
                 "lower_body_occlusion_level",

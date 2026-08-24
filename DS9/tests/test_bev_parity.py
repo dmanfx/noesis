@@ -166,6 +166,31 @@ mismatched_used = processor._footpoint_from_track(
     },
     (100, 50),
 )
+world_only = processor._footpoint_from_track(
+    {
+        "class_id": 0,
+        "tracker_id": 47,
+        "tracker_lifecycle_generation": 3,
+        "stable_id": 6,
+        "frame_id": 78,
+        "world_valid": True,
+        "world": [1.25, 0.0, 2.5],
+        "world_frame": "backend_world_m",
+        "world_frame_revision": "revision-1",
+    },
+    (100, 50),
+)
+unbound_world_only = processor._footpoint_from_track(
+    {
+        "class_id": 0,
+        "tracker_id": 48,
+        "tracker_lifecycle_generation": 3,
+        "world_valid": True,
+        "world": [1.25, 0.0, 2.5],
+        "world_frame": "backend_world_m",
+    },
+    (100, 50),
+)
 print(json.dumps({
     "hooks_origin": str(Path(hooks.__file__).resolve()),
     "frame_id": footpoint.frame_id,
@@ -177,6 +202,31 @@ print(json.dumps({
     "v": footpoint.v,
     "invalid_status_depth_m": invalid_status.depth_m,
     "mismatched_used_depth_m": mismatched_used.depth_m,
+    "world_only": {
+        "present": world_only is not None,
+        "u": world_only.u if world_only is not None else None,
+        "v": world_only.v if world_only is not None else None,
+        "method": world_only.method if world_only is not None else None,
+        "tracker_id": world_only.tracker_id if world_only is not None else None,
+        "generation": (
+            world_only.tracker_lifecycle_generation
+            if world_only is not None
+            else None
+        ),
+        "world": (
+            [world_only.world_x, world_only.world_z]
+            if world_only is not None
+            else None
+        ),
+        "world_frame": world_only.world_frame if world_only is not None else None,
+        "world_frame_revision": (
+            world_only.world_frame_revision if world_only is not None else None
+        ),
+        "canonical_world_required": (
+            world_only.canonical_world_required if world_only is not None else None
+        ),
+    },
+    "unbound_world_only_present": unbound_world_only is not None,
     "debug": footpoint.debug,
 }, sort_keys=True))
 """
@@ -312,6 +362,19 @@ def test_forced_ds9_hook_preserves_complete_footpoint_contract() -> None:
     assert payload["v"] == 90.0
     assert payload["invalid_status_depth_m"] is None
     assert payload["mismatched_used_depth_m"] is None
+    assert payload["world_only"] == {
+        "present": True,
+        "u": None,
+        "v": None,
+        "method": "world",
+        "tracker_id": 47,
+        "generation": 3,
+        "world": [1.25, 2.5],
+        "world_frame": "backend_world_m",
+        "world_frame_revision": "revision-1",
+        "canonical_world_required": True,
+    }
+    assert payload["unbound_world_only_present"] is False
     assert payload["debug"]["track_frame_id"] == 77
     assert payload["debug"]["image_scale"] == [2.0, 2.0]
 
@@ -720,6 +783,7 @@ def test_provider_free_mode_publishes_exact_paired_empty_frame() -> None:
         "frame_id": 1,
         "observed_at_us": 1_000_000,
         "tracking_publication_sequence": 3,
+        "tracking_outbound_submission_id": 7,
     }
     assert receipt.status == "admitted"
     assert receipt.tracking_outbound_submission_id == 7

@@ -96,6 +96,27 @@ def test_below_floor_resident_cannot_be_rescued_by_large_allowed_prior() -> None
     assert decision.reason == "appearance_below_floor"
 
 
+def test_policy_floor_is_stable_across_scalar_and_blas_roundoff() -> None:
+    scorer = OpenSetScorer(
+        OpenSetPolicy(
+            appearance_floor=0.70,
+            calibrated_confidence_floor=0.0,
+            ambiguity_margin_floor=0.0,
+        )
+    )
+
+    rounded_boundary = scorer.score_tracklet(
+        observation("track-boundary", candidate("resident", 0.70 - 2e-16))
+    ).candidates[0]
+    meaningful_miss = scorer.score_tracklet(
+        observation("track-miss", candidate("resident", 0.70 - 1e-6))
+    ).candidates[0]
+
+    assert rounded_boundary.eligible is True
+    assert meaningful_miss.eligible is False
+    assert meaningful_miss.reason == "appearance_below_floor"
+
+
 def test_resident_prior_reranks_only_already_acceptable_candidate() -> None:
     policy = OpenSetPolicy(
         ambiguity_margin_floor=0.02,

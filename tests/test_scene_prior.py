@@ -740,3 +740,30 @@ def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> Non
     np.testing.assert_allclose(frame.camera_forward_world_xz, (1, 0), atol=1e-12)
     assert frame.target_revision_id == "vt_camera-a_exact"
     assert frame.source_floor_offset_m == pytest.approx(2.0)
+
+
+def test_scene_prior_preview_frame_derives_reference_locked_source_floor() -> None:
+    frame = _camera_preview_frame(
+        {
+            "reference_camera_id": "camera-a",
+            "camera_calibration_row": {
+                "E": np.eye(4, dtype=np.float64).flatten(order="F").tolist(),
+            },
+            "camera_calibration_bytes": b"camera-calibration",
+            "target_revision_metadata": {
+                "schema": "target.v1",
+                "revision_id": "vt_camera-a_reference",
+                "floor_alignment": {
+                    "status": "reference_locked",
+                    "world_correction_col_major": np.eye(4, dtype=np.float64)
+                    .flatten(order="F")
+                    .tolist(),
+                    "target_floor_y": 0.0,
+                },
+            },
+            "target_revision_metadata_bytes": b"target-metadata",
+        }
+    )
+
+    assert frame.source_floor_normal == pytest.approx((0.0, 1.0, 0.0))
+    assert frame.source_floor_offset_m == pytest.approx(0.0)

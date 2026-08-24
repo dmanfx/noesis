@@ -82,6 +82,39 @@ def _admit_broadcast_batch_sync(
     return admission
 
 
+def _prepared_world_json_payloads(
+    publication: Any,
+    preparation: Any,
+) -> tuple[list[Mapping[str, Any]], Mapping[str, Any], list[Mapping[str, Any]]] | None:
+    """Reuse the world service's already-prepared JSON cohort when present.
+
+    ``CanonicalWorldService`` creates the exact JSON-native payload tuple used
+    by its durable journal before returning the owner-bound preparation.  The
+    tuple is safe to reuse for outbound admission because the frozen WebSocket
+    boundary only reads it, and the authority commit still runs before gate
+    release.  Non-canonical/test preparation objects retain the model-dump
+    fallback below.
+    """
+
+    cached = getattr(preparation, "serialized_payloads", None)
+    if not isinstance(cached, tuple):
+        return None
+    observation_count = len(getattr(publication, "observations", ()))
+    event_count = len(getattr(publication, "events", ()))
+    expected_count = observation_count + 1 + event_count
+    if len(cached) != expected_count:
+        return None
+    observations = cached[:observation_count]
+    snapshot_index = observation_count
+    snapshot = cached[snapshot_index]
+    events = cached[snapshot_index + 1 :]
+    if not isinstance(snapshot, Mapping):
+        return None
+    if not all(isinstance(item, Mapping) for item in (*observations, *events)):
+        return None
+    return list(observations), snapshot, list(events)
+
+
 def _record_response_model_error(
     ws_server: Any,
     *,
@@ -310,18 +343,30 @@ class TrackingTelemetryPublisher:
                         "noesis.observation.person"
                     )
                     payload["observation_contract_version"] = 1
-                    payload["observations"] = [
-                        item.model_dump(mode="json")
-                        for item in publication.observations
-                    ]
-                    snapshot_payload = publication.snapshot.model_dump(
-                        mode="json"
+                    prepared_json = _prepared_world_json_payloads(
+                        publication,
+                        world_preparation,
                     )
+                    if prepared_json is None:
+                        observation_payloads = [
+                            item.model_dump(mode="json")
+                            for item in publication.observations
+                        ]
+                        snapshot_payload = publication.snapshot.model_dump(
+                            mode="json"
+                        )
+                        event_payloads = [
+                            item.model_dump(mode="json")
+                            for item in publication.events
+                        ]
+                    else:
+                        (
+                            observation_payloads,
+                            snapshot_payload,
+                            event_payloads,
+                        ) = prepared_json
+                    payload["observations"] = observation_payloads
                     payload["world_snapshot"] = snapshot_payload
-                    event_payloads = [
-                        item.model_dump(mode="json")
-                        for item in publication.events
-                    ]
                     payload["world_events"] = event_payloads
                     batch.append(
                         {

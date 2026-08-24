@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot, Footpoint
+from noesis_core.coordinate_frames import camera_ground_frame_from_extrinsics_col_major
 
 
 class _FakeWs:
@@ -186,11 +187,76 @@ def _coverage_renderer(
     return renderer
 
 
+def test_camera_local_ground_projection_uses_horizontal_pitched_camera_basis() -> None:
+    """A pitched/yawed camera must not inject height into BEV X/Z."""
+    right = np.asarray([0.877, 0.0, -0.480], dtype=np.float64)
+    right /= np.linalg.norm(right)
+    forward_horizontal = np.asarray([0.480, 0.0, 0.877], dtype=np.float64)
+    forward_horizontal /= np.linalg.norm(forward_horizontal)
+    pitch_cos = math.cos(math.radians(20.0))
+    pitch_sin = math.sin(math.radians(20.0))
+    forward = pitch_cos * forward_horizontal + pitch_sin * np.asarray(
+        [0.0, -1.0, 0.0],
+        dtype=np.float64,
+    )
+    down = np.cross(forward, right)
+    camera_to_world = np.eye(4, dtype=np.float64)
+    camera_to_world[:3, :3] = np.column_stack((right, down, forward))
+    camera_to_world[:3, 3] = np.asarray([2.3, 1.6, -4.2], dtype=np.float64)
+    assert np.linalg.det(camera_to_world[:3, :3]) == pytest.approx(1.0)
+
+    extrinsics = np.linalg.inv(camera_to_world).flatten(order="F").tolist()
+    frame = camera_ground_frame_from_extrinsics_col_major(extrinsics)
+    R_wc = camera_to_world[:3, :3]
+    C_world = camera_to_world[:3, 3]
+
+    floor_below_camera = C_world + np.asarray([0.0, -1.6, 0.0])
+    local = BevRenderer._world_to_camera_local_ground(  # type: ignore[attr-defined]
+        float(floor_below_camera[0]),
+        0.0,
+        float(floor_below_camera[2]),
+        R_wc,
+        C_world,
+        frame,
+    )
+    assert local == pytest.approx((0.0, 0.0), abs=1e-12)
+
+    # Use asymmetric right/forward floor probes so both axes and their signs
+    # are covered.  The result must equal the shared CameraGroundFrame basis.
+    probes = (
+        floor_below_camera + 1.7 * frame.camera_right_world,
+        floor_below_camera + 3.2 * frame.camera_forward_world,
+        floor_below_camera + 1.1 * frame.camera_right_world + 2.4 * frame.camera_forward_world,
+    )
+    expected = ((1.7, 0.0), (0.0, 3.2), (1.1, 2.4))
+    for probe, target in zip(probes, expected):
+        projected = BevRenderer._world_to_camera_local_ground(  # type: ignore[attr-defined]
+            float(probe[0]),
+            0.0,
+            float(probe[2]),
+            R_wc,
+            C_world,
+            frame,
+        )
+        assert projected == pytest.approx(target, abs=1e-12)
+
+    # This is the regression: the old full-camera R^T projection leaked pitch
+    # into the forward coordinate for the floor point below the camera.
+    legacy = R_wc.T @ (floor_below_camera - C_world)
+    assert abs(float(legacy[2])) > 0.1
+
+
 def test_camera_local_bev_publishes_floorplan_frame_and_prefers_floor_contact_ray() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
         ws,
-        trails_cfg={"enabled": False},
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+        },
         smoothing_cfg={"enabled": False},
         frame="camera_local_ground_m",
     )
@@ -639,9 +705,17 @@ def test_camera_local_bev_drops_canonical_track_without_valid_world() -> None:
     renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
     renderer.config_per_cam["cam0"].auto_fit_extents = False
 
+    base = _floor_camera_calibration()
+    calib = SimpleNamespace(
+        **{
+            **base.__dict__,
+            "world_frame_id": "backend_world_m",
+            "world_frame_revision": "active-revision",
+        }
+    )
     renderer.render_and_publish(
         "cam0",
-        _floor_camera_calibration(),
+        calib,
         footpoints=[
             Footpoint(
                 u=740.0,
@@ -657,7 +731,300 @@ def test_camera_local_bev_drops_canonical_track_without_valid_world() -> None:
         timestamp_us=1_000_000,
     )
 
-    assert ws.messages[-1]["footpoints"] == []
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 1
+    assert payload["droppedFootpoints"][0]["reason"] == "canonical_world_missing"
+
+
+def test_camera_local_bev_emits_revision_bound_world_without_image_anchor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NOESIS_BEV_ALIGNMENT_DEBUG", "1")
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = (
+        renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    )
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    base = _floor_camera_calibration()
+    calib = SimpleNamespace(
+        **{
+            **base.__dict__,
+            "world_frame_id": "backend_world_m",
+            "world_frame_revision": "active-revision",
+        }
+    )
+
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[
+            Footpoint(
+                u=None,
+                v=None,
+                method="world",
+                stable_id=7,
+                tracker_id=101,
+                tracker_lifecycle_generation=4,
+                world_x=0.4,
+                world_z=3.59,
+                depth_m=6.0,
+                depth_source="depth_registered_m",
+                anchor_source="anchor_hold",
+                canonical_world_required=True,
+                world_frame="backend_world_m",
+                world_frame_revision="active-revision",
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["droppedFootpointCount"] == 0
+    assert len(payload["footpoints"]) == 1
+    point = payload["footpoints"][0]
+    assert point["trackerId"] == 101
+    assert point["trackerLifecycleGeneration"] == 4
+    assert point["displaySource"] == "world_to_camera_local"
+    assert point["x"] == pytest.approx(0.4)
+    assert point["y"] == pytest.approx(3.59)
+    assert point["alignmentDebug"]["activeAnchor"] is None
+
+
+def test_camera_local_bev_keeps_canonical_world_outside_pcf_admission_surface() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+
+    renderer.render_and_publish(
+        "cam0",
+        _calibration(),
+        footpoints=[
+            Footpoint(
+                u=640.0,
+                v=360.0,
+                stable_id=7,
+                tracker_id=101,
+                world_x=5.0,
+                world_z=2.0,
+                canonical_world_required=True,
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert len(payload["footpoints"]) == 1
+    assert payload["droppedFootpointCount"] == 0
+    point = payload["footpoints"][0]
+    assert point["canonicalWorld"] is True
+    assert point["x"] == pytest.approx(5.0)
+    assert point["y"] == pytest.approx(2.0)
+
+
+def test_camera_local_bev_fail_closes_canonical_world_beyond_explicit_distance_guard() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    renderer.config_per_cam["cam0"].max_distance_m = 2.0
+
+    def render(x: float, z: float, timestamp_us: int) -> dict:
+        renderer.render_and_publish(
+            "cam0",
+            _calibration(),
+            footpoints=[
+                Footpoint(
+                    u=None,
+                    v=None,
+                    method="world",
+                    stable_id=7,
+                    tracker_id=101,
+                    tracker_lifecycle_generation=4,
+                    world_x=x,
+                    world_z=z,
+                    canonical_world_required=True,
+                    world_frame="backend_world_m",
+                    world_frame_revision="active-revision",
+                    trail_segment_id=7,
+                )
+            ],
+            timestamp_us=timestamp_us,
+        )
+        return ws.messages[-1]
+
+    first = render(0.4, 0.4, 1_000_000)
+    second = render(0.5, 0.5, 1_100_000)
+    assert second["trails"]
+    payload = render(5.0, 2.0, 1_200_000)
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 1
+    assert payload["trails"] == []
+    dropped = payload["droppedFootpoints"][0]
+    assert dropped["reason"] == "canonical_world_outside_max_distance"
+    assert dropped["canonicalWorld"] is True
+    assert dropped["x"] == pytest.approx(5.0)
+    assert dropped["y"] == pytest.approx(2.0)
+    assert dropped["trackerLifecycleGeneration"] == 4
+    assert dropped["trailSegmentId"] == 7
+    returned = render(0.6, 0.6, 1_300_000)
+    assert returned["trails"] == []
+    resumed = render(0.7, 0.6, 1_400_000)
+    assert len(resumed["trails"]) == 1
+    assert resumed["trails"][0]["trailSegmentId"] == 7
+    assert [point["x"] for point in resumed["trails"][0]["points"]] == pytest.approx(
+        [0.6, 0.7]
+    )
+
+
+def test_camera_local_bev_keeps_canonical_world_point_in_bounded_pcf_display_margin() -> None:
+    """The PCF extent is presentation metadata, not live-world validity."""
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+        floorplan_bounds_provider=lambda _camera: _active_floorplan(
+            bounds={"min_x": -4.0, "max_x": 4.0, "min_z": 0.0, "max_z": 8.0},
+            grid_shape=[80, 80],
+        ),
+    )
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = True
+
+    renderer.render_and_publish(
+        "cam0",
+        _floor_camera_calibration(),
+        footpoints=[
+            Footpoint(
+                u=None,
+                v=None,
+                method="world",
+                stable_id=7,
+                tracker_id=101,
+                world_x=4.5,
+                world_z=2.0,
+                canonical_world_required=True,
+                world_frame="backend_world_m",
+                world_frame_revision="active-revision",
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"]
+    point = payload["footpoints"][0]
+    assert point["x"] == pytest.approx(4.5)
+    assert point["y"] == pytest.approx(2.0)
+    assert point["floorplanInside"] is False
+    assert point["normX"] > 1.0
+    assert payload["floorplanBounds"] == {
+        "min_x": -4.0,
+        "max_x": 4.0,
+        "min_z": 0.0,
+        "max_z": 8.0,
+    }
+    assert payload["displayBounds"] == {
+        "min_x": -8.0,
+        "max_x": 8.0,
+        "min_z": -4.0,
+        "max_z": 12.0,
+    }
+    assert payload["droppedFootpointCount"] == 0
+
+    renderer.render_and_publish(
+        "cam0",
+        _floor_camera_calibration(),
+        footpoints=[
+            Footpoint(
+                u=None,
+                v=None,
+                method="world",
+                stable_id=7,
+                tracker_id=101,
+                world_x=5.5,
+                world_z=2.0,
+                canonical_world_required=True,
+                world_frame="backend_world_m",
+                world_frame_revision="active-revision",
+            )
+        ],
+        timestamp_us=1_100_000,
+    )
+    outside_payload = ws.messages[-1]
+    assert len(outside_payload["footpoints"]) == 1
+    assert outside_payload["footpoints"][0]["x"] == pytest.approx(5.5)
+    assert outside_payload["footpoints"][0]["y"] == pytest.approx(2.0)
+    assert outside_payload["droppedFootpointCount"] == 0
+
+
+def test_camera_local_bev_rejects_absurd_canonical_world_without_configured_distance() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+
+    renderer.render_and_publish(
+        "cam0",
+        _calibration(),
+        footpoints=[
+            Footpoint(
+                u=None,
+                v=None,
+                method="world",
+                stable_id=7,
+                tracker_id=101,
+                world_x=3.844,
+                world_z=30.147,
+                canonical_world_required=True,
+                world_frame="backend_world_m",
+                world_frame_revision="active-revision",
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 1
+    assert payload["droppedFootpoints"][0]["reason"] == (
+        "canonical_world_outside_display_guard"
+    )
+    assert payload["droppedFootpoints"][0]["x"] == pytest.approx(3.844)
+    assert payload["droppedFootpoints"][0]["y"] == pytest.approx(30.147)
 
 
 def test_camera_local_bev_rejects_mismatched_canonical_world_revision(monkeypatch) -> None:
@@ -673,10 +1040,12 @@ def test_camera_local_bev_rejects_mismatched_canonical_world_revision(monkeypatc
     renderer.config_per_cam["cam0"].auto_fit_extents = False
     base = _floor_camera_calibration()
     calib = SimpleNamespace(
-        **base.__dict__,
-        world_frame_id="backend_world_m",
-        world_frame_revision="active-revision",
-        frame_transform_sha256="a" * 64,
+        **{
+            **base.__dict__,
+            "world_frame_id": "backend_world_m",
+            "world_frame_revision": "active-revision",
+            "frame_transform_sha256": "a" * 64,
+        }
     )
 
     renderer.render_and_publish(
@@ -701,7 +1070,70 @@ def test_camera_local_bev_rejects_mismatched_canonical_world_revision(monkeypatc
 
     payload = ws.messages[-1]
     assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 1
     assert payload["droppedFootpoints"][0]["reason"] == "canonical_world_revision_mismatch"
+
+
+def _assert_camera_local_bev_rejects_missing_canonical_world_binding(
+    world_frame: str | None,
+    world_frame_revision: str | None,
+) -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    base = _floor_camera_calibration()
+    calib = SimpleNamespace(
+        **{
+            **base.__dict__,
+            "world_frame_id": "backend_world_m",
+            "world_frame_revision": "active-revision",
+            "frame_transform_sha256": "a" * 64,
+        }
+    )
+
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[
+            Footpoint(
+                u=740.0,
+                v=626.0,
+                stable_id=7,
+                tracker_id=101,
+                world_x=0.4,
+                world_z=3.59,
+                canonical_world_required=True,
+                world_frame=world_frame,
+                world_frame_revision=world_frame_revision,
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 1
+    assert payload["droppedFootpoints"][0]["reason"] == "canonical_world_revision_mismatch"
+
+
+def test_camera_local_bev_rejects_missing_canonical_world_frame() -> None:
+    _assert_camera_local_bev_rejects_missing_canonical_world_binding(
+        None,
+        "active-revision",
+    )
+
+
+def test_camera_local_bev_rejects_missing_canonical_world_revision() -> None:
+    _assert_camera_local_bev_rejects_missing_canonical_world_binding(
+        "backend_world_m",
+        None,
+    )
 
 
 def test_camera_local_bev_prefers_depth_fused_world_when_it_disagrees_with_floor_contact_ray() -> None:
@@ -1063,8 +1495,8 @@ def test_camera_local_bev_uses_active_floorplan_bounds_for_floor_contact_candida
     point = payload["footpoints"][0]
 
     assert payload["boundsSource"] == "active_floorplan"
-    assert math.isclose(payload["xMin"], -4.0, abs_tol=1e-6)
-    assert math.isclose(payload["zMax"], 7.0, abs_tol=1e-6)
+    assert math.isclose(payload["xMin"], -8.0, abs_tol=1e-6)
+    assert math.isclose(payload["zMax"], 11.0, abs_tol=1e-6)
     assert point["displaySource"] == "floor_contact_ray"
     assert math.isclose(point["x"], 0.666667, abs_tol=1e-3)
     assert math.isclose(point["y"], 6.666667, abs_tol=1e-3)
@@ -1414,7 +1846,7 @@ def test_world_bev_preserves_scene_units_without_second_stage_smoothing() -> Non
     assert math.isclose(point["x"], 10.0, abs_tol=1e-6)
 
 
-def test_world_bev_skips_anchor_hold_points() -> None:
+def test_world_bev_emits_canonical_anchor_hold_with_admission_provenance() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
         ws,
@@ -1439,7 +1871,18 @@ def test_world_bev_skips_anchor_hold_points() -> None:
     renderer.render_and_publish(
         "cam0",
         calib,
-        footpoints=[Footpoint(u=640.0, v=360.0, stable_id=7, tracker_id=101, world_x=1.0, world_z=2.0, anchor_source="anchor_hold")],
+        footpoints=[
+            Footpoint(
+                u=640.0,
+                v=360.0,
+                stable_id=7,
+                tracker_id=101,
+                world_x=1.0,
+                world_z=2.0,
+                anchor_source="anchor_hold",
+                canonical_world_required=True,
+            )
+        ],
         timestamp_us=1_000_000,
     )
 
@@ -1447,8 +1890,60 @@ def test_world_bev_skips_anchor_hold_points() -> None:
     payload = ws.messages[-1]
     assert payload["trail_smoothing_owner"] == "backend"
     assert payload["bev_world_points_smoothed"] is False
-    assert payload["footpoints"] == []
+    assert payload["footpoints"][0]["x"] == pytest.approx(1.0)
+    assert payload["footpoints"][0]["y"] == pytest.approx(2.0)
+    assert payload["footpoints"][0]["anchorSource"] == "anchor_hold"
+    assert payload["footpoints"][0]["worldAdmission"] == "held"
+    assert payload["droppedFootpointCount"] == 0
     assert payload["trails"] == []
+
+
+def test_world_bev_labels_bounded_canonical_cv_prediction() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": True},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+
+    renderer.render_and_publish(
+        "cam0",
+        _calibration(),
+        footpoints=[
+            Footpoint(
+                u=640.0,
+                v=360.0,
+                stable_id=7,
+                tracker_id=101,
+                world_x=1.25,
+                world_z=2.5,
+                anchor_source="cv_prediction",
+                canonical_world_required=True,
+                trail_append_allowed=True,
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"][0]["worldAdmission"] == "predicted"
+    assert payload["footpoints"][0]["anchorSource"] == "cv_prediction"
+    assert payload["footpoints"][0]["x"] == pytest.approx(1.25)
+    assert payload["footpoints"][0]["y"] == pytest.approx(2.5)
+    assert payload["footpoints"][0]["trailAppendAllowed"] is True
+    assert payload["droppedFootpointCount"] == 0
 
 
 def test_backend_trails_are_published_from_producer_history() -> None:
@@ -1660,6 +2155,59 @@ def test_backend_trails_do_not_splice_history_across_tracker_remap() -> None:
     assert math.isclose(by_tracker[202]["points"][-1]["x"], 10.5, abs_tol=1e-6)
 
 
+def test_backend_trails_drop_old_generation_when_tracker_id_is_reused() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    for timestamp_us, x, generation in (
+        (1_000_000, 0.0, 11),
+        (1_100_000, 0.5, 11),
+        (1_200_000, 10.0, 12),
+        (1_300_000, 10.5, 12),
+    ):
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    u=640.0,
+                    v=360.0,
+                    stable_id=7,
+                    tracker_id=101,
+                    tracker_lifecycle_generation=generation,
+                    world_x=x,
+                    world_z=0.0,
+                )
+            ],
+            timestamp_us=timestamp_us,
+        )
+
+    payload = ws.messages[-1]
+    assert len(payload["trails"]) == 1
+    trail = payload["trails"][0]
+    assert trail["trackerId"] == 101
+    assert trail["trackerLifecycleGeneration"] == 12
+    assert [point["x"] for point in trail["points"]] == pytest.approx([10.0, 10.5])
+    assert payload["footpoints"][0]["trackerLifecycleGeneration"] == 12
+
+
 def test_backend_trail_break_starts_new_segment_after_reacquisition() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
@@ -1705,6 +2253,88 @@ def test_backend_trail_break_starts_new_segment_after_reacquisition() -> None:
         )
 
     trail = ws.messages[-1]["trails"][0]
+    assert [point["x"] for point in trail["points"]] == pytest.approx([10.0, 10.5])
+
+
+def test_backend_exact_tombstone_breaks_same_generation_return() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    for timestamp_us, x in ((1_000_000, 0.0), (1_100_000, 0.5)):
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    u=640.0,
+                    v=360.0,
+                    stable_id=7,
+                    tracker_id=101,
+                    tracker_lifecycle_generation=11,
+                    world_x=x,
+                    world_z=0.0,
+                )
+            ],
+            timestamp_us=timestamp_us,
+        )
+    assert [point["x"] for point in ws.messages[-1]["trails"][0]["points"]] == pytest.approx([0.0, 0.5])
+
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[],
+        timestamp_us=1_200_000,
+        tracker_lifecycle_tombstones=[
+            {
+                "camera_id": "cam0",
+                "tracker_id": 101,
+                "tracker_lifecycle_generation": 11,
+                "last_seen_frame_id": 11,
+                "last_seen_observed_at_us": 1_100_000,
+                "disappeared_at_frame_id": 12,
+                "disappeared_at_observed_at_us": 1_200_000,
+            }
+        ],
+    )
+    assert ws.messages[-1]["trails"] == []
+
+    for timestamp_us, x in ((1_300_000, 10.0), (1_400_000, 10.5)):
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    u=640.0,
+                    v=360.0,
+                    stable_id=7,
+                    tracker_id=101,
+                    tracker_lifecycle_generation=11,
+                    world_x=x,
+                    world_z=0.0,
+                )
+            ],
+            timestamp_us=timestamp_us,
+        )
+
+    trail = ws.messages[-1]["trails"][0]
+    assert trail["trackerLifecycleGeneration"] == 11
     assert [point["x"] for point in trail["points"]] == pytest.approx([10.0, 10.5])
 
 
@@ -1805,12 +2435,53 @@ def test_camera_local_coverage_union_admits_foyer_beyond_floorplan_raster() -> N
     assert point["coverageInside"] is True
     assert point["coverageRegion"] == "foyer"
     assert point["floorplanInside"] is False
+
     assert point["normX"] > 1.0
 
     trail = payload["trails"][0]
     assert trail["points"][-1]["coverageInside"] is True
     assert trail["points"][-1]["coverageRegion"] == "foyer"
     assert trail["points"][-1]["floorplanInside"] is False
+
+
+def test_retained_canonical_trail_keeps_authority_when_current_dot_is_absent() -> None:
+    ws = _FakeWs()
+    renderer = _coverage_renderer(ws, trails=True)
+    calib = _coverage_calibration()
+
+    for timestamp_us, x in ((1_000_000, 5.0), (1_100_000, 5.5)):
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    u=640.0,
+                    v=360.0,
+                    stable_id=7,
+                    tracker_id=101,
+                    world_x=x,
+                    world_z=2.0,
+                    canonical_world_required=True,
+                )
+            ],
+            timestamp_us=timestamp_us,
+        )
+
+    # The current cohort has no dot, but the producer retains the bounded
+    # trail history for its normal display window.
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[],
+        timestamp_us=1_200_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert len(payload["trails"]) == 1
+    trail = payload["trails"][0]
+    assert trail["canonicalWorld"] is True
+    assert all(point["coverageInside"] is False for point in trail["points"])
 
 
 def test_camera_local_coverage_union_rejects_gap_inside_union_bbox() -> None:
@@ -1884,3 +2555,77 @@ def test_camera_local_coverage_config_fails_closed_when_polygon_is_invalid() -> 
             frame="camera_local_ground_m",
             coverage_envelopes_cfg=invalid,
         )
+
+
+def test_camera_local_bev_omits_nonfinite_floor_contact_without_canonical_drop(monkeypatch) -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+
+    calib = CalibrationSnapshot(
+        camera_id="cam0",
+        intrinsics=np.eye(3, dtype=np.float64),
+        extrinsics_col_major=np.eye(4, dtype=np.float64).flatten(order="F").tolist(),
+        floor_y=0.0,
+        image_size=(1280, 720),
+        world_frame_id="backend_world_m",
+        world_frame_revision="revision-1",
+    )
+
+    def project(world_x, _world_y, world_z, *_args):
+        # The image-derived floor ray is invalid, while the producer-owned
+        # canonical world point remains finite and publishable.
+        if float(world_x) == 10.0 and float(world_z) == 20.0:
+            return float("nan"), float("inf")
+        return float(world_x), float(world_z)
+
+    monkeypatch.setattr(renderer, "_world_to_camera_local_ground", project)
+    footpoint = Footpoint(
+        u=10.0,
+        v=20.0,
+        method="image_foot",
+        stable_id=7,
+        tracker_id=101,
+        world_x=1.0,
+        world_z=2.0,
+        anchor_source="pose_depth_fused",
+        canonical_world_required=True,
+        world_frame="backend_world_m",
+        world_frame_revision="revision-1",
+    )
+
+    # Directly exercise the helper's typed omission path.  The invalid ray
+    # must be skipped rather than invoking the render-scope drop closure.
+    assert renderer._select_floor_contact_ray(  # type: ignore[attr-defined]
+        fp=footpoint,
+        calib=calib,
+        H_img2plane=np.eye(3, dtype=np.float64),
+        R_wc=np.eye(3, dtype=np.float64),
+        C_world=np.zeros(3, dtype=np.float64),
+        x_range=(-4.0, 4.0),
+        z_range=(0.0, 12.0),
+        coverage_envelope=None,
+        floorplan_alignment=None,
+    ) is None
+
+    result = renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[footpoint],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert result.status == "admitted"
+    assert len(payload["footpoints"]) == 1
+    assert payload["footpoints"][0]["canonicalWorld"] is True
+    assert payload["footpoints"][0]["displaySource"] == "world_to_camera_local"
+    assert payload["droppedFootpointCount"] == 0
+    assert "droppedFootpoints" not in payload

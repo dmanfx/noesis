@@ -170,11 +170,25 @@ class EnrollmentObservationKey:
 
     @property
     def tracklet_id(self) -> str:
-        return json.dumps(
-            [self.run_id, self.camera_id, self.tracker_id],
-            ensure_ascii=False,
-            separators=(",", ":"),
+        return identity_tracklet_id(
+            self.run_id,
+            self.camera_id,
+            self.tracker_id,
         )
+
+
+def identity_tracklet_id(run_id: str, camera_id: str, tracker_id: str) -> str:
+    """Build the canonical camera-local tracklet ID without fake evidence."""
+
+    return json.dumps(
+        [
+            _require_text(run_id, "run_id"),
+            _require_text(camera_id, "camera_id"),
+            _require_text(tracker_id, "tracker_id"),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @dataclass(frozen=True)

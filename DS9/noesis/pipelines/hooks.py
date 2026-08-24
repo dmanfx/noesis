@@ -14,7 +14,7 @@ import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -70,6 +70,7 @@ from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
 from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
 from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
+    TrackingContinuityUpdate,
     TrackingLifecycleRegistry,
     pair_safe_publication_interval_s,
 )
@@ -84,14 +85,24 @@ from noesis.telemetry.person_ground_state import (
     PersonGroundState,
     PoseAnchorCandidate,
     assess_lower_body_occlusion,
+    advance_human_cv_prediction,
+    bind_world_frame,
     begin_source_admission,
     classify_posture,
     commit_image_path_point,
     complete_source_admission,
+    mark_world_measurement_unavailable,
+    observe_bbox_stationarity,
+    observe_coherent_image_motion,
+    record_accepted_image_geometry,
     resolve_pose_floor_anchor,
     source_score,
+    transport_accepted_image_foot,
+    integrate_projective_ground_observation,
     update_human_cv_filter,
     update_motion_mode,
+    world_frame_binding_from_calibration,
+    world_frame_matches_calibration,
 )
 from noesis.telemetry.world_contract_adapter import (
     frame_temporal_contract as _frame_temporal_contract,
@@ -232,15 +243,34 @@ _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS = (
     "world_floor_incidence_sin",
     "world_floor_admitted",
     "world_floor_rejection_reason",
+    "world_floor_contact_plausible",
+    "world_floor_contact_gap_px",
+    "world_floor_contact_gap_ratio",
+    "world_floor_contact_rejection_reason",
+    "world_floor_bbox_bottom_range_m",
+    "world_floor_contact_range_delta_m",
+    "world_floor_contact_range_tolerance_m",
     "world_depth_candidate",
+    "world_depth_rejection_reason",
+    "world_observation_range_m",
+    "world_observation_range_limit_m",
+    "world_observation_range_admitted",
+    "world_observation_range_rejection_reason",
     "world_prefilter_measurement",
     "world_filter_prediction",
+    "world_prediction_provenance",
+    "world_prediction_image_foot",
+    "world_projective_continuation_allowed",
+    "world_projective_authoritative_allowed",
     "world_measurement_accepted",
     "world_rejection_reason",
     "world_innovation_m",
     "world_innovation_limit_m",
     "world_reacquire_count",
     "world_reacquired",
+    "world_contact_basis",
+    "world_image_motion_supported",
+    "world_image_motion_streak",
     "trail_break_required",
     "trail_segment_id",
     "world_fusion_policy_id",
@@ -469,6 +499,28 @@ def _increment_core_counter(metric: str, delta: int = 1) -> int:
     with _CORE_PATH_INSTRUMENTATION._lock:
         current = int(_CORE_PATH_INSTRUMENTATION.counters.get(key, 0))
         updated = current + int(delta)
+        _CORE_PATH_INSTRUMENTATION.counters[key] = updated
+        return updated
+
+
+def _set_core_counter(metric: str, value: int) -> int:
+    """Set an instrumentation gauge stored alongside monotonic counters."""
+
+    key = str(metric)
+    normalized = max(0, int(value))
+    with _CORE_PATH_INSTRUMENTATION._lock:
+        _CORE_PATH_INSTRUMENTATION.counters[key] = normalized
+    return normalized
+
+
+def _max_core_counter(metric: str, value: int) -> int:
+    """Raise a monotonic instrumentation high-watermark."""
+
+    key = str(metric)
+    normalized = max(0, int(value))
+    with _CORE_PATH_INSTRUMENTATION._lock:
+        current = int(_CORE_PATH_INSTRUMENTATION.counters.get(key, 0))
+        updated = max(current, normalized)
         _CORE_PATH_INSTRUMENTATION.counters[key] = updated
         return updated
 
@@ -2180,8 +2232,8 @@ class MapAnythingProcessor:
         frame_w = 0
         frame_h = 0
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", "source_frame_width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", "source_frame_height", default=0) or 0)
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -3349,13 +3401,13 @@ class V3DTCuboidOverlayProcessor:
     def _frame_size(self, frame_meta: Any) -> Tuple[int, int]:
         frame_w = int(
             _meta_lookup(
-                frame_meta, "source_frame_width", "frame_width", "width", default=0
+                frame_meta, "frame_width", "width", "source_frame_width", default=0
             )
             or 0
         )
         frame_h = int(
             _meta_lookup(
-                frame_meta, "source_frame_height", "frame_height", "height", default=0
+                frame_meta, "frame_height", "height", "source_frame_height", default=0
             )
             or 0
         )
@@ -3668,6 +3720,28 @@ class _TrailTrackState:
     vel_world_z: float = 0.0
     last_measure_speed: float = 0.0
     trail_segment_id: Optional[int] = None
+    tracker_lifecycle_generation: Optional[int] = None
+    anchor_basis: Optional[Tuple[Any, ...]] = None
+
+
+@dataclass
+class _WorldClockState:
+    """Per-source world-filter clock anchored to stream media PTS.
+
+    ``buf_pts`` is stream-relative, so using it directly as an epoch timestamp
+    would make TTLs and ghost gaps incomparable across cameras.  The first
+    usable PTS is therefore anchored to the observed wall clock for that
+    source.  Subsequent frames advance in the media domain while retaining a
+    wall-clock-shaped value for cross-source housekeeping.
+    """
+
+    source_epoch: int = 0
+    base_media_pts_ns: Optional[int] = None
+    base_observed_ts: Optional[float] = None
+    last_media_pts_ns: Optional[int] = None
+    logical_ts: Optional[float] = None
+    last_observed_ts: Optional[float] = None
+    basis: str = "observed_clock"
 
 
 # Product-owned person-ground state and scoring stay single-source. DS9 only
@@ -3945,31 +4019,101 @@ class TrailOverlayProcessor:
             camera_id = None
         return str(camera_id or f"camera_{int(sensor_id)}")
 
-    def _analytics_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
+    @staticmethod
+    def _frame_id(frame_meta: Any) -> Optional[int]:
+        value = _meta_lookup(frame_meta, "frame_number", "frame_num", default=None)
+        try:
+            parsed = int(value)
+        except Exception:
+            return None
+        return parsed if parsed >= 0 else None
+
+    def _analytics_track_map(
+        self,
+        sensor_id: int,
+        frame_id: Optional[int] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Return only the analytics rows belonging to this exact video frame.
+
+        The analytics processor owns a latest-per-source cache.  A latest cache
+        is useful for diagnostics but is not a valid join key for OSD metadata:
+        the tiler callback can observe frame N while the cache already contains
+        frame N+1.  In floor mode that would make a trail jump to a different
+        person's/current-frame anchor.  Keep the join exact and fail closed.
+        """
         processor = getattr(self.pipeline, "analytics_telemetry_processor", None)
         getter = getattr(processor, "get_active_track_map", None)
         if not callable(getter):
             return {}
         try:
-            track_map = getter(int(sensor_id)) or {}
+            # Production processor exposes an exact-frame ring.  Test doubles
+            # may still implement the historical one-argument getter; their
+            # returned rows are filtered below, but production never falls
+            # back from a missing frame.
+            try:
+                track_map = getter(int(sensor_id), frame_id) if frame_id is not None else getter(int(sensor_id))
+            except TypeError:
+                track_map = getter(int(sensor_id))
         except Exception:
             return {}
-        return dict(track_map) if isinstance(track_map, Mapping) else {}
+        if not isinstance(track_map, Mapping):
+            return {}
+
+        indexed: Dict[int, Dict[str, Any]] = {}
+        for key, value in track_map.items():
+            if not isinstance(value, Mapping):
+                continue
+            if frame_id is not None:
+                try:
+                    track_frame_id = int(value.get("frame_id"))
+                except Exception:
+                    continue
+                if track_frame_id != int(frame_id):
+                    continue
+            tracker_id = value.get("tracker_id", value.get("track_id", key))
+            try:
+                tracker_id_int = int(tracker_id)
+            except Exception:
+                continue
+            if tracker_id_int < 0:
+                continue
+            indexed[tracker_id_int] = dict(value)
+        return indexed
 
     def _resolve_calibration(self, sensor_id: int, camera_id: str) -> Any:
         provider = getattr(self.pipeline, "bev_calibration", None)
-        snapshot = getattr(provider, "snapshot", None)
-        if not callable(snapshot):
+        world_snapshot = getattr(provider, "world_snapshot", None)
+        if not callable(world_snapshot):
             return None
         try:
-            return snapshot(int(sensor_id), str(camera_id))
+            return world_snapshot(int(sensor_id), str(camera_id))
         except Exception:
             return None
 
     def _frame_source_size(self, frame_meta: Any, calib: Any | None = None) -> Tuple[int, int]:
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            frame_w = int(
+                _meta_lookup(
+                    frame_meta,
+                    "frame_width",
+                    "width",
+                    "source_width",
+                    "source_frame_width",
+                    default=0,
+                )
+                or 0
+            )
+            frame_h = int(
+                _meta_lookup(
+                    frame_meta,
+                    "frame_height",
+                    "height",
+                    "source_height",
+                    "source_frame_height",
+                    default=0,
+                )
+                or 0
+            )
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -3992,7 +4136,7 @@ class TrailOverlayProcessor:
         return max(0, int(frame_w)), max(0, int(frame_h))
 
     def _frame_compositor_rect(self, frame_meta: Any) -> Optional[Tuple[float, float, float, float]]:
-        rect = getattr(frame_meta, "compositor_rect", None)
+        rect = _meta_lookup(frame_meta, "compositor_rect", default=None)
         if rect is None:
             return None
         try:
@@ -4006,14 +4150,95 @@ class TrailOverlayProcessor:
             return None
         return float(left), float(top), float(width), float(height)
 
-    def _source_to_mosaic(self, frame_meta: Any, u: float, v: float, source_size: Tuple[int, int]) -> Tuple[float, float]:
-        src_w, src_h = source_size
+    @staticmethod
+    def _normalize_image_size(value: Any) -> Optional[Tuple[int, int]]:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return None
+        try:
+            width = int(value[0])
+            height = int(value[1])
+        except Exception:
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return int(width), int(height)
+
+    def _tiler_grid(self) -> Optional[Tuple[int, int]]:
+        tiler = self.pipeline.components.get("tiler")
+        cfg = tiler.config if tiler is not None and isinstance(tiler.config, Mapping) else {}
+        try:
+            cols = int(cfg.get("columns", 0) or 0)
+            rows = int(cfg.get("rows", 0) or 0)
+        except Exception:
+            cols = 0
+            rows = 0
+        if cols <= 0 or rows <= 0:
+            # The canonical three-camera graph is source-id ordered and uses a
+            # 3x1 layout.  Retain a useful deterministic fallback for tests or
+            # metadata paths that omit the plugin's layout fields.
+            try:
+                source_count = max(
+                    len(getattr(self.pipeline, "camera_labels", {}) or {}),
+                    int(getattr(self.pipeline, "batch_size", 0) or 0),
+                )
+            except Exception:
+                source_count = 0
+            if source_count <= 1:
+                cols, rows = 1, 1
+            else:
+                cols = 3
+                rows = max(1, int(math.ceil(float(source_count) / float(cols))))
+        return int(cols), int(rows)
+
+    def _source_to_mosaic(
+        self,
+        frame_meta: Any,
+        u: float,
+        v: float,
+        source_size: Tuple[int, int],
+    ) -> Optional[Tuple[float, float]]:
+        """Map a source-image pixel into the post-tiler mosaic.
+
+        Source validity is checked before applying either an explicit compositor
+        rectangle or the configured source-id tile.  Invalid coordinates must
+        be rejected, never clipped to an apparently plausible mosaic edge.
+        """
+        try:
+            src_w, src_h = int(source_size[0]), int(source_size[1])
+            u_f, v_f = float(u), float(v)
+        except Exception:
+            return None
+        if src_w <= 0 or src_h <= 0 or not math.isfinite(u_f) or not math.isfinite(v_f):
+            return None
+        if u_f < 0.0 or u_f >= float(src_w) or v_f < 0.0 or v_f >= float(src_h):
+            return None
+
         comp = self._frame_compositor_rect(frame_meta)
-        if comp is None or src_w <= 0 or src_h <= 0:
-            return float(u), float(v)
-        left, top, width, height = comp
-        x = float(left) + float(u) * (float(width) / float(src_w))
-        y = float(top) + float(v) * (float(height) / float(src_h))
+        if comp is not None:
+            left, top, width, height = comp
+            x = float(left) + u_f * (float(width) / float(src_w))
+            y = float(top) + v_f * (float(height) / float(src_h))
+        else:
+            mosaic_w, mosaic_h = self._mosaic_size
+            grid = self._tiler_grid()
+            if grid is None or mosaic_w <= 0 or mosaic_h <= 0:
+                return float(u_f), float(v_f)
+            cols, rows = grid
+            source_id = self._frame_source_id(frame_meta)
+            if source_id < 0 or source_id >= cols * rows:
+                return None
+            tile_w = float(mosaic_w) / float(cols)
+            tile_h = float(mosaic_h) / float(rows)
+            x = float(source_id % cols) * tile_w + u_f * (tile_w / float(src_w))
+            y = float(source_id // cols) * tile_h + v_f * (tile_h / float(src_h))
+
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
+        mosaic_w, mosaic_h = self._mosaic_size
+        if mosaic_w > 0 and (x < 0.0 or x >= float(mosaic_w)):
+            return None
+        if mosaic_h > 0 and (y < 0.0 or y >= float(mosaic_h)):
+            return None
         return float(x), float(y)
 
     @staticmethod
@@ -4255,7 +4480,60 @@ class TrailOverlayProcessor:
         if uv is None:
             return None
         source_size = self._frame_source_size(frame_meta, calib)
+        calib_size = self._normalize_image_size(getattr(calib, "image_size", None))
+        if calib_size is not None and source_size[0] > 0 and source_size[1] > 0:
+            uv = (
+                float(uv[0]) * float(source_size[0]) / float(calib_size[0]),
+                float(uv[1]) * float(source_size[1]) / float(calib_size[1]),
+            )
         return self._source_to_mosaic(frame_meta, float(uv[0]), float(uv[1]), source_size)
+
+    @staticmethod
+    def _anchor_basis_token(
+        track: Mapping[str, Any],
+        source_size: Tuple[int, int],
+        anchor_key: str,
+        *,
+        reprojected: bool,
+    ) -> Tuple[Any, ...]:
+        explicit_basis = None
+        for key in (
+            "anchor_coordinate_basis",
+            "image_coordinate_basis",
+            "image_basis",
+            "coordinate_basis",
+        ):
+            if track.get(key) is not None:
+                explicit_basis = track.get(key)
+                break
+        if isinstance(explicit_basis, Mapping):
+            explicit_basis = tuple(
+                sorted((str(key), repr(value)) for key, value in explicit_basis.items())
+            )
+        elif explicit_basis is not None:
+            explicit_basis = str(explicit_basis)
+        return (
+            str(anchor_key),
+            explicit_basis,
+            (int(source_size[0]), int(source_size[1])),
+            str(track.get("world_frame") or ""),
+            str(track.get("world_frame_revision") or ""),
+            "world_snapshot" if reprojected else "track_image",
+        )
+
+    @staticmethod
+    def _reset_trail_state(state: _TrailTrackState) -> None:
+        state.points.clear()
+        state.ema_x = None
+        state.ema_y = None
+        state.ema_ts = 0.0
+        state.last_measure_world_x = None
+        state.last_measure_world_z = None
+        state.last_measure_ts = 0.0
+        state.vel_world_x = 0.0
+        state.vel_world_z = 0.0
+        state.last_measure_speed = 0.0
+        state.anchor_basis = None
 
     def _resolve_active_anchor(
         self,
@@ -4265,67 +4543,122 @@ class TrailOverlayProcessor:
         track_id: int,
         state: _TrailTrackState,
         now: float,
-    ) -> Tuple[float, float, bool]:
+        *,
+        track_info: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Tuple[float, float, bool]]:
         rect = getattr(obj_meta, "rect_params", None)
         if rect is None:
-            raise ValueError("rect_params required for trail anchor")
+            return None
         left = float(getattr(rect, "left", 0.0) or 0.0)
         top = float(getattr(rect, "top", 0.0) or 0.0)
         width = float(getattr(rect, "width", 0.0) or 0.0)
         height = float(getattr(rect, "height", 0.0) or 0.0)
+        if not all(math.isfinite(value) for value in (left, top, width, height)):
+            return None
+        if width <= 1.0 or height <= 1.0:
+            return None
         x_bbox = float(left) + float(width) * 0.5
         y_bbox = float(top) + float(height)
         if self.config.anchor_mode != "floor_plane_gravity_drop":
-            return float(x_bbox), float(y_bbox), False
+            source_size = self._frame_source_size(frame_meta)
+            mapped = self._source_to_mosaic(frame_meta, x_bbox, y_bbox, source_size)
+            if mapped is None:
+                return None
+            return float(mapped[0]), float(mapped[1]), False
 
-        track_map = self._analytics_track_map(sensor_id)
-        track = track_map.get(int(track_id))
+        # Floor trails are a projection of the exact canonical tracking row.
+        # A missing row (or a row from another frame) is not permission to
+        # switch to a bbox-bottom anchor: that would create a second estimator
+        # and is the source of the visible lines-to-frame-edge failure.
+        track = track_info
         if not isinstance(track, Mapping):
-            return float(x_bbox), float(y_bbox), False
+            return None
 
         measured_world = track.get("world")
         if not isinstance(measured_world, (list, tuple)) or len(measured_world) < 3 or track.get("world_valid") is not True:
-            return float(x_bbox), float(y_bbox), False
+            return None
         try:
             measured_world_arr = np.asarray(
                 [float(measured_world[0]), float(measured_world[1]), float(measured_world[2])],
                 dtype=np.float64,
             )
         except Exception:
-            return float(x_bbox), float(y_bbox), False
+            return None
+        if not np.all(np.isfinite(measured_world_arr)):
+            return None
 
-        source_uv = None
-        for key in ("image_base", "image_foot"):
-            uv = track.get(key)
-            if isinstance(uv, (list, tuple)) and len(uv) >= 2:
-                try:
-                    source_uv = (float(uv[0]), float(uv[1]))
-                except Exception:
-                    source_uv = None
-                if source_uv is not None:
-                    break
-        if source_uv is None:
-            camera_id = self._camera_id_for_sensor(sensor_id)
-            calib = self._resolve_calibration(sensor_id, camera_id)
-            if calib is None or getattr(calib, "intrinsics", None) is None or getattr(calib, "extrinsics_col_major", None) is None:
-                return float(x_bbox), float(y_bbox), False
-            flip_u, flip_v = self._infer_image_flips(camera_id, calib)
-            uv = project_world_to_image(
-                measured_world_arr,
-                calib.intrinsics,
-                calib.extrinsics_col_major,
-                tuple(int(x) for x in calib.image_size),
-                unit_scale=1.0,
-                flip_u=bool(flip_u),
-                flip_v=bool(flip_v),
-            )
-            if uv is None:
-                return float(x_bbox), float(y_bbox), False
-            source_uv = (float(uv[0]), float(uv[1]))
+        # The world row is the sole floor-mode render authority.  In
+        # particular, do not prefer ``image_base``/``image_foot`` here: those
+        # values can be produced by a different detector/coordinate basis and
+        # would make the OSD trail disagree with the BEV point for the same
+        # exact tracking cohort.  They remain useful diagnostic metadata, but
+        # the active world snapshot must be reprojected for display.
+        camera_id = self._camera_id_for_sensor(sensor_id)
+        calib = self._resolve_calibration(sensor_id, camera_id)
+        if calib is None or getattr(calib, "intrinsics", None) is None or getattr(calib, "extrinsics_col_major", None) is None:
+            return None
+        # The canonical world row is only meaningful under the active
+        # calibration snapshot. A revisioned reload must not reproject an
+        # older row, and must not retain a prior trail segment while waiting
+        # for a compatible row.
+        if not world_frame_matches_calibration(
+            track,
+            calib,
+            default_frame_id="backend_world_m",
+        ):
+            self._reset_trail_state(state)
+            return None
+        try:
+            calib_image_size = tuple(int(x) for x in calib.image_size)
+        except Exception:
+            return None
+        if len(calib_image_size) < 2 or calib_image_size[0] <= 0 or calib_image_size[1] <= 0:
+            return None
+        flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+        uv = project_world_to_image(
+            measured_world_arr,
+            calib.intrinsics,
+            calib.extrinsics_col_major,
+            calib_image_size,
+            unit_scale=1.0,
+            flip_u=bool(flip_u),
+            flip_v=bool(flip_v),
+        )
+        if uv is None:
+            return None
+        source_uv = (float(uv[0]), float(uv[1]))
+        source_key = "world_reprojection"
+        reprojected = True
+
+        source_size = self._normalize_image_size(track.get("image_size") or track.get("frame_size"))
+        if source_size is None:
+            source_size = self._frame_source_size(frame_meta)
+        if source_size[0] <= 0 or source_size[1] <= 0:
+            return None
+
+        calib_size = self._normalize_image_size(getattr(calib, "image_size", None))
+        if calib_size is None or calib_size[0] <= 0 or calib_size[1] <= 0:
+            return None
+        source_uv = (
+            float(source_uv[0]) * float(source_size[0]) / float(calib_size[0]),
+            float(source_uv[1]) * float(source_size[1]) / float(calib_size[1]),
+        )
+
+        basis = self._anchor_basis_token(
+            track,
+            source_size,
+            str(source_key or "canonical"),
+            reprojected=bool(reprojected),
+        )
+        if state.anchor_basis is not None and state.anchor_basis != basis:
+            self._reset_trail_state(state)
+        state.anchor_basis = basis
 
         self._update_world_measurement(state, float(measured_world_arr[0]), float(measured_world_arr[2]), float(now))
-        x, y = self._source_to_mosaic(frame_meta, float(source_uv[0]), float(source_uv[1]), self._frame_source_size(frame_meta, None))
-        return float(x), float(y), False
+        mapped = self._source_to_mosaic(frame_meta, float(source_uv[0]), float(source_uv[1]), source_size)
+        if mapped is None:
+            return None
+        return float(mapped[0]), float(mapped[1]), False
 
     def _commit_point(
         self,
@@ -4336,8 +4669,13 @@ class TrailOverlayProcessor:
         *,
         predicted: bool,
         append_allowed: bool = True,
+        canonical_floor: bool = False,
     ) -> None:
-        if state.points:
+        # Canonical floor anchors are already filtered by PersonGroundState and
+        # projected through the active world calibration.  Applying another
+        # speed limiter/EMA here makes OSD a lagging second estimator and can
+        # draw a long synthetic segment when the exact frame join changes.
+        if state.points and not canonical_floor:
             prev = state.points[-1]
             dt = max(0.0, float(now) - float(prev.ts))
             if dt > 0.0 and self.config.max_speed_px_per_s > 0.0:
@@ -4350,7 +4688,7 @@ class TrailOverlayProcessor:
                     x = float(prev.x) + dx * scale
                     y = float(prev.y) + dy * scale
 
-        if self.config.smooth_tau_s > 0.0:
+        if self.config.smooth_tau_s > 0.0 and not canonical_floor:
             if state.ema_x is None or state.ema_y is None:
                 state.ema_x, state.ema_y = float(x), float(y)
                 state.ema_ts = float(now)
@@ -4477,11 +4815,17 @@ class TrailOverlayProcessor:
         sensor_tracks = self._tracks.setdefault(sensor_id, {})
 
         mosaic_w, mosaic_h = self._mosaic_size
-        max_x = float(mosaic_w) if mosaic_w > 0 else None
-        max_y = float(mosaic_h) if mosaic_h > 0 else None
         max_points_per_track = max(2, int(self.config.max_points_per_track))
         tracks_seen = 0
         present_track_ids: set[int] = set()
+        frame_id = self._frame_id(frame_meta)
+        # Fetch the latest cache once.  The helper discards every row whose
+        # publication frame is not exactly this frame.
+        track_map = (
+            self._analytics_track_map(sensor_id, frame_id)
+            if frame_id is not None
+            else {}
+        )
 
         # Update trail state for all configured objects.
         for obj_meta in object_items:
@@ -4514,19 +4858,59 @@ class TrailOverlayProcessor:
             if width <= 1.0 or height <= 1.0:
                 continue
 
-            x = left + width * 0.5
-            y = top + height
-
-            if max_x is not None:
-                x = float(max(0.0, min(x, max_x)))
-            if max_y is not None:
-                y = float(max(0.0, min(y, max_y)))
+            track_info = track_map.get(int(track_id))
+            if not isinstance(track_info, Mapping):
+                # A detector/SDK object without the exact canonical analytics
+                # row is not drawable trail evidence.  Clear any prior points
+                # immediately and, crucially, do not refresh liveness; doing
+                # so kept stale trails visible and connected their return to a
+                # new bbox near the bottom of the mosaic.
+                stale_state = sensor_tracks.get(track_id)
+                if stale_state is not None:
+                    self._reset_trail_state(stale_state)
+                    stale_state.trail_segment_id = None
+                continue
 
             state = sensor_tracks.get(track_id)
             if state is None:
                 state = _TrailTrackState(points=deque(maxlen=max_points_per_track))
                 sensor_tracks[track_id] = state
-            state.last_seen_ts = float(now)
+
+            generation = track_info.get("tracker_lifecycle_generation")
+            try:
+                generation_int = int(generation) if generation is not None else None
+            except Exception:
+                generation_int = None
+            if (
+                generation_int is not None
+                and state.tracker_lifecycle_generation is not None
+                and generation_int != int(state.tracker_lifecycle_generation)
+            ):
+                self._reset_trail_state(state)
+                state.trail_segment_id = None
+            if generation_int is not None:
+                state.tracker_lifecycle_generation = generation_int
+
+            # A non-sampled frame still gets a cheap validity check.  If the
+            # exact canonical row is already invalid, stale points must break
+            # immediately; otherwise a later valid row reconnects to a bad
+            # segment.  Full projection remains decimated by draw_stride.
+            if not do_sample:
+                if self.config.anchor_mode == "floor_plane_gravity_drop":
+                    world = track_info.get("world")
+                    invalid_world = track_info.get("world_valid") is not True
+                    if isinstance(world, (list, tuple)) and len(world) >= 3:
+                        try:
+                            invalid_world = invalid_world or not all(
+                                math.isfinite(float(world[index]))
+                                for index in range(3)
+                            )
+                        except (TypeError, ValueError):
+                            invalid_world = True
+                    if invalid_world:
+                        self._reset_trail_state(state)
+                        state.trail_segment_id = None
+                continue
 
             # Always prune old samples so disappeared tracks naturally fade out.
             while state.points and (now - float(state.points[0].ts)) > float(self.config.window_s):
@@ -4535,20 +4919,26 @@ class TrailOverlayProcessor:
             if not do_sample:
                 continue
 
-            x, y, predicted = self._resolve_active_anchor(
+            resolved = self._resolve_active_anchor(
                 sensor_id,
                 frame_meta,
                 obj_meta,
                 int(track_id),
                 state,
                 float(now),
+                track_info=track_info,
             )
-            if max_x is not None:
-                x = float(max(0.0, min(x, max_x)))
-            if max_y is not None:
-                y = float(max(0.0, min(y, max_y)))
-            track_map = self._analytics_track_map(sensor_id)
-            track_info = track_map.get(int(track_id)) if isinstance(track_map, Mapping) else None
+            # No valid exact-frame canonical anchor means no new OSD point.
+            # In particular, never substitute the current bbox in floor mode.
+            if resolved is None:
+                self._reset_trail_state(state)
+                state.trail_segment_id = None
+                continue
+            # Liveness is refreshed only after an exact canonical anchor has
+            # resolved.  Missing/invalid rows therefore cannot keep stale
+            # trail state alive.
+            state.last_seen_ts = float(now)
+            x, y, predicted = resolved
             append_allowed = True
             if isinstance(track_info, Mapping):
                 segment_id = track_info.get("trail_segment_id")
@@ -4575,7 +4965,23 @@ class TrailOverlayProcessor:
                 float(y),
                 predicted=bool(predicted),
                 append_allowed=append_allowed,
+                canonical_floor=bool(
+                    self.config.anchor_mode == "floor_plane_gravity_drop"
+                    and not predicted
+                ),
             )
+
+        # An exact canonical snapshot is also authoritative when the SDK no
+        # longer carries an object row.  Break retained history for every
+        # lifecycle absent from this frame before gap prediction or rendering;
+        # otherwise a compatible same-generation return would reconnect to the
+        # last point on the far side of the exact disappearance cohort.
+        exact_track_ids = {int(track_id) for track_id in track_map}
+        for track_id, state in sensor_tracks.items():
+            if int(track_id) in exact_track_ids:
+                continue
+            self._reset_trail_state(state)
+            state.trail_segment_id = None
 
         if do_sample and self.config.anchor_mode == "floor_plane_gravity_drop":
             for track_id, state in sensor_tracks.items():
@@ -4585,10 +4991,6 @@ class TrailOverlayProcessor:
                 if x_y is None:
                     continue
                 x, y = x_y
-                if max_x is not None:
-                    x = float(max(0.0, min(float(x), max_x)))
-                if max_y is not None:
-                    y = float(max(0.0, min(float(y), max_y)))
                 self._commit_point(state, float(now), float(x), float(y), predicted=True)
 
         if os.environ.get("NOESIS_TRAILS_RENDER", "1").strip().lower() in ("0", "false", "no", "off"):
@@ -6529,14 +6931,23 @@ class _ObjectDepthFusionProcessor:
         *,
         crop_rect: Tuple[int, int, int, int],
         bbox: Tuple[float, float, float, float],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[List[float]], int]:
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        Optional[List[float]],
+        int,
+        List[Tuple[float, float, float, float, float, float]],
+    ]:
         x0, y0, x1, y1 = [int(value) for value in crop_rect]
         width = max(0, x1 - x0)
         height = max(0, y1 - y0)
         body_mask = np.zeros((height, width), dtype=np.uint8)
         contact_mask = np.zeros((height, width), dtype=np.uint8)
+        contact_capsules: List[
+            Tuple[float, float, float, float, float, float]
+        ] = []
         if width <= 0 or height <= 0:
-            return body_mask.astype(bool), contact_mask.astype(bool), None, 0
+            return body_mask.astype(bool), contact_mask.astype(bool), None, 0, contact_capsules
 
         threshold = _read_env_float(
             "NOESIS_OBJECT_DEPTH_POSE_KPT_THRESHOLD",
@@ -6594,17 +7005,55 @@ class _ObjectDepthFusionProcessor:
                     int(round((0.35 * float(knee[0])) + (0.65 * float(ankle[0])))),
                     int(round((0.35 * float(knee[1])) + (0.65 * float(ankle[1])))),
                 )
-                cv2.line(
-                    contact_mask,
-                    lower_leg_start,
-                    ankle,
-                    1,
-                    thickness=max(3, contact_radius),
+            else:
+                lower_leg_start = ankle
+            # OpenCV line thickness is a diameter while the ankle circle uses
+            # a radius.  The former implementation passed ``contact_radius``
+            # as a capsule radius and therefore made the native lower-leg band
+            # nearly twice as wide as the host mask.  Carry both radii in one
+            # compact compound primitive: a thin segment plus the ankle disk.
+            line_radius = max(1.5, 0.5 * float(max(3, contact_radius)))
+            contact_capsules.append(
+                (
+                    float(x0 + lower_leg_start[0]),
+                    float(y0 + lower_leg_start[1]),
+                    float(x0 + ankle[0]),
+                    float(y0 + ankle[1]),
+                    float(line_radius),
+                    float(contact_radius),
                 )
-            cv2.circle(contact_mask, ankle, contact_radius, 1, thickness=-1)
+            )
 
         if not contact_points:
-            return body_mask.astype(bool), contact_mask.astype(bool), None, 0
+            return body_mask.astype(bool), contact_mask.astype(bool), None, 0, contact_capsules
+
+        # Rasterize the diagnostic/fallback mask from the exact continuous
+        # predicate used by the CUDA sampler.  Pixel centers are absolute
+        # aligned-frame coordinates, matching the native +0.5 convention.
+        grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
+        point_x = np.asarray(grid_x, dtype=np.float32) + 0.5
+        point_y = np.asarray(grid_y, dtype=np.float32) + 0.5
+        for ax, ay, bx, by, line_radius, ankle_radius in contact_capsules:
+            dx = float(bx) - float(ax)
+            dy = float(by) - float(ay)
+            length_sq = (dx * dx) + (dy * dy)
+            if length_sq > 1.0e-6:
+                t = ((point_x - float(ax)) * dx + (point_y - float(ay)) * dy) / length_sq
+                t = np.clip(t, 0.0, 1.0)
+            else:
+                t = np.zeros((height, width), dtype=np.float32)
+            nearest_x = float(ax) + (t * dx)
+            nearest_y = float(ay) + (t * dy)
+            segment_active = (
+                np.square(point_x - nearest_x) + np.square(point_y - nearest_y)
+                <= float(line_radius) * float(line_radius)
+            )
+            ankle_active = (
+                np.square(point_x - float(bx)) + np.square(point_y - float(by))
+                <= float(ankle_radius) * float(ankle_radius)
+            )
+            contact_mask[np.asarray(segment_active | ankle_active)] = 1
+
         contact_uv = [
             float(x0) + (sum(float(point[0]) for point in contact_points) / len(contact_points)),
             float(y0) + (sum(float(point[1]) for point in contact_points) / len(contact_points)),
@@ -6614,6 +7063,7 @@ class _ObjectDepthFusionProcessor:
             contact_mask.astype(bool),
             contact_uv,
             len(contact_points),
+            contact_capsules,
         )
 
     def _extract_instance_mask_payload(self, obj_meta: Any) -> Optional[Mapping[str, Any]]:
@@ -7016,22 +7466,59 @@ class _ObjectDepthFusionProcessor:
         contact_mask: np.ndarray,
         contact_uv: Optional[Sequence[float]],
         visible_ankles: int,
+        contact_capsules: Optional[Sequence[Sequence[float]]] = None,
     ) -> Optional[ObjectDepthResult]:
         depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
         if depth_device_frame is None:
             return None
         body_area = int(np.count_nonzero(body_mask))
+        contact_area = int(np.count_nonzero(contact_mask))
         if body_area <= 0:
             return None
-        body_stats = self._sample_mask_stats_native(
-            depth_device_frame,
-            crop_rect=crop_rect,
-            mask=body_mask,
-            stage_name="object_depth.native_pose_capsule_stats",
-        )
-        if body_stats is None:
-            return None
-        _increment_core_counter("object_depth_gpu_roi_copies_total")
+
+        # Position authority needs only compact ankle/contact support.  The
+        # native method receives at most two scalar [ax, ay, bx, by, radius]
+        # capsules, samples their union from the GPU-resident depth tensor,
+        # and returns one compact statistic.  No image-sized host mask is
+        # uploaded. With no observed ankle contact, fail closed without
+        # touching the GPU at all.
+        body_stats: Mapping[str, Any] = {}
+        if contact_uv is not None and visible_ankles > 0 and contact_area > 0 and contact_capsules:
+            sample_capsule_stats = getattr(
+                depth_device_frame,
+                "sample_pose_capsule_stats",
+                None,
+            )
+            if not callable(sample_capsule_stats):
+                return None
+            try:
+                start_ns = time.perf_counter_ns()
+                stats_raw = sample_capsule_stats(
+                    [list(capsule) for capsule in contact_capsules[:2]],
+                    _read_env_int(
+                        "NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+                        4096,
+                        min_value=128,
+                    ),
+                )
+                _record_core_stage_timing(
+                    "object_depth.native_pose_contact_capsule_stats",
+                    start_ns,
+                    item_count=int(contact_area),
+                )
+            except Exception:
+                logger.debug(
+                    "Native pose-contact object-depth ROI stats failed",
+                    exc_info=True,
+                )
+                return None
+            if not isinstance(stats_raw, Mapping):
+                return None
+            body_stats = dict(stats_raw)
+            body_area = int(
+                body_stats.get("sampled_capsule_area_px", contact_area) or contact_area
+            )
+            _increment_core_counter("object_depth_gpu_roi_copies_total")
 
         try:
             sample_count = int(body_stats.get("sample_count", 0) or 0)
@@ -7050,17 +7537,10 @@ class _ObjectDepthFusionProcessor:
         anchor_depth_spread_m: Optional[float] = None
         evidence_quality = "rejected"
         evidence_reason: Optional[str] = "pose_ankles_unavailable"
-        status = "no_ground_contact" if sample_count > 0 else "no_valid_depth"
+        status = "no_ground_contact"
 
-        contact_area = int(np.count_nonzero(contact_mask))
-        if contact_uv is not None and visible_ankles > 0 and contact_area > 0:
-            contact_stats = self._sample_mask_stats_native(
-                depth_device_frame,
-                crop_rect=crop_rect,
-                mask=contact_mask,
-                max_samples_env="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
-                stage_name="object_depth.native_pose_contact_stats",
-            )
+        if contact_uv is not None and visible_ankles > 0 and contact_area > 0 and contact_capsules:
+            contact_stats = body_stats
             if contact_stats is not None:
                 try:
                     contact_count = int(contact_stats.get("sample_count", 0) or 0)
@@ -7531,6 +8011,9 @@ class _ObjectDepthFusionProcessor:
         pose_contact_mask: Optional[np.ndarray] = None
         pose_contact_uv: Optional[List[float]] = None
         pose_visible_ankles = 0
+        pose_contact_capsules: List[
+            Tuple[float, float, float, float, float, float]
+        ] = []
         if not mask_payload:
             pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox)
             if pose_keypoints is not None:
@@ -7539,6 +8022,7 @@ class _ObjectDepthFusionProcessor:
                     pose_contact_mask,
                     pose_contact_uv,
                     pose_visible_ankles,
+                    pose_contact_capsules,
                 ) = self._pose_capsule_masks(
                     pose_keypoints,
                     crop_rect=(x0, y0, x1, y1),
@@ -7549,6 +8033,7 @@ class _ObjectDepthFusionProcessor:
                     pose_contact_mask = None
                     pose_contact_uv = None
                     pose_visible_ankles = 0
+                    pose_contact_capsules = []
 
         if not mask_payload and pose_body_mask is not None and pose_contact_mask is not None:
             native_pose_result = self._sample_pose_capsule_result_native(
@@ -7561,6 +8046,7 @@ class _ObjectDepthFusionProcessor:
                 contact_mask=pose_contact_mask,
                 contact_uv=pose_contact_uv,
                 visible_ankles=pose_visible_ankles,
+                contact_capsules=pose_contact_capsules,
             )
             if native_pose_result is not None:
                 return native_pose_result
@@ -7830,13 +8316,678 @@ class _ObjectDepthFusionOperator(_BatchMetadataOperatorBase):  # pragma: no cove
                 logger.exception("Failed to fuse object depth within batch metadata (DS8)")
 
 
+def _copy_public_scalar(value: Any) -> Any:
+    """Copy the bounded scalar metadata allowed across the media boundary.
+
+    The analytics callback must never hand DeepStream-owned metadata, surfaces,
+    tensors, or Python objects with a runtime lifetime to the publication
+    worker.  Public tracking payloads are deliberately JSON-shaped; recursively
+    copy only that shape and normalize numpy scalar values at the boundary.
+    """
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, np.generic):
+        try:
+            return value.item()
+        except Exception:
+            return None
+    if isinstance(value, Mapping):
+        return {
+            str(key): _copy_public_scalar(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_copy_public_scalar(item) for item in value]
+    # There should be no opaque values in the public contract.  Returning None
+    # is safer than retaining a borrowed SDK object in an asynchronous queue.
+    return None
+
+
+_IDENTITY_V2_SHADOW_MAX_PRIMITIVES_PER_FRAME = 64
+_IDENTITY_V2_SHADOW_MAX_EMBEDDING_DIM = 4096
+_IDENTITY_V2_SHADOW_MAX_PENDING_SOURCES = 64
+
+
+def _identity_v2_tracker_id_for_epoch(
+    tracker_id: Any,
+    source_epoch: int,
+) -> str:
+    """Return the coordinator tracklet key for one physical source timeline."""
+
+    tracker_key = str(tracker_id).strip()
+    if not tracker_key:
+        raise ValueError("identity-v2 tracker ID must be non-empty")
+    epoch = int(source_epoch)
+    if epoch < 0:
+        raise ValueError("identity-v2 source epoch must be non-negative")
+    if epoch == 0:
+        return tracker_key
+    return f"{tracker_key}@source_epoch:{epoch}"
+
+
+def _copy_bounded_identity_sequence(
+    value: Optional[Sequence[Any]],
+    *,
+    maximum: int,
+    field_name: str,
+) -> Optional[Tuple[float, ...]]:
+    """Detach one small numeric identity field from callback-owned objects."""
+
+    if value is None:
+        return None
+    limit = max(0, int(maximum))
+    # Production ReID/bbox/world fields are owned one-dimensional ndarrays.
+    # ``tolist`` performs the bounded native-to-Python copy in C instead of
+    # holding the GIL once per 256-D element.  Other sequence types retain the
+    # conservative iterator path below.
+    if (
+        isinstance(value, np.ndarray)
+        and value.ndim == 1
+        and value.dtype.kind in "biuf"
+    ):
+        return tuple(map(float, value[:limit].tolist()))
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be a numeric sequence") from exc
+    copied: List[float] = []
+    for index, raw in enumerate(iterator):
+        if index >= limit:
+            break
+        try:
+            copied.append(float(raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} contains a non-numeric value") from exc
+    return tuple(copied)
+
+
+def _copy_shadow_identity_primitives(
+    *,
+    primitives: Sequence[IdentityFramePrimitive],
+    copied_track_by_original_id: Mapping[int, Dict[str, Any]],
+    embedding_dim: int,
+    source_epoch: int,
+) -> Tuple[IdentityFramePrimitive, ...]:
+    """Bind compact shadow inputs to private detached scalar track identities."""
+
+    dimension = int(embedding_dim)
+    if dimension <= 0 or dimension > _IDENTITY_V2_SHADOW_MAX_EMBEDDING_DIM:
+        raise ValueError(
+            "identity-v2 embedding dimension is outside the bounded worker contract"
+        )
+    epoch = int(source_epoch)
+    if epoch < 0:
+        raise ValueError("identity-v2 source epoch must be non-negative")
+
+    primitive_by_track: Dict[int, IdentityFramePrimitive] = {}
+    for index, primitive in enumerate(primitives):
+        if index >= _IDENTITY_V2_SHADOW_MAX_PRIMITIVES_PER_FRAME:
+            raise ValueError(
+                "identity-v2 shadow source frame exceeds bounded primitive limit "
+                f"{_IDENTITY_V2_SHADOW_MAX_PRIMITIVES_PER_FRAME}"
+            )
+        if not isinstance(primitive, IdentityFramePrimitive):
+            raise TypeError("identity-v2 shadow primitives must be typed values")
+        track_key = id(primitive.public_track)
+        if track_key in primitive_by_track:
+            raise ValueError(
+                "identity-v2 shadow primitives contain a duplicate public track"
+            )
+        primitive_by_track[track_key] = primitive
+
+    copied: List[IdentityFramePrimitive] = []
+    for track_key, public_track in copied_track_by_original_id.items():
+        primitive = primitive_by_track.pop(int(track_key), None)
+        if primitive is None:
+            continue
+        primitive_tracker_id = str(primitive.tracker_id).strip()
+        public_tracker_id = public_track.get(
+            "tracker_id",
+            public_track.get("track_id"),
+        )
+        expected_tracker_id = _identity_v2_tracker_id_for_epoch(
+            public_tracker_id,
+            epoch,
+        )
+        if primitive_tracker_id != expected_tracker_id:
+            raise ValueError(
+                "identity-v2 primitive tracker does not match its public track"
+            )
+        if str(public_track.get("camera_id") or "").strip() != str(
+            primitive.camera_id
+        ).strip():
+            raise ValueError(
+                "identity-v2 primitive camera does not match its public track"
+            )
+        try:
+            public_frame_id = int(public_track.get("frame_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "identity-v2 public track has no valid frame identity"
+            ) from exc
+        if public_frame_id != int(primitive.frame_id):
+            raise ValueError(
+                "identity-v2 primitive frame does not match its public track"
+            )
+        try:
+            public_source_epoch = int(public_track.get("source_epoch"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "identity-v2 public track has no valid source epoch"
+            ) from exc
+        if public_source_epoch != epoch:
+            raise ValueError(
+                "identity-v2 public track source epoch does not match its cohort"
+            )
+        copied.append(
+            IdentityFramePrimitive(
+                camera_id=str(primitive.camera_id),
+                tracker_id=primitive_tracker_id,
+                frame_id=int(primitive.frame_id),
+                public_track=public_track,
+                embedding=_copy_bounded_identity_sequence(
+                    primitive.embedding,
+                    # One extra value preserves the service's existing invalid-
+                    # dimension rejection without copying an unbounded vector.
+                    maximum=dimension + 1,
+                    field_name="identity-v2 embedding",
+                ),
+                diagnostic_track=None,
+                bbox=_copy_bounded_identity_sequence(
+                    primitive.bbox,
+                    maximum=4,
+                    field_name="identity-v2 bbox",
+                ),
+                frame_size=_copy_bounded_identity_sequence(
+                    primitive.frame_size,
+                    maximum=2,
+                    field_name="identity-v2 frame_size",
+                ),
+                detection_confidence=(
+                    None
+                    if primitive.detection_confidence is None
+                    else float(primitive.detection_confidence)
+                ),
+                tracker_confidence=(
+                    None
+                    if primitive.tracker_confidence is None
+                    else float(primitive.tracker_confidence)
+                ),
+                world_xyz=_copy_bounded_identity_sequence(
+                    primitive.world_xyz,
+                    maximum=3,
+                    field_name="identity-v2 world_xyz",
+                ),
+                world_valid=bool(primitive.world_valid),
+            )
+        )
+    if primitive_by_track:
+        raise ValueError(
+            "identity-v2 shadow primitive is not bound to a published track"
+        )
+    return tuple(copied)
+
+
+@dataclass(frozen=True)
+class _ScalarPublicationFrameMeta:
+    """Frame metadata snapshot used by the worker; no SDK object is retained."""
+
+    frame_number: int
+    frame_num: int
+    buf_pts: int
+    source_id: int
+
+
+@dataclass
+class _TrackingPublicationWork:
+    source_id: int
+    camera_id: str
+    frame_id: int
+    observed_at_us: int
+    now_ts: float
+    timestamp_us: int
+    tracks: List[Dict[str, Any]]
+    footpoints: List[Footpoint]
+    temporal_contract: Dict[str, Any]
+    # Lifecycle stamping is performed in the media callback before its rows
+    # are exposed to OSD.  The worker carries that exact continuity receipt;
+    # it must never derive a second generation from a later snapshot.
+    continuity: TrackingContinuityUpdate | None = None
+    source_epoch: int = 0
+    admitted_at_ns: int = field(default_factory=time.perf_counter_ns)
+
+
+@dataclass(frozen=True)
+class _ShadowIdentityWork:
+    """Detached optional identity work; no canonical track row is retained."""
+
+    source_id: int
+    camera_id: str
+    frame_id: int
+    observed_at: float
+    primitives: Tuple[IdentityFramePrimitive, ...]
+    admission_sequence: int
+    admitted_at_ns: int = field(default_factory=time.perf_counter_ns)
+
+
+class _ShadowIdentityWorker:
+    """Latest-per-source shadow scorer isolated from canonical publication.
+
+    Shadow IdentityV2 performs diagnostics and may also mutate its private
+    visitor gallery.  Those SQLite transactions have measured tails far above
+    one tracking publication interval, so they cannot share the ordered
+    tracking/world/BEV worker.  This worker retains at most one pending item
+    per source and replaces stale pending work when it falls behind.  The
+    current item is worker-owned; canonical rows and SDK metadata are never
+    referenced or mutated.
+    """
+
+    def __init__(
+        self,
+        processor: "_AnalyticsTelemetryProcessor",
+        *,
+        failure_callback: Optional[Callable[[BaseException], None]] = None,
+        max_pending_sources: int = _IDENTITY_V2_SHADOW_MAX_PENDING_SOURCES,
+    ) -> None:
+        self._processor = processor
+        self._failure_callback = failure_callback
+        self._max_pending_sources = max(1, int(max_pending_sources))
+        self._condition = threading.Condition(threading.Lock())
+        self._pending: Dict[int, _ShadowIdentityWork] = {}
+        self._stopping = False
+        self._terminal_failure: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="NoesisShadowIdentity",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def terminal_failure(self) -> BaseException | None:
+        with self._condition:
+            return self._terminal_failure
+
+    @property
+    def pending_count(self) -> int:
+        with self._condition:
+            return len(self._pending)
+
+    def enqueue(self, work: _ShadowIdentityWork) -> bool:
+        source = int(work.source_id)
+        with self._condition:
+            if self._stopping or self._terminal_failure is not None:
+                _increment_core_counter("identity_v2.shadow.dropped_unavailable_total")
+                return False
+            existing = self._pending.get(source)
+            if existing is None and len(self._pending) >= self._max_pending_sources:
+                _increment_core_counter("identity_v2.shadow.dropped_capacity_total")
+                return False
+            if existing is not None:
+                # The older frame is optional comparison evidence. Replacing
+                # it keeps this lane fresh without delaying its canonical
+                # tracking/world/BEV cohort.
+                _increment_core_counter("identity_v2.shadow.coalesced_total")
+            self._pending[source] = work
+            _set_core_counter(
+                "identity_v2.shadow.pending_sources",
+                len(self._pending),
+            )
+            _max_core_counter(
+                "identity_v2.shadow.pending_sources_high_watermark",
+                len(self._pending),
+            )
+            _increment_core_counter("identity_v2.shadow.enqueued_total")
+            self._condition.notify()
+            return True
+
+    def _take(self) -> Optional[_ShadowIdentityWork]:
+        with self._condition:
+            yielded_for_backlog = False
+            while not self._stopping:
+                if not self._pending:
+                    self._condition.wait()
+                    continue
+                # Keep optional work pending while canonical cohorts are
+                # queued. Newer source work can still replace it, so this is
+                # a bounded yield/coalescing point rather than an unbounded
+                # shadow queue or a canonical drop.
+                backlogged = getattr(
+                    self._processor,
+                    "_canonical_publication_backlogged",
+                    None,
+                )
+                if callable(backlogged) and bool(backlogged()):
+                    if not yielded_for_backlog:
+                        _increment_core_counter(
+                            "identity_v2.shadow.yielded_canonical_backlog_total"
+                        )
+                        yielded_for_backlog = True
+                    self._condition.wait(timeout=0.005)
+                    continue
+                # The callback samples observed_at from one monotonic wall-clock
+                # domain. Oldest-first selection preserves that global order when
+                # camera-local pending work has been replaced.
+                source, work = min(
+                    self._pending.items(),
+                    key=lambda item: (
+                        float(item[1].observed_at),
+                        int(item[1].admission_sequence),
+                        int(item[0]),
+                    ),
+                )
+                self._pending.pop(source, None)
+                _set_core_counter(
+                    "identity_v2.shadow.pending_sources",
+                    len(self._pending),
+                )
+                return work
+            return None
+
+    def _fail_shadow(self, error: BaseException) -> None:
+        callback = self._failure_callback
+        with self._condition:
+            if self._terminal_failure is None:
+                self._terminal_failure = error
+            discarded = len(self._pending)
+            self._pending.clear()
+            _set_core_counter("identity_v2.shadow.pending_sources", 0)
+            self._stopping = True
+            self._condition.notify_all()
+        _increment_core_counter("identity_v2.shadow.worker_failures_total")
+        if discarded:
+            _increment_core_counter(
+                "identity_v2.shadow.dropped_after_failure_total",
+                discarded,
+            )
+        if callable(callback):
+            try:
+                callback(error)
+            except Exception:
+                logger.exception("Shadow identity degradation callback failed")
+
+    def _run(self) -> None:  # pragma: no cover - exercised by focused worker tests
+        while True:
+            work = self._take()
+            if work is None:
+                return
+            started_ns = time.perf_counter_ns()
+            _record_core_stage_timing(
+                "identity_v2.shadow_queue_wait",
+                int(work.admitted_at_ns),
+                item_count=len(work.primitives),
+            )
+            _set_core_counter("identity_v2.shadow.inflight", 1)
+            try:
+                self._processor._process_identity_v2_source_frame(
+                    camera_id=str(work.camera_id),
+                    frame_id=int(work.frame_id),
+                    primitives=work.primitives,
+                    observed_at=float(work.observed_at),
+                    fatal=False,
+                )
+                _increment_core_counter("identity_v2.shadow.completed_total")
+            except Exception as exc:
+                logger.exception(
+                    "Optional shadow identity worker failed for source %s frame %s; "
+                    "canonical tracking remains active",
+                    work.source_id,
+                    work.frame_id,
+                )
+                self._fail_shadow(exc)
+                return
+            finally:
+                _set_core_counter("identity_v2.shadow.inflight", 0)
+                _record_core_stage_timing(
+                    "identity_v2.shadow_process_source_frame",
+                    started_ns,
+                    item_count=len(work.primitives),
+                )
+
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+        with self._condition:
+            discarded = len(self._pending)
+            self._pending.clear()
+            _set_core_counter("identity_v2.shadow.pending_sources", 0)
+            self._stopping = True
+            self._condition.notify_all()
+        if discarded:
+            _increment_core_counter(
+                "identity_v2.shadow.dropped_shutdown_total",
+                discarded,
+            )
+        if not wait:
+            return
+        timeout = max(0.001, float(timeout_s))
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("shadow identity worker did not quiesce")
+
+
+class _TrackingPublicationWorker:
+    """One bounded FIFO worker for tracking + paired BEV output.
+
+    The callback only extracts public scalar metadata and appends a bounded
+    item for the source.  The worker fairly rotates sources while preserving
+    exact per-source order.  Overflow is terminal rather than silently
+    dropping a canonical tracking/world/BEV cohort.  A publisher failure is
+    likewise terminal and is surfaced through the existing runtime failure
+    callback.
+    """
+
+    def __init__(
+        self,
+        processor: "_AnalyticsTelemetryProcessor",
+        *,
+        failure_callback: Optional[Callable[[BaseException], None]] = None,
+        max_pending_per_source: int = 16,
+        max_pending_total: int = 64,
+    ) -> None:
+        self._processor = processor
+        self._failure_callback = failure_callback
+        self._condition = threading.Condition(threading.Lock())
+        self._pending: Dict[int, deque[_TrackingPublicationWork]] = {}
+        self._pending_total = 0
+        self._max_pending_per_source = max(1, int(max_pending_per_source))
+        self._max_pending_total = max(
+            self._max_pending_per_source,
+            int(max_pending_total),
+        )
+        self._ready_sources: deque[int] = deque()
+        self._stopping = False
+        self._terminal_failure: BaseException | None = None
+        self._inflight = False
+        self._last_frame_by_source: Dict[int, int] = {}
+        self._last_epoch_by_source: Dict[int, int] = {}
+        self._thread = threading.Thread(
+            target=self._run,
+            name="NoesisTrackingPublication",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def terminal_failure(self) -> BaseException | None:
+        with self._condition:
+            return self._terminal_failure
+
+    @property
+    def busy(self) -> bool:
+        """Whether canonical work is queued or currently being published."""
+
+        with self._condition:
+            return bool(self._pending_total or self._inflight)
+
+    def enqueue(self, work: _TrackingPublicationWork) -> bool:
+        source = int(work.source_id)
+        callback: Optional[Callable[[BaseException], None]] = None
+        error: BaseException | None = None
+        with self._condition:
+            if self._stopping or self._terminal_failure is not None:
+                return False
+            pending = self._pending.setdefault(source, deque())
+            if (
+                len(pending) >= self._max_pending_per_source
+                or self._pending_total >= self._max_pending_total
+            ):
+                error = RuntimeError(
+                    "tracking publication worker queue overflow for source "
+                    f"{source} frame {work.frame_id}"
+                )
+                # Do not silently drop canonical cohorts.  Transition to the
+                # terminal state while still under the condition, then invoke
+                # the callback outside the lock.  Already-admitted work stays
+                # in its per-source FIFO and drains before the worker exits;
+                # only this newly rejected cohort is refused.
+                self._terminal_failure = error
+                self._stopping = True
+                _increment_core_counter(
+                    "tracking.publication_worker.overflow_total"
+                )
+                self._condition.notify_all()
+                callback = self._failure_callback
+            else:
+                if not pending:
+                    self._ready_sources.append(source)
+                pending.append(work)
+                self._pending_total += 1
+                _set_core_counter(
+                    "tracking.publication_worker.pending_total",
+                    self._pending_total,
+                )
+                _max_core_counter(
+                    "tracking.publication_worker.pending_high_watermark",
+                    self._pending_total,
+                )
+                _increment_core_counter(
+                    "tracking.publication_worker.enqueued_total"
+                )
+                self._condition.notify()
+                return True
+        if callback is not None and error is not None:
+            try:
+                callback(error)
+            except Exception:
+                logger.exception("Tracking publication overflow callback failed")
+        return False
+
+    def _take(self) -> Optional[_TrackingPublicationWork]:
+        with self._condition:
+            while not self._ready_sources and not self._stopping:
+                self._condition.wait()
+            if not self._ready_sources:
+                return None
+            source = self._ready_sources.popleft()
+            pending = self._pending.get(source)
+            if not pending:
+                self._pending.pop(source, None)
+                return None
+            work = pending.popleft()
+            self._pending_total = max(0, self._pending_total - 1)
+            _set_core_counter(
+                "tracking.publication_worker.pending_total",
+                self._pending_total,
+            )
+            self._inflight = True
+            if pending:
+                self._ready_sources.append(source)
+            else:
+                self._pending.pop(source, None)
+            return work
+
+    def _fail_terminal(self, error: BaseException) -> None:
+        _increment_core_counter("tracking.publication_worker.failures_total")
+        with self._condition:
+            if self._terminal_failure is None:
+                self._terminal_failure = error
+            self._pending.clear()
+            self._ready_sources.clear()
+            self._pending_total = 0
+            _set_core_counter("tracking.publication_worker.pending_total", 0)
+            self._stopping = True
+            self._condition.notify_all()
+        if callable(self._failure_callback):
+            try:
+                self._failure_callback(error)
+            except Exception:
+                logger.exception("Tracking publication failure callback failed")
+
+    def _run(self) -> None:  # pragma: no cover - exercised by focused worker tests
+        while True:
+            work = self._take()
+            if work is None:
+                return
+            item_started_ns = time.perf_counter_ns()
+            _record_core_stage_timing(
+                "tracking.publication_worker_queue_wait",
+                int(work.admitted_at_ns),
+                item_count=len(work.tracks),
+            )
+            _set_core_counter("tracking.publication_worker.inflight", 1)
+            try:
+                source = int(work.source_id)
+                epoch = int(work.source_epoch)
+                last_epoch = self._last_epoch_by_source.get(source)
+                if last_epoch is not None and epoch < int(last_epoch):
+                    raise RuntimeError(
+                        "tracking publication worker received an older source epoch "
+                        f"for source {source}: {epoch} < {last_epoch}"
+                    )
+                if last_epoch is not None and epoch > int(last_epoch):
+                    self._last_frame_by_source.pop(source, None)
+                self._last_epoch_by_source[source] = epoch
+                last_frame = self._last_frame_by_source.get(source)
+                if last_frame is not None and int(work.frame_id) <= int(last_frame):
+                    raise RuntimeError(
+                        "tracking publication worker received a non-advancing frame "
+                        f"for source {work.source_id}: {work.frame_id} <= {last_frame}"
+                    )
+                self._processor._publish_tracking_work(work)
+                self._last_frame_by_source[int(work.source_id)] = int(work.frame_id)
+                _increment_core_counter(
+                    "tracking.publication_worker.completed_total"
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Canonical tracking publication worker failed for source %s frame %s",
+                    work.source_id,
+                    work.frame_id,
+                )
+                self._fail_terminal(exc)
+                return
+            finally:
+                with self._condition:
+                    self._inflight = False
+                    self._condition.notify_all()
+                _set_core_counter("tracking.publication_worker.inflight", 0)
+                _record_core_stage_timing(
+                    "tracking.publication_worker_item",
+                    item_started_ns,
+                    item_count=len(work.tracks),
+                )
+
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+        if not wait:
+            return
+        timeout = max(0.001, float(timeout_s))
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("tracking publication worker did not quiesce")
+
+
 @dataclass
 class _AnalyticsTelemetryProcessor:
     pipeline: "DS8Pipeline"
     tracking_pub: "TrackingTelemetryPublisher"
     camera_labels: Mapping[int, str]
     sensor_id_map: Mapping[int, int]
-    publication_gate: RuntimePublicationGate
+    publication_gate: RuntimePublicationGate = field(
+        default_factory=RuntimePublicationGate
+    )
     tracking_mode: Optional[str] = None
     bev_renderer: Any = None
     bev_calibration: Any = None
@@ -7852,6 +9003,15 @@ class _AnalyticsTelemetryProcessor:
     _occupancy_last_seen: Dict[int, Dict[str, float]] = field(default_factory=dict, init=False, repr=False)
     _occupancy_grace_s: float = field(default=0.0, init=False, repr=False)
     _active_tracks: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
+    _active_tracks_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    # Exact scalar rows retained only long enough for the tiler/OSD callback
+    # to join the same frame.  This is deliberately not a latest-only cache.
+    _track_snapshot_ring: Dict[
+        int, "OrderedDict[int, Dict[int, Dict[str, Any]]]"
+    ] = field(default_factory=dict, init=False, repr=False)
+    _track_snapshot_ring_size: int = field(default=8, init=False, repr=False)
     _transitions_state: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
     _v3dt_reid_track_grace_s: float = field(default=0.0, init=False, repr=False)
@@ -7891,6 +9051,10 @@ class _AnalyticsTelemetryProcessor:
     _sid_metrics_log_interval_s: float = field(default=10.0, init=False, repr=False)
     _sid_metrics_last_log_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
     _world_state_by_track: Dict[Tuple[int, int], _WorldAnchorState] = field(default_factory=dict, init=False, repr=False)
+    _world_state_ghost_by_track: Dict[
+        Tuple[int, int], Tuple[_WorldAnchorState, float]
+    ] = field(default_factory=dict, init=False, repr=False)
+    _world_state_ghost_ttl_s: float = field(default=0.75, init=False, repr=False)
     _world_state_ttl_s: float = field(default=3.0, init=False, repr=False)
     _world_state_prune_interval_s: float = field(default=1.0, init=False, repr=False)
     _world_state_last_prune_ts: float = field(default=0.0, init=False, repr=False)
@@ -7909,6 +9073,7 @@ class _AnalyticsTelemetryProcessor:
     _world_height_min_m: float = field(default=0.60, init=False, repr=False)
     _world_height_max_m: float = field(default=2.40, init=False, repr=False)
     _world_anchor_hold_ttl_s: float = field(default=0.40, init=False, repr=False)
+    _world_stationary_hold_ttl_s: float = field(default=2.0, init=False, repr=False)
     _reid_embeds_per_frame_max: int = field(default=2, init=False, repr=False)
     _pose_anchor_native_per_frame_max: int = field(default=1, init=False, repr=False)
     _pose_anchor_native_remaining: int = field(default=1, init=False, repr=False)
@@ -7919,8 +9084,49 @@ class _AnalyticsTelemetryProcessor:
     _last_bev_publish_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
     _last_tracking_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _last_bev_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _last_tracking_enqueue_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    _last_tracking_enqueue_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _last_observed_tracker_keys_by_sensor: Dict[int, frozenset[int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _tracking_publication_worker: _TrackingPublicationWorker | None = field(
+        default=None, init=False, repr=False
+    )
+    _shadow_identity_worker: _ShadowIdentityWorker | None = field(
+        default=None, init=False, repr=False
+    )
+    _shadow_identity_admission_sequence: int = field(
+        default=0, init=False, repr=False
+    )
+    _shadow_identity_publish_interval_s: float = field(
+        default=0.5, init=False, repr=False
+    )
+    _last_shadow_identity_enqueue_ts_by_sensor: Dict[int, float] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _tracking_lifecycle: TrackingLifecycleRegistry = field(
         default_factory=TrackingLifecycleRegistry, init=False, repr=False
+    )
+    _source_frame_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    _last_source_frame_by_sensor: Dict[int, Tuple[int, int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _source_frame_inflight: Dict[int, Tuple[int, int, int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _source_epoch_by_sensor: Dict[int, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    # World/filter time is source-local media time rebased onto the observed
+    # wall-clock epoch.  It is deliberately separate from the publication
+    # ordering clock, whose exact observed_at_us contract remains unchanged.
+    _world_clock_by_sensor: Dict[int, _WorldClockState] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _last_media_pts_ns_by_sensor: Dict[int, int] = field(
+        default_factory=dict, init=False, repr=False
     )
 
     def __post_init__(self) -> None:
@@ -8105,6 +9311,24 @@ class _AnalyticsTelemetryProcessor:
             )
         except Exception:
             self._world_anchor_hold_ttl_s = 0.40
+        try:
+            self._world_stationary_hold_ttl_s = max(
+                self._world_anchor_hold_ttl_s,
+                float(
+                    str(
+                        os.environ.get(
+                            "NOESIS_WORLD_STATIONARY_HOLD_TTL_S",
+                            "2.0",
+                        )
+                    ).strip()
+                    or "2.0"
+                ),
+            )
+        except Exception:
+            self._world_stationary_hold_ttl_s = max(
+                self._world_anchor_hold_ttl_s,
+                2.0,
+            )
         self._human_ground_cfg = HumanGroundConfig(
             static_px_threshold=float(self._world_static_px_threshold),
             max_speed_mps=float(self._world_max_speed_scene_per_s),
@@ -8112,6 +9336,7 @@ class _AnalyticsTelemetryProcessor:
             alpha_good=float(self._world_smooth_alpha_good),
             alpha_weak=float(self._world_smooth_alpha_weak),
             kpt_conf_threshold=float(self._pose_anchor_kpt_threshold),
+            rejected_prediction_horizon_s=float(self._world_anchor_hold_ttl_s),
         )
         self._reid_embeds_per_frame_max = _read_env_int("NOESIS_REID_EMBEDS_PER_FRAME_MAX", 2, min_value=0)
         self._pose_anchor_native_per_frame_max = _read_env_int(
@@ -8139,6 +9364,12 @@ class _AnalyticsTelemetryProcessor:
             0.0 if empty_tracking_hz <= 0.0 else 1.0 / float(empty_tracking_hz)
         )
         self._bev_publish_interval_s = 0.0 if bev_max_hz <= 0.0 else 1.0 / float(bev_max_hz)
+        shadow_max_hz = _read_env_float(
+            "NOESIS_IDENTITY_V2_SHADOW_MAX_HZ",
+            2.0,
+            min_value=0.1,
+        )
+        self._shadow_identity_publish_interval_s = 1.0 / float(shadow_max_hz)
 
     def _tracking_interval_for_frame(self, track_count: int) -> float:
         return pair_safe_publication_interval_s(
@@ -8187,21 +9418,709 @@ class _AnalyticsTelemetryProcessor:
         _increment_core_counter(f"detection_wake.{counter_prefix}_publish_skipped")
         return False
 
-    def get_active_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
-        tracks = self._active_tracks.get(int(sensor_id)) or []
+    def _observed_tracker_keys_changed(
+        self,
+        sensor_id: int,
+        tracks: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        current: set[int] = set()
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                continue
+            try:
+                tracker_id = int(track.get("tracker_id", track.get("track_id")))
+            except (TypeError, ValueError):
+                continue
+            if tracker_id >= 0:
+                current.add(tracker_id)
+        current_keys = frozenset(current)
+        previous = self._last_observed_tracker_keys_by_sensor.get(int(sensor_id))
+        self._last_observed_tracker_keys_by_sensor[int(sensor_id)] = current_keys
+        return previous is None or previous != current_keys
+
+    def _ensure_tracking_publication_worker(self) -> _TrackingPublicationWorker:
+        worker = self._tracking_publication_worker
+        if worker is None:
+            worker = _TrackingPublicationWorker(
+                self,
+                failure_callback=getattr(self.tracking_pub, "_report_failure", None),
+            )
+            self._tracking_publication_worker = worker
+        return worker
+
+    def _canonical_publication_backlogged(self) -> bool:
+        """Return whether optional work must yield to canonical publication."""
+
+        worker = self._tracking_publication_worker
+        return worker is not None and worker.busy
+
+    def _ensure_shadow_identity_worker(self) -> _ShadowIdentityWorker:
+        worker = self._shadow_identity_worker
+        if worker is None:
+            worker = _ShadowIdentityWorker(
+                self,
+                failure_callback=getattr(
+                    self.pipeline,
+                    "identity_v2_shadow_failure_callback",
+                    None,
+                ),
+            )
+            self._shadow_identity_worker = worker
+        return worker
+
+    def _prepare_tracking_cohort(
+        self,
+        *,
+        sensor_id: int,
+        camera_id: str,
+        frame_id: int,
+        observed_at_us: int,
+        tracks: Sequence[MutableMapping[str, Any]],
+        footpoints: Sequence[Footpoint],
+    ) -> TrackingContinuityUpdate:
+        """Stamp one lifecycle on the rows shared by OSD, BEV, and worker.
+
+        This runs after all public rows have been assembled but before
+        ``_active_tracks`` and the scalar worker packet are created.  The
+        worker therefore consumes the exact same generation-bearing mappings
+        that the tiler/OSD exact-frame join observes.
+        """
+
+        source = int(sensor_id)
+        frame = int(frame_id)
+        observed = int(observed_at_us)
+        with self._source_frame_lock:
+            previous = self._last_source_frame_by_sensor.get(source)
+            epoch = int(self._source_epoch_by_sensor.get(source, 0))
+            prepared = self._source_frame_inflight.pop(source, None)
+            if prepared is not None and prepared[:2] == (frame, observed):
+                epoch = int(prepared[2])
+            elif previous is not None:
+                previous_frame, previous_observed = previous
+                if frame <= int(previous_frame):
+                    # DeepStream reconnects/file loops may restart the source
+                    # frame counter.  Only a strictly newer processing clock
+                    # can prove this is a new epoch; otherwise reject the
+                    # reorder instead of silently publishing stale geometry.
+                    if observed > int(previous_observed):
+                        epoch = self._tracking_lifecycle.reset_source(source)
+                        self._source_epoch_by_sensor[source] = int(epoch)
+                        with self._active_tracks_lock:
+                            self._track_snapshot_ring.pop(source, None)
+                        _increment_core_counter(
+                            "tracking.source_epoch_reconnect_total"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "source frame is not advancing and timestamp did not "
+                            f"prove reconnect: source={source} frame={frame} "
+                            f"previous={previous_frame}"
+                        )
+                elif observed <= int(previous_observed):
+                    raise RuntimeError(
+                        "source observed_at_us reordered: "
+                        f"source={source} observed={observed} "
+                        f"previous={previous_observed}"
+                    )
+
+            continuity = self._tracking_lifecycle.update_frame(
+                source_id=source,
+                camera_id=str(camera_id),
+                frame_id=frame,
+                observed_at_us=observed,
+                tracks=tracks,
+            )
+            self._source_epoch_by_sensor[source] = int(continuity.source_epoch)
+            self._last_source_frame_by_sensor[source] = (frame, observed)
+
+        self._stamp_footpoint_lifecycles(footpoints, tracks)
+        for track in tracks:
+            if isinstance(track, MutableMapping):
+                track["source_epoch"] = int(continuity.source_epoch)
+        return continuity
+
+    @staticmethod
+    def _valid_world_media_pts_ns(value: Any) -> Optional[int]:
+        """Normalize one DeepStream PTS; zero/CLOCK_TIME_NONE is unavailable."""
+
+        try:
+            parsed = int(value or 0)
+        except Exception:
+            return None
+        if parsed <= 0 or parsed >= (1 << 64) - 1:
+            return None
+        return parsed
+
+    def _world_timestamp_for_frame(
+        self,
+        sensor_id: int,
+        *,
+        media_pts_ns: Any,
+        observed_ts: float,
+    ) -> float:
+        """Return the filter clock for one source frame.
+
+        Media PTS supplies the frame-to-frame delta whenever it is usable.
+        The offset keeps the value in the observed wall-clock epoch so the
+        existing bounded state/ghost TTLs remain meaningful across cameras.
+        Missing or duplicated PTS falls back to a monotonic observed value;
+        it never rewinds an already accepted filter timestamp.
+        """
+
+        source = int(sensor_id)
+        try:
+            observed = float(observed_ts)
+        except Exception:
+            observed = float(time.time())
+        if not math.isfinite(observed) or observed <= 0.0:
+            observed = float(time.time())
+        observed = max(1e-9, observed)
+        media = self._valid_world_media_pts_ns(media_pts_ns)
+        with self._source_frame_lock:
+            epoch = int(self._source_epoch_by_sensor.get(source, 0))
+            clock = self._world_clock_by_sensor.get(source)
+            if clock is None or int(clock.source_epoch) != epoch:
+                clock = _WorldClockState(source_epoch=epoch)
+                self._world_clock_by_sensor[source] = clock
+
+            previous_logical = clock.logical_ts
+            if media is not None:
+                if clock.base_media_pts_ns is None:
+                    clock.base_media_pts_ns = int(media)
+                    clock.base_observed_ts = float(observed)
+                    clock.logical_ts = float(observed)
+                    clock.last_media_pts_ns = int(media)
+                    clock.basis = "media_pts"
+                elif (
+                    clock.last_media_pts_ns is not None
+                    and int(media) > int(clock.last_media_pts_ns)
+                ):
+                    base_pts = int(clock.base_media_pts_ns)
+                    base_observed = float(clock.base_observed_ts or observed)
+                    candidate = base_observed + (int(media) - base_pts) / 1e9
+                    # A temporary fallback (for example, one unavailable PTS)
+                    # must not make the filter time go backwards on recovery.
+                    if previous_logical is not None and candidate < float(previous_logical):
+                        clock.logical_ts = float(previous_logical)
+                        clock.basis = "observed_clock_fallback"
+                    else:
+                        clock.logical_ts = float(candidate)
+                        clock.basis = "media_pts"
+                    clock.last_media_pts_ns = int(media)
+                elif (
+                    clock.last_media_pts_ns is not None
+                    and int(media) == int(clock.last_media_pts_ns)
+                ):
+                    clock.logical_ts = max(float(previous_logical or 0.0), float(observed))
+                    clock.basis = "observed_clock_fallback"
+                else:
+                    # A decreasing PTS is handled as a source reconnect by
+                    # _begin_source_frame_timeline.  Keep this helper safe for
+                    # direct callers and never feed a negative dt to the
+                    # physical filter if metadata arrives out of order.
+                    clock.logical_ts = max(float(previous_logical or 0.0), float(observed))
+                    clock.basis = "observed_clock_fallback"
+            else:
+                clock.logical_ts = max(float(previous_logical or 0.0), float(observed))
+                clock.basis = "observed_clock"
+            clock.last_observed_ts = float(observed)
+            return float(clock.logical_ts or observed)
+
+    def _clear_world_source_state(self, source: int) -> None:
+        """Discard world state and timebase at a physical source boundary."""
+
+        source_id = int(source)
+        self._world_clock_by_sensor.pop(source_id, None)
+        for key in tuple(self._world_state_by_track):
+            if int(key[0]) == source_id:
+                self._world_state_by_track.pop(key, None)
+        for key in tuple(self._world_state_ghost_by_track):
+            if int(key[0]) == source_id:
+                self._world_state_ghost_by_track.pop(key, None)
+
+    def _begin_source_frame_timeline(
+        self,
+        *,
+        sensor_id: int,
+        frame_id: int,
+        observed_at_us: int,
+        media_pts_ns: int = 0,
+    ) -> int:
+        """Validate/reset a source timeline before world estimation runs."""
+
+        source = int(sensor_id)
+        frame = int(frame_id)
+        observed = int(observed_at_us)
+        media = self._valid_world_media_pts_ns(media_pts_ns)
+        with self._source_frame_lock:
+            previous = self._last_source_frame_by_sensor.get(source)
+            epoch = int(self._source_epoch_by_sensor.get(source, 0))
+            epoch_reset = False
+            if previous is not None:
+                previous_frame, previous_observed = previous
+                if frame <= int(previous_frame):
+                    if observed > int(previous_observed):
+                        epoch = self._tracking_lifecycle.reset_source(source)
+                        epoch_reset = True
+                        self._source_epoch_by_sensor[source] = int(epoch)
+                        with self._active_tracks_lock:
+                            self._track_snapshot_ring.pop(source, None)
+                        # A reconnect is a hard physical timeline boundary;
+                        # discard old filter/ghost state before this frame is
+                        # allowed to request a generation.
+                        self._clear_world_source_state(source)
+                        _increment_core_counter(
+                            "tracking.source_epoch_reconnect_total"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "source frame is not advancing and timestamp did not "
+                            f"prove reconnect: source={source} frame={frame} "
+                            f"previous={previous_frame}"
+                        )
+                elif observed <= int(previous_observed):
+                    raise RuntimeError(
+                        "source observed_at_us reordered: "
+                        f"source={source} observed={observed} "
+                        f"previous={previous_observed}"
+                    )
+            previous_media = self._last_media_pts_ns_by_sensor.get(source)
+            if (
+                media is not None
+                and previous_media is not None
+                and int(media) < int(previous_media)
+            ):
+                # A source can restart while its frame counter continues. A
+                # decreasing stream PTS is the only additional reconnect
+                # signal needed here; equal PTS is tolerated as a duplicate
+                # and uses the observed-clock fallback for that frame.
+                if not epoch_reset:
+                    epoch = self._tracking_lifecycle.reset_source(source)
+                    epoch_reset = True
+                    self._source_epoch_by_sensor[source] = int(epoch)
+                    with self._active_tracks_lock:
+                        self._track_snapshot_ring.pop(source, None)
+                    self._clear_world_source_state(source)
+                    _increment_core_counter(
+                        "tracking.source_epoch_reconnect_total"
+                    )
+            self._source_epoch_by_sensor[source] = int(epoch)
+            self._last_source_frame_by_sensor[source] = (frame, observed)
+            if media is not None:
+                self._last_media_pts_ns_by_sensor[source] = int(media)
+            self._source_frame_inflight[source] = (frame, observed, int(epoch))
+            return int(epoch)
+
+    def _set_active_tracks_snapshot(
+        self,
+        sensor_id: int,
+        frame_id: int,
+        tracks: List[Dict[str, Any]],
+    ) -> None:
+        """Publish active rows and retain a bounded exact-frame scalar ring."""
+
         indexed: Dict[int, Dict[str, Any]] = {}
         for track in tracks:
             if not isinstance(track, Mapping):
                 continue
-            tracker_id = track.get("tracker_id", track.get("track_id"))
             try:
-                tracker_id_int = int(tracker_id)
-            except Exception:
+                tracker_id = int(track.get("tracker_id", track.get("track_id")))
+            except (TypeError, ValueError):
                 continue
-            if tracker_id_int < 0:
-                continue
-            indexed[int(tracker_id_int)] = dict(track)
-        return indexed
+            if tracker_id >= 0:
+                indexed[tracker_id] = track if isinstance(track, dict) else dict(track)
+        source = int(sensor_id)
+        with self._active_tracks_lock:
+            self._active_tracks[source] = tracks
+            ring = self._track_snapshot_ring.setdefault(source, OrderedDict())
+            ring[int(frame_id)] = indexed
+            ring.move_to_end(int(frame_id))
+            while len(ring) > int(self._track_snapshot_ring_size):
+                ring.popitem(last=False)
+
+    def _publish_tracking_work(self, work: _TrackingPublicationWork) -> None:
+        """Publish one exact tracking/BEV cohort outside the media callback."""
+
+        publish_start_ns = time.perf_counter_ns()
+        continuity = work.continuity
+        # Compatibility for direct/unit callers that construct a work packet
+        # without the media-side continuity receipt.  Native DS9 always carries
+        # the receipt created before _active_tracks is published.
+        if continuity is None:
+            continuity = self._tracking_lifecycle.update_frame(
+                source_id=int(work.source_id),
+                camera_id=str(work.camera_id),
+                frame_id=int(work.frame_id),
+                observed_at_us=int(work.observed_at_us),
+                tracks=work.tracks,
+            )
+        if (
+            continuity.source_id != int(work.source_id)
+            or continuity.frame_id != int(work.frame_id)
+            or continuity.observed_at_us != int(work.observed_at_us)
+        ):
+            raise RuntimeError("tracking continuity receipt does not match work cohort")
+        self._stamp_footpoint_lifecycles(work.footpoints, work.tracks)
+        lease = self.publication_gate.acquire()
+        if lease is None:
+            raise RuntimeError(
+                "runtime publication gate rejected an admitted tracking cohort"
+            )
+        with lease:
+            # Media-side continuity rows can be several frames ahead of this
+            # bounded worker. Bind tombstones against the last successfully
+            # published lifecycle immediately before the tracking publish;
+            # never publish the media-time preview carried by the cohort.
+            continuity = self._tracking_lifecycle.prepare_publication(continuity)
+            tracking_receipt = _require_tracking_publication_receipt(
+                self.tracking_pub.publish(
+                    int(work.source_id),
+                    work.tracks,
+                    frame_metadata={
+                        "frame_id": int(work.frame_id),
+                        "source_epoch": int(work.source_epoch),
+                        "tracker_lifecycle_tombstones": list(continuity.tombstones),
+                        "observed_at_us": int(work.observed_at_us),
+                        **dict(work.temporal_contract),
+                    },
+                ),
+                source_id=int(work.source_id),
+                frame_id=int(work.frame_id),
+                observed_at_us=int(work.observed_at_us),
+            )
+            # Tracking/world authority is committed immediately after its
+            # typed admission receipt, matching the existing publisher
+            # contract.  BEV is paired to that exact receipt.  A failed BEV
+            # render is terminal for this canonical worker rather than being
+            # hidden while later tracking rows continue without their paired
+            # spatial publication.
+            current_epoch = self._tracking_lifecycle.source_epoch(int(work.source_id))
+            if int(continuity.source_epoch) > int(current_epoch):
+                raise RuntimeError(
+                    "tracking continuity receipt belongs to a future source epoch"
+                )
+            if int(continuity.source_epoch) == int(current_epoch):
+                self._tracking_lifecycle.mark_published(continuity)
+            else:
+                # A source rewind can be observed by the media callback while
+                # an older exact cohort is still draining FIFO.  Its tracking
+                # and BEV rows remain ordered and are published before the new
+                # epoch, but its lifecycle commit was intentionally superseded
+                # by reset_source and must not mutate the new epoch's state.
+                _increment_core_counter("tracking.superseded_epoch_commit_total")
+            self._last_tracking_publish_ts_by_sensor[int(work.source_id)] = float(
+                work.now_ts
+            )
+            self._last_tracking_count_by_sensor[int(work.source_id)] = len(work.tracks)
+            _record_core_stage_timing(
+                "tracking.publish",
+                publish_start_ns,
+                item_count=len(work.tracks),
+            )
+
+            # A processor used for tracking-only/unit paths has no paired BEV
+            # authority.  Do not manufacture a BEV failure in that mode; the
+            # terminal paired-failure rule applies only when a renderer is
+            # actually configured.
+            if self.bev_renderer is None:
+                return
+
+            bev_receipt = self._publish_bev(
+                int(work.source_id),
+                str(work.camera_id),
+                _ScalarPublicationFrameMeta(
+                    frame_number=int(work.frame_id),
+                    frame_num=int(work.frame_id),
+                    buf_pts=int(work.timestamp_us) * 1000,
+                    source_id=int(work.source_id),
+                ),
+                work.footpoints,
+                now_ts=float(work.now_ts),
+                track_count=len(work.tracks),
+                paired_with_tracking=True,
+                tracking_receipt=tracking_receipt,
+                observed_at_us=int(work.observed_at_us),
+                timestamp_us=int(work.timestamp_us),
+                tracker_lifecycle_tombstones=continuity.tombstones,
+            )
+            if bev_receipt.status == "failed":
+                raise bev_receipt.failure or RuntimeError(
+                    "BEV publication failed without a cause"
+                )
+            if bev_receipt.status == "startup_pending":
+                logger.debug(
+                    "BEV authority startup pending for sensor %s frame %s",
+                    work.source_id,
+                    work.frame_id,
+                )
+
+    def _enqueue_tracking_publication(
+        self,
+        *,
+        sensor_id: int,
+        camera_id: str,
+        frame_meta: Any,
+        tracks: Sequence[Mapping[str, Any]],
+        footpoints: Sequence[Footpoint],
+        now_ts: float,
+        temporal_contract: Mapping[str, Any],
+        continuity: TrackingContinuityUpdate,
+        force: bool,
+        identity_v2_primitives: Optional[Sequence[IdentityFramePrimitive]] = None,
+    ) -> bool:
+        frame_id = int(
+            _meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0
+        )
+        timestamp_us = int(self._frame_timestamp_us(frame_meta))
+        observed_at_us = int(
+            temporal_contract.get("observed_at_us")
+            or max(1, int(float(now_ts) * 1_000_000))
+        )
+        count = len(tracks)
+        interval = self._tracking_interval_for_frame(count)
+        if not self._publish_gate_due(
+            self._last_tracking_enqueue_ts_by_sensor,
+            self._last_tracking_enqueue_count_by_sensor,
+            sensor_id=int(sensor_id),
+            now_ts=float(now_ts),
+            count=count,
+            interval_s=interval,
+            counter_prefix="tracking",
+            update=False,
+            force=bool(force),
+        ):
+            return False
+
+        # Keep the conversion explicit and typed for the canonical worker
+        # packet. The gate runs first so rate-suppressed frames do not pay a
+        # recursive public-contract copy. No borrowed DeepStream metadata is
+        # retained beyond this callback.
+        scalar_copy_start_ns = time.perf_counter_ns()
+        copied_tracks: List[Dict[str, Any]] = []
+        copied_track_by_original_id: Dict[int, Dict[str, Any]] = {}
+        for track in tracks:
+            copied = _copy_public_scalar(track)
+            if isinstance(copied, Mapping):
+                copied_track = dict(copied)
+                copied_tracks.append(copied_track)
+                copied_track_by_original_id[id(track)] = copied_track
+        _record_core_stage_timing(
+            "analytics.public_scalar_copy",
+            scalar_copy_start_ns,
+            item_count=len(copied_tracks),
+        )
+
+        work = _TrackingPublicationWork(
+            source_id=int(sensor_id),
+            camera_id=str(camera_id),
+            frame_id=frame_id,
+            observed_at_us=observed_at_us,
+            now_ts=float(now_ts),
+            timestamp_us=timestamp_us,
+            tracks=copied_tracks,
+            footpoints=list(footpoints),
+            temporal_contract=dict(_copy_public_scalar(dict(temporal_contract)) or {}),
+            continuity=continuity,
+            source_epoch=int(continuity.source_epoch),
+        )
+        canonical_backlogged_before_enqueue = (
+            self._canonical_publication_backlogged()
+        )
+        # Tests and synthetic processors without a native pipeline retain the
+        # old deterministic synchronous behavior.  Native DS9 always has a
+        # pipeline object and uses the non-blocking worker.
+        if getattr(self.pipeline, "ds_pipeline", None) is None:
+            self._publish_tracking_work(work)
+        else:
+            worker = self._ensure_tracking_publication_worker()
+            if not worker.enqueue(work):
+                error = worker.terminal_failure or RuntimeError(
+                    "tracking publication worker is unavailable"
+                )
+                logger.error("Tracking publication enqueue failed: %s", error)
+                return False
+        self._last_tracking_enqueue_ts_by_sensor[int(sensor_id)] = float(now_ts)
+        self._last_tracking_enqueue_count_by_sensor[int(sensor_id)] = count
+
+        # Shadow identity is optional comparison/evidence work. Give it an
+        # independent deep scalar snapshot only after the canonical cohort is
+        # admitted. Its latest-per-source worker may coalesce stale work and
+        # may degrade independently; neither copy nor scoring failure can
+        # reject, delay, or mutate the exact tracking/world/BEV rows above.
+        if identity_v2_primitives is not None:
+            existing_shadow_worker = self._shadow_identity_worker
+            if (
+                existing_shadow_worker is not None
+                and existing_shadow_worker.terminal_failure is not None
+            ):
+                # A failed optional lane stays disabled. Avoid repeatedly
+                # copying embeddings on every later canonical frame merely to
+                # discover the same terminal state at enqueue time.
+                _increment_core_counter(
+                    "identity_v2.shadow.dropped_unavailable_total"
+                )
+                return True
+            # Shadow scoring is optional and can hold the GIL while it updates
+            # its private gallery. Never add that work while canonical cohorts
+            # are queued, and cap admitted comparison frames independently for
+            # every source. The canonical cohort above remains admitted either
+            # way; these counters describe diagnostic freshness only.
+            if canonical_backlogged_before_enqueue:
+                _increment_core_counter(
+                    "identity_v2.shadow.dropped_canonical_backlog_total"
+                )
+                return True
+            shadow_interval_s = float(
+                getattr(self, "_shadow_identity_publish_interval_s", 0.5)
+            )
+            last_shadow_ts = self._last_shadow_identity_enqueue_ts_by_sensor.get(
+                int(sensor_id)
+            )
+            if (
+                shadow_interval_s > 0.0
+                and last_shadow_ts is not None
+                and float(now_ts) - float(last_shadow_ts) < shadow_interval_s
+            ):
+                _increment_core_counter("identity_v2.shadow.rate_limited_total")
+                return True
+            primitive_copy_start_ns = time.perf_counter_ns()
+            try:
+                service = getattr(self.pipeline, "identity_v2_service", None)
+                if service is None or bool(
+                    getattr(service, "authoritative", False)
+                ):
+                    raise RuntimeError(
+                        "shadow identity-v2 primitives have no matching shadow service"
+                    )
+                shadow_track_by_original_id: Dict[int, Dict[str, Any]] = {}
+                for track_key, copied_track in copied_track_by_original_id.items():
+                    # The service needs only the scalar binding identity; the
+                    # primitive already carries bbox/world/quality inputs. Do
+                    # not duplicate the complete canonical row (pose, depth,
+                    # analytics, etc.) merely to provide a private mutation
+                    # target for shadow diagnostics.
+                    shadow_binding: Dict[str, Any] = {}
+                    for field_name in (
+                        "camera_id",
+                        "tracker_id",
+                        "track_id",
+                        "frame_id",
+                        "source_epoch",
+                    ):
+                        if field_name in copied_track:
+                            shadow_binding[field_name] = copied_track[field_name]
+                    shadow_track_by_original_id[int(track_key)] = shadow_binding
+                shadow_primitives = _copy_shadow_identity_primitives(
+                    primitives=identity_v2_primitives,
+                    copied_track_by_original_id=shadow_track_by_original_id,
+                    embedding_dim=int(
+                        getattr(service, "embedding_dim", self._reid_embedding_dim)
+                    ),
+                    source_epoch=int(continuity.source_epoch),
+                )
+                sequence = int(self._shadow_identity_admission_sequence)
+                self._shadow_identity_admission_sequence = sequence + 1
+                shadow_admitted = self._ensure_shadow_identity_worker().enqueue(
+                    _ShadowIdentityWork(
+                        source_id=int(sensor_id),
+                        camera_id=str(camera_id),
+                        frame_id=int(frame_id),
+                        observed_at=float(now_ts),
+                        primitives=shadow_primitives,
+                        admission_sequence=sequence,
+                    )
+                )
+                if shadow_admitted:
+                    self._last_shadow_identity_enqueue_ts_by_sensor[
+                        int(sensor_id)
+                    ] = float(now_ts)
+            except Exception as exc:
+                _increment_core_counter("identity_v2.shadow.copy_failures_total")
+                callback = getattr(
+                    self.pipeline,
+                    "identity_v2_shadow_failure_callback",
+                    None,
+                )
+                if callable(callback):
+                    try:
+                        callback(exc)
+                    except Exception:
+                        logger.exception(
+                            "Shadow identity copy degradation callback failed"
+                        )
+                logger.exception(
+                    "Optional shadow identity work was rejected; canonical cohort "
+                    "source=%s frame=%s remains admitted",
+                    sensor_id,
+                    frame_id,
+                )
+            finally:
+                _record_core_stage_timing(
+                    "identity_v2.shadow_primitive_copy",
+                    primitive_copy_start_ns,
+                    item_count=len(identity_v2_primitives),
+                )
+        return True
+
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+        failures: List[BaseException] = []
+        shadow_worker = self._shadow_identity_worker
+        if shadow_worker is not None:
+            try:
+                shadow_worker.shutdown(wait=wait, timeout_s=timeout_s)
+            except BaseException as exc:
+                failures.append(exc)
+        worker = self._tracking_publication_worker
+        if worker is not None:
+            try:
+                worker.shutdown(wait=wait, timeout_s=timeout_s)
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError(
+                "analytics telemetry workers did not quiesce: "
+                + "; ".join(str(error) for error in failures)
+            ) from failures[0]
+
+    def get_active_track_map(
+        self,
+        sensor_id: int,
+        frame_id: Optional[int] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Return active rows or an exact frame from the bounded scalar ring.
+
+        Supplying ``frame_id`` is an exact join: an absent frame returns an
+        empty map and never falls back to the latest source state.  That
+        distinction prevents a tiler callback for frame N from drawing the
+        canonical anchor for frame N+1.
+        """
+
+        source = int(sensor_id)
+        with self._active_tracks_lock:
+            if frame_id is None:
+                tracks = list(self._active_tracks.get(source) or [])
+                indexed: Dict[int, Dict[str, Any]] = {}
+                for track in tracks:
+                    if not isinstance(track, Mapping):
+                        continue
+                    tracker_id = track.get("tracker_id", track.get("track_id"))
+                    try:
+                        tracker_id_int = int(tracker_id)
+                    except Exception:
+                        continue
+                    if tracker_id_int < 0:
+                        continue
+                    indexed[int(tracker_id_int)] = dict(track)
+                return indexed
+            ring = self._track_snapshot_ring.get(source)
+            snapshot = ring.get(int(frame_id)) if ring is not None else None
+            if snapshot is None:
+                return {}
+            return {
+                int(tracker_id): dict(track)
+                for tracker_id, track in snapshot.items()
+                if isinstance(track, Mapping)
+            }
 
     def _maybe_log_stable_id_metrics(self, sensor_id: int, now_ts: float) -> None:
         if not self._sid_metrics_log_enabled or not self._stable_id_enabled:
@@ -8260,18 +10179,19 @@ class _AnalyticsTelemetryProcessor:
     ) -> Any:
         """Return the calibration view owned by the active world producer.
 
-        Baseline tracking estimates world positions in the revision-bound
-        active world view. V3DT/MV3DT already own their metric world output and
-        therefore continue to use the raw calibration snapshot.
+        Every world admission check uses the same revision-bound target-frame
+        view, including seeded V3DT/bbox3d observations.  Using the raw
+        camera-calibration frame for only the seeded path makes a non-identity
+        scene-prior transform appear as a range or frame mismatch later in the
+        pipeline.
         """
 
         provider = self.bev_calibration
         if provider is None:
             return None
-        if not self._tracking_mode_is_v3dt():
-            world_snapshot = getattr(provider, "world_snapshot", None)
-            if callable(world_snapshot):
-                return world_snapshot(sensor_id, camera_id)
+        world_snapshot = getattr(provider, "world_snapshot", None)
+        if callable(world_snapshot):
+            return world_snapshot(sensor_id, camera_id)
         return provider.snapshot(sensor_id, camera_id)
 
     def _resolve_tracking_mode(self, override: Optional[str] = None) -> str:
@@ -8598,6 +10518,9 @@ class _AnalyticsTelemetryProcessor:
                 identity_v2_service is not None
                 and getattr(identity_v2_service, "authoritative", False)
             )
+            identity_v2_shadow = bool(
+                identity_v2_service is not None and not identity_v2_authoritative
+            )
             self._pose_anchor_native_remaining = int(self._pose_anchor_native_per_frame_max)
             reid_budget_remaining = int(self._reid_embeds_per_frame_max)
             _increment_core_counter("detection_wake.frames")
@@ -8606,6 +10529,17 @@ class _AnalyticsTelemetryProcessor:
             tracks: List[Dict[str, Any]] = []
             diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_number", -1))
+            source_epoch = self._begin_source_frame_timeline(
+                sensor_id=int(sensor_id),
+                frame_id=int(frame_id),
+                observed_at_us=int(temporal_contract["observed_at_us"]),
+                media_pts_ns=int(temporal_contract.get("media_pts_ns", 0) or 0),
+            )
+            world_now_ts = self._world_timestamp_for_frame(
+                int(sensor_id),
+                media_pts_ns=temporal_contract.get("media_pts_ns", 0),
+                observed_ts=float(now_ts),
+            )
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
@@ -8620,7 +10554,12 @@ class _AnalyticsTelemetryProcessor:
             object_items = getattr(frame_meta, "object_items", None) or []
             for obj_meta in object_items:
                 _increment_core_counter("detection_wake.objects_seen")
+                track_build_start_ns = time.perf_counter_ns()
                 raw = self._build_track_dict_ds8(obj_meta, camera_id)
+                _record_core_stage_timing(
+                    "analytics.track_build",
+                    track_build_start_ns,
+                )
                 if raw is None:
                     continue
                 if self._tracking_mode_is_v3dt():
@@ -8729,16 +10668,7 @@ class _AnalyticsTelemetryProcessor:
                     )
                     _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
-                    if not identity_v2_authoritative:
-                        callback = getattr(
-                            self.pipeline, "identity_v2_failure_callback", None
-                        )
-                        if callable(callback) and identity_v2_service is not None:
-                            callback(
-                                RuntimeError(
-                                    "legacy identity unavailable while identity-v2 is shadowing"
-                                )
-                            )
+                    if not identity_v2_authoritative and not identity_v2_shadow:
                         self._stamp_osd_label_ds8(
                             obj_meta, sensor_id=sensor_id, stable_id=None
                         )
@@ -8815,6 +10745,15 @@ class _AnalyticsTelemetryProcessor:
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int if stable_id_int > 0 else None,
                     "tracker_id": tracker_id_int,
+                    # Peek before world augmentation so a reused numeric
+                    # tracker cannot inherit the prior lifecycle's filter.
+                    "tracker_lifecycle_generation": self._tracking_lifecycle.peek_generation(
+                        int(sensor_id),
+                        int(tracker_id_int),
+                        frame_id=int(frame_id),
+                        observed_at_us=int(temporal_contract["observed_at_us"]),
+                        bbox=raw.get("bbox"),
+                    ),
                     "camera_id": camera_id,
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
@@ -8851,6 +10790,8 @@ class _AnalyticsTelemetryProcessor:
                     "world_quality",
                     "world_quality_reason",
                     "world_frame",
+                    "world_frame_revision",
+                    "world_transform_sha256",
                     "world_source",
                 ):
                     if key in raw:
@@ -8859,6 +10800,7 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
+                world_augment_start_ns = time.perf_counter_ns()
                 self._augment_track_with_world(
                     sensor_id,
                     camera_id,
@@ -8866,15 +10808,26 @@ class _AnalyticsTelemetryProcessor:
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
+                    world_now_ts=float(world_now_ts),
                 )
+                _record_core_stage_timing(
+                    "analytics.world_augment",
+                    world_augment_start_ns,
+                )
+                public_fields_start_ns = time.perf_counter_ns()
                 self._apply_scene_prior_shadow(camera_id, public_track)
                 self._apply_public_depth_fields(public_track, depth_result)
+                _record_core_stage_timing(
+                    "analytics.public_fields",
+                    public_fields_start_ns,
+                )
                 try:
                     setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
                 except Exception:
                     pass
                 # Stamp OSD after world/depth augmentation so ``depth=`` reflects
                 # registered optical range without implying canonical world Z.
+                osd_start_ns = time.perf_counter_ns()
                 self._stamp_osd_label_ds8(
                     obj_meta,
                     sensor_id=sensor_id,
@@ -8884,6 +10837,10 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if not identity_v2_authoritative:
                     self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
+                _record_core_stage_timing(
+                    "analytics.osd_object",
+                    osd_start_ns,
+                )
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
@@ -8919,7 +10876,14 @@ class _AnalyticsTelemetryProcessor:
                 identity_v2_primitives.append(
                     IdentityFramePrimitive(
                         camera_id=camera_id,
-                        tracker_id=str(tracker_id_int),
+                        # Tracker IDs may be reused after a source reconnect.
+                        # Scope the coordinator's tracklet key to the physical
+                        # source timeline while preserving the raw diagnostic
+                        # tracker_id in the public row.
+                        tracker_id=_identity_v2_tracker_id_for_epoch(
+                            tracker_id_int,
+                            source_epoch,
+                        ),
                         frame_id=frame_id,
                         public_track=public_track,
                         embedding=emb,
@@ -8934,6 +10898,7 @@ class _AnalyticsTelemetryProcessor:
                 )
                 diagnostics_tracks.append(diag_track)
 
+                footpoint_start_ns = time.perf_counter_ns()
                 fp = self._footpoint_from_track(
                     public_track,
                     frame_dims,
@@ -8942,15 +10907,29 @@ class _AnalyticsTelemetryProcessor:
                         camera_id,
                     ),
                 )
+                _record_core_stage_timing(
+                    "analytics.footpoint",
+                    footpoint_start_ns,
+                )
                 if fp is not None:
                     footpoints.append(fp)
 
-            self._process_identity_v2_source_frame(
-                camera_id=camera_id,
-                frame_id=frame_id,
-                primitives=identity_v2_primitives,
-                observed_at=now_ts,
-            )
+            post_frame_start_ns = time.perf_counter_ns()
+            if identity_v2_authoritative:
+                identity_v2_start_ns = time.perf_counter_ns()
+                try:
+                    self._process_identity_v2_source_frame(
+                        camera_id=camera_id,
+                        frame_id=frame_id,
+                        primitives=identity_v2_primitives,
+                        observed_at=now_ts,
+                    )
+                finally:
+                    _record_core_stage_timing(
+                        "identity_v2.process_source_frame",
+                        identity_v2_start_ns,
+                        item_count=len(identity_v2_primitives),
+                    )
             if identity_v2_authoritative:
                 present_stable_ids = set()
                 footpoints = []
@@ -9009,7 +10988,44 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             if not identity_v2_authoritative:
                 self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
-            self._active_tracks[sensor_id] = tracks
+            if (
+                not tracks
+                and os.environ.get("NOESIS_REID_TEST_MODE") == "1"
+                and not identity_v2_authoritative
+            ):
+                synthetic = {
+                    "camera_id": camera_id,
+                    "stable_id": 1,
+                    "tracker_id": 1,
+                    "bbox": (0.0, 0.0, 10.0, 10.0),
+                    "image_size": [int(frame_dims[0]), int(frame_dims[1])],
+                    "frame_id": frame_id,
+                    "zone": None,
+                    "class_id": 0,
+                    "identity_kind": "provisional",
+                    **temporal_contract,
+                }
+                tracks.append(synthetic)
+                present_stable_ids.add(1)
+                present_track_ids.add(1)
+            self._clear_absent_world_state(
+                sensor_id,
+                (
+                    track.get("tracker_id", track.get("track_id"))
+                    for track in tracks
+                    if isinstance(track, Mapping)
+                ),
+                now_ts=float(world_now_ts),
+            )
+            continuity = self._prepare_tracking_cohort(
+                sensor_id=int(sensor_id),
+                camera_id=str(camera_id),
+                frame_id=int(frame_id),
+                observed_at_us=int(temporal_contract["observed_at_us"]),
+                tracks=tracks,
+                footpoints=footpoints,
+            )
+            self._set_active_tracks_snapshot(sensor_id, frame_id, tracks)
             if not identity_v2_authoritative:
                 self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
@@ -9062,100 +11078,29 @@ class _AnalyticsTelemetryProcessor:
                 self._reid_debug_emb_found = 0
                 self._reid_debug_emb_missing = 0
 
-            if (
-                not tracks
-                and os.environ.get("NOESIS_REID_TEST_MODE") == "1"
-                and not identity_v2_authoritative
-            ):
-                synthetic = {
-                    "camera_id": camera_id,
-                    "stable_id": 1,
-                    "tracker_id": 1,
-                    "bbox": (0.0, 0.0, 10.0, 10.0),
-                    "image_size": [int(frame_dims[0]), int(frame_dims[1])],
-                    "frame_id": frame_id,
-                    "zone": None,
-                    "class_id": 0,
-                    "identity_kind": "provisional",
-                    **temporal_contract,
-                }
-                tracks.append(synthetic)
-                present_stable_ids.add(1)
-                present_track_ids.add(1)
-
-            continuity = self._tracking_lifecycle.update_frame(
-                source_id=sensor_id,
-                camera_id=camera_id,
-                frame_id=frame_id,
-                observed_at_us=int(temporal_contract["observed_at_us"]),
-                tracks=tracks,
+            tracker_keys_changed = self._observed_tracker_keys_changed(
+                sensor_id,
+                tracks,
             )
-
-            if self._publish_gate_due(
-                self._last_tracking_publish_ts_by_sensor,
-                self._last_tracking_count_by_sensor,
-                sensor_id=sensor_id,
-                now_ts=now_ts,
-                count=len(tracks),
-                interval_s=self._tracking_interval_for_frame(len(tracks)),
-                counter_prefix="tracking",
-                update=False,
-                force=continuity.tracker_keys_changed,
-            ):
-                tracking_published = False
-                try:
-                    publish_start_ns = time.perf_counter_ns()
-                    tracking_receipt = _require_tracking_publication_receipt(
-                        self.tracking_pub.publish(
-                            sensor_id,
-                            tracks,
-                            frame_metadata={
-                                "frame_id": frame_id,
-                                "tracker_lifecycle_tombstones": list(
-                                    continuity.tombstones
-                                ),
-                                **temporal_contract,
-                            },
-                        ),
-                        source_id=sensor_id,
-                        frame_id=frame_id,
-                        observed_at_us=int(
-                            temporal_contract["observed_at_us"]
-                        ),
-                    )
-                    self._tracking_lifecycle.mark_published(continuity)
-                    self._last_tracking_publish_ts_by_sensor[int(sensor_id)] = float(
-                        now_ts
-                    )
-                    self._last_tracking_count_by_sensor[int(sensor_id)] = len(tracks)
-                    _record_core_stage_timing("tracking.publish", publish_start_ns, item_count=len(tracks))
-                    tracking_published = True
-                except Exception:  # pragma: no cover - telemetry should never break pipeline
-                    logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
-                if tracking_published:
-                    try:
-                        bev_receipt = self._publish_bev(
-                            sensor_id,
-                            camera_id,
-                            frame_meta,
-                            footpoints,
-                            now_ts=now_ts,
-                            track_count=len(tracks),
-                            paired_with_tracking=True,
-                            tracking_receipt=tracking_receipt,
-                        )
-                        if bev_receipt.status == "failed":
-                            raise bev_receipt.failure or RuntimeError(
-                                "BEV publication failed without a cause"
-                            )
-                        if bev_receipt.status == "startup_pending":
-                            logger.debug(
-                                "BEV authority startup pending for sensor %s frame %s",
-                                sensor_id,
-                                frame_id,
-                            )
-                    except Exception:
-                        logger.exception("BEV publish failed for sensor %s", sensor_id)
+            self._enqueue_tracking_publication(
+                sensor_id=int(sensor_id),
+                camera_id=str(camera_id),
+                frame_meta=frame_meta,
+                tracks=tracks,
+                footpoints=footpoints,
+                now_ts=float(now_ts),
+                temporal_contract=temporal_contract,
+                continuity=continuity,
+                force=tracker_keys_changed,
+                identity_v2_primitives=(
+                    identity_v2_primitives if identity_v2_shadow else None
+                ),
+            )
+            _record_core_stage_timing(
+                "analytics.post_frame",
+                post_frame_start_ns,
+                item_count=len(tracks),
+            )
             _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=len(tracks))
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame (DS8)")
@@ -9185,6 +11130,17 @@ class _AnalyticsTelemetryProcessor:
             tracks: List[Dict[str, Any]] = []
             diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_num", -1))
+            self._begin_source_frame_timeline(
+                sensor_id=int(sensor_id),
+                frame_id=int(frame_id),
+                observed_at_us=int(temporal_contract["observed_at_us"]),
+                media_pts_ns=int(temporal_contract.get("media_pts_ns", 0) or 0),
+            )
+            world_now_ts = self._world_timestamp_for_frame(
+                int(sensor_id),
+                media_pts_ns=temporal_contract.get("media_pts_ns", 0),
+                observed_ts=float(now_ts),
+            )
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
@@ -9270,6 +11226,13 @@ class _AnalyticsTelemetryProcessor:
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int,
                     "tracker_id": tracker_id_int,
+                    "tracker_lifecycle_generation": self._tracking_lifecycle.peek_generation(
+                        int(sensor_id),
+                        int(tracker_id_int),
+                        frame_id=int(frame_id),
+                        observed_at_us=int(temporal_contract["observed_at_us"]),
+                        bbox=raw.get("bbox"),
+                    ),
                     "camera_id": camera_id,
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
@@ -9301,6 +11264,8 @@ class _AnalyticsTelemetryProcessor:
                     "world_quality",
                     "world_quality_reason",
                     "world_frame",
+                    "world_frame_revision",
+                    "world_transform_sha256",
                     "world_source",
                 ):
                     if key in raw:
@@ -9318,6 +11283,7 @@ class _AnalyticsTelemetryProcessor:
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
+                    world_now_ts=float(world_now_ts),
                 )
                 self._apply_scene_prior_shadow(camera_id, public_track)
                 self._apply_public_depth_fields(public_track, depth_result)
@@ -9369,7 +11335,40 @@ class _AnalyticsTelemetryProcessor:
             self._publish_occupancy(sensor_id, occupancy_counts)
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
-            self._active_tracks[sensor_id] = tracks
+            if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
+                synthetic = {
+                    "camera_id": camera_id,
+                    "stable_id": 1,
+                    "tracker_id": 1,
+                    "bbox": (0.0, 0.0, 10.0, 10.0),
+                    "image_size": [int(frame_dims[0]), int(frame_dims[1])],
+                    "frame_id": frame_id,
+                    "zone": None,
+                    "class_id": 0,
+                    "identity_kind": "provisional",
+                    **temporal_contract,
+                }
+                tracks.append(synthetic)
+                present_stable_ids.add(1)
+                present_track_ids.add(1)
+            self._clear_absent_world_state(
+                sensor_id,
+                (
+                    track.get("tracker_id", track.get("track_id"))
+                    for track in tracks
+                    if isinstance(track, Mapping)
+                ),
+                now_ts=float(world_now_ts),
+            )
+            continuity = self._prepare_tracking_cohort(
+                sensor_id=int(sensor_id),
+                camera_id=str(camera_id),
+                frame_id=int(frame_id),
+                observed_at_us=int(temporal_contract["observed_at_us"]),
+                tracks=tracks,
+                footpoints=footpoints,
+            )
+            self._set_active_tracks_snapshot(sensor_id, frame_id, tracks)
             self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
             if self.diagnostics_logger:
@@ -9403,94 +11402,21 @@ class _AnalyticsTelemetryProcessor:
                     }
                 )
 
-            if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
-                synthetic = {
-                    "camera_id": camera_id,
-                    "stable_id": 1,
-                    "tracker_id": 1,
-                    "bbox": (0.0, 0.0, 10.0, 10.0),
-                    "image_size": [int(frame_dims[0]), int(frame_dims[1])],
-                    "frame_id": frame_id,
-                    "zone": None,
-                    "class_id": 0,
-                    "identity_kind": "provisional",
-                    **temporal_contract,
-                }
-                tracks.append(synthetic)
-                present_stable_ids.add(1)
-                present_track_ids.add(1)
-
-            continuity = self._tracking_lifecycle.update_frame(
-                source_id=sensor_id,
-                camera_id=camera_id,
-                frame_id=frame_id,
-                observed_at_us=int(temporal_contract["observed_at_us"]),
-                tracks=tracks,
+            tracker_keys_changed = self._observed_tracker_keys_changed(
+                sensor_id,
+                tracks,
             )
-
-            if self._publish_gate_due(
-                self._last_tracking_publish_ts_by_sensor,
-                self._last_tracking_count_by_sensor,
-                sensor_id=sensor_id,
-                now_ts=now_ts,
-                count=len(tracks),
-                interval_s=self._tracking_interval_for_frame(len(tracks)),
-                counter_prefix="tracking",
-                update=False,
-                force=continuity.tracker_keys_changed,
-            ):
-                tracking_published = False
-                try:
-                    tracking_receipt = _require_tracking_publication_receipt(
-                        self.tracking_pub.publish(
-                            sensor_id,
-                            tracks,
-                            frame_metadata={
-                                "frame_id": frame_id,
-                                "tracker_lifecycle_tombstones": list(
-                                    continuity.tombstones
-                                ),
-                                **temporal_contract,
-                            },
-                        ),
-                        source_id=sensor_id,
-                        frame_id=frame_id,
-                        observed_at_us=int(
-                            temporal_contract["observed_at_us"]
-                        ),
-                    )
-                    self._tracking_lifecycle.mark_published(continuity)
-                    self._last_tracking_publish_ts_by_sensor[int(sensor_id)] = float(
-                        now_ts
-                    )
-                    self._last_tracking_count_by_sensor[int(sensor_id)] = len(tracks)
-                    tracking_published = True
-                except Exception:  # pragma: no cover - telemetry should never break pipeline
-                    logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
-                if tracking_published:
-                    try:
-                        bev_receipt = self._publish_bev(
-                            sensor_id,
-                            camera_id,
-                            frame_meta,
-                            footpoints,
-                            now_ts=now_ts,
-                            track_count=len(tracks),
-                            paired_with_tracking=True,
-                            tracking_receipt=tracking_receipt,
-                        )
-                        if bev_receipt.status == "failed":
-                            raise bev_receipt.failure or RuntimeError(
-                                "BEV publication failed without a cause"
-                            )
-                        if bev_receipt.status == "startup_pending":
-                            logger.debug(
-                                "BEV authority startup pending for sensor %s frame %s",
-                                sensor_id,
-                                frame_id,
-                            )
-                    except Exception:
-                        logger.exception("BEV publish failed for sensor %s", sensor_id)
+            self._enqueue_tracking_publication(
+                sensor_id=int(sensor_id),
+                camera_id=str(camera_id),
+                frame_meta=frame_meta,
+                tracks=tracks,
+                footpoints=footpoints,
+                now_ts=float(now_ts),
+                temporal_contract=temporal_contract,
+                continuity=continuity,
+                force=tracker_keys_changed,
+            )
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame")
 
@@ -9588,8 +11514,11 @@ class _AnalyticsTelemetryProcessor:
 
     def _frame_source_size(self, frame_meta: Any) -> Tuple[int, int]:
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            # Object metadata is expressed in the post-dewarp/post-mux raster.
+            # Prefer that canonical frame size; source-native dimensions are
+            # only a fallback for metadata producers that do not expose it.
+            frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", "source_frame_width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", "source_frame_height", default=0) or 0)
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -9618,11 +11547,27 @@ class _AnalyticsTelemetryProcessor:
             return width, height
         # A principal point is not required to be the image center. Inferring
         # dimensions as 2*cx/2*cy silently rescales dewarped detections whenever
-        # the calibrated optical center is off-center. Let frame metadata own
-        # the size when calibration has no declared resolution.
+        # the calibrated optical center is off-center. The canonical frame
+        # metadata owns the raster whenever it declares one.
         return None
 
     def _track_image_size(self, sensor_id: int, frame_meta: Any) -> Tuple[int, int]:
+        # The tracker bbox/pose raster is the canonical frame raster, not the
+        # calibration loader's raw intrinsics resolution.  Using the latter
+        # when the frame is already dewarped/muxed up (e.g. 1280 -> 1920)
+        # causes a second 1.5x transform before projection.
+        canonical_w, canonical_h = _canonical_frame_size(
+            frame_meta,
+            self._frame_dims(),
+        )
+        if canonical_w > 8 and canonical_h > 8:
+            return canonical_w, canonical_h
+        # If native metadata does not carry the raster, streammux's configured
+        # output is the post-dewarp tracker coordinate space.  Do not fall
+        # back to a source-native calibration size and apply a second scale.
+        configured_w, configured_h = self._frame_dims()
+        if configured_w > 8 and configured_h > 8:
+            return configured_w, configured_h
         intrinsic_size = self._intrinsics_base_image_size(sensor_id)
         if intrinsic_size is not None:
             return intrinsic_size
@@ -9739,6 +11684,39 @@ class _AnalyticsTelemetryProcessor:
 
         if class_id not in self._bev_class_ids:
             return None
+
+        # A revision-bound canonical world point is already the spatial
+        # authority consumed by BEV.  Do not make that transport contingent on
+        # an image contact that may legitimately be absent while a tracked
+        # person is partially outside the raster.  A BEV-compatible identity
+        # remains mandatory so the renderer never creates anonymous history.
+        canonical_world_transport = False
+        if track.get("world_valid") is True:
+            raw_world = track.get("world")
+            try:
+                world_x_value = float(raw_world[0])
+                world_z_value = float(raw_world[2])
+            except (IndexError, TypeError, ValueError, OverflowError):
+                pass
+            else:
+                try:
+                    tracker_value = int(
+                        track.get("tracker_id", track.get("track_id"))
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    tracker_value = -1
+                try:
+                    stable_value = int(track.get("stable_id"))
+                except (TypeError, ValueError, OverflowError):
+                    stable_value = -1
+                canonical_world_transport = bool(
+                    (tracker_value >= 0 or stable_value > 0)
+                    and math.isfinite(world_x_value)
+                    and math.isfinite(world_z_value)
+                    and str(track.get("world_frame") or "").strip()
+                    and str(track.get("world_frame_revision") or "").strip()
+                )
+
         u = v = None
         method = None
         bbox_source_tuple: Optional[Tuple[float, float, float, float]] = None
@@ -9771,23 +11749,22 @@ class _AnalyticsTelemetryProcessor:
             method = label
             break
 
+        if (u is None or v is None) and bbox_source_tuple is not None:
+            left, top, width, height = bbox_source_tuple
+            if width > 0.0 and height > 0.0:
+                clipped = _clip_uv(
+                    float(left + width * 0.5),
+                    float(top + height),
+                )
+                if clipped is not None:
+                    u, v = clipped
+                    method = "bbox"
         if u is None or v is None:
-            if bbox_source_tuple is None:
+            if not canonical_world_transport:
                 return None
-            try:
-                left, top, width, height = [float(x) for x in bbox_source_tuple]
-            except Exception:
-                return None
-            if width <= 0.0 or height <= 0.0:
-                return None
-            u = left + width * 0.5
-            v = top + height
-            clipped = _clip_uv(float(u), float(v))
-            if clipped is None:
-                return None
-            u, v = clipped
-            method = "bbox"
-        u, v = _scale_uv_to_target(float(u), float(v))
+            method = "world"
+        else:
+            u, v = _scale_uv_to_target(float(u), float(v))
         bbox_tuple = (
             _scale_bbox_to_target(bbox_source_tuple)
             if bbox_source_tuple is not None
@@ -9893,6 +11870,15 @@ class _AnalyticsTelemetryProcessor:
             trail_segment_int = int(trail_segment) if trail_segment is not None else None
         except Exception:
             trail_segment_int = None
+        lifecycle_generation = track.get("tracker_lifecycle_generation")
+        try:
+            lifecycle_generation_int = (
+                int(lifecycle_generation)
+                if lifecycle_generation is not None
+                else None
+            )
+        except Exception:
+            lifecycle_generation_int = None
         idle_jitter_raw = track.get("idle_jitter_m")
         try:
             idle_jitter = (
@@ -9906,6 +11892,7 @@ class _AnalyticsTelemetryProcessor:
             method=method or "bbox",
             stable_id=stable_id_int,
             tracker_id=tracker_id_int,
+            tracker_lifecycle_generation=lifecycle_generation_int,
             world_x=world_x,
             world_z=world_z,
             depth_m=depth_m,
@@ -10004,6 +11991,31 @@ class _AnalyticsTelemetryProcessor:
             },
         )
 
+    @staticmethod
+    def _stamp_footpoint_lifecycles(
+        footpoints: Sequence[Footpoint],
+        tracks: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Bind BEV trail identity to the lifecycle stamped for this frame."""
+
+        generation_by_tracker: Dict[int, int] = {}
+        for track in tracks:
+            try:
+                tracker_id = int(track.get("tracker_id", track.get("track_id")))
+                generation = int(track.get("tracker_lifecycle_generation"))
+            except (TypeError, ValueError):
+                continue
+            if tracker_id >= 0 and generation >= 0:
+                generation_by_tracker[tracker_id] = generation
+        for footpoint in footpoints:
+            try:
+                tracker_id = int(footpoint.tracker_id)
+            except (TypeError, ValueError):
+                continue
+            footpoint.tracker_lifecycle_generation = generation_by_tracker.get(
+                tracker_id
+            )
+
     def _frame_timestamp_us(self, frame_meta: Any) -> int:
         pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=0) or 0)
         if pts_ns <= 0:
@@ -10045,7 +12057,7 @@ class _AnalyticsTelemetryProcessor:
         return None
 
     def _maybe_prune_world_state(self, now_ts: float) -> None:
-        if not self._world_state_by_track:
+        if not self._world_state_by_track and not self._world_state_ghost_by_track:
             return
         if (float(now_ts) - float(self._world_state_last_prune_ts)) < float(self._world_state_prune_interval_s):
             return
@@ -10053,14 +12065,179 @@ class _AnalyticsTelemetryProcessor:
         ttl = float(self._world_state_ttl_s)
         if ttl <= 0.0:
             self._world_state_by_track.clear()
-            return
-        expired: List[Tuple[int, int]] = []
-        for key, state in self._world_state_by_track.items():
-            ts = float(getattr(state, "ts", 0.0) or 0.0)
-            if (float(now_ts) - ts) > ttl:
-                expired.append(key)
-        for key in expired:
-            self._world_state_by_track.pop(key, None)
+        else:
+            expired: List[Tuple[int, int]] = []
+            for key, state in self._world_state_by_track.items():
+                ts = float(getattr(state, "ts", 0.0) or 0.0)
+                if (float(now_ts) - ts) > ttl:
+                    expired.append(key)
+            for key in expired:
+                self._world_state_by_track.pop(key, None)
+        ghost_ttl = float(self._world_state_ghost_ttl_s)
+        for key, (_state, absent_ts) in tuple(
+            self._world_state_ghost_by_track.items()
+        ):
+            if ghost_ttl <= 0.0 or (float(now_ts) - float(absent_ts)) > ghost_ttl:
+                self._world_state_ghost_by_track.pop(key, None)
+
+    def _world_state_for_observation(
+        self,
+        key: Tuple[int, int],
+        *,
+        now_ts: float,
+        bbox: Optional[Sequence[float]],
+        lifecycle_generation: Optional[int] = None,
+    ) -> Tuple[_WorldAnchorState, bool]:
+        """Return active state or restore a visually continuous short ghost."""
+
+        state = self._world_state_by_track.get(key)
+        if state is not None and lifecycle_generation is not None:
+            prior_generation = getattr(state, "tracker_lifecycle_generation", None)
+            if prior_generation is not None and int(prior_generation) != int(lifecycle_generation):
+                # A numeric tracker ID was reused.  Do not let its filter,
+                # velocity, or seated lock cross the lifecycle boundary.
+                self._world_state_by_track.pop(key, None)
+                state = None
+        if state is not None:
+            if lifecycle_generation is not None:
+                setattr(state, "tracker_lifecycle_generation", int(lifecycle_generation))
+            return state, False
+        ghost = self._world_state_ghost_by_track.pop(key, None)
+        restored = False
+        if ghost is not None:
+            candidate, absent_ts = ghost
+            prior_generation = getattr(candidate, "tracker_lifecycle_generation", None)
+            if (
+                lifecycle_generation is not None
+                and prior_generation is not None
+                and int(prior_generation) != int(lifecycle_generation)
+            ):
+                ghost = None
+            if ghost is None:
+                candidate = None
+        if ghost is not None and candidate is not None:
+            gap_s = float(now_ts) - float(absent_ts)
+            try:
+                left, top, width, height = (
+                    float(value) for value in bbox[:4]  # type: ignore[index]
+                )
+                prior_left, prior_top, prior_width, prior_height = (
+                    float(value) for value in candidate.bbox_geometry  # type: ignore[union-attr]
+                )
+                if (
+                    width <= 1.0
+                    or height <= 1.0
+                    or prior_width <= 1.0
+                    or prior_height <= 1.0
+                ):
+                    raise ValueError("bbox geometry is not usable")
+                inter_left = max(left, prior_left)
+                inter_top = max(top, prior_top)
+                inter_right = min(left + width, prior_left + prior_width)
+                inter_bottom = min(top + height, prior_top + prior_height)
+                inter_width = max(0.0, inter_right - inter_left)
+                inter_height = max(0.0, inter_bottom - inter_top)
+                intersection = inter_width * inter_height
+                union = (
+                    (width * height)
+                    + (prior_width * prior_height)
+                    - intersection
+                )
+                iou = intersection / union if union > 1e-6 else 0.0
+                center_u = left + width * 0.5
+                center_v = top + height * 0.5
+                prior_center_u = prior_left + prior_width * 0.5
+                prior_center_v = prior_top + prior_height * 0.5
+                diagonal = max(
+                    1.0,
+                    math.hypot(width, height),
+                    math.hypot(prior_width, prior_height),
+                )
+                center_ratio = math.hypot(
+                    center_u - prior_center_u,
+                    center_v - prior_center_v,
+                ) / diagonal
+                area_ratio = max(
+                    (width * height) / (prior_width * prior_height),
+                    (prior_width * prior_height) / (width * height),
+                )
+                restored = bool(
+                    0.0 <= gap_s <= float(self._world_state_ghost_ttl_s)
+                    and width > 1.0
+                    and height > 1.0
+                    and prior_width > 1.0
+                    and prior_height > 1.0
+                    and all(
+                        math.isfinite(value)
+                        for value in (
+                            iou,
+                            center_ratio,
+                            area_ratio,
+                        )
+                    )
+                    and iou >= 0.75
+                    and center_ratio <= 0.25
+                    and area_ratio <= 1.75
+                )
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                restored = False
+            if restored:
+                state = candidate
+        if state is None:
+            state = _WorldAnchorState()
+        if lifecycle_generation is not None:
+            setattr(state, "tracker_lifecycle_generation", int(lifecycle_generation))
+        self._world_state_by_track[key] = state
+        return state, restored
+
+    def _clear_absent_world_state(
+        self,
+        sensor_id: int,
+        present_track_ids: Iterable[int],
+        *,
+        now_ts: Optional[float] = None,
+    ) -> None:
+        """Quarantine kinematics when a tracker lifecycle disappears.
+
+        ``_world_state_by_track`` is deliberately keyed by the physical
+        ``(sensor_id, tracker_id)`` pair.  The tracker lifecycle registry can
+        assign a new generation when NvDCF omits an object for one processed
+        frame and later re-creates the same numeric tracker ID.  A TTL-only
+        cache would then splice a reused ID into the old person's velocity,
+        innovation gate, and stationary lock.  Dropping state immediately,
+        however, makes a one-frame metadata/ReID gap restart a physically
+        continuous person cold and causes the BEV dot to disappear.  Move the
+        state into a short quarantine; `_world_state_for_observation` restores
+        it only when the returning bbox matches the prior image position and
+        scale.  Trail lifecycle remains separate and is never restored.
+
+        The caller supplies the same canonical tracker rows that feed the
+        lifecycle registry.  This matters when StableID cannot produce a
+        public row for one frame: retaining the physical key would still
+        splice the next public lifecycle into stale state.  Do not carry the
+        state blindly across that boundary.  This is bounded scalar dictionary
+        work over the existing small track set and does not touch image data or
+        the media path.
+        """
+        present: set[int] = set()
+        for track_id in present_track_ids:
+            try:
+                parsed = int(track_id)
+            except Exception:
+                continue
+            if parsed >= 0:
+                present.add(parsed)
+        sensor = int(sensor_id)
+        absent_ts = float(time.time() if now_ts is None else now_ts)
+        for key in tuple(self._world_state_by_track):
+            try:
+                key_sensor, tracker_id = int(key[0]), int(key[1])
+            except Exception:
+                continue
+            if key_sensor == sensor and tracker_id not in present:
+                state = self._world_state_by_track.pop(key, None)
+                if state is not None:
+                    self._world_state_ghost_by_track[key] = (state, absent_ts)
 
     def _extract_pose_payload_for_anchor(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
         if obj_meta is None or noesis_pose_meta_ext is None:
@@ -10263,10 +12440,36 @@ class _AnalyticsTelemetryProcessor:
             u=float(anchor_uv[0]),
             v=float(anchor_uv[1]),
             source="person_mask_floor",
+            contact_basis=f"depth:{anchor_band}",
             quality=quality,
             quality_reason=quality_reason,
             height_lock_eligible=False,
         )
+
+    @staticmethod
+    def _depth_measurement_is_current(
+        depth_result: Optional[ObjectDepthResult],
+    ) -> bool:
+        """Return whether metric depth belongs to this exact object frame."""
+        if depth_result is None or depth_result.measurement_cached is True:
+            return False
+        if (
+            depth_result.measurement_age_us is not None
+            and int(depth_result.measurement_age_us) > 0
+        ):
+            return False
+        if (
+            depth_result.measurement_frame_id is not None
+            and int(depth_result.measurement_frame_id) != int(depth_result.frame_id)
+        ):
+            return False
+        if (
+            depth_result.measurement_ts_us is not None
+            and depth_result.ts_us is not None
+            and int(depth_result.measurement_ts_us) != int(depth_result.ts_us)
+        ):
+            return False
+        return True
 
     @staticmethod
     def _scene_per_meter(calib: Any) -> float:
@@ -10776,6 +12979,24 @@ class _AnalyticsTelemetryProcessor:
             return _DepthObservationResult(None, 0.0, f"depth_status_{depth_result.status}")
         if not bool(depth_result.is_metric) or str(depth_result.unit) != "m":
             return _DepthObservationResult(None, 0.0, "depth_not_metric")
+        anchor_depth_m = depth_result.anchor_depth_m
+        raw_depth_value = (
+            float(anchor_depth_m)
+            if anchor_depth_m is not None
+            and math.isfinite(float(anchor_depth_m))
+            and float(anchor_depth_m) > 0.0
+            else None
+        )
+        if not self._depth_measurement_is_current(depth_result):
+            # Cached range remains available through the public depth
+            # provenance fields, but it is not a current-frame metric
+            # observation and must never update/reacquire the world filter.
+            return _DepthObservationResult(
+                None,
+                0.0,
+                "depth_measurement_not_current",
+                raw_depth_m=raw_depth_value,
+            )
         anchor_source = str(depth_result.anchor_source or "")
         if anchor_source == "lower_body_band":
             min_support_count = 16
@@ -10794,7 +13015,6 @@ class _AnalyticsTelemetryProcessor:
             anchor_source_weight = 0.50
         else:
             return _DepthObservationResult(None, 0.0, "depth_anchor_source_invalid")
-        anchor_depth_m = depth_result.anchor_depth_m
         if anchor_depth_m is None or not math.isfinite(float(anchor_depth_m)) or float(anchor_depth_m) <= 0.0:
             return _DepthObservationResult(None, 0.0, "depth_anchor_missing")
         support_count = int(
@@ -10903,6 +13123,8 @@ class _AnalyticsTelemetryProcessor:
         beta: float,
         quality: str = "good",
         force_accept: bool = False,
+        contact_basis: Optional[str] = None,
+        image_motion_supported: bool = False,
     ) -> np.ndarray:
         mx = float(measurement[0])
         mz = float(measurement[2])
@@ -10918,6 +13140,8 @@ class _AnalyticsTelemetryProcessor:
             quality=str(quality or "good"),
             config=self._human_ground_cfg,
             force_accept=bool(force_accept),
+            contact_basis=contact_basis,
+            image_motion_supported=bool(image_motion_supported),
         )
 
     def _update_track_world_state(
@@ -10932,6 +13156,8 @@ class _AnalyticsTelemetryProcessor:
         beta: float,
         quality: str = "good",
         force_accept: bool = False,
+        contact_basis: Optional[str] = None,
+        image_motion_supported: bool = False,
     ) -> np.ndarray:
         """Record pre-filter evidence and apply the shared physical filter."""
         track["world_prefilter_measurement"] = [
@@ -10955,8 +13181,20 @@ class _AnalyticsTelemetryProcessor:
             beta=float(beta),
             quality=str(quality or "good"),
             force_accept=bool(force_accept),
+            contact_basis=contact_basis,
+            image_motion_supported=bool(image_motion_supported),
         )
         if state is not None:
+            # A physical reject advances only the bounded process model.  The
+            # pre-filter prediction above is useful for accepted observations,
+            # but after a long reject run it can be stale/unbounded diagnostic
+            # evidence.  Publish the exact bounded filter output instead.
+            if not bool(state.measurement_accepted):
+                track["world_filter_prediction"] = [
+                    float(result[0]),
+                    float(floor_y),
+                    float(result[2]),
+                ]
             complete_source_admission(
                 state,
                 measurement_accepted=bool(state.measurement_accepted),
@@ -11009,6 +13247,134 @@ class _AnalyticsTelemetryProcessor:
         track["world_depth_weight_effective"] = float(effective_depth)
         return effective_floor, effective_depth, bool(profile.floor_only_allowed)
 
+    def _projective_continuation_allowed(self, camera_id: str, track: Dict[str, Any]) -> bool:
+        """Return the calibrated policy decision for weak floor continuation.
+
+        A projective point is never promoted to ``last_good_world`` here, so a
+        depth-required camera retains depth as its metric authority.  The
+        policy is still consulted and published: an active profile is required
+        for weak continuation, while ``floor_only_allowed`` records whether
+        the same point could be authoritative on its own.
+        """
+
+        policy = self.world_fusion_policy
+        if policy is None:
+            allowed = True
+            authoritative_allowed = True
+        else:
+            try:
+                profile = policy.profile(str(camera_id))
+                allowed = True
+                authoritative_allowed = bool(profile.floor_only_allowed)
+            except Exception:
+                allowed = False
+                authoritative_allowed = False
+        track["world_projective_continuation_allowed"] = bool(allowed)
+        track["world_projective_authoritative_allowed"] = bool(authoritative_allowed)
+        return bool(allowed)
+
+    @staticmethod
+    def _floor_contact_bbox_gate(
+        *,
+        anchor_uv: Optional[Sequence[float]],
+        bbox: Optional[Sequence[float]],
+        incidence_sin: float,
+        track: Dict[str, Any],
+        anchor_range_m: Optional[float] = None,
+        bbox_bottom_range_m: Optional[float] = None,
+    ) -> bool:
+        """Reject a near-horizon pose contact above its detector silhouette.
+
+        A floor ray from a low-incidence pixel is extremely sensitive to a
+        small vertical anchor error.  At the far edge of the Family Room
+        replay, pose ankles can be hallucinated well above the detector box
+        bottom; intersecting that point with the floor creates a plausible
+        finite point many metres behind the visible person.  Keep this as an
+        estimator-side plausibility gate: it does not clamp or consult the
+        presentation floorplan.
+
+        Missing image geometry is left to the existing ray/range checks.  A
+        bbox gap is only rejected when the ray is also near the horizon, so
+        modest detector padding or lower-body occlusion is not turned into a
+        blanket loss of metric observations.
+        """
+
+        track["world_floor_contact_plausible"] = True
+        track.pop("world_floor_contact_gap_px", None)
+        track.pop("world_floor_contact_gap_ratio", None)
+        track.pop("world_floor_contact_rejection_reason", None)
+        if anchor_uv is None or bbox is None or len(anchor_uv) < 2 or len(bbox) < 4:
+            return True
+        try:
+            anchor_u = float(anchor_uv[0])
+            anchor_v = float(anchor_uv[1])
+            _left, top, width, height = (float(value) for value in bbox[:4])
+            incidence = float(incidence_sin)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return True
+        if not all(
+            math.isfinite(value)
+            for value in (anchor_u, anchor_v, top, width, height, incidence)
+        ) or width <= 1.0 or height <= 1.0:
+            return True
+
+        bbox_bottom = float(top) + float(height)
+        gap_px = float(bbox_bottom) - float(anchor_v)
+        gap_ratio = float(gap_px) / float(height)
+        track["world_floor_contact_gap_px"] = float(gap_px)
+        track["world_floor_contact_gap_ratio"] = float(gap_ratio)
+
+        range_delta_m = math.nan
+        if anchor_range_m is not None and bbox_bottom_range_m is not None:
+            try:
+                range_delta_m = float(anchor_range_m) - float(bbox_bottom_range_m)
+                range_tolerance_m = max(
+                    2.0,
+                    0.20 * float(bbox_bottom_range_m),
+                )
+                if all(
+                    math.isfinite(value)
+                    for value in (
+                        float(anchor_range_m),
+                        float(bbox_bottom_range_m),
+                        range_delta_m,
+                        range_tolerance_m,
+                    )
+                ):
+                    track["world_floor_bbox_bottom_range_m"] = float(
+                        bbox_bottom_range_m
+                    )
+                    track["world_floor_contact_range_delta_m"] = float(
+                        range_delta_m
+                    )
+                    track["world_floor_contact_range_tolerance_m"] = float(
+                        range_tolerance_m
+                    )
+                else:
+                    range_delta_m = math.nan
+            except (TypeError, ValueError, OverflowError):
+                range_delta_m = math.nan
+
+        # Use a fractional tolerance for ordinary detector padding while
+        # retaining a small absolute tolerance for compact, distant boxes.
+        max_gap_px = max(16.0, 0.20 * float(height))
+        near_horizon = float(incidence) < 0.10
+        implausible_gap = float(gap_px) > max_gap_px
+        implausible_range = bool(
+            math.isfinite(float(range_delta_m))
+            and float(range_delta_m)
+            > float(track.get("world_floor_contact_range_tolerance_m", math.inf))
+        )
+        plausible = not (near_horizon and (implausible_gap or implausible_range))
+        track["world_floor_contact_plausible"] = bool(plausible)
+        if not plausible:
+            track["world_floor_contact_rejection_reason"] = (
+                "bbox_contact_range_disagreement_near_horizon"
+                if implausible_range and not implausible_gap
+                else "bbox_contact_gap_near_horizon"
+            )
+        return bool(plausible)
+
     def _admit_floor_ray_range(
         self,
         camera_id: str,
@@ -11016,12 +13382,17 @@ class _AnalyticsTelemetryProcessor:
         calib: Any,
         floor_candidate: np.ndarray,
         track: Dict[str, Any],
+        anchor_uv: Optional[Sequence[float]] = None,
+        bbox: Optional[Sequence[float]] = None,
+        flip_u: bool = False,
+        flip_v: bool = False,
     ) -> bool:
         policy = self.world_fusion_policy
         if policy is None:
-            return True
-        profile = policy.profile(str(camera_id))
-        limit_m = float(profile.floor_ray_max_range_m)
+            limit_m: Optional[float] = None
+        else:
+            profile = policy.profile(str(camera_id))
+            limit_m = float(profile.floor_ray_max_range_m)
         track["world_floor_range_limit_m"] = limit_m
         admitted = False
         rejection_reason = "floor_ray_geometry_invalid"
@@ -11042,12 +13413,59 @@ class _AnalyticsTelemetryProcessor:
             )
             track["world_floor_range_m"] = horizontal_range_m
             track["world_floor_incidence_sin"] = incidence_sin
-            admitted = bool(
+            bbox_bottom_range_m: Optional[float] = None
+            if bbox is not None and len(bbox) >= 4:
+                try:
+                    bbox_left, bbox_top, bbox_width, bbox_height = (
+                        float(value) for value in bbox[:4]
+                    )
+                    bbox_bottom_hit = self._project_pixel_to_floor_world(
+                        calib,
+                        bbox_left + 0.5 * bbox_width,
+                        bbox_top + bbox_height,
+                        flip_u=bool(flip_u),
+                        flip_v=bool(flip_v),
+                    )
+                    if bbox_bottom_hit is not None:
+                        bbox_bottom_delta = (
+                            np.asarray(bbox_bottom_hit, dtype=np.float64)
+                            - camera_world
+                        )
+                        bbox_bottom_range_m = float(
+                            math.hypot(
+                                float(bbox_bottom_delta[0]),
+                                float(bbox_bottom_delta[2]),
+                            )
+                        )
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    bbox_bottom_range_m = None
+            if bbox_bottom_range_m is not None:
+                track["world_floor_bbox_bottom_range_m"] = float(
+                    bbox_bottom_range_m
+                )
+            range_admitted = bool(
                 math.isfinite(horizontal_range_m)
-                and horizontal_range_m <= limit_m
+                and (
+                    limit_m is None
+                    or horizontal_range_m <= float(limit_m)
+                )
             )
-            if not admitted:
+            contact_admitted = self._floor_contact_bbox_gate(
+                anchor_uv=anchor_uv,
+                bbox=bbox,
+                incidence_sin=incidence_sin,
+                track=track,
+                anchor_range_m=horizontal_range_m,
+                bbox_bottom_range_m=bbox_bottom_range_m,
+            )
+            admitted = bool(range_admitted and contact_admitted)
+            if not range_admitted:
                 rejection_reason = "floor_ray_range_exceeded"
+            elif not contact_admitted:
+                rejection_reason = str(
+                    track.get("world_floor_contact_rejection_reason")
+                    or "floor_ray_contact_invalid"
+                )
         except Exception:
             admitted = False
         track["world_floor_admitted"] = admitted
@@ -11056,6 +13474,71 @@ class _AnalyticsTelemetryProcessor:
         else:
             track["world_floor_rejection_reason"] = rejection_reason
         return admitted
+
+    def _admit_world_observation_range(
+        self,
+        camera_id: str,
+        *,
+        calib: Any,
+        world_candidate: np.ndarray,
+        track: Dict[str, Any],
+    ) -> bool:
+        """Admit any metric world candidate against the calibrated range envelope.
+
+        ``floor_ray_max_range_m`` is the only calibrated per-camera metric
+        envelope in the fusion policy.  It was originally applied only to the
+        floor ray, which left registered-depth points on a separate path.  A
+        depth point is still a camera-originated metric observation and must
+        not be allowed to seed the canonical filter beyond that envelope.
+        This is an estimator-side rejection, never a PCF/display crop.
+        """
+        policy = self.world_fusion_policy
+        if policy is None:
+            return True
+        profile = policy.profile(str(camera_id))
+        limit_m = float(profile.floor_ray_max_range_m)
+        track["world_observation_range_limit_m"] = limit_m
+        admitted = False
+        rejection_reason = "world_observation_range_invalid"
+        try:
+            _rotation, camera_world = parse_extrinsics(calib.extrinsics_col_major)
+            unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+            if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+                unit_scale = 1.0
+            camera_world = np.asarray(camera_world, dtype=np.float64) * unit_scale
+            candidate = np.asarray(world_candidate, dtype=np.float64)
+            if candidate.shape[0] < 3 or not np.all(np.isfinite(candidate[:3])):
+                raise ValueError("world candidate is not finite")
+            delta = candidate[:3] - camera_world[:3]
+            horizontal_range_m = float(math.hypot(float(delta[0]), float(delta[2])))
+            track["world_observation_range_m"] = horizontal_range_m
+            admitted = bool(
+                math.isfinite(horizontal_range_m)
+                and horizontal_range_m <= limit_m
+            )
+            if not admitted:
+                rejection_reason = "world_observation_range_exceeded"
+        except Exception:
+            admitted = False
+        track["world_observation_range_admitted"] = admitted
+        if admitted:
+            track.pop("world_observation_range_rejection_reason", None)
+        else:
+            track["world_observation_range_rejection_reason"] = rejection_reason
+        return admitted
+
+    @staticmethod
+    def _invalidate_world_track(track: Dict[str, Any], reason: str) -> None:
+        """Remove an untrusted world result at the canonical publication boundary."""
+
+        track["world_valid"] = False
+        track["world_quality"] = "invalid"
+        track["world_quality_reason"] = str(reason or "world_observation_invalid")
+        track.pop("world", None)
+        track.pop("world_source", None)
+        track.pop("world_frame", None)
+        track.pop("world_frame_revision", None)
+        track.pop("world_transform_sha256", None)
 
     def _set_track_image_base_from_world(
         self,
@@ -11085,6 +13568,101 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             return
 
+    def _project_image_motion_prediction(
+        self,
+        *,
+        camera_id: str,
+        state: Optional[_WorldAnchorState],
+        bbox_project: Sequence[float],
+        calib: Any,
+        now_ts: float,
+        lifecycle_generation: Optional[int],
+        flip_u: bool,
+        flip_v: bool,
+        track: Dict[str, Any],
+    ) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+        """Project one bounded bbox-transported foot as weak observation.
+
+        This candidate is downstream of metric admission and is integrated (if
+        policy permits weak continuation) only by
+        ``integrate_projective_ground_observation``. It never changes the
+        accepted image origin: every frame is transported from the last
+        physically accepted foot/bbox, so a run of rejected frames cannot
+        integrate image-anchor drift.
+        """
+
+        if state is None or state.last_good_world is None:
+            return None
+        transported = transport_accepted_image_foot(
+            state,
+            bbox=bbox_project,
+            now_ts=float(now_ts),
+            lifecycle_generation=lifecycle_generation,
+            ttl_s=float(self._world_anchor_hold_ttl_s),
+            config=self._human_ground_cfg,
+        )
+        if transported is None:
+            return None
+        u, v, age_s, center_step_px, scale_ratio, transport_name = transported
+        try:
+            width, height = (int(calib.image_size[0]), int(calib.image_size[1]))
+        except Exception:
+            return None
+        if not (0.0 <= float(u) < float(width) and 0.0 <= float(v) < float(height)):
+            return None
+        hit = self._project_pixel_to_floor_world(
+            calib,
+            float(u),
+            float(v),
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+        if hit is None:
+            return None
+        candidate = np.asarray(hit, dtype=np.float64)
+        if candidate.shape[0] < 3 or not np.all(np.isfinite(candidate[:3])):
+            return None
+        # Reuse the exact per-camera ray envelope used for authoritative floor
+        # observations.  This is a metric/ray gate, not a clamp.
+        if not self._admit_floor_ray_range(
+            camera_id,
+            calib=calib,
+            floor_candidate=candidate,
+            track=track,
+            anchor_uv=(float(u), float(v)),
+            bbox=bbox_project,
+            flip_u=flip_u,
+            flip_v=flip_v,
+        ):
+            return None
+        try:
+            prior = np.asarray(state.last_good_world, dtype=np.float64)
+            world_delta_m = math.hypot(
+                float(candidate[0]) - float(prior[0]),
+                float(candidate[2]) - float(prior[2]),
+            )
+        except Exception:
+            return None
+        allowed_world_delta_m = (
+            float(self._human_ground_cfg.max_speed_mps) * max(0.0, float(age_s))
+            + float(self._human_ground_cfg.projective_world_slack_m)
+        )
+        if not math.isfinite(world_delta_m) or world_delta_m > allowed_world_delta_m:
+            return None
+        provenance = {
+            "type": "bbox_affine_floor_projection",
+            "non_authoritative": True,
+            "origin": "last_accepted_image_foot",
+            "transport": str(transport_name),
+            "age_s": float(age_s),
+            "bbox_center_step_px": float(center_step_px),
+            "bbox_scale_ratio": float(scale_ratio),
+            "image_foot": [float(u), float(v)],
+            "world_delta_m": float(world_delta_m),
+            "world_delta_limit_m": float(allowed_world_delta_m),
+        }
+        return candidate, provenance
+
     def _refine_seeded_world_with_ground_state(
         self,
         sensor_id: int,
@@ -11092,52 +13670,131 @@ class _AnalyticsTelemetryProcessor:
         track: Dict[str, Any],
         *,
         world_source_label: str,
+        world_now_ts: Optional[float] = None,
     ) -> None:
         """Adapt a pre-seeded SDK world observation into shared human state."""
         if self.bev_calibration is None:
-            track.setdefault("world_quality", "good")
-            track.setdefault("world_frame", self._world_frame)
+            self._invalidate_world_track(track, "calibration_unavailable")
             return
         if track.get("world_valid") is not True:
             return
         world = track.get("world")
         if not isinstance(world, (list, tuple)) or len(world) < 3:
+            self._invalidate_world_track(track, "seeded_world_invalid")
             return
         try:
             mx, my, mz = (float(world[0]), float(world[1]), float(world[2]))
         except Exception:
+            self._invalidate_world_track(track, "seeded_world_invalid")
             return
         if not (math.isfinite(mx) and math.isfinite(my) and math.isfinite(mz)):
+            self._invalidate_world_track(track, "seeded_world_nonfinite")
             return
 
         try:
-            calib = self.bev_calibration.snapshot(sensor_id, camera_id)
+            calib = self._world_calibration_snapshot(sensor_id, camera_id)
             if calib is None or calib.intrinsics is None or calib.extrinsics_col_major is None:
-                track.setdefault("world_quality", "good")
-                track.setdefault("world_frame", self._world_frame)
+                self._invalidate_world_track(track, "calibration_unavailable")
                 return
 
-            now_ts = float(time.time())
+            world_frame_id, world_frame_revision, world_transform_sha256 = (
+                world_frame_binding_from_calibration(
+                    calib,
+                    default_frame_id=self._world_frame,
+                )
+            )
+            # Native V3DT bbox3d metadata is produced in the current backend
+            # world frame, but older bridge payloads do not carry the active
+            # revision digest. Bind that one trusted producer to the current
+            # immutable snapshot; arbitrary pre-seeded world rows are handled
+            # by _augment_track_with_world and remain fail-closed.
+            if (
+                str(world_source_label) == "bbox3d"
+                and track.get("world_frame") == str(world_frame_id or self._world_frame)
+            ):
+                if world_frame_revision and not track.get("world_frame_revision"):
+                    track["world_frame_revision"] = str(world_frame_revision)
+                if world_transform_sha256 and not track.get("world_transform_sha256"):
+                    track["world_transform_sha256"] = str(world_transform_sha256)
+            if not world_frame_matches_calibration(track, calib, default_frame_id=self._world_frame):
+                self._invalidate_world_track(track, "world_frame_mismatch")
+                return
+
+            now_ts = (
+                float(world_now_ts)
+                if world_now_ts is not None
+                else self._world_timestamp_for_frame(
+                    int(sensor_id),
+                    media_pts_ns=track.get("media_pts_ns", 0),
+                    observed_ts=float(time.time()),
+                )
+            )
             world_key = self._world_track_key(sensor_id, track)
             self._maybe_prune_world_state(now_ts)
             state: Optional[_WorldAnchorState] = None
             if world_key is not None:
-                state = self._world_state_by_track.get(world_key)
-                if state is None:
-                    state = _WorldAnchorState()
-                    self._world_state_by_track[world_key] = state
+                state, restored = self._world_state_for_observation(
+                    world_key,
+                    now_ts=now_ts,
+                    bbox=track.get("bbox"),
+                    lifecycle_generation=(
+                        int(track.get("tracker_lifecycle_generation"))
+                        if track.get("tracker_lifecycle_generation") is not None
+                        else None
+                    ),
+                )
+                if restored:
+                    track["world_state_continuity"] = "restored_short_ghost"
                 state.ts = now_ts
+                if bind_world_frame(
+                    state,
+                    world_frame_id=world_frame_id,
+                    world_frame_revision=world_frame_revision,
+                    world_transform_sha256=world_transform_sha256,
+                ):
+                    # A calibration revision is a physical discontinuity even
+                    # when the tracker ID survives. Never let a rejected
+                    # seeded observation inherit the prior world's hold.
+                    track["world_state_continuity"] = "reset_world_frame"
+                    state.ts = now_ts
 
-            hit = self._update_track_world_state(
-                track,
-                state,
-                measurement=np.array([mx, float(calib.floor_y), mz], dtype=np.float64),
-                floor_y=float(calib.floor_y),
-                now_ts=now_ts,
-                alpha=float(self._world_smooth_alpha_good),
-                beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
-                quality="good",
-            )
+            metric_candidate = np.array([mx, float(calib.floor_y), mz], dtype=np.float64)
+            if not self._admit_world_observation_range(
+                camera_id,
+                calib=calib,
+                world_candidate=metric_candidate,
+                track=track,
+            ):
+                rejection_reason = str(
+                    track.get("world_observation_range_rejection_reason")
+                    or "world_observation_range_exceeded"
+                )
+                if state is None:
+                    track["world_valid"] = False
+                    track["world_quality"] = "invalid"
+                    track["world_quality_reason"] = rejection_reason
+                    track.pop("world", None)
+                    track.pop("world_source", None)
+                    return
+                mark_world_measurement_unavailable(state, reason=rejection_reason)
+                hit = advance_human_cv_prediction(
+                    state,
+                    floor_y=float(calib.floor_y),
+                    now_ts=now_ts,
+                    config=self._human_ground_cfg,
+                    reason=rejection_reason,
+                )
+            else:
+                hit = self._update_track_world_state(
+                    track,
+                    state,
+                    measurement=metric_candidate,
+                    floor_y=float(calib.floor_y),
+                    now_ts=now_ts,
+                    alpha=float(self._world_smooth_alpha_good),
+                    beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
+                    quality="good",
+                )
 
             if state is not None and not state.measurement_accepted:
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
@@ -11145,8 +13802,32 @@ class _AnalyticsTelemetryProcessor:
                     state.last_good_world is not None
                     and hold_age <= float(self._world_anchor_hold_ttl_s)
                 ):
-                    hit = np.asarray(state.last_good_world, dtype=np.float64)
-                    world_source_label = "anchor_hold"
+                    can_predict = bool(
+                        str(state.motion_mode or "unknown")
+                        not in ("idle", "sit", "lie")
+                        and (
+                            str(state.motion_mode or "unknown") == "walk"
+                            or bool(state.image_motion_supported)
+                        )
+                    )
+                    pred_x, pred_z, _prediction_age = self._predict_world_state(
+                        state,
+                        now_ts,
+                    )
+                    if can_predict and pred_x is not None and pred_z is not None:
+                        hit = np.asarray(
+                            [float(pred_x), float(calib.floor_y), float(pred_z)],
+                            dtype=np.float64,
+                        )
+                        track["world_filter_prediction"] = [
+                            float(pred_x),
+                            float(calib.floor_y),
+                            float(pred_z),
+                        ]
+                        world_source_label = "cv_prediction"
+                    else:
+                        hit = np.asarray(state.last_good_world, dtype=np.float64)
+                        world_source_label = "anchor_hold"
                     track["world_quality"] = "estimated"
                     track["world_quality_reason"] = str(
                         state.measurement_rejection_reason or "physical_measurement_rejected"
@@ -11160,6 +13841,7 @@ class _AnalyticsTelemetryProcessor:
                     )
                     track.pop("world", None)
                     track.pop("world_source", None)
+                    state.trail_append_allowed = False
                     for key, value in state.as_public_fields().items():
                         if value is not None:
                             track[key] = value
@@ -11181,6 +13863,11 @@ class _AnalyticsTelemetryProcessor:
                     image_foot_uv=image_uv,
                     config=self._human_ground_cfg,
                 )
+                if (
+                    world_source_label == "cv_prediction"
+                    and state.motion_mode in ("idle", "sit", "lie")
+                ):
+                    world_source_label = "anchor_hold"
                 if state.motion_mode in ("idle", "sit", "lie") and state.locked_world is not None:
                     hit = np.array(
                         [float(state.locked_world[0]), float(calib.floor_y), float(state.locked_world[1])],
@@ -11190,6 +13877,33 @@ class _AnalyticsTelemetryProcessor:
                     state.world_z = float(state.locked_world[1])
                     state.vel_world_x = 0.0
                     state.vel_world_z = 0.0
+
+            # Motion-mode locking can replace a rejected seeded posterior with
+            # a held point, so validate once more after that canonical-state
+            # operation and before publishing the refined row.
+            if not self._admit_world_observation_range(
+                camera_id,
+                calib=calib,
+                world_candidate=np.asarray(hit, dtype=np.float64),
+                track=track,
+            ):
+                rejection_reason = str(
+                    track.get("world_observation_range_rejection_reason")
+                    or "world_observation_range_exceeded"
+                )
+                if state is not None:
+                    mark_world_measurement_unavailable(
+                        state,
+                        reason=rejection_reason,
+                    )
+                    state.trail_append_allowed = False
+                track["world_estimator_evaluated"] = True
+                self._invalidate_world_track(track, rejection_reason)
+                if state is not None:
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
+                return
 
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
             # V3DT already publishes ``image_base`` from the opposite cuboid
@@ -11207,18 +13921,27 @@ class _AnalyticsTelemetryProcessor:
             track["world"] = [wx, wy, wz]
             track["world_valid"] = True
             track.setdefault("world_quality", "good")
-            track["world_frame"] = self._world_frame
+            track["world_frame"] = str(world_frame_id or self._world_frame)
+            if world_frame_revision:
+                track["world_frame_revision"] = str(world_frame_revision)
+            else:
+                track.pop("world_frame_revision", None)
+            if world_transform_sha256:
+                track["world_transform_sha256"] = str(world_transform_sha256)
+            else:
+                track.pop("world_transform_sha256", None)
             track["world_source"] = str(world_source_label)
             if state is not None:
                 for key, value in state.as_public_fields().items():
                     if value is not None:
                         track[key] = value
-                state.last_good_world = (wx, wy, wz)
-                state.last_good_ts = now_ts
-                state.ts = now_ts
+                if world_source_label not in ("anchor_hold", "cv_prediction"):
+                    state.last_good_world = (wx, wy, wz)
+                    state.last_good_ts = now_ts
+                    state.ts = now_ts
         except Exception:
-            track.setdefault("world_quality", "good")
-            track.setdefault("world_frame", self._world_frame)
+            logger.debug("Seeded world refinement failed", exc_info=True)
+            self._invalidate_world_track(track, "world_refinement_failed")
 
     def _apply_scene_prior_shadow(
         self,
@@ -11310,13 +14033,13 @@ class _AnalyticsTelemetryProcessor:
         obj_meta: Any | None = None,
         pose_kpts_abs: Optional[np.ndarray] = None,
         depth_result: Optional[ObjectDepthResult] = None,
+        world_now_ts: Optional[float] = None,
     ) -> None:
         """Calculate world coordinates for a track if calibration is available."""
         if self._tracking_mode_is_v3dt():
             has_bbox3d_world = bool(
                 isinstance(track.get("bbox3d"), Mapping)
                 and track.get("world_source") == "bbox3d"
-                and track.get("world_frame") == self._world_frame
                 and track.get("world_valid") is True
                 and isinstance(track.get("world"), (list, tuple))
             )
@@ -11327,6 +14050,12 @@ class _AnalyticsTelemetryProcessor:
                         camera_id,
                         track,
                         world_source_label="bbox3d",
+                        world_now_ts=world_now_ts,
+                    )
+                else:
+                    self._invalidate_world_track(
+                        track,
+                        "calibration_unavailable",
                     )
                 return
             # V3DT is its own source of shared metric world truth. Missing or
@@ -11343,6 +14072,8 @@ class _AnalyticsTelemetryProcessor:
                 track.pop(field_name, None)
             return
         if self.bev_calibration is None:
+            if track.get("world") is not None or track.get("world_valid") is True:
+                self._invalidate_world_track(track, "calibration_unavailable")
             return
         if track.get("world_estimator_evaluated") is True:
             return
@@ -11353,17 +14084,32 @@ class _AnalyticsTelemetryProcessor:
                     camera_id,
                     track,
                     world_source_label="bbox3d",
+                    world_now_ts=world_now_ts,
                 )
             return
         if track.get("world") is not None and track.get("world_valid") is True:
-            track.setdefault("world_quality", "good")
-            track.setdefault("world_frame", self._world_frame)
+            # Do not trust an arbitrary pre-seeded row. Route it through the
+            # same revision-bound calibration, range, and PersonGroundState
+            # admission as bbox3d seeds.
+            self._refine_seeded_world_with_ground_state(
+                sensor_id,
+                camera_id,
+                track,
+                world_source_label=str(track.get("world_source") or "preseeded_world"),
+                world_now_ts=world_now_ts,
+            )
             return
 
         try:
             calib = self._world_calibration_snapshot(sensor_id, camera_id)
             if calib is None or calib.intrinsics is None or calib.extrinsics_col_major is None:
                 return
+            world_frame_id, world_frame_revision, world_transform_sha256 = (
+                world_frame_binding_from_calibration(
+                    calib,
+                    default_frame_id=self._world_frame,
+                )
+            )
 
             bbox = track.get("bbox")
             if not bbox or len(bbox) < 4:
@@ -11375,16 +14121,57 @@ class _AnalyticsTelemetryProcessor:
                 return
 
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
-            now_ts = float(time.time())
+            now_ts = (
+                float(world_now_ts)
+                if world_now_ts is not None
+                else self._world_timestamp_for_frame(
+                    int(sensor_id),
+                    media_pts_ns=track.get("media_pts_ns", 0),
+                    observed_ts=float(time.time()),
+                )
+            )
             world_key = self._world_track_key(sensor_id, track)
             self._maybe_prune_world_state(now_ts)
             state: Optional[_WorldAnchorState] = None
             if world_key is not None:
-                state = self._world_state_by_track.get(world_key)
-                if state is None:
-                    state = _WorldAnchorState()
-                    self._world_state_by_track[world_key] = state
+                state, restored = self._world_state_for_observation(
+                    world_key,
+                    now_ts=now_ts,
+                    bbox=bbox,
+                    lifecycle_generation=(
+                        int(track.get("tracker_lifecycle_generation"))
+                        if track.get("tracker_lifecycle_generation") is not None
+                        else None
+                    ),
+                )
+                if restored:
+                    track["world_state_continuity"] = "restored_short_ghost"
                 state.ts = float(now_ts)
+                if bind_world_frame(
+                    state,
+                    world_frame_id=world_frame_id,
+                    world_frame_revision=world_frame_revision,
+                    world_transform_sha256=world_transform_sha256,
+                ):
+                    # A calibration revision is a physical discontinuity even
+                    # when the numeric tracker ID is unchanged. Clear all
+                    # holds/predictions before evaluating this frame.
+                    track["world_state_continuity"] = "reset_world_frame"
+                    state.ts = float(now_ts)
+
+            try:
+                current_frame_id = int(track.get("frame_id", -1))
+            except Exception:
+                current_frame_id = -1
+            bbox_stationary_supported = bool(
+                state is not None
+                and observe_bbox_stationarity(
+                    state,
+                    frame_id=current_frame_id,
+                    bbox=bbox,
+                    config=self._human_ground_cfg,
+                )
+            )
 
             if pose_kpts_abs is None:
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, bbox)
@@ -11394,12 +14181,37 @@ class _AnalyticsTelemetryProcessor:
                 calib_image_size,
             )
 
+            previous_posture = (
+                str(state.posture or "unknown")
+                if state is not None
+                else "unknown"
+            )
+            previous_motion = (
+                str(state.motion_mode or "unknown")
+                if state is not None
+                else "unknown"
+            )
             posture = classify_posture(
                 kpts_abs=pose_kpts_abs,
                 bbox=bbox,
                 height_ref_scene=state.height_ref_scene if state is not None else None,
                 config=self._human_ground_cfg,
             )
+            # Pose can briefly lose its compact seated geometry while the
+            # tracker remains on the same person.  Do not let that one-frame
+            # ``unknown`` state reopen the standing leg-extension heuristic:
+            # the extrapolated hip/knee point is not a ground contact.
+            if posture == "unknown" and state is not None:
+                held_non_upright = bool(
+                    previous_posture in ("sitting", "lying")
+                    and float(state.last_non_upright_ts) >= 0.0
+                    and float(now_ts) - float(state.last_non_upright_ts)
+                    <= float(self._human_ground_cfg.occlusion_upright_memory_s)
+                )
+                if previous_motion == "sit" or held_non_upright:
+                    posture = "sitting"
+                elif previous_motion == "lie":
+                    posture = "lying"
             occlusion_assessment = (
                 assess_lower_body_occlusion(
                     state,
@@ -11422,6 +14234,12 @@ class _AnalyticsTelemetryProcessor:
                 posture = "standing"
             if state is not None:
                 state.posture = str(posture)
+            stationary_hold_eligible = bool(
+                state is not None
+                and state.last_good_world is not None
+                and bbox_stationary_supported
+                and posture in ("sitting", "lying")
+            )
 
             pose_anchor = (
                 self._resolve_pose_floor_anchor(pose_kpts_abs, posture=posture)
@@ -11429,10 +14247,59 @@ class _AnalyticsTelemetryProcessor:
                 else None
             )
             person_anchor = self._resolve_person_depth_anchor(depth_result)
+            depth_reports_no_ground_contact = bool(
+                depth_result is not None
+                and str(depth_result.status or "") == "no_ground_contact"
+            )
+            if (
+                pose_anchor is not None
+                and str(pose_anchor.source) == "pose_leg_floor"
+                and (
+                    posture in ("sitting", "lying")
+                    or depth_reports_no_ground_contact
+                )
+            ):
+                # The source is an extrapolated ankle, not an observed contact.
+                # Keep any independently supported person-mask/ankle depth
+                # candidate available, but never floor-project this estimate
+                # for a known non-upright person.
+                pose_anchor = None
             if pose_anchor is None:
                 anchor_candidate = person_anchor
             else:
                 anchor_candidate = pose_anchor
+
+            contact_basis = (
+                str(anchor_candidate.contact_basis or anchor_candidate.source)
+                if anchor_candidate is not None
+                else None
+            )
+            image_motion_supported = False
+            if state is not None:
+                anchor_is_current = bool(
+                    anchor_candidate is not None
+                    and not force_occlusion_gravity
+                    and (
+                        pose_anchor is not None
+                        or self._depth_measurement_is_current(depth_result)
+                    )
+                )
+                try:
+                    current_frame_id = int(track.get("frame_id", -1))
+                except Exception:
+                    current_frame_id = -1
+                image_motion_supported = observe_coherent_image_motion(
+                    state,
+                    frame_id=current_frame_id,
+                    image_foot_uv=(
+                        (float(anchor_candidate.u), float(anchor_candidate.v))
+                        if anchor_is_current and anchor_candidate is not None
+                        else None
+                    ),
+                    bbox=bbox if anchor_is_current else None,
+                    contact_basis=contact_basis if anchor_is_current else None,
+                    config=self._human_ground_cfg,
+                )
 
             hit: Optional[np.ndarray] = None
             floor_candidate: Optional[np.ndarray] = None
@@ -11443,6 +14310,7 @@ class _AnalyticsTelemetryProcessor:
             reject_current_geometry = False
             floor_ray_admitted = True
             floor_ray_rejection_reason: Optional[str] = None
+            depth_measurement_not_current = False
 
             if anchor_candidate is not None and not force_occlusion_gravity:
                 track["image_foot"] = [float(anchor_candidate.u), float(anchor_candidate.v)]
@@ -11452,6 +14320,13 @@ class _AnalyticsTelemetryProcessor:
                     track_image_size,
                     calib_image_size,
                 )
+                # Keep the accepted image foot in the calibration raster. It
+                # is the predictor's physical image basis; ``track.image_foot``
+                # remains in the source-track raster for OSD compatibility.
+                track["_world_current_image_foot_calib"] = [
+                    float(pose_u),
+                    float(pose_v),
+                ]
                 hit = self._project_pixel_to_floor_world(
                     calib,
                     float(pose_u),
@@ -11476,6 +14351,9 @@ class _AnalyticsTelemetryProcessor:
                     depth_obs = depth_observation.world_point
                     depth_weight = float(depth_observation.weight)
                     depth_reason = str(depth_observation.reason)
+                    depth_measurement_not_current = (
+                        depth_reason == "depth_measurement_not_current"
+                    )
                     if depth_observation.raw_depth_m is not None:
                         track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
                     track["depth_registered_m"] = (
@@ -11492,6 +14370,19 @@ class _AnalyticsTelemetryProcessor:
                             float(depth_obs[1]),
                             float(depth_obs[2]),
                         ]
+                        if not self._admit_world_observation_range(
+                            camera_id,
+                            calib=calib,
+                            world_candidate=np.asarray(depth_obs, dtype=np.float64),
+                            track=track,
+                        ):
+                            track["world_depth_rejection_reason"] = str(
+                                track.get("world_observation_range_rejection_reason")
+                                or "world_observation_range_exceeded"
+                            )
+                            depth_obs = None
+                            depth_weight = 0.0
+                            depth_reason = str(track["world_depth_rejection_reason"])
                     base_floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
                     floor_weight, effective_depth_weight, floor_only_allowed = self._world_fusion_weights(
                         camera_id,
@@ -11504,6 +14395,10 @@ class _AnalyticsTelemetryProcessor:
                         calib=calib,
                         floor_candidate=floor_candidate,
                         track=track,
+                        anchor_uv=(float(pose_u), float(pose_v)),
+                        bbox=bbox_project,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
                     )
                     if not floor_ray_admitted:
                         floor_ray_rejection_reason = str(
@@ -11576,6 +14471,8 @@ class _AnalyticsTelemetryProcessor:
                                 alpha=alpha,
                                 beta=beta,
                                 quality=quality,
+                                contact_basis=contact_basis,
+                                image_motion_supported=image_motion_supported,
                             )
                         else:
                             hit = None
@@ -11619,6 +14516,8 @@ class _AnalyticsTelemetryProcessor:
                                 alpha=alpha,
                                 beta=beta,
                                 quality=quality,
+                                contact_basis=contact_basis,
+                                image_motion_supported=image_motion_supported,
                             )
                         else:
                             hit = None
@@ -11634,7 +14533,20 @@ class _AnalyticsTelemetryProcessor:
                         if not floor_ray_admitted:
                             quality_reason = floor_ray_rejection_reason
                         elif not reject_current_geometry:
-                            quality_reason = "fusion_policy_requires_registered_depth"
+                            quality_reason = (
+                                "depth_measurement_not_current"
+                                if depth_measurement_not_current
+                                else (
+                                    "world_observation_range_exceeded"
+                                    if depth_reason == "world_observation_range_exceeded"
+                                    else "fusion_policy_requires_registered_depth"
+                                )
+                            )
+                        if depth_measurement_not_current and state is not None:
+                            mark_world_measurement_unavailable(
+                                state,
+                                reason="depth_measurement_not_current",
+                            )
                 else:
                     hit = None
 
@@ -11642,6 +14554,11 @@ class _AnalyticsTelemetryProcessor:
             # postures/motion modes. A short box alone can be lower-body
             # occlusion of a standing person — height lock is exactly for that case.
             allow_gravity = posture not in ("sitting", "lying")
+            if depth_reports_no_ground_contact:
+                # Native body-depth samples without a contact band are not a
+                # valid floor constraint; do not turn the bbox/height prior
+                # into a second hallucinated floor anchor.
+                allow_gravity = False
             if (
                 not force_occlusion_gravity
                 and state is not None
@@ -11669,15 +14586,28 @@ class _AnalyticsTelemetryProcessor:
                     state=state,
                 )
                 if gravity_hit is not None:
-                    gravity_admitted = True
+                    gravity_admitted = self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(gravity_hit, dtype=np.float64),
+                        track=track,
+                    )
+                    if not gravity_admitted:
+                        quality_reason = str(
+                            track.get("world_observation_range_rejection_reason")
+                            or "world_observation_range_exceeded"
+                        )
                     if force_occlusion_gravity:
-                        gravity_admitted = self._admit_live_world_source(
-                            state,
-                            candidate_source="gravity_drop",
-                            quality="estimated",
-                            depth_weight=0.0,
-                            posture="standing",
-                            authoritative=True,
+                        gravity_admitted = bool(
+                            gravity_admitted
+                            and self._admit_live_world_source(
+                                state,
+                                candidate_source="gravity_drop",
+                                quality="estimated",
+                                depth_weight=0.0,
+                                posture="standing",
+                                authoritative=True,
+                            )
                         )
                     if gravity_admitted:
                         hit = self._update_track_world_state(
@@ -11695,6 +14625,8 @@ class _AnalyticsTelemetryProcessor:
                                 ),
                             ),
                             quality="estimated",
+                            contact_basis="gravity_drop",
+                            image_motion_supported=False,
                         )
                         world_source = "gravity_drop"
                         quality = "estimated"
@@ -11721,8 +14653,12 @@ class _AnalyticsTelemetryProcessor:
                     quality_reason
                     if quality_reason in (
                         "fusion_policy_requires_registered_depth",
+                        "depth_measurement_not_current",
+                        "world_observation_range_exceeded",
                         "floor_ray_range_exceeded",
                         "floor_ray_geometry_invalid",
+                        "bbox_contact_gap_near_horizon",
+                        "bbox_contact_range_disagreement_near_horizon",
                     )
                     else "source_hysteresis_rejected_current_measurement"
                 )
@@ -11732,19 +14668,210 @@ class _AnalyticsTelemetryProcessor:
                 and "world_prefilter_measurement" in track
                 and not state.measurement_accepted
             )
+            # Projective continuation is evaluated from the last accepted
+            # separate material-motion bit so a failed transport cannot fall
+            # through to a frozen anchor hold after a real bbox displacement.
+            projective_prediction: Optional[Tuple[np.ndarray, Dict[str, Any]]] = None
+            bbox_motion_material = False
+            if state is not None and state.last_accepted_bbox_geometry is not None:
+                try:
+                    previous_bbox = state.last_accepted_bbox_geometry
+                    current_left, current_top, current_width, current_height = (
+                        float(value) for value in bbox_project[:4]
+                    )
+                    previous_center = (
+                        float(previous_bbox[0]) + float(previous_bbox[2]) * 0.5,
+                        float(previous_bbox[1]) + float(previous_bbox[3]) * 0.5,
+                    )
+                    current_center = (
+                        current_left + current_width * 0.5,
+                        current_top + current_height * 0.5,
+                    )
+                    bbox_motion_material = bool(
+                        math.hypot(
+                            current_center[0] - previous_center[0],
+                            current_center[1] - previous_center[1],
+                        )
+                        > max(8.0, float(self._human_ground_cfg.static_px_threshold) * 2.0)
+                    )
+                except Exception:
+                    bbox_motion_material = True
+            if state is not None and (measurement_rejected or hit is None):
+                projective_prediction = self._project_image_motion_prediction(
+                    camera_id=camera_id,
+                    state=state,
+                    bbox_project=bbox_project,
+                    calib=calib,
+                    now_ts=float(now_ts),
+                    lifecycle_generation=(
+                        int(track.get("tracker_lifecycle_generation"))
+                        if track.get("tracker_lifecycle_generation") is not None
+                        else None
+                    ),
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                    track=track,
+                )
+
+            # A projective point is allowed to influence the canonical state
+            # only when the calibrated camera policy permits weak continuation
+            # and this frame has no current metric candidate or its candidate
+            # was rejected.  It is still passed through PersonGroundState's
+            # physical CV gate; the old display-only branch is gone.
+            projective_integrated = False
+            projective_rejection_reason: Optional[str] = None
+            projective_origin_reason = (
+                str(state.measurement_rejection_reason)
+                if (
+                    state is not None
+                    and measurement_rejected
+                    and state.measurement_rejection_reason
+                )
+                else None
+            )
+            projective_allowed = self._projective_continuation_allowed(
+                camera_id,
+                track,
+            )
+            if (
+                state is not None
+                and projective_prediction is not None
+                and projective_allowed
+                and (
+                    anchor_candidate is None
+                    or depth_measurement_not_current
+                    or source_measurement_rejected
+                    or measurement_rejected
+                )
+            ):
+                projective_point, prediction_provenance = projective_prediction
+                integrated = integrate_projective_ground_observation(
+                    state,
+                    measurement=projective_point,
+                    floor_y=float(calib.floor_y),
+                    now_ts=float(now_ts),
+                    config=self._human_ground_cfg,
+                )
+                if integrated is not None:
+                    hit = np.asarray(integrated, dtype=np.float64)
+                    prediction_provenance = dict(prediction_provenance)
+                    prediction_provenance["state_integrated"] = True
+                    track["world_filter_prediction"] = [
+                        float(hit[0]),
+                        float(calib.floor_y),
+                        float(hit[2]),
+                    ]
+                    track["world_prediction_provenance"] = prediction_provenance
+                    track["world_prediction_image_foot"] = list(
+                        prediction_provenance["image_foot"]
+                    )
+                    world_source = "image_motion_prediction"
+                    quality = "estimated"
+                    projective_reason = (
+                        "depth_measurement_not_current"
+                        if depth_measurement_not_current
+                        else str(
+                            projective_origin_reason
+                            or fallback_reason
+                            or "world_measurement_unavailable"
+                        )
+                    )
+                    state.measurement_rejection_reason = projective_reason
+                    quality_reason = (
+                        f"{projective_reason},"
+                        "predicted_from_accepted_image_motion"
+                    )
+                    projective_integrated = True
+                else:
+                    projective_rejection_reason = str(
+                        state.measurement_rejection_reason
+                        or "projective_observation_rejected"
+                    )
+
+            # A missing/filtered candidate must not inherit the previous
+            # frame's ``measurement_accepted=True`` diagnostic.  Mark the
+            # current frame explicitly unavailable before choosing the
+            # bounded process-model fallback below.
+            if state is not None and hit is None and not measurement_rejected:
+                if projective_rejection_reason:
+                    measurement_rejected = True
+                else:
+                    mark_world_measurement_unavailable(
+                        state,
+                        reason=(
+                            "depth_measurement_not_current"
+                            if depth_measurement_not_current
+                            else str(fallback_reason or "world_measurement_unavailable")
+                        ),
+                    )
+                    measurement_rejected = True
+
+            if projective_integrated:
+                # The canonical state/output has already been selected. Do
+                # not reinterpret it as a held or display-only point below.
+                measurement_rejected = False
+
             if measurement_rejected:
                 quality_reason = str(
                     state.measurement_rejection_reason or "physical_measurement_rejected"
                 )
                 fallback_reason = quality_reason
+                if stationary_hold_eligible:
+                    quality_reason = f"{quality_reason},stationary_bbox_hold"
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
+                hold_ttl_s = (
+                    float(self._world_stationary_hold_ttl_s)
+                    if stationary_hold_eligible
+                    else float(self._world_anchor_hold_ttl_s)
+                )
                 if (
                     state.last_good_world is not None
-                    and hold_age <= float(self._world_anchor_hold_ttl_s)
+                    and hold_age <= hold_ttl_s
                 ):
-                    hit = np.asarray(state.last_good_world, dtype=np.float64)
+                    process_point = advance_human_cv_prediction(
+                        state,
+                        floor_y=float(calib.floor_y),
+                        now_ts=float(now_ts),
+                        config=self._human_ground_cfg,
+                        reason=str(quality_reason),
+                    )
+                    if process_point is not None:
+                        track["world_filter_prediction"] = [
+                            float(process_point[0]),
+                            float(calib.floor_y),
+                            float(process_point[2]),
+                        ]
+                        if stationary_hold_eligible or (
+                            int(current_frame_id) < 0 and not bbox_motion_material
+                        ):
+                            # ``advance_human_cv_prediction`` has already
+                            # advanced the one canonical process state.  Do
+                            # not replace that bounded posterior with the
+                            # older ``last_good_world`` here: doing so makes
+                            # a cv_prediction -> anchor_hold transition jump
+                            # backwards by the entire rejected interval (and
+                            # can exceed the physical speed bound).  The hold
+                            # remains non-authoritative/non-appending through
+                            # its source label and trail gate; only the
+                            # accepted metric anchor remains unchanged.
+                            hit = np.asarray(process_point, dtype=np.float64)
+                            world_source = "anchor_hold"
+                        else:
+                            hit = np.asarray(process_point, dtype=np.float64)
+                            world_source = "cv_prediction"
+                        track["world_prediction_provenance"] = {
+                            "type": "bounded_cv_process",
+                            "non_authoritative": True,
+                            "state_integrated": True,
+                            "reason": str(quality_reason),
+                        }
+                        track["world_prediction_image_foot"] = list(
+                            track.get("image_foot") or []
+                        )
+                    else:
+                        hit = None
+                        world_source = None
                     quality = "estimated"
-                    world_source = "anchor_hold"
                 else:
                     hit = None
                     quality = "invalid"
@@ -11757,13 +14884,80 @@ class _AnalyticsTelemetryProcessor:
                 and state.last_good_world is not None
             ):
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
-                if hold_age <= float(self._world_anchor_hold_ttl_s):
-                    hit = np.asarray(state.last_good_world, dtype=np.float64)
-                    world_source = "anchor_hold"
-                    quality = "estimated"
-                    quality_reason = fallback_reason
+                hold_ttl_s = (
+                    float(self._world_stationary_hold_ttl_s)
+                    if stationary_hold_eligible
+                    else float(self._world_anchor_hold_ttl_s)
+                )
+                if hold_age <= hold_ttl_s:
+                    process_point = advance_human_cv_prediction(
+                        state,
+                        floor_y=float(calib.floor_y),
+                        now_ts=float(now_ts),
+                        config=self._human_ground_cfg,
+                        reason=(
+                            "depth_measurement_not_current"
+                            if depth_measurement_not_current
+                            else str(fallback_reason or "world_measurement_unavailable")
+                        ),
+                    )
+                    if process_point is not None:
+                        track["world_filter_prediction"] = [
+                            float(process_point[0]),
+                            float(calib.floor_y),
+                            float(process_point[2]),
+                        ]
+                        hit = np.asarray(process_point, dtype=np.float64)
+                        world_source = "cv_prediction"
+                        track["world_prediction_provenance"] = {
+                            "type": "bounded_cv_process",
+                            "non_authoritative": True,
+                            "state_integrated": True,
+                            "reason": str(
+                                "depth_measurement_not_current"
+                                if depth_measurement_not_current
+                                else fallback_reason
+                            ),
+                        }
+                        quality = "estimated"
+                        if world_source == "anchor_hold" and not depth_measurement_not_current:
+                            quality_reason = fallback_reason
+                        if stationary_hold_eligible and world_source == "anchor_hold":
+                            quality_reason = f"{quality_reason},stationary_bbox_hold"
+                    else:
+                        hit = None
+                        world_source = None
 
             if hit is not None:
+                # The final point may be a bounded CV/hold posterior rather
+                # than the current metric sample. Re-admit the exact output
+                # against the same active calibration before image reprojection
+                # or BEV/trail publication. A prediction that leaves the
+                # calibrated camera envelope is typed invalid; it is never
+                # clipped, seeded as last-good, or appended to a trail.
+                if not self._admit_world_observation_range(
+                    camera_id,
+                    calib=calib,
+                    world_candidate=np.asarray(hit, dtype=np.float64),
+                    track=track,
+                ):
+                    rejection_reason = str(
+                        track.get("world_observation_range_rejection_reason")
+                        or "world_observation_range_exceeded"
+                    )
+                    if state is not None:
+                        mark_world_measurement_unavailable(
+                            state,
+                            reason=rejection_reason,
+                        )
+                        state.trail_append_allowed = False
+                    track["world_estimator_evaluated"] = True
+                    self._invalidate_world_track(track, rejection_reason)
+                    if state is not None:
+                        for key, value in state.as_public_fields().items():
+                            if value is not None:
+                                track[key] = value
+                    return
                 track["world_estimator_evaluated"] = True
                 if (
                     world_source == "gravity_drop"
@@ -11795,21 +14989,61 @@ class _AnalyticsTelemetryProcessor:
                     except Exception:
                         image_uv = None
                 if state is not None:
+                    # Keep the bounded process posterior across the motion
+                    # mode update.  ``update_motion_mode`` may enter/retain
+                    # an idle-like mode and restore ``locked_world``; that
+                    # lock can predate the current rejected-frame posterior.
+                    # Saving this candidate lets the lock logic update its
+                    # bookkeeping without replacing the point that is about
+                    # to be emitted.
+                    bounded_process_hit = (
+                        np.asarray(hit, dtype=np.float64).copy()
+                        if world_source
+                        in ("cv_prediction", "image_motion_prediction", "anchor_hold")
+                        else None
+                    )
                     update_motion_mode(
                         state,
                         now_ts=float(now_ts),
                         image_foot_uv=image_uv,
                         config=self._human_ground_cfg,
                     )
+                    if (
+                        world_source == "cv_prediction"
+                        and state.motion_mode in ("idle", "sit", "lie")
+                    ):
+                        # A prediction is only a continuity aid for an active
+                        # track.  If current image evidence now classifies the
+                        # person as stationary/seated/lying, downgrade to a
+                        # true non-appending hold for this frame.
+                        world_source = "anchor_hold"
+                    if world_source == "anchor_hold":
+                        state.trail_append_allowed = False
+                    elif world_source in ("cv_prediction", "image_motion_prediction"):
+                        state.trail_append_allowed = True
+                    if bounded_process_hit is not None:
+                        # A stale idle lock is a process/display state, not a
+                        # new metric observation. Preserve the current bounded
+                        # posterior and move the lock to that same point so a
+                        # later frame cannot snap back to the old location.
+                        hit = bounded_process_hit
+                        state.world_x = float(hit[0])
+                        state.world_z = float(hit[2])
+                        if state.motion_mode in ("idle", "sit", "lie"):
+                            state.locked_world = (
+                                float(hit[0]),
+                                float(hit[2]),
+                            )
                     if state.motion_mode in ("idle", "sit", "lie") and state.locked_world is not None:
-                        hit = np.array(
-                            [float(state.locked_world[0]), float(calib.floor_y), float(state.locked_world[1])],
-                            dtype=np.float64,
-                        )
-                        state.world_x = float(state.locked_world[0])
-                        state.world_z = float(state.locked_world[1])
-                        state.vel_world_x = 0.0
-                        state.vel_world_z = 0.0
+                        if bounded_process_hit is None:
+                            hit = np.array(
+                                [float(state.locked_world[0]), float(calib.floor_y), float(state.locked_world[1])],
+                                dtype=np.float64,
+                            )
+                            state.world_x = float(state.locked_world[0])
+                            state.world_z = float(state.locked_world[1])
+                            state.vel_world_x = 0.0
+                            state.vel_world_z = 0.0
 
                 self._set_track_image_base_from_world(track, calib=calib, world_point=hit, flip_u=flip_u, flip_v=flip_v)
                 wx = float(hit[0])
@@ -11823,17 +15057,15 @@ class _AnalyticsTelemetryProcessor:
                     track["world_quality_reason"] = str(quality_reason)
                 else:
                     track.pop("world_quality_reason", None)
-                track["world_frame"] = str(
-                    getattr(calib, "world_frame_id", self._world_frame)
-                    or self._world_frame
-                )
-                world_frame_revision = str(
-                    getattr(calib, "world_frame_revision", "") or ""
-                ).strip()
+                track["world_frame"] = str(world_frame_id or self._world_frame)
                 if world_frame_revision:
                     track["world_frame_revision"] = world_frame_revision
                 else:
                     track.pop("world_frame_revision", None)
+                if world_transform_sha256:
+                    track["world_transform_sha256"] = world_transform_sha256
+                else:
+                    track.pop("world_transform_sha256", None)
                 if world_source:
                     track["world_source"] = str(world_source)
                 else:
@@ -11842,23 +15074,65 @@ class _AnalyticsTelemetryProcessor:
                     for key, value in state.as_public_fields().items():
                         if value is not None:
                             track[key] = value
-                    if world_source != "anchor_hold":
+                    if world_source not in (
+                        "anchor_hold",
+                        "cv_prediction",
+                        "image_motion_prediction",
+                    ):
                         state.last_good_world = (float(wx), float(wy), float(wz))
                         state.last_good_ts = float(now_ts)
                         state.ts = float(now_ts)
+                        # Store only the image basis that produced a physically
+                        # accepted world point.  Predictions/holds never move
+                        # this origin, which makes repeated rejected frames
+                        # non-integrating by construction.
+                        accepted_foot = track.get("_world_current_image_foot_calib")
+                        if (
+                            not isinstance(accepted_foot, (list, tuple))
+                            or len(accepted_foot) < 2
+                        ):
+                            accepted_foot = track.get("image_base")
+                        record_accepted_image_geometry(
+                            state,
+                            image_foot_uv=(
+                                (float(accepted_foot[0]), float(accepted_foot[1]))
+                                if isinstance(accepted_foot, (list, tuple))
+                                and len(accepted_foot) >= 2
+                                else None
+                            ),
+                            bbox=bbox_project,
+                            now_ts=float(now_ts),
+                            lifecycle_generation=(
+                                int(track.get("tracker_lifecycle_generation"))
+                                if track.get("tracker_lifecycle_generation") is not None
+                                else None
+                            ),
+                        )
             else:
                 track["world_estimator_evaluated"] = True
                 track["world_valid"] = False
                 track["world_quality"] = "invalid"
                 track["world_quality_reason"] = str(fallback_reason or "no_floor_intersection")
                 track.pop("world_source", None)
+                track.pop("world_filter_prediction", None)
+                track.pop("world_prediction_image_foot", None)
+                track.pop("world_prediction_provenance", None)
                 if state is not None:
+                    state.trail_append_allowed = False
                     for key, value in state.as_public_fields().items():
                         if value is not None:
                             track[key] = value
         except Exception:
-            # Silently fail; world coordinates are best-effort
-            pass
+            # A calibration/refinement failure must not preserve arbitrary
+            # pre-existing world_valid state or let a partial point cross the
+            # publication boundary.
+            logger.debug("World augmentation failed", exc_info=True)
+            self._invalidate_world_track(track, "world_estimation_failed")
+        finally:
+            # Calibration-raster predictor state is an implementation detail,
+            # not part of the public tracking contract.  Never let the
+            # temporary underscore field cross the scalar publication boundary.
+            track.pop("_world_current_image_foot_calib", None)
 
     def _publish_bev(
         self,
@@ -11871,6 +15145,9 @@ class _AnalyticsTelemetryProcessor:
         track_count: Optional[int] = None,
         paired_with_tracking: bool = False,
         tracking_receipt: Optional[TrackingPublicationReceipt] = None,
+        observed_at_us: Optional[int] = None,
+        timestamp_us: Optional[int] = None,
+        tracker_lifecycle_tombstones: Sequence[Mapping[str, Any]] = (),
     ) -> BevPublicationReceipt:
         if self.bev_renderer is None:
             raise RuntimeError("BEV publication requested without a renderer")
@@ -11882,7 +15159,11 @@ class _AnalyticsTelemetryProcessor:
                 "paired BEV publication requires a tracking admission receipt"
             )
         ts_now = float(now_ts) if now_ts is not None else time.time()
-        ts_us = self._frame_timestamp_us(frame_meta)
+        ts_us = int(
+            timestamp_us
+            if timestamp_us is not None
+            else self._frame_timestamp_us(frame_meta)
+        )
         frame_id = int(
             _meta_lookup(
                 frame_meta,
@@ -11892,7 +15173,9 @@ class _AnalyticsTelemetryProcessor:
             )
             or 0
         )
-        observed_at_us = max(1, int(ts_now * 1_000_000))
+        observed_at_us_value = max(1, int(ts_now * 1_000_000))
+        if observed_at_us is not None:
+            observed_at_us_value = max(1, int(observed_at_us))
         tracking_sequence = (
             tracking_receipt.tracking_publication_sequence
             if tracking_receipt is not None
@@ -11929,7 +15212,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -11948,7 +15231,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -11965,7 +15248,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -11979,9 +15262,12 @@ class _AnalyticsTelemetryProcessor:
                 timestamp_us=ts_us,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
+                tracker_lifecycle_tombstones=list(
+                    tracker_lifecycle_tombstones
+                ),
             )
             _record_core_stage_timing("bev.render_and_publish", publish_start_ns, item_count=len(footpoints))
         except Exception as exc:
@@ -11996,7 +15282,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -12013,7 +15299,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -12021,7 +15307,7 @@ class _AnalyticsTelemetryProcessor:
         if (
             receipt.source_id != int(sensor_id)
             or receipt.frame_id != frame_id
-            or receipt.observed_at_us != observed_at_us
+            or receipt.observed_at_us != observed_at_us_value
             or receipt.tracking_publication_sequence != tracking_sequence
             or receipt.tracking_outbound_submission_id
             != tracking_submission_id
@@ -12037,7 +15323,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=camera_id,
                 source_id=int(sensor_id),
                 frame_id=frame_id,
-                observed_at_us=observed_at_us,
+                observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,
                 tracking_outbound_submission_id=tracking_submission_id,
                 failure=failure,
@@ -12295,6 +15581,7 @@ class _AnalyticsTelemetryProcessor:
         frame_id: int,
         primitives: Sequence[IdentityFramePrimitive],
         observed_at: float,
+        fatal: bool = True,
     ) -> None:
         service = getattr(self.pipeline, "identity_v2_service", None)
         if service is None:
@@ -12307,9 +15594,14 @@ class _AnalyticsTelemetryProcessor:
                 observed_at=float(observed_at),
             )
         except Exception as exc:
-            callback = getattr(self.pipeline, "identity_v2_failure_callback", None)
-            if callable(callback):
-                callback(exc)
+            if fatal:
+                callback = getattr(
+                    self.pipeline,
+                    "identity_v2_failure_callback",
+                    None,
+                )
+                if callable(callback):
+                    callback(exc)
             raise
 
     def _maybe_assign_stable_id(
@@ -12654,7 +15946,11 @@ class _AnalyticsTelemetryProcessor:
         if track.get("depth_anchor_m") is None:
             track["depth_anchor_m"] = float(depth_result.anchor_depth_m) if depth_result.anchor_depth_m is not None else None
         if track.get("depth_used_m") is None:
-            track["depth_used_m"] = _depth_used_m(depth_result)
+            track["depth_used_m"] = (
+                _depth_used_m(depth_result)
+                if self._depth_measurement_is_current(depth_result)
+                else None
+            )
         track["depth_registered_m"] = track.get("depth_registered_m")
         track["depth_registration_status"] = track.get("depth_registration_status")
         track["depth_registration_id"] = track.get("depth_registration_id")

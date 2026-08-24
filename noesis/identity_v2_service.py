@@ -39,6 +39,7 @@ from reid.identity_v2 import (
     IdentityStore,
     IdentityV2Runtime,
     IdentityEvidenceRecorder,
+    identity_tracklet_id,
     load_migration_review,
     OpenSetPolicy,
     OverlapSharePermit,
@@ -1036,7 +1037,11 @@ class IdentityV2Service:
                         f"model_layer={self.model_layer}",
                     ),
                 )
-                tracklet_id = observation.to_runtime().key.tracklet_id
+                tracklet_id = identity_tracklet_id(
+                    self.run_id,
+                    camera,
+                    tracker_id,
+                )
                 observations.append(observation)
                 primitives_by_tracklet[tracklet_id] = primitive
                 observation_by_tracklet[tracklet_id] = observation
@@ -1133,18 +1138,10 @@ class IdentityV2Service:
 
             for primitive in rows:
                 tracker_id = _require_text(primitive.tracker_id, "primitive tracker_id")
-                tracklet_id = (
-                    PrimitiveFrameObservation(
-                        run_id=self.run_id,
-                        camera_id=camera,
-                        tracker_id=tracker_id,
-                        frame_id=frame,
-                        observation_id="missing-embedding",
-                        quality=0.0,
-                        embedding=(1.0,) + (0.0,) * (self.embedding_dim - 1),
-                    )
-                    .to_runtime()
-                    .key.tracklet_id
+                tracklet_id = identity_tracklet_id(
+                    self.run_id,
+                    camera,
+                    tracker_id,
                 )
                 if tracklet_id in current_tracklets:
                     continue
@@ -1173,17 +1170,11 @@ class IdentityV2Service:
                 if recent.camera_id == camera and tracklet_id not in current_tracklets:
                     self._recent_proofs.pop(tracklet_id, None)
             visible_tracklets = {
-                PrimitiveFrameObservation(
-                    run_id=self.run_id,
-                    camera_id=camera,
-                    tracker_id=_require_text(row.tracker_id, "primitive tracker_id"),
-                    frame_id=frame,
-                    observation_id="visible-tracklet",
-                    quality=0.0,
-                    embedding=(1.0,) + (0.0,) * (self.embedding_dim - 1),
+                identity_tracklet_id(
+                    self.run_id,
+                    camera,
+                    _require_text(row.tracker_id, "primitive tracker_id"),
                 )
-                .to_runtime()
-                .key.tracklet_id
                 for row in rows
             }
             for tracklet_id, held in tuple(self._held_overlays.items()):
@@ -1327,7 +1318,15 @@ class IdentityV2Service:
                 sid = parsed_sid if parsed_sid > 0 else None
                 raw_name = " ".join(str(identity.get("display_name") or "").split())
                 display_name = raw_name or None
-            tracker_id = str(primitive.tracker_id)
+            # The coordinator tracker key may be source-epoch scoped after a
+            # reconnect.  The downstream SDK metadata still carries the raw
+            # numeric tracker ID, so keep the exact-frame OSD join on that
+            # public value while identity resolution uses the scoped key.
+            tracker_id = str(
+                track.get("tracker_id", primitive.tracker_id)
+            ).strip()
+            if not tracker_id:
+                raise ValueError("identity-v2 public OSD tracker ID is empty")
             self._osd_decisions[(frame_key[0], frame_key[1], tracker_id)] = (
                 IdentityOsdDecision(
                     camera_id=frame_key[0],

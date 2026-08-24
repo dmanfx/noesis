@@ -1,5 +1,5 @@
 # DS9.1 WebSocket API contracts
-_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-15._
+_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-23._
 
 The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
@@ -110,11 +110,14 @@ Canonical type routing is explicit and fail-closed:
   validates tracking-first order, exact cohort fields, embedded/separate
   snapshot equality, event count/order/equality, and rejects BEV or
   noncanonical mixing before admission.
-- `bev-frame` may use only `broadcast_bev_sync`. It keeps its own typed sender
-  receipt and must carry the already committed tracking cohort; it is never an
-  authority-gate exception routed through generic broadcast.
+- `bev-frame` and `bev-status` may use only `broadcast_bev_sync`. They share
+  one typed, bounded sender route. A cohort-bound status carries the same
+  top-level tracking identity as the failed BEV attempt, including
+  `trackingOutboundSubmissionId`; the dashboard rejects an older or unbound
+  status once a newer canonical frame is admitted. A startup/transport status
+  without a cohort is only a reset before canonical frame admission.
 - Generic sync, batch, targeted, async, and coalescer entry points reject all
-  four canonical types, including top-level canonical JSON supplied as raw text
+  five canonical types, including top-level canonical JSON supplied as raw text
   or UTF-8 binary. Noncanonical raw traffic remains supported. Pre-encoded
   envelopes carry a server-instance owner token and must have exact ASCII byte
   length plus matching encoded/declared type, so caller-constructed frozen JSON
@@ -128,8 +131,8 @@ An arbitrary same-process caller could always violate Python object privacy, so
 exclusive call sites, exact shape validation, and fail-closed runtime review are
 the maintainability enforcement.
 
-Canonical `tracking`, `world_snapshot`, `world_event`, and `bev-frame` messages
-are never latest-only coalesced. One tracking frame plus its exact world
+Canonical `tracking`, `world_snapshot`, `world_event`, `bev-frame`, and
+`bev-status` messages are never latest-only coalesced. One tracking frame plus its exact world
 snapshot/events enters the queue as one ordered batch and is delivered in list
 order by one coroutine. Batch admission is all-or-none, but transport delivery
 is not a multi-frame socket transaction: a later client disconnect can still
@@ -213,6 +216,10 @@ Emitted ~1 Hz when `stats_callback` is registered
         "revision_count": <int>,
         "loaded_revision_count": <int>,
         "cameras": { /* exact space/prior binding by camera */ }
+      },
+      "identity_v2_shadow": {
+        "status": "enabled"|"disabled"|"degraded",
+        "last_error": <string|null>
       },
       "boundary_cpu_serialization_p99_ms": <float|null>,
       "boundary_cpu_serialization_p99_10s_ms": <float|null>,
@@ -337,6 +344,18 @@ never accepted. The result is observable under
   and `object_depth_attach_failure_total.<reason>` count rejected/unavailable
   native attachment paths. A failed attachment is not reported as an attached
   status and cannot become canonical depth evidence.
+- `tracking.publication_worker.pending_total`,
+  `pending_high_watermark`, `inflight`, `enqueued_total`, `completed_total`,
+  `overflow_total`, and `failures_total` expose the exact canonical worker.
+  `identity_v2.shadow.pending_sources`, `pending_sources_high_watermark`,
+  `inflight`, `enqueued_total`, `completed_total`, `coalesced_total`, the
+  shadow-only drop totals, and `worker_failures_total` expose the optional
+  shadow lane. Their stage timings are
+  `tracking.publication_worker_item`,
+  `tracking.publication_worker_queue_wait`,
+  `identity_v2.shadow_process_source_frame`, and
+  `identity_v2.shadow_queue_wait`; BEV retains
+  `bev.render_and_publish`.
 
 ## 3. Mosaic Video (WebRTC)
 
@@ -389,7 +408,8 @@ Emitted by `BevRenderer`:
     "source_id": <int>,
     "frame_id": <int>,
     "observed_at_us": <int epoch microseconds>,
-    "tracking_publication_sequence": <int>
+    "tracking_publication_sequence": <int>,
+    "tracking_outbound_submission_id": <int>
   },
   "w": <int>,
   "h": <int>,
@@ -427,11 +447,13 @@ Emitted by `BevRenderer`:
       "method": "<string>",
       "stableId": <int|null>,
       "trackerId": <int|null>,
+      "trackerLifecycleGeneration": <int|null>,
       "frameId": <int>,
       "anchorSource": "<string|null>",
       "anchorQuality": "<string|null>",
       "anchorReason": "<string|null>",
-      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"|"registered_depth_anchor",
+      "displaySource": "world"|"world_to_camera_local"|"world_floor_fallback_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"|"registered_depth_anchor",
+      "worldAdmission": "accepted"|"predicted"|"held"|null,
       "worldFrame": "backend_world_m"|null,
       "worldFrameRevision": "<revision>"|null,
       "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
@@ -443,7 +465,19 @@ Emitted by `BevRenderer`:
       "coverageRegion": "<semantic-region>"|null
     }
   ],
-  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ]} ],
+  "droppedFootpointCount": <int>,
+  "droppedFootpoints": [
+    {
+      "stableId": <int|null>,
+      "trackerId": <int|null>,
+      "trackerLifecycleGeneration": <int|null>,
+      "trailSegmentId": <int|null>,
+      "reason": "canonical_world_missing"|"canonical_world_nonfinite"|"canonical_world_outside_admission_surface"|"canonical_world_outside_max_distance"|"canonical_world_outside_display_guard"|"<other canonical admission reason>",
+      "canonicalWorld": true,
+      "anchorSource": "<string|null>"
+    }
+  ],
+  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "canonicalWorld": <bool>, "trailSegmentId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ]} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
@@ -485,7 +519,33 @@ Emitted by `BevRenderer`:
   that frame. A renderer that is not configured does not change tracking
   cadence.
 - `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
-- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. Every live tracker footpoint is marked canonical-world-required by the DS9 producer: its only admissible production display source is `world_to_camera_local`, projected from the producer-owned filtered `track.world`. Registered depth, floor-contact rays, and image anchors may appear in alignment diagnostics, but they cannot move a live tracked-person dot. A live track without a finite, in-bounds canonical world point is omitted. `registered_depth_anchor`, `floor_contact_ray`, `image_depth_anchor`, and `image_anchor` remain legacy/non-tracker or diagnostic source values only.
+- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. Every live tracker footpoint is marked canonical-world-required by the DS9 producer: its only admissible production display source is `world_to_camera_local`, projected from the producer-owned filtered `track.world`. `world_floor_fallback_to_camera_local` is a legacy/noncanonical diagnostic path emitted only for compatibility when a noncanonical world fallback is projected into the camera-local view; it is not permitted to move an active canonical tracked-person dot. Registered depth, floor-contact rays, and image anchors may appear in alignment diagnostics, but they cannot move a live canonical tracked-person dot. A live track without a finite canonical world point inside the producer-published `displayBounds` is omitted. The dashboard uses that exact metric display envelope for camera-local cohorts; it does not invent a second margin, auto-fit to tracks, clamp points, or remap raw metric coordinates. The active PCF raster remains the semantic `floorplanBounds`, not a live tracking validity gate: a finite canonical point in the display envelope may be emitted unchanged with `floorplanInside=false`. When `coverageInside=false` is carried on a canonical world point, it remains diagnostic and does not become a second dashboard-only rejection gate; legacy/noncanonical candidates still honor the configured coverage polygon. `canonical_world_outside_display_guard` is a bounded renderer-side presentation safety drop, not a replacement for the producer's world-validity decision. `registered_depth_anchor`, `floor_contact_ray`, `image_depth_anchor`, and `image_anchor` remain legacy/non-tracker or diagnostic source values only.
+- `camera_local_ground_m` uses the horizontal projection of the active camera's
+  right and forward axes. Camera pitch and camera height must not contribute to
+  local X/Z. Consequently, the floor point vertically below the camera is
+  exactly `(0, 0)`. Consumers must not substitute the pitched OpenCV camera
+  frame or reconstruct this transform from raw, differently revisioned `E`.
+- `worldAdmission=predicted` means the exact current cohort did not provide an
+  accepted current metric observation because its candidates were missing,
+  stale, or physically rejected, so the producer displayed a bounded
+  constant-velocity continuation of the canonical world filter. It remains in
+  the same revision-bound world frame, but is not a fresh position measurement:
+  `world_measurement_accepted=false`, `world_source="cv_prediction"`, and
+  `world_filter_prediction` carries the displayed prediction. Prediction does
+  not advance the last-good measurement timestamp. Rejected updates predict
+  from one fixed last-good rejection anchor and are capped at 0.40 seconds;
+  repeated rejects cannot advance that anchor or accumulate unbounded drift.
+  Trail growth remains controlled by `trailAppendAllowed`.
+- `footpoints[].worldAdmission=held` means the exact current cohort had no
+  accepted new position and the producer intentionally retained its last-good
+  canonical world point. The head remains visible, but no trail sample is
+  appended. The normal hold cap is 0.40 seconds. A trusted seated or lying
+  lifecycle may hold for at most 2.0 seconds only while exact-frame detector
+  boxes prove stationary continuity; that exception remains
+  `world_measurement_accepted=false` and trail-disabled. A genuinely
+  unplaceable canonical track is omitted and accounted for by
+  `droppedFootpointCount` plus a bounded `droppedFootpoints` reason list; normal
+  operation never hides that omission behind alignment-debug mode.
 - `floorplanBounds` and the other `floorplan*` fields bind the MapAnything raster
   to the active floorplan registry's metric bounds, grid, resolution, exact
   snapshot identity, and capture timestamps. The registry accepts only
@@ -495,17 +555,20 @@ Emitted by `BevRenderer`:
   the dashboard clears points instead of retaining a dot across a mismatch.
   When a reviewed ray-to-floorplan transform exists, `floorplanAlignment`
   reports its quality/count/residual evidence and whether it was applied.
-- A configured `coverageEnvelope` is a separate semantic admission surface for
-  that camera. Its regions are a union of camera-local X/Z polygons; a point is
-  admitted when it lies in any region or within `boundaryToleranceM` of a
-  region edge. The tolerance never moves, clips, or smooths the point.
-  `displayBounds`/`xMin`/`xMax`/`zMin`/`zMax` cover both the raster and the
-  envelope, while `floorplanBounds` continues to describe only the raster.
-  Consequently, a valid point may declare `coverageInside=true` and
-  `floorplanInside=false`. Consumers must use its raw metric `x`/`y` coordinates
-  in that case rather than remapping the out-of-range floorplan normalization.
-  Cameras without a configured envelope retain the active-floorplan rectangle
-  as their admission surface.
+- A configured `coverageEnvelope` is a separate camera-local geometry contract.
+  Its regions are a union of X/Z polygons and its boundary tolerance never
+  moves, clips, or smooths a point. For legacy/noncanonical candidates it is
+  the producer-side admission surface. Canonical world points remain owned by
+  the producer's revision-bound world state: `coverageInside=false` is preserved
+  as diagnostic provenance and is not silently applied as a second dashboard
+  rejection gate. `displayBounds`/`xMin`/`xMax`/`zMin`/`zMax` cover both the
+  raster and the configured envelope, while `floorplanBounds` continues to
+  describe only the raster. Consumers use raw metric `x`/`y` coordinates rather
+  than remapping out-of-range floorplan normalization. Cameras without a
+  configured envelope retain the active-floorplan rectangle as their semantic
+  `floorplanBounds`; the producer publishes the exact fixed, bounded display
+  envelope for canonical live points. The dashboard consumes that envelope
+  verbatim. It is not an alternate world estimator or a PCF extension.
 - Camera-local mode with an active-floorplan provider has no config-bounds or
   auto-extents substitute. Before the first valid record, a provider result of
   `None` records `startup_pending` and emits neither a camera-local `bev-frame`
@@ -536,8 +599,29 @@ Emitted by `BevRenderer`:
   `person_ground_state.py` already own the only track-position filtering stage
   (human CV filter + stationary lock).
 - When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in the declared BEV `frame` with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
-- World-mode BEV omits `anchor_hold` head points from `footpoints`/`trails` so stale held positions do not render as drifting or out-of-bounds trail segments after temporary occlusion.
-- Backend world-BEV smoothing and trail history are keyed by tracker-local identity (`trackerId` when present, otherwise `stableId`) to match the nvOSD trail path; `stableId` remains display metadata and may legitimately span multiple tracker histories over time.
+- `trails[].canonicalWorld` is the producer-owned authority marker for the
+  retained trail, including frames where the current `footpoints` cohort is
+  empty. A `true` marker permits a finite trail sample with
+  `coverageInside=false` to remain displayable; coverage remains diagnostic for
+  that canonical world trail. Consumers must fail closed for an unmarked
+  retained trail with no current canonical footpoint; during the transition,
+  legacy payloads may infer authority only from a matching current footpoint.
+- The post-tiler OSD trail consumer joins a canonical track only on the exact
+  `(source_id, frame_id)` analytics cohort and maps the track's declared
+  source-image basis into that source's configured mosaic tile. It must not use
+  a last-seen row, bbox-bottom fallback, or edge clamp; tracker lifecycle or
+  image-basis changes break the trail segment.
+- World-mode BEV emits a canonical `anchor_hold` head point with
+  `worldAdmission=held` so a visible track does not disappear merely because
+  the current measurement was rejected. Held points never extend trail
+  history. A canonical `cv_prediction` head is emitted with
+  `worldAdmission=predicted` and may extend history only while
+  `trailAppendAllowed=true`. Legacy/non-canonical held anchors remain
+  inadmissible.
+- Backend world-BEV trail history is keyed by tracker-local identity plus
+  `trackerLifecycleGeneration` when available (`stableId` is fallback display
+  metadata only). A reused numeric tracker ID removes its older generation
+  immediately and cannot inherit or connect that trail.
 - Coordinate note: BEV renders on the ground plane (XZ). `footpoints[].x` is X and `footpoints[].y` is Z in the declared `frame`.
 - The active-floorplan BEV is a local display surface, so it declares
   `frame=camera_local_ground_m`. It does not change canonical tracking/world
@@ -609,7 +693,7 @@ direct-write or `memory://` publication fallback.
 
 Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` is internal and never exposed.
 
-Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry, disappearance emits an exact tombstone, and reappearance receives a new positive lifecycle generation. Downstream clients can therefore distinguish rate-limited camera-frame gaps from a missing publication or tracker-ID reuse. The canonical world service removes that source's evidence immediately on the empty frame while retaining source-order state; tracker shadow age remains the owner of brief detector occlusion.
+Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry and disappearance emits an exact tombstone. A same-camera numeric tracker ID may reuse its lifecycle generation only when it returns within 350 ms and strict bbox position/scale compatibility proves a short metadata gap. A moved, size-incompatible, expired, evicted, unknown, or post-reconnect return receives a new positive generation. Downstream clients can therefore distinguish rate-limited camera-frame gaps from absence and numeric tracker-ID reuse. On every exact processed frame, the canonical world service removes absent filter state from active authority. Scalar-only quarantine may restore it only across that same compatible 350 ms lifecycle grace; otherwise position, velocity, lock, rejection, and hold state start cold. The exact tombstone still breaks BEV/OSD trail history even when the compatible generation is reused. Tracker shadow age remains the owner of brief detector occlusion.
 
 ```json
 {
@@ -685,12 +769,24 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "world_quality": "good"|"estimated"|"invalid",
       "world_quality_reason": "<string|null>",
       "world_frame": "backend_world_m"|null,
-      "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "world_frame_revision": "<revision|null>",
+      "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
       "world_floor_range_m": <float|null>,
       "world_floor_range_limit_m": <float|null>,
       "world_floor_incidence_sin": <float|null>,
       "world_floor_admitted": <bool|null>,
       "world_floor_rejection_reason": "floor_ray_range_exceeded"|"floor_ray_geometry_invalid"|null,
+      "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
+      "world_prediction_image_foot": [<float u>, <float v>]|null,
+      "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
+      "world_measurement_accepted": <bool|null>,
+      "world_rejection_reason": "<string|null>",
+      "world_contact_basis": "<string|null>",
+      "world_image_motion_supported": <bool|null>,
+      "world_image_motion_streak": <int|null>,
+      "world_state_continuity": "restored_short_ghost"|null,
+      "world_reacquire_count": <int|null>,
+      "world_reacquired": <bool|null>,
       "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
       "posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "trail_append_allowed": <bool|null>,
@@ -733,12 +829,12 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
         "tracker_id": "<string>",
         "frame_id": <int>,
         "observation_id": "obs1:<sha256>"
-      } | null,
+      } | null, /* authoritative identity-v2 only */
       "identity_v2": {
-        "mode": "shadow"|"authoritative",
+        "mode": "authoritative",
         "state": "unknown"|"provisional"|"visitor"|"resident",
         "reason": "<string>",
-        "subject_id": "<shadow-only diagnostic string|null>",
+        "subject_id": null,
         "compatibility_sid": <int|null>,
         "display_name": "<string|null>",
         "resident_uuid": "<uuid|null>",
@@ -789,6 +885,29 @@ Tracking telemetry has two world-source scopes:
 
 - Top-level `world_source="backend_world_fused"` advertises that the baseline DS9.1 runtime owns the canonical world estimator in the backend.
 - Per-track `world_source` records which observation path updated that specific track on the current frame.
+- Per-track `world_source="cv_prediction"` is a bounded continuation of the
+  canonical constant-velocity state when the current metric observation is
+  missing, stale, or physically rejected. It is not a fresh measurement and
+  does not advance the
+  last-good measurement timestamp; `world_measurement_accepted=false` and
+  `world_filter_prediction` explain the displayed point. `anchor_hold` remains
+  a retained last-good position after a missing or rejected measurement.
+  `world_source="image_motion_prediction"` is the stricter projective
+  continuation used when the current bbox moved but its metric/depth anchor was
+  missing or rejected.  It transports the last physically accepted image foot
+  through the current bbox affine change and projects that pixel through the
+  active corrected floor plane.  It is non-authoritative, never updates the
+  filter or last-good origin, is bounded by image-motion, ray, metric-speed,
+  and short-TTL gates, and exposes `world_prediction_image_foot` plus
+  `world_prediction_provenance`.  If those gates fail after material bbox
+  motion, the track is omitted for that frame rather than frozen at an old
+  position.
+
+The producer applies the human-speed limit to the proposed published filter
+state, not only to its stored velocity. An observation inside the measurement
+innovation allowance is quarantined when it would create an unreachable
+same-segment step. A coherent relocation must instead be published as a new
+`trail_segment_id` with `trail_break_required=true`.
 
 `tracks[].scene_prior` is optional, additive shadow evidence for cameras bound
 by the configured site catalog. It evaluates only a valid
@@ -827,7 +946,8 @@ user-visible or durable person identity and must never substitute for resolved
 identity fields.
 
 Fresh persisted embedding provenance is an all-or-none triad on both the public
-track and its matching `observations[].payload`:
+track and its matching `observations[].payload` when authoritative identity-v2
+owns that row:
 
 - `embedding_sequence` is the exact sequence of the durably appended private
   identity-evidence record.
@@ -837,21 +957,27 @@ track and its matching `observations[].payload`:
 
 The triad is stamped only after the private evidence append returns a complete,
 model-matching durable record for every observation in that source frame. Async
-DS9/replay publication may omit the triad while the frame is still being
+authoritative publication may omit the triad while the frame is still being
 persisted; `identity_v2.evidence_persistence` is then `queued` or `dropped`.
+Default shadow scoring persists its private evidence independently and never
+retrofits this triad onto an already admitted canonical tracking row.
 Partial triads are contract errors. Raw embedding vectors are never part of
 public tracking or observation payloads.
 
-`embedding_present` is exact current-frame truth owned by identity-v2. It is
-`true` when the server extracted and validated a model-profile embedding for
-that exact track/frame, so the row also has `identity_observation_key`.
-Legacy StableID gallery/cache diagnostics cannot set it. `fresh_embedding`
-likewise describes the live identity decision. `evidence_persistence` is
+`embedding_present` is exact current-frame server-extraction truth. It is
+`true` only when the producer extracted a model-profile embedding for that
+exact track/frame; a legacy StableID gallery/cache diagnostic cannot set it.
+In authoritative mode, successful identity-v2 validation additionally creates
+`identity_observation_key`, and `fresh_embedding` describes its live identity
+decision. In shadow mode, those nested decision/linkage fields remain private
+and are not joined back into canonical WebSocket tracking. Authoritative
+`evidence_persistence` is
 `durable` when the triad is present, `queued` while async score-only evidence
 is awaiting the writer, and `dropped` when bounded admission discarded it.
-Queued/dropped rows retain live identity truth but are not durable evidence
-anchors. A missing tensor or tracker-continuity hold sets
-`identity_v2.fresh_embedding=false`, clears the key/triad, and reports
+Queued/dropped authoritative rows retain live identity truth but are not
+durable evidence anchors. In authoritative mode, a missing tensor or
+tracker-continuity hold sets `identity_v2.fresh_embedding=false` and clears the
+key/triad. In either mode a missing exact tensor reports
 `embedding_present=false`.
 
 `observations[].payload.depth_present` is semantic evidence, not a proxy for a
@@ -965,6 +1091,11 @@ and kitchen rather than publishing an unbounded floor fallback.
   In the latter case, a syntactically valid bbox/depth bottom at a counter or
   table edge is deliberately demoted before fusion.
 - `anchor_hold`: no current valid observation; the estimator is briefly holding the last reliable world state.
+- `image_motion_prediction`: the current metric/depth observation was missing
+  or rejected, so a last-accepted image foot was transported by the current
+  detector-box affine motion and floor-projected for bounded display
+  continuity.  This point is not a measurement and must not become a new
+  predictor origin.
 - `bbox3d`: `v3dt` mode only. `bbox3d` and `velocity3d` preserve the locked
   profile's tracker tuple for diagnostics. They are not public world-space
   vectors. The producer derives the bbox ground endpoint, applies the required
@@ -1042,24 +1173,45 @@ Validation diagnostics:
     `embedding_dimension`: optional persisted-evidence provenance, present only
     as the complete triad described above.
   - `sid_candidate`: provisional candidate SID before confirmation (when applicable).
-- Identity-v2 runs one joint resolver call after the complete source-frame
+- A sub-second metadata gap may retain a settled StableID without a fresh
+  embedding only for the same camera and tracker-local ID, within 0.75 seconds,
+  and only when strict bbox overlap, center-motion, and area-ratio gates all
+  pass. The carried embedding remains internal and the current row reports no
+  fresh embedding evidence. This continuity aid cannot claim an ID already
+  active in the same frame and is not cross-camera ReID.
+- Identity-v2 runs one joint resolver call after a complete source-frame
   primitive batch is detached from SDK metadata. In default `shadow` mode,
-  legacy public identity fields remain unchanged and `identity_v2` is diagnostic
-  comparison evidence. In `authoritative` mode, v2 clears and replaces all
-  legacy public identity fields: an open-set unknown has null `stable_id`, name,
-  resident UUID, and visitor generation; a visitor has a compatibility SID and
-  generation but no name; a resident has a compatibility SID, durable UUID, and
-  display name. `stable_id` is only the numeric compatibility boundary, never a
-  durable subject identity.
+  canonical tracking/world/BEV is admitted first and never waits for or accepts
+  mutation from that call. A separate bounded worker retains only the newest
+  pending scalar snapshot per source, so an older shadow cohort or empty
+  heartbeat may be coalesced when scoring/visitor persistence is slower than
+  input. Capacity, copy, scoring, and persistence failures affect shadow
+  comparison freshness only. Consequently, a shadow diagnostic is not a
+  same-frame field promised on the canonical `tracking` row; consumers must not
+  wait for it or join it by last-seen state. No frame surface, SDK object,
+  borrowed diagnostic row, or embedding is published on WebSocket. A frame
+  suppressed by the tracking publication cadence has no shadow work. In
+  `authoritative` mode, the call remains synchronous after the one-shot metadata
+  walk because its result owns same-frame public identity. V2 then clears and
+  replaces all legacy public identity fields: an open-set unknown has null
+  `stable_id`, name, resident UUID, and visitor generation; a visitor has a
+  compatibility SID and generation but no name; a resident has a compatibility
+  SID, durable UUID, and display name. `stable_id` is only the numeric
+  compatibility boundary, never a durable subject identity. After a source
+  reconnect, the internal identity tracklet key is scoped by `source_epoch` so
+  a reused numeric tracker ID starts a new coordinator lifecycle; the public
+  diagnostic `tracker_id` remains unchanged.
 - Internal resident/visitor subject keys do not become new legacy wire IDs.
-  `identity_v2.subject_id` is shadow-only comparison evidence; authoritative
-  output uses resident UUID/name or visitor SID/generation and leaves legacy
-  `reid_identity` / `appearance_id` clear.
-- A resolved label may be held briefly across SGIE reinference gaps on the exact
-  same tracker-local track. Such rows set `identity_v2.fresh_embedding=false`,
-  cannot produce overlap proof or an enrollment key, and are cleared immediately
-  when the track disappears. A fresh resolver unknown still clears the label;
-  this bounded continuity hold never converts rejection into a match.
+  Shadow `subject_id` remains private comparison evidence and is not emitted on
+  canonical tracking. Authoritative output uses resident UUID/name or visitor
+  SID/generation and leaves legacy `reid_identity` / `appearance_id` clear.
+- In authoritative mode, a resolved label may be held briefly across SGIE
+  reinference gaps on the exact same tracker-local track. Such rows set
+  `identity_v2.fresh_embedding=false`, cannot produce overlap proof or an
+  enrollment key, and are cleared immediately when the track disappears. A
+  fresh resolver unknown still clears the label; this bounded continuity hold
+  never converts rejection into a match. The corresponding shadow decision is
+  private cache/evidence only.
 - Once a fresh resident/visitor subject is accepted for a camera-local tracker,
   it cannot switch directly to another subject while that tracker state is
   continuous. Alternative subjects are hard-masked. The accepted subject is

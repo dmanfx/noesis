@@ -1,5 +1,5 @@
 # DS9.1 metadata contracts
-_Status: canonical native-host metadata contract, updated 2026-08-15._
+_Status: canonical native-host metadata contract, updated 2026-08-23._
 
 This document summarizes the key metadata structures used by the DS9.1 pipeline, both on-frame (user meta) and in downstream telemetry.
 
@@ -255,7 +255,8 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_quality": "good"|"estimated"|"invalid",
   "world_quality_reason": "<string|null>",
   "world_frame": "<string|null>",
-  "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+  "world_frame_revision": "<revision|null>",
+  "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
   "world_floor_candidate": [<float x>, <float y>, <float z>]|null,
   "world_floor_range_m": <float|null>,
   "world_floor_range_limit_m": <float|null>,
@@ -265,12 +266,18 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_depth_candidate": [<float x>, <float y>, <float z>]|null,
   "world_prefilter_measurement": [<float x>, <float y>, <float z>]|null,
   "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
+  "world_prediction_image_foot": [<float u>, <float v>]|null,
+  "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
   "world_measurement_accepted": <bool|null>,
   "world_rejection_reason": "<string|null>",
   "world_innovation_m": <float|null>,
   "world_innovation_limit_m": <float|null>,
   "world_reacquire_count": <int|null>,
   "world_reacquired": <bool|null>,
+  "world_contact_basis": "<string|null>",
+  "world_image_motion_supported": <bool|null>,
+  "world_image_motion_streak": <int|null>,
+  "world_state_continuity": "restored_short_ghost"|null,
   "world_fusion_policy_id": "<sha256|null>",
   "world_floor_weight_scale": <float|null>,
   "world_depth_weight_scale": <float|null>,
@@ -335,14 +342,57 @@ watermark so absence cannot be confused with replay or telemetry stall.
   for a resolved resident/visitor and may be null for an authoritative
   identity-v2 open-set unknown.
 - Negative/provisional stable IDs are internal-only and must not be emitted to clients.
+- A sub-second metadata gap may reuse a settled StableID without a fresh
+  embedding only for the same camera and tracker-local ID, within 0.75 seconds,
+  and only when strict bbox overlap, center-motion, and area-ratio gates all
+  pass. The carried embedding remains internal and the current row still
+  reports no fresh embedding evidence. This continuity aid cannot claim an ID
+  already active in that frame and is not cross-camera ReID.
 - `dwell_time` is derived per track by `_AnalyticsTelemetryProcessor` using zone entry timestamps; it is null when no zone is available.
 - `bbox3d` and `velocity3d` are attached when `NVDS_OBJ_3D_META` (SV3DT/MV3DT) is present. In the locked V3DT profile they retain the tracker tuple for diagnostics; consumers must not reinterpret them directly as canonical world coordinates.
 - In baseline mode, `image_foot` is the active current-frame image anchor chosen by the backend estimator and `image_base` is the canonical image reprojection of the filtered world state. In V3DT mode, `image_foot` is the native tracker ground-foot metadata, while `image_base` is the separately derived projection of the opposite cuboid endpoint. Keeping both prevents a self-referential reprojection check.
-- In baseline mode, `world` is produced by the shared `PersonGroundState` estimator. A startup-validated, calibration- and depth-registration-bound policy selects the admitted observation mix per camera. Every calibrated floor ray is independently range-gated against the camera profile before it can seed height lock or filter state; a non-finite ray or one beyond `floor_ray_max_range_m` remains diagnostic-only and reports `floor_ray_geometry_invalid` or `floor_ray_range_exceeded`. When registered depth is admitted, it owns X/Z and the floor plane contributes contact Y; the two positions are not averaged. A rejected floor ray does not suppress a valid registered-depth observation, which is admitted as depth-only. A rejected registered-depth sample is never projected or used for height lock, but it does not suppress an independent in-range floor ray when that camera's policy explicitly permits floor-only placement. A registered-depth-only profile remains fail-closed and never silently falls back to a floor ray. `gravity_drop` and the bounded `anchor_hold` are explicitly degraded temporal outputs, not live measurement sources.
-- Impossible innovations are rejected rather than clipped into plausible motion. A bounded run of mutually consistent observations may reacquire the same tracker lifecycle; that increments durable `trail_segment_id` and pulses `trail_break_required` so trail consumers cannot draw a teleport even if they miss the pulse frame. Source hysteresis is committed only after the physical gate accepts the observation.
+- In baseline mode, `world` is produced by the shared `PersonGroundState` estimator. A startup-validated, calibration- and depth-registration-bound policy selects the admitted observation mix per camera. Every calibrated floor ray is independently range-gated against the camera profile before it can seed height lock or filter state; a non-finite ray or one beyond `floor_ray_max_range_m` remains diagnostic-only and reports `floor_ray_geometry_invalid` or `floor_ray_range_exceeded`. When registered depth is admitted, it owns X/Z and the floor plane contributes contact Y; the two positions are not averaged. A rejected floor ray does not suppress a valid registered-depth observation, which is admitted as depth-only. A rejected registered-depth sample is never projected or used for height lock, but it does not suppress an independent in-range floor ray when that camera's policy explicitly permits floor-only placement. A registered-depth-only profile remains fail-closed and never silently falls back to a floor ray. `gravity_drop` and the bounded temporal outputs `cv_prediction` and `anchor_hold` are explicitly degraded paths, not live measurement sources.
+- `cv_prediction` means the current metric observation was missing, stale, or
+  physically rejected, so the producer displayed a bounded constant-velocity
+  continuation of the canonical filtered world state. It remains in the
+  revision-bound `world_frame`, sets `world_measurement_accepted=false`, and
+  does not advance the last-good measurement timestamp; `world_filter_prediction`
+  records the displayed prediction. Rejected updates predict from one fixed
+  last-good rejection anchor for no more than 0.40 seconds, so a reject run
+  cannot integrate drift. `anchor_hold` means the producer retained the
+  last-good world point after a missing or physically rejected measurement.
+  It may remain visible as a canonical BEV head with `worldAdmission="held"`,
+  but it must not append a trail sample. Its normal cap is 0.40 seconds; a
+  seated/lying lifecycle may extend to 2.0 seconds only with exact-frame
+  stationary bbox continuity. Prediction may append only when
+  `trail_append_allowed=true`.
+- `image_motion_prediction` is a separate, stricter degraded path for a
+  materially moving detector box whose current metric/depth anchor is missing
+  or rejected. It transports the last physically accepted image foot through
+  the current bbox affine change and projects that pixel through the active
+  corrected floor plane. It is non-authoritative, does not update filter or
+  last-good image state, and exposes `world_prediction_image_foot` plus
+  `world_prediction_provenance`; failed image/ray/metric/TTL gates fail closed
+  instead of publishing a frozen point.
+- World estimator state is lifecycle-scoped, not merely numeric-tracker-ID
+  scoped. An exact processed frame removes all world/filter/lock state for
+  tracker keys absent from that source before the numeric ID can be reused.
+- Impossible innovations are rejected rather than clipped into plausible motion.
+  The filter also evaluates its proposed posterior against
+  `max_speed_mps * dt`; an observation inside the wider measurement-noise gate
+  is still quarantined when it would publish an unreachable same-segment step.
+  A bounded run of mutually consistent observations may reacquire the same
+  tracker lifecycle; that increments durable `trail_segment_id` and pulses
+  `trail_break_required` so trail consumers cannot draw a teleport even if
+  they miss the pulse frame. Source hysteresis is committed only after the
+  physical gate accepts the observation.
 - In `v3dt` mode, `world`/`world_source="bbox3d"` come from the bbox ground endpoint only after the profile's required `xzy` tracker-to-world conversion. The public result is Y-up meters in `world_frame="backend_world_m"`; absent/invalid bbox or axis metadata leaves world invalid instead of selecting a ray-plane fallback.
 - The current V3DT contract does not permit `world_frame="camera_local"`. Shared-world SV3DT output does not by itself prove MV3DT overlap fusion or cross-camera ID propagation.
-- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, held, or invalid. Producer-side floor-ray rejection uses the stable reasons `floor_ray_range_exceeded` and `floor_ray_geometry_invalid`; downstream renderers must not clamp or reinterpret those rejected candidates as valid world positions.
+- `world_frame_revision` identifies the exact active calibrated/Scene Prior
+  world revision used for the track. A renderer or consumer must reject a
+  missing or mismatched revision rather than mixing the point with another
+  camera/prior revision.
+- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, predicted, held, or invalid. Producer-side floor-ray rejection uses the stable reasons `floor_ray_range_exceeded` and `floor_ray_geometry_invalid`; downstream renderers must not clamp or reinterpret those rejected candidates as valid world positions.
 - `projection_confidence`, `temporal_confidence`, `reid_confidence`,
   `reid_identity`, `appearance_id`, `occluded`, and
   `occlusion_uncertainty_m` are optional validation diagnostics. They are used
@@ -350,33 +400,50 @@ watermark so absence cannot be confused with replay or telemetry stall.
   absence means the corresponding validation evidence is incomplete, not
   implicitly passing.
 - Identity-v2 does not attach Python objects or embeddings as DeepStream user
-  meta. Each hook copies server-extracted SGIE values into immutable
-  `PrimitiveFrameObservation` rows while walking the transient source frame
-  once, invokes the shared coordinator once for the complete source batch, and
-  then decorates only detached public dictionaries. The exact enrollment key is
-  derived from run/camera/tracker/frame identity, active engine-byte SHA-256,
-  declared tensor layer/dimension, and float32 embedding bytes. Public metadata
-  exposes the key and decision diagnostics, never the embedding.
+  meta. Each hook copies server-extracted SGIE values into a bounded detached
+  primitive batch while walking the transient source frame once. Authoritative
+  mode invokes the shared coordinator synchronously because it owns same-frame
+  public identity. Shadow mode receives a separate deep scalar snapshot only
+  after canonical tracking/world/BEV admission. Its isolated worker keeps the
+  newest pending cohort per source, so stale shadow cohorts may be coalesced or
+  dropped without changing the exact canonical cohort. Shadow results do not
+  mutate or delay that cohort and are not promised on its tracking row; they
+  remain comparison/evidence and bounded post-resolution OSD-cache work. A
+  publication-rate-skipped frame has no shadow work, and an admitted empty
+  cohort is eligible but may be superseded before scoring. Copy, capacity,
+  scoring, or visitor-persistence failure degrades only shadow work. No raw
+  surface, SDK object, borrowed SDK diagnostic mapping, or public embedding crosses either
+  asynchronous boundary. After reconnect, the coordinator's internal tracker
+  key is source-epoch scoped while the public process-local `tracker_id` stays
+  raw. The exact enrollment key is derived from
+  run/camera/tracker/frame identity, active engine-byte SHA-256, declared tensor
+  layer/dimension, and float32 embedding bytes. Authoritative public metadata
+  exposes the key and decision diagnostics, never the embedding. Shadow keys
+  and decisions remain in private evidence/cache state and are not joined back
+  into an already admitted canonical row.
 - Persisted public embedding provenance is the all-or-none
   `embedding_sequence` / `embedding_model_sha256` / `embedding_dimension`
   triad. The sequence links to the exact durably appended private evidence row;
   the fingerprint and dimension must match the active model. The triad is
-  omitted when evidence capture is disabled, persistence fails, or the public
-  identity is only a tracker-continuity hold. Partial triads are invalid.
-- `embedding_present` is rewritten by the process-owned identity-v2 adapter and
-  describes a valid server extraction for that exact track/frame. A legacy
-  gallery/cache diagnostic is not frame evidence. `identity_observation_key`
-  and `identity_v2.fresh_embedding` likewise describe live extraction/decision
-  truth. Async DS9/replay rows may omit the durable triad while
+  omitted when evidence capture is disabled, persistence fails, the mode is
+  shadow, or the public identity is only a tracker-continuity hold. Partial
+  triads are invalid.
+- `embedding_present` describes a valid server extraction for that exact
+  track/frame; a legacy gallery/cache diagnostic is not frame evidence. In
+  authoritative mode, `identity_observation_key` and
+  `identity_v2.fresh_embedding` additionally describe live validation and
+  decision truth. Async authoritative rows may omit the durable triad while
   `identity_v2.evidence_persistence` is explicitly `queued` or `dropped`;
   those rows retain live identity truth but cannot serve as durable evidence
-  anchors. Synchronous persisted rows use `durable`. Missing tensors and
-  continuity holds set the live fields false and clear the key/triad.
-- The adapter may retain a resolved public overlay for a bounded tracker-
-  continuity window when SGIE does not emit a fresh tensor on an intervening
-  frame. It does not retain that row as overlap/enrollment evidence, marks it
-  `fresh_embedding=false`, and removes it on the first camera frame where the
-  tracker is absent.
+  anchors. Synchronous persisted rows use `durable`. Shadow linkage/decisions
+  remain private. Missing tensors and continuity holds set the applicable live
+  fields false and clear the key/triad.
+- In authoritative mode, the adapter may retain a resolved public overlay for
+  a bounded tracker-continuity window when SGIE does not emit a fresh tensor on
+  an intervening frame. It does not retain that row as overlap/enrollment
+  evidence, marks it `fresh_embedding=false`, and removes it on the first
+  camera frame where the tracker is absent. Shadow mode may retain the analogous
+  decision only in its private evidence/OSD cache.
 - An accepted subject is immutable for the lifetime of that camera-local
   tracker state. Other subjects become hard constraints, not score competitors;
   the locked subject still has to pass every open-set and exclusivity gate.
@@ -535,7 +602,7 @@ box-only detectors use a bounded lower-person bbox band.
   "class_id": 0,
   "bbox": [left, top, width, height],
   "score": 0.87,
-  "sampling_mode": "instance_mask" | "bbox_band",
+  "sampling_mode": "instance_mask" | "pose_capsule_native" | "bbox_diagnostic",
   "status": "ok",
   "unit": "m",
   "is_metric": true,
@@ -568,7 +635,7 @@ box-only detectors use a bounded lower-person bbox band.
 
 **Notes:**
 
-- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS9.1 frame coordinates. `instance_mask` samples decoded person support; `pose_capsule` samples ankle/lower-leg support derived from attached pose metadata. A bbox-only core sample is diagnostic and cannot become person-ground authority.
+- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS9.1 frame coordinates. `instance_mask` samples decoded person support. `pose_capsule_native` derives a GPU-resident union of at most two compound contacts from attached pose metadata: each contact is a thin lower-leg segment plus a full ankle disk, with separate line and ankle radii. The host diagnostic mask and CUDA sampler use the same pixel-center predicate and read one compact statistic. Only endpoints and the two radii cross the Python/native boundary. If no ankle contact is observed it fails closed before launching depth work. It does not upload a host mask or run a second body-mask sample. A bbox-only core sample is diagnostic and cannot become person-ground authority.
 - `bbox` and all mask/band/depth statistics are expressed in that canonical DS9.1 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
 - If neither the native mask nor bounded bbox-band path can produce usable statistics, the aligned depth frame is not ready, or geometry is inconsistent, the payload may still be attached with a non-`"ok"` `status`.
 - `status` is mandatory and distinguishes usable samples (`"ok"`) from object-local failures such as `"no_valid_depth"`, `"missing_mask"`, `"mask_decode_failed"`, `"depth_not_ready"`, or `"transform_mismatch"`.

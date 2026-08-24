@@ -271,6 +271,44 @@ def test_track_image_size_uses_declared_resolution_not_principal_point() -> None
     assert processor._track_image_size(2, frame_meta) == (1280, 720)  # type: ignore[attr-defined]
 
 
+def test_post_mux_frame_raster_is_not_scaled_again_from_raw_intrinsics() -> None:
+    """Family's 1920x1080 tracker raster must not be treated as 1280x720."""
+    calib = _build_anchor_snapshot()
+    processor = _build_anchor_processor(calib)
+    processor.bev_calibration = SimpleNamespace(
+        _intrinsics_loader=SimpleNamespace(
+            get=lambda _source_id: SimpleNamespace(width=1280, height=720)
+        )
+    )
+    frame_meta = SimpleNamespace(
+        source_frame_width=1280,
+        source_frame_height=720,
+        frame_width=1920,
+        frame_height=1080,
+    )
+
+    assert processor._track_image_size(0, frame_meta) == (1920, 1080)
+    bbox = [600.0, 300.0, 240.0, 360.0]
+    assert processor._scale_bbox_to_image_size(
+        bbox,
+        processor._track_image_size(0, frame_meta),
+        (1920, 1080),
+    ) == pytest.approx(bbox)
+
+    # Native metadata producers are allowed to omit the canonical frame
+    # dimensions.  The configured post-mux raster still outranks both the raw
+    # source size and the raw calibration artifact in that case.
+    processor.pipeline.frame_size = (1920, 1080)
+    frame_meta_without_canonical_size = SimpleNamespace(
+        source_frame_width=1280,
+        source_frame_height=720,
+    )
+    assert processor._track_image_size(
+        0,
+        frame_meta_without_canonical_size,
+    ) == (1920, 1080)
+
+
 def test_pose_keypoints_scale_into_calibration_image_coordinates() -> None:
     processor = _build_anchor_processor(_build_anchor_snapshot())
     keypoints = np.array(
@@ -570,6 +608,9 @@ def test_identity_v2_receives_one_complete_source_frame_batch(
     processor.handle_frame_ds8(frame)  # type: ignore[attr-defined]
 
     assert _NativeReidExt.calls == 2
+    # The shared SDK-neutral processor invokes the identity service
+    # synchronously.  DS9's canonical adapter owns a separate bounded worker;
+    # this legacy/shared contract has no worker lifecycle to shut down.
     assert len(identity_service.calls) == 1
     call = identity_service.calls[0]
     assert call["camera_id"] == "camera_0"
@@ -1409,7 +1450,106 @@ def test_floor_ray_range_rejection_does_not_seed_world_state(
     assert state.height_ref_scene is None
 
 
-def test_rejected_floor_ray_preserves_registered_depth_only_observation(
+def test_depth_observation_range_rejection_does_not_seed_world_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A depth point cannot bypass the calibrated first-sample range gate."""
+    calib = _build_anchor_snapshot()
+    processor = _build_anchor_processor(calib)
+    processor.world_fusion_policy = _fusion_policy(
+        floor_weight_scale=0.0,
+        depth_weight_scale=1.0,
+        floor_only_allowed=False,
+    )
+    # Keep the image/floor candidate in range, but make the depth projection
+    # itself absurd.  This isolates the bypass that used to let a depth-only
+    # first sample seed the filter outside the calibrated envelope.
+    foot_world = [0.0, 0.0, 6.0]
+    bbox = _anchor_bbox(calib, foot_world=foot_world)
+    monkeypatch.setattr(
+        hooks,
+        "noesis_pose_meta_ext",
+        _PoseExt(_build_pose_payload(calib, bbox, foot_z=6.0)),
+    )
+    raw_depth_m = 36.0
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=123,
+        object_id=806,
+        class_id=0,
+        bbox=bbox,
+        score=0.91,
+        sampling_mode="instance_mask",
+        status="ok",
+        unit="m",
+        is_metric=True,
+        sample_count=512,
+        valid_fraction=0.96,
+        anchor_source="lower_body_band",
+        anchor_depth_m=raw_depth_m,
+        depth_center=raw_depth_m,
+        depth_median=raw_depth_m,
+    )
+
+    track = {"tracker_id": 806, "bbox": bbox}
+    processor._augment_track_with_world(  # type: ignore[attr-defined]
+        0,
+        "cam0",
+        track,
+        obj_meta=SimpleNamespace(),
+        depth_result=depth_result,
+    )
+
+    assert track["world_valid"] is False
+    assert track["world_quality_reason"] in {
+        "world_observation_range_exceeded",
+        "world_measurement_unavailable",
+    }
+    assert track["world_depth_rejection_reason"] == "world_observation_range_exceeded"
+    assert track["world_observation_range_admitted"] is False
+    assert track["world_observation_range_limit_m"] == pytest.approx(22.0)
+    assert track["world_observation_range_m"] > 22.0
+    state = processor._world_state_by_track[(0, 806)]  # type: ignore[attr-defined]
+    assert state.last_good_world is None
+    assert state.world_x is None
+
+
+def test_bbox3d_preseed_range_rejection_does_not_seed_world_state() -> None:
+    """A pre-seeded tracker world point must use the same metric gate."""
+    calib = _build_anchor_snapshot()
+    processor = _build_anchor_processor(calib)
+    processor.world_fusion_policy = _fusion_policy(
+        floor_weight_scale=1.0,
+        depth_weight_scale=1.0,
+        floor_only_allowed=True,
+    )
+    track = {
+        "tracker_id": 807,
+        "bbox": _anchor_bbox(calib, foot_world=[0.0, 0.0, 6.0]),
+        "bbox3d": {"x": 0.0, "y": 0.0, "z": 30.0},
+        "world": [0.0, 0.0, 30.0],
+        "world_valid": True,
+        "world_source": "bbox3d",
+        "world_frame": "backend_world_m",
+    }
+
+    processor._refine_seeded_world_with_ground_state(  # type: ignore[attr-defined]
+        0,
+        "cam0",
+        track,
+        world_source_label="bbox3d",
+    )
+
+    assert track["world_valid"] is False
+    assert "world" not in track
+    assert track["world_quality_reason"] == "world_observation_range_exceeded"
+    assert track["world_observation_range_admitted"] is False
+    state = processor._world_state_by_track[(0, 807)]  # type: ignore[attr-defined]
+    assert state.last_good_world is None
+    assert state.world_x is None
+
+
+def test_registered_depth_fuses_when_shared_floor_ray_is_admitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calib = _build_anchor_snapshot()
@@ -1423,7 +1563,7 @@ def test_rejected_floor_ray_preserves_registered_depth_only_observation(
     monkeypatch.setattr(
         hooks,
         "noesis_pose_meta_ext",
-        _PoseExt(_build_pose_payload(calib, bbox, foot_z=30.0)),
+        _PoseExt(_build_pose_payload(calib, bbox, foot_z=6.0)),
     )
 
     track = {"tracker_id": 805, "bbox": bbox}
@@ -1436,9 +1576,14 @@ def test_rejected_floor_ray_preserves_registered_depth_only_observation(
     )
 
     assert track["world_valid"] is True
-    assert track["world_source"] == "pose_depth_only"
-    assert track["world_floor_admitted"] is False
-    assert track["world_floor_weight_effective"] == pytest.approx(0.0)
+    # The canonical DS9 adapter has an additional near-horizon bbox-contact
+    # gate, covered by DS9/tests/test_family_floor_contact_geometry.py.  The
+    # shared SDK-neutral hook does not apply that adapter-only gate here, and
+    # this synthetic candidate has healthy ray incidence, so both observations
+    # are correctly fused on this path.
+    assert track["world_source"] == "pose_depth_fused"
+    assert track["world_floor_admitted"] is True
+    assert track["world_floor_weight_effective"] == pytest.approx(1.0)
     assert track["world_depth_weight_effective"] > 0.0
 
 
@@ -1698,7 +1843,8 @@ def test_all_ds8_ds9_v3dt_handlers_emit_bev_only_after_tracking_success() -> Non
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "_publish_bev"
         ]
-        assert len(calls) == 2, path
+        expected_calls = 1 if path == Path("DS9/noesis/pipelines/hooks.py") else 2
+        assert len(calls) == expected_calls, path
         for call in calls:
             assert any(
                 keyword.arg == "paired_with_tracking"
@@ -1708,7 +1854,14 @@ def test_all_ds8_ds9_v3dt_handlers_emit_bev_only_after_tracking_success() -> Non
             ), path
             ancestor = parents.get(call)
             guarded = False
+            worker_owned = False
             while ancestor is not None:
+                if (
+                    path == Path("DS9/noesis/pipelines/hooks.py")
+                    and isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and ancestor.name == "_publish_tracking_work"
+                ):
+                    worker_owned = True
                 if (
                     isinstance(ancestor, ast.If)
                     and isinstance(ancestor.test, ast.Name)
@@ -1717,7 +1870,7 @@ def test_all_ds8_ds9_v3dt_handlers_emit_bev_only_after_tracking_success() -> Non
                     guarded = True
                     break
                 ancestor = parents.get(ancestor)
-            assert guarded, path
+            assert guarded or worker_owned, path
 
 
 def test_pose_depth_fusion_prefers_anchor_band_support_over_whole_mask_support(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1792,6 +1945,51 @@ def test_gravity_drop_reuses_height_lock_when_pose_feet_disappear(monkeypatch: p
         "lower_body_occlusion=waist_hips"
     )
     assert np.allclose(track_partial["world"], [0.0, 0.0, 6.0], atol=0.25)
+
+
+def test_gravity_drop_range_rejection_cannot_seed_or_replace_world_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calib = _build_anchor_snapshot()
+    processor = _build_anchor_processor(calib)
+    processor.world_fusion_policy = _fusion_policy(
+        floor_weight_scale=1.0,
+        depth_weight_scale=0.0,
+        floor_only_allowed=True,
+    )
+    bbox_full = _anchor_bbox(calib, foot_world=[0.0, 0.0, 6.0])
+    monkeypatch.setattr(
+        hooks,
+        "noesis_pose_meta_ext",
+        _PoseExt(_build_pose_payload(calib, bbox_full, foot_z=6.0)),
+    )
+    track_full = {"tracker_id": 808, "bbox": bbox_full}
+    processor._augment_track_with_world(0, "cam0", track_full, obj_meta=SimpleNamespace())  # type: ignore[attr-defined]
+    state = processor._world_state_by_track[(0, 808)]  # type: ignore[attr-defined]
+    assert state.last_good_world is not None
+
+    def _absurd_gravity(_self: Any, *_args: Any, **_kwargs: Any) -> np.ndarray:
+        return np.asarray([0.0, 0.0, 30.0], dtype=np.float64)
+
+    monkeypatch.setattr(hooks._AnalyticsTelemetryProcessor, "_gravity_drop_world", _absurd_gravity)
+    monkeypatch.setattr(hooks, "noesis_pose_meta_ext", _PoseExt(None))
+    bbox_partial = [
+        float(bbox_full[0]),
+        float(bbox_full[1]),
+        float(bbox_full[2]),
+        float(bbox_full[3]) * 0.30,
+    ]
+    track_partial = {"tracker_id": 808, "bbox": bbox_partial}
+    processor._augment_track_with_world(0, "cam0", track_partial, obj_meta=SimpleNamespace())  # type: ignore[attr-defined]
+
+    assert track_partial["world_valid"] is True
+    # The rejected candidate must not alter the canonical state.  Depending on
+    # the active bounded-fallback policy, the prior state is surfaced as an
+    # explicit hold or as a CV prediction; both are valid here.
+    assert track_partial["world_source"] in {"anchor_hold", "cv_prediction"}
+    assert track_partial["world_observation_range_admitted"] is False
+    assert track_partial["world"] == pytest.approx([0.0, 0.0, 6.0], abs=0.25)
+    assert state.last_good_world == pytest.approx((0.0, 0.0, 6.0), abs=0.25)
 
 
 @pytest.mark.parametrize(
@@ -2180,7 +2378,10 @@ def test_world_state_update_rejects_physically_impossible_measurement() -> None:
     assert np.allclose(updated, [10.0, 0.0, 20.0])
     assert state.measurement_accepted is False
     assert state.measurement_rejection_reason == "physical_innovation_exceeded"
-    assert state.reacquire_count == 1
+    # Reacquisition is deliberately evidence-gated.  A direct filter caller
+    # did not provide a stable contact basis plus exact-frame image motion, so
+    # this impossible sample is quarantined without starting a reacquire run.
+    assert state.reacquire_count == 0
 
 
 def test_world_augmentation_quarantines_impossible_measurement(

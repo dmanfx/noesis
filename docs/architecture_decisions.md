@@ -424,18 +424,46 @@ while preserving the accepted batch-global identity and geometry contracts.
 **Accepted:** 2026-08-23
 
 Baseline person grounding is estimated once in the camera's active
-`backend_world_m` revision. Family Room binds raw camera calibration to the
-active room prior with an explicit rigid `Wc` edge; raw `E` remains calibration
-evidence, while live floor rays use `E @ inv(Wc)` and the leveled floor. Frame,
-transform, calibration, alignment, and Scene Prior revisions must agree or the
-observation fails closed.
+`backend_world_m` revision. Every active room prior has an explicit revision
+binding: identity is still an explicit edge, while a leveled prior uses its
+recorded rigid `Wc`. Raw `E` remains calibration evidence; live floor rays use
+the active `E @ inv(Wc)` view and its leveled floor. Frame, transform,
+calibration, alignment, and Scene Prior revisions must agree or the observation
+fails closed.
 
 Seated or lying hips and torsos are never projected as floor contacts. Visible
-ankles or supported person pixels may contribute; bbox-only and contaminated
-depth remain diagnostics. BEV, the dashboard, OSD trails, and later 3D clients
-consume the filtered world state and may only apply a revision-checked view
-transform. They cannot reselect depth, cast a new floor ray, or smooth the
-canonical point a second time.
+ankles or supported person pixels may contribute; bbox-only, cached-as-current,
+and contaminated depth remain diagnostics. BEV, the dashboard, OSD trails, and
+later 3D clients consume the filtered world state and may only apply a
+revision-checked view transform. A 2D BEV transform uses horizontal
+camera-right and camera-forward axes, never the pitched camera frame. They
+cannot reselect depth, cast a new floor ray, or smooth the canonical point a
+second time.
+
+A current canonical hold stays visible with explicit held provenance and does
+not extend its trail. Its normal cap is 0.40 seconds; only a trusted
+seated/lying lifecycle with exact-frame stationary bbox continuity may hold for
+up to 2.0 seconds. When a current depth sample is unavailable or stale, a
+bounded canonical constant-velocity prediction may remain visible with
+predicted provenance. Reject-driven prediction remains anchored to the last
+accepted state, is capped at 0.40 seconds, does not advance last-good state, and
+may extend history only when `trail_append_allowed=true`. Exact absence removes
+the state from active authority and places it in a 0.75-second quarantine. It
+is restored only for the same camera/tracker key when the returning bbox also
+matches the prior image position and scale; otherwise the new lifecycle starts
+cold. BEV/OSD trail history remains generation-keyed and is never restored.
+OSD joins the canonical track on the exact
+source/frame cohort, maps the declared source-image basis into the configured
+mosaic tile, and breaks history on tracker lifecycle or coordinate-basis
+changes. It never connects a missing/out-of-bounds canonical anchor to bbox
+bottom or a clamped mosaic edge.
+
+The physical gate applies to the proposed published posterior as well as the
+raw measurement innovation. Measurement-noise slack may admit evidence for
+filtering, but it may not create a continuous step faster than
+`max_speed_mps`. Such a proposal is quarantined and uses the bounded prediction
+path; only evidence-backed reacquisition may relocate the head, and that
+relocation always increments the trail segment.
 
 **Why:** A second display estimator and two different floor revisions produced
 posture- and range-dependent metre-scale placement errors. One explicit state
@@ -471,3 +499,59 @@ operational rules are centralized in
 synchronization effects, not insufficient detector throughput. Optional
 evidence and durable I/O must degrade their own freshness without delaying the
 authoritative video/tracking path.
+
+## ADR-022 — Image-motion prediction is display-only continuity
+
+**Accepted:** 2026-08-23
+
+When a current person ground measurement is missing or physically rejected, the
+canonical producer may transport the last physically accepted image foot by
+the current detector-box affine motion and project it through the active
+corrected floor plane. This `image_motion_prediction` is bounded by lifecycle,
+short-TTL, image-step/speed, ray, and metric-speed gates; it never updates the
+world filter or its accepted image origin. Stationary `anchor_hold` remains the
+only fallback for a seated/lying box proven stationary, and failed transport
+after material bbox motion fails closed.
+
+**Why:** The tracker can move coherently while DAv2/pose contact is temporarily
+unavailable. Reusing a fixed world point makes the BEV lie about position;
+integrating a rejected CV state compounds error. A one-frame projective bridge
+keeps all displays on the same PCF world while preserving honest authority and
+bounded failure behavior.
+
+## ADR-023 — Shadow identity is isolated from canonical publication
+
+**Accepted:** 2026-08-23
+
+Identity-v2 authoritative mode remains synchronous after the source metadata
+walk because its decision owns the same-frame public identity. Shadow mode is
+diagnostic: the media callback copies at most 64 compact primitives with a
+bounded embedding dimension only after the exact tracking/world/BEV cohort is
+admitted. It gives a separate deep scalar snapshot to one bounded shadow
+worker. That worker retains at most the newest pending item per source and at
+most 64 pending sources; replacing a stale same-source item, rejecting an
+excess source, or becoming unavailable affects shadow freshness only. It does
+not retain frame surfaces, SDK objects, diagnostic rows, or public embeddings.
+
+Canonical rows never wait for shadow scoring and are never mutated by its
+result. A rate-gated camera frame has no shadow work. An admitted cohort,
+including an empty heartbeat, is eligible for shadow work but may be superseded
+by a newer pending cohort from the same source. A source reconnect scopes the
+coordinator's tracker key by `source_epoch` while leaving the public
+process-local numeric tracker ID unchanged. Copy, binding, mode, resolver, or
+visitor-persistence failure degrades and stops only the shadow lane; it does
+not fail the canonical publication worker or stop media. Authoritative
+identity retains its synchronous fail-closed behavior.
+
+The runtime exposes current/high-water pending counts, in-flight state,
+completed/coalesced/drop/failure totals, and per-call shadow and canonical
+publication timings in the existing core-path stats. The canonical worker
+remains exact per-source FIFO with no coalescing or silent drops.
+
+**Why:** A paced replay against the populated visitor store measured shadow
+processing at about 22.4 source-frames/s, including roughly 89 ms p95 tails,
+while canonical publication required about 29.6 source-frames/s. Visitor
+observation/session SQLite mutations dominated that tail. Sharing the exact
+publication worker therefore accumulated backlog until its finite queue
+failed. Shadow comparison and visitor persistence are reconstructable evidence;
+tracking/world/BEV are the product authority and must remain independent.

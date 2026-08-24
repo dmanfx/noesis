@@ -99,6 +99,40 @@ def require_native_exclusion_element(config: Mapping[str, Any]) -> str:
         )
     return element
 
+
+def _parse_recorded_replay_policy(
+    raw: Any,
+) -> Tuple[bool, bool]:
+    """Validate the narrow, opt-in clock policy for local recorded sources.
+
+    ``identity`` pacing is intentionally not inferred from a ``file:`` URI.  A
+    recorded graph must opt in explicitly so the canonical live configuration
+    keeps its existing source/queue behavior.  The two switches are kept
+    independent: ``realtime`` clocks the source and ``preserve_frames`` turns
+    off the latest-only decode queue policy.  Normal acceptance replay uses
+    both.
+    """
+
+    if raw is None:
+        return False, False
+    if not isinstance(raw, Mapping):
+        raise ValueError("recorded_replay must be a mapping")
+    allowed = {"realtime", "preserve_frames"}
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "recorded_replay contains unsupported keys: " + ", ".join(unknown)
+        )
+
+    values: list[bool] = []
+    for key in ("realtime", "preserve_frames"):
+        value = raw.get(key, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"recorded_replay.{key} must be a boolean")
+        values.append(value)
+    return values[0], values[1]
+
+
 try:  # DS9 runtime provides this; tests can still run without it.
     from pyservicemaker import Pipeline as DSPipeline
 except Exception:  # pragma: no cover - import-safe fallback when DS libs absent
@@ -800,11 +834,27 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             return False
         return value.lower().endswith((".mp4", ".mkv"))
 
+    def _is_local_recorded_replay_uri(uri: str) -> bool:
+        """Return true for the local recordings accepted by replay pacing."""
+        value = str(uri or "").strip().lower()
+        if not value.startswith("file:"):
+            return False
+        # Keep this aligned with the nvurisrcbin/file-loop URI contract.
+        return value.endswith((".mp4", ".mkv"))
+
     path = Path(yaml_path)
     if not path.exists():
         raise FileNotFoundError(path)
 
     cfg: Dict[str, Any] = load_pipeline_config(path, materialize_secrets=True)
+
+    # Recorded files otherwise run as fast as the graph permits, which can
+    # make analytics outrun media timestamps and exercise latest-only queues.
+    # Keep realtime pacing and frame preservation a strict, top-level opt-in so
+    # the canonical live configuration keeps its existing behavior.
+    recorded_replay_realtime, recorded_replay_preserve_frames = (
+        _parse_recorded_replay_policy(cfg.get("recorded_replay"))
+    )
 
     errors: List[str] = []
 
@@ -1149,6 +1199,22 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             _safe_add(ds_pipeline, source, pipeline.errors)
             _apply_component_config(ds_pipeline, source, pipeline.errors)
 
+            local_recorded_replay = _is_local_recorded_replay_uri(uri)
+            source_tail = source.name
+            if recorded_replay_realtime and local_recorded_replay:
+                replay_clock = Component(
+                    name=f"source_replay_clock_{idx}",
+                    element="identity",
+                    config={"sync": True},
+                    downstream=[],
+                )
+                pipeline.components[replay_clock.name] = replay_clock
+                _safe_add(ds_pipeline, replay_clock, pipeline.errors)
+                _apply_component_config(ds_pipeline, replay_clock, pipeline.errors)
+                _safe_link(ds_pipeline, pipeline.errors, source.name, replay_clock.name)
+                source.downstream = [replay_clock.name]
+                source_tail = replay_clock.name
+
             # Isolate each decoded source before dewarping/muxing so one
             # reconnecting camera cannot back-pressure the other sources. The
             # progress probe is attached after this queue, or after dewarping
@@ -1158,7 +1224,11 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                 name=f"source_decode_queue_{idx}",
                 element="queue",
                 config={
-                    "leaky": 2,
+                    "leaky": (
+                        0
+                        if recorded_replay_preserve_frames and local_recorded_replay
+                        else 2
+                    ),
                     "max-size-buffers": 4,
                     "max-size-bytes": 0,
                     "max-size-time": 0,
@@ -1168,8 +1238,11 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             pipeline.components[decode_queue.name] = decode_queue
             _safe_add(ds_pipeline, decode_queue, pipeline.errors)
             _apply_component_config(ds_pipeline, decode_queue, pipeline.errors)
-            _safe_link(ds_pipeline, pipeline.errors, source.name, decode_queue.name)
-            source.downstream = [decode_queue.name]
+            _safe_link(ds_pipeline, pipeline.errors, source_tail, decode_queue.name)
+            if source_tail != source.name:
+                pipeline.components[source_tail].downstream = [decode_queue.name]
+            else:
+                source.downstream = [decode_queue.name]
 
             dewarp_cfg = dict(dewarp_cfg_raw) if isinstance(dewarp_cfg_raw, dict) else {}
             dewarp_enabled = bool(dewarp_cfg.get("enable", False))

@@ -101,10 +101,12 @@ from noesis.telemetry.person_ground_state import (
     PersonGroundState,
     PoseAnchorCandidate,
     assess_lower_body_occlusion,
+    advance_human_cv_prediction,
     begin_source_admission,
     classify_posture,
     commit_image_path_point,
     complete_source_admission,
+    mark_world_measurement_unavailable,
     resolve_pose_floor_anchor,
     source_score,
     update_human_cv_filter,
@@ -208,6 +210,11 @@ _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS = (
     "world_floor_admitted",
     "world_floor_rejection_reason",
     "world_depth_candidate",
+    "world_depth_rejection_reason",
+    "world_observation_range_m",
+    "world_observation_range_limit_m",
+    "world_observation_range_admitted",
+    "world_observation_range_rejection_reason",
     "world_prefilter_measurement",
     "world_filter_prediction",
     "world_measurement_accepted",
@@ -1730,8 +1737,8 @@ class MapAnythingProcessor:
         frame_w = 0
         frame_h = 0
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", "source_frame_width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", "source_frame_height", default=0) or 0)
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -2916,8 +2923,8 @@ class TrailOverlayProcessor:
 
     def _frame_source_size(self, frame_meta: Any, calib: Any | None = None) -> Tuple[int, int]:
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", "source_frame_width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", "source_frame_height", default=0) or 0)
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -7672,8 +7679,11 @@ class _AnalyticsTelemetryProcessor:
 
     def _frame_source_size(self, frame_meta: Any) -> Tuple[int, int]:
         try:
-            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
-            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+            # Object metadata is expressed in the post-dewarp/post-mux raster.
+            # Prefer that canonical frame size; source-native dimensions are
+            # only a fallback for metadata producers that do not expose it.
+            frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", "source_frame_width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", "source_frame_height", default=0) or 0)
         except Exception:
             frame_w = 0
             frame_h = 0
@@ -7702,11 +7712,30 @@ class _AnalyticsTelemetryProcessor:
             return width, height
         # A principal point is not required to be the image center. Inferring
         # dimensions as 2*cx/2*cy silently rescales dewarped detections whenever
-        # the calibrated optical center is off-center. Let frame metadata own
-        # the size when calibration has no declared resolution.
+        # the calibrated optical center is off-center. The canonical frame
+        # metadata owns the raster whenever it declares one.
         return None
 
     def _track_image_size(self, sensor_id: int, frame_meta: Any) -> Tuple[int, int]:
+        # The tracker bbox/pose raster is the canonical frame raster, not the
+        # calibration loader's raw intrinsics resolution.  Using the latter
+        # when the frame is already dewarped/muxed up (e.g. 1280 -> 1920)
+        # causes a second 1.5x transform before projection.
+        try:
+            canonical_w = int(_meta_lookup(frame_meta, "frame_width", "width", default=0) or 0)
+            canonical_h = int(_meta_lookup(frame_meta, "frame_height", "height", default=0) or 0)
+        except Exception:
+            canonical_w = canonical_h = 0
+        if canonical_w > 8 and canonical_h > 8:
+            return canonical_w, canonical_h
+        # When native metadata omits the per-frame raster, the streammux
+        # dimensions are the only authoritative post-dewarp tracker raster.
+        # Prefer them over source-native dimensions or raw calibration
+        # intrinsics; otherwise a dewarped 1920x1080 source can be scaled a
+        # second time as though it were still 1280x720.
+        configured_w, configured_h = self._frame_dims()
+        if configured_w > 8 and configured_h > 8:
+            return configured_w, configured_h
         intrinsic_size = self._intrinsics_base_image_size(sensor_id)
         if intrinsic_size is not None:
             return intrinsic_size
@@ -9012,6 +9041,50 @@ class _AnalyticsTelemetryProcessor:
             track["world_floor_rejection_reason"] = rejection_reason
         return admitted
 
+    def _admit_world_observation_range(
+        self,
+        camera_id: str,
+        *,
+        calib: Any,
+        world_candidate: np.ndarray,
+        track: Dict[str, Any],
+    ) -> bool:
+        """Admit any metric world candidate against the calibrated range envelope."""
+        policy = self.world_fusion_policy
+        if policy is None:
+            return True
+        profile = policy.profile(str(camera_id))
+        limit_m = float(profile.floor_ray_max_range_m)
+        track["world_observation_range_limit_m"] = limit_m
+        admitted = False
+        rejection_reason = "world_observation_range_invalid"
+        try:
+            _rotation, camera_world = parse_extrinsics(calib.extrinsics_col_major)
+            unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+            if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+                unit_scale = 1.0
+            camera_world = np.asarray(camera_world, dtype=np.float64) * unit_scale
+            candidate = np.asarray(world_candidate, dtype=np.float64)
+            if candidate.shape[0] < 3 or not np.all(np.isfinite(candidate[:3])):
+                raise ValueError("world candidate is not finite")
+            delta = candidate[:3] - camera_world[:3]
+            horizontal_range_m = float(math.hypot(float(delta[0]), float(delta[2])))
+            track["world_observation_range_m"] = horizontal_range_m
+            admitted = bool(
+                math.isfinite(horizontal_range_m)
+                and horizontal_range_m <= limit_m
+            )
+            if not admitted:
+                rejection_reason = "world_observation_range_exceeded"
+        except Exception:
+            admitted = False
+        track["world_observation_range_admitted"] = admitted
+        if admitted:
+            track.pop("world_observation_range_rejection_reason", None)
+        else:
+            track["world_observation_range_rejection_reason"] = rejection_reason
+        return admitted
+
     def _set_track_image_base_from_world(
         self,
         track: Dict[str, Any],
@@ -9086,16 +9159,42 @@ class _AnalyticsTelemetryProcessor:
                 state.ts = float(now_ts)
 
             measurement = np.array([mx, float(calib.floor_y), mz], dtype=np.float64)
-            hit = self._update_track_world_state(
-                track,
-                state,
-                measurement=measurement,
-                floor_y=float(calib.floor_y),
-                now_ts=float(now_ts),
-                alpha=float(self._world_smooth_alpha_good),
-                beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
-                quality="good",
-            )
+            if not self._admit_world_observation_range(
+                camera_id,
+                calib=calib,
+                world_candidate=measurement,
+                track=track,
+            ):
+                rejection_reason = str(
+                    track.get("world_observation_range_rejection_reason")
+                    or "world_observation_range_exceeded"
+                )
+                if state is None:
+                    track["world_valid"] = False
+                    track["world_quality"] = "invalid"
+                    track["world_quality_reason"] = rejection_reason
+                    track.pop("world", None)
+                    track.pop("world_source", None)
+                    return
+                mark_world_measurement_unavailable(state, reason=rejection_reason)
+                hit = advance_human_cv_prediction(
+                    state,
+                    floor_y=float(calib.floor_y),
+                    now_ts=float(now_ts),
+                    config=self._human_ground_cfg,
+                    reason=rejection_reason,
+                )
+            else:
+                hit = self._update_track_world_state(
+                    track,
+                    state,
+                    measurement=measurement,
+                    floor_y=float(calib.floor_y),
+                    now_ts=float(now_ts),
+                    alpha=float(self._world_smooth_alpha_good),
+                    beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
+                    quality="good",
+                )
 
             if state is not None and not state.measurement_accepted:
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
@@ -9443,6 +9542,19 @@ class _AnalyticsTelemetryProcessor:
                             float(depth_obs[1]),
                             float(depth_obs[2]),
                         ]
+                        if not self._admit_world_observation_range(
+                            camera_id,
+                            calib=calib,
+                            world_candidate=np.asarray(depth_obs, dtype=np.float64),
+                            track=track,
+                        ):
+                            track["world_depth_rejection_reason"] = str(
+                                track.get("world_observation_range_rejection_reason")
+                                or "world_observation_range_exceeded"
+                            )
+                            depth_obs = None
+                            depth_weight = 0.0
+                            depth_reason = str(track["world_depth_rejection_reason"])
                     base_floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
                     floor_weight, effective_depth_weight, floor_only_allowed = self._world_fusion_weights(
                         camera_id,
@@ -9585,7 +9697,11 @@ class _AnalyticsTelemetryProcessor:
                         if not floor_ray_admitted:
                             quality_reason = floor_ray_rejection_reason
                         elif not reject_current_geometry:
-                            quality_reason = "fusion_policy_requires_registered_depth"
+                            quality_reason = (
+                                "world_observation_range_exceeded"
+                                if depth_reason == "world_observation_range_exceeded"
+                                else "fusion_policy_requires_registered_depth"
+                            )
                 else:
                     hit = None
 
@@ -9622,15 +9738,28 @@ class _AnalyticsTelemetryProcessor:
                     state=state,
                 )
                 if gravity_hit is not None:
-                    gravity_admitted = True
+                    gravity_admitted = self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(gravity_hit, dtype=np.float64),
+                        track=track,
+                    )
+                    if not gravity_admitted:
+                        quality_reason = str(
+                            track.get("world_observation_range_rejection_reason")
+                            or "world_observation_range_exceeded"
+                        )
                     if force_occlusion_gravity:
-                        gravity_admitted = self._admit_live_world_source(
-                            state,
-                            candidate_source="gravity_drop",
-                            quality="estimated",
-                            depth_weight=0.0,
-                            posture="standing",
-                            authoritative=True,
+                        gravity_admitted = bool(
+                            gravity_admitted
+                            and self._admit_live_world_source(
+                                state,
+                                candidate_source="gravity_drop",
+                                quality="estimated",
+                                depth_weight=0.0,
+                                posture="standing",
+                                authoritative=True,
+                            )
                         )
                     if gravity_admitted:
                         hit = self._update_track_world_state(
@@ -9674,6 +9803,7 @@ class _AnalyticsTelemetryProcessor:
                     quality_reason
                     if quality_reason in (
                         "fusion_policy_requires_registered_depth",
+                        "world_observation_range_exceeded",
                         "floor_ray_range_exceeded",
                         "floor_ray_geometry_invalid",
                     )

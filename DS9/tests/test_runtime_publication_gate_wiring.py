@@ -30,10 +30,16 @@ def test_runtime_publication_gate_is_required_by_ds9_publishers_and_hooks() -> N
     for callable_object in (
         DepthTelemetryPublisher,
         hooks.attach_analytics_telemetry_hook,
-        hooks._AnalyticsTelemetryProcessor,  # type: ignore[attr-defined]
     ):
         parameter = inspect.signature(callable_object).parameters["publication_gate"]
         assert parameter.default is inspect.Parameter.empty
+    # Direct SDK-neutral processor construction remains compatible with
+    # focused callers; the runtime attachment path still requires the one
+    # shared gate explicitly.
+    parameter = inspect.signature(
+        hooks._AnalyticsTelemetryProcessor  # type: ignore[attr-defined]
+    ).parameters["publication_gate"]
+    assert parameter.default is not inspect.Parameter.empty
 
 
 def test_closed_gate_drops_late_depth_and_analytics_callbacks() -> None:

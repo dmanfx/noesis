@@ -33,8 +33,24 @@ export const bevCohort = (payload) => {
     if (payload[topKey] !== expected) return null;
     if (cohort[cohortKey] !== expected) return null;
   }
+  if (cohort.tracking_outbound_submission_id !== outboundSubmissionId) {
+    return null;
+  }
   return { sourceId, frameId, observedAtUs, sequence, outboundSubmissionId };
 };
+
+const hasCohortMetadata = (payload) => (
+  payload
+  && typeof payload === 'object'
+  && (
+    Object.prototype.hasOwnProperty.call(payload, 'cohort')
+    || Object.prototype.hasOwnProperty.call(payload, 'sourceId')
+    || Object.prototype.hasOwnProperty.call(payload, 'frameId')
+    || Object.prototype.hasOwnProperty.call(payload, 'observedAtUs')
+    || Object.prototype.hasOwnProperty.call(payload, 'trackingPublicationSequence')
+    || Object.prototype.hasOwnProperty.call(payload, 'trackingOutboundSubmissionId')
+  )
+);
 
 const canonicalFrame = (payload) => {
   const mode = String(payload?.frame_mode ?? '').trim().toLowerCase();
@@ -92,6 +108,61 @@ export const admitBevFrame = (previous, incoming) => {
   };
 };
 
+/**
+ * Admit a BEV status only for the exact/current producer cohort.
+ *
+ * A status is allowed to clear a frame when it has the same cohort (the
+ * renderer failed that attempt) or a strictly newer cohort. A cohort-less
+ * status is only valid before a canonical frame exists; otherwise a delayed
+ * error would erase newer dots/trails. Local transport resets use
+ * clearBevForStatus directly and intentionally bypass producer admission.
+ */
+export const admitBevStatus = (previous, incoming) => {
+  if (!incoming || incoming.type !== 'bev-status') {
+    return { admitted: false, reason: 'not_bev_status', payload: null };
+  }
+  const cameraId = bevCameraId(incoming);
+  if (!cameraId) return { admitted: false, reason: 'camera_missing', payload: null };
+
+  const incomingHasCohort = hasCohortMetadata(incoming);
+  const nextCohort = incomingHasCohort ? bevCohort(incoming) : null;
+  if (incomingHasCohort && !nextCohort) {
+    return { admitted: false, reason: 'cohort_invalid', payload: null };
+  }
+
+  const previousCohort = previous ? bevCohort(previous) : null;
+  if (!nextCohort) {
+    if (previousCohort) {
+      return { admitted: false, reason: 'cohort_missing', payload: null };
+    }
+    return {
+      admitted: true,
+      reason: 'admitted_unbound_status',
+      payload: clearBevForStatus(previous, { ...incoming, cameraId }),
+    };
+  }
+
+  if (previousCohort && nextCohort.sourceId === previousCohort.sourceId) {
+    const sameCohort = (
+      nextCohort.observedAtUs === previousCohort.observedAtUs
+      && nextCohort.outboundSubmissionId === previousCohort.outboundSubmissionId
+    );
+    const newerCohort = (
+      nextCohort.observedAtUs > previousCohort.observedAtUs
+      && nextCohort.outboundSubmissionId > previousCohort.outboundSubmissionId
+    );
+    if (!sameCohort && !newerCohort) {
+      return { admitted: false, reason: 'cohort_not_newer', payload: null };
+    }
+  }
+
+  return {
+    admitted: true,
+    reason: 'admitted',
+    payload: clearBevForStatus(previous, { ...incoming, cameraId }),
+  };
+};
+
 export const clearBevForStatus = (previous, status) => ({
   ...(previous && typeof previous === 'object' ? previous : {}),
   ...(status && typeof status === 'object' ? status : {}),
@@ -99,6 +170,8 @@ export const clearBevForStatus = (previous, status) => ({
   cameraId: bevCameraId(status) || bevCameraId(previous),
   footpoints: [],
   trails: [],
+  droppedFootpoints: [],
+  droppedFootpointCount: 0,
 });
 
 export const bevMatchesFloorplan = (bev, floorplan) => {

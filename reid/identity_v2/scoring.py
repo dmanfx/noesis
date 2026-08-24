@@ -15,6 +15,16 @@ from .models import (
 )
 
 
+# BLAS-backed gallery scoring and the former scalar reduction can differ by a
+# few ULPs.  Keep policy decisions stable at an exact configured boundary
+# without making the tolerance large enough to hide a meaningful score gap.
+_POLICY_COMPARISON_EPSILON = 1e-12
+
+
+def _below_policy_floor(value: float, floor: float) -> bool:
+    return float(value) < float(floor) - _POLICY_COMPARISON_EPSILON
+
+
 @dataclass(frozen=True)
 class OpenSetPolicy:
     """Open-set scoring and conservative household-prior policy.
@@ -145,11 +155,14 @@ class OpenSetScorer:
         # open-set and quality requirement has passed.
         if quality < self.policy.quality_floor:
             reason = "quality_below_floor"
-        elif raw < self.policy.appearance_floor:
+        elif _below_policy_floor(raw, self.policy.appearance_floor):
             reason = "appearance_below_floor"
         elif not bool(candidate.hard_allowed):
             reason = str(candidate.hard_constraint_reason or "hard_constraint")
-        elif confidence < self.policy.calibrated_confidence_floor:
+        elif _below_policy_floor(
+            confidence,
+            self.policy.calibrated_confidence_floor,
+        ):
             reason = "confidence_below_floor"
         else:
             eligible = True
@@ -230,7 +243,7 @@ class OpenSetScorer:
                 pre_prior_winner_id=best.identity_id,
                 pre_prior_margin=margin,
             )
-        if margin < self.policy.ambiguity_margin_floor:
+        if _below_policy_floor(margin, self.policy.ambiguity_margin_floor):
             return TrackletScores(
                 observation=observation,
                 candidates=scored,

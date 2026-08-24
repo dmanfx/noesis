@@ -430,7 +430,12 @@ class WebSocketServer:
     AUTHORITY_GATED_MESSAGE_TYPES = frozenset(
         {"tracking", "world_snapshot", "world_event"}
     )
-    DEDICATED_BEV_MESSAGE_TYPES = frozenset({"bev-frame"})
+    # BEV frames and their fail-closed status/error records share one ordered
+    # sender route.  A status is not a substitute for a frame, but it must
+    # occupy the same bounded outbound path so a late error cannot overtake a
+    # newer admitted frame without carrying an older cohort that the client
+    # can reject.
+    DEDICATED_BEV_MESSAGE_TYPES = frozenset({"bev-frame", "bev-status"})
     CANONICAL_MESSAGE_TYPES = (
         AUTHORITY_GATED_MESSAGE_TYPES | DEDICATED_BEV_MESSAGE_TYPES
     )
@@ -5107,18 +5112,22 @@ class WebSocketServer:
         *,
         response_model_timing: Optional[BoundaryResponseModelTiming] = None,
     ) -> OutboundAdmissionReceipt:
-        """Admit one canonical BEV frame through its dedicated receipt route."""
+        """Admit one canonical BEV frame/status through its typed route."""
 
-        if (
-            not isinstance(message, dict)
-            or str(message.get("type", "")) not in self.DEDICATED_BEV_MESSAGE_TYPES
-        ):
-            raise TypeError("broadcast_bev_sync requires type=bev-frame")
+        if not isinstance(message, dict):
+            raise TypeError(
+                "broadcast_bev_sync requires a typed BEV message"
+            )
+        message_type = str(message.get("type", ""))
+        if message_type not in self.DEDICATED_BEV_MESSAGE_TYPES:
+            raise TypeError(
+                "broadcast_bev_sync requires type=bev-frame or bev-status"
+            )
         response_model_timing = self._require_response_model_timing(
             message,
             response_model_timing,
             route="broadcast",
-            message_type="bev-frame",
+            message_type=message_type,
         )
         frozen_message, payload_bytes = self._freeze_outbound_message(message)
         submitted_ns = time.perf_counter_ns()
@@ -5259,6 +5268,7 @@ class WebSocketServer:
             "world_snapshot",
             "world_event",
             "bev-frame",
+            "bev-status",
         }:
             return None
         if message_type not in self._json_coalesce_interval_by_type:

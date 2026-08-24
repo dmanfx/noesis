@@ -18,6 +18,16 @@ are native-host only and must not require Docker.
 - Historical documents never override current guidance.
 - Current architecture and operating facts are indexed by `docs/README.md`.
 
+## Git branch authority
+
+- `DS9` is the only active development branch for this shared checkout.
+- `feature_DS8` is a frozen historical pointer. Do not switch to it, commit to
+  it, merge into it, or push it unless the user explicitly requests that exact
+  operation.
+- Before every commit, verify that `git branch --show-current` returns `DS9`.
+  Agents share this worktree, so do not change the checked-out branch without
+  explicit user direction.
+
 ## Required DeepStream route
 
 Before SDK-facing work, read the matching skill under `.agents/skills/` and the

@@ -6,6 +6,10 @@
 
 - Root `AGENTS.md` applies first; this file narrows DS9.1 work.
 - `DS9/docs/history/` is non-normative migration and experiment evidence.
+- Work in this subtree belongs on the repository `DS9` branch. Treat
+  `feature_DS8` as read-only history, verify the current branch before a
+  commit, and do not switch the shared checkout without explicit user
+  direction.
 
 ## Runtime authority
 

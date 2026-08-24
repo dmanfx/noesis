@@ -8,6 +8,8 @@ canonical DS9.1 runtime. It is not an independently runnable DS8 stack.
 - Root `AGENTS.md` applies.
 - A nearer `AGENTS.md` may add narrower rules.
 - Historical DS8 descriptions under `docs/history/` are non-normative.
+- Work in this subtree belongs on the repository `DS9` branch. Treat
+  `feature_DS8` as read-only and verify the branch before committing.
 
 ## Scope
 

@@ -5,6 +5,9 @@
 - Root `AGENTS.md` applies.
 - A nearer workstream `AGENTS.md` may add product-specific rules.
 - `plans/archive/` is historical and non-normative.
+- Active planning work belongs on the repository `DS9` branch. Do not switch
+  to or commit on the historical `feature_DS8` branch without explicit user
+  direction.
 
 ## Rules
 

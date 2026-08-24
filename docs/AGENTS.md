@@ -8,6 +8,9 @@ policy lives in the root `AGENTS.md`; this file narrows documentation practice.
 - Root `AGENTS.md` is authoritative.
 - `docs/history/` is an archive and is never normative.
 - `docs/README.md` is the current documentation index.
+- Current documentation work belongs on the repository `DS9` branch. Do not
+  switch to or commit on the historical `feature_DS8` branch without explicit
+  user direction.
 
 ## Documentation rules
 

@@ -533,7 +533,12 @@ def test_async_journal_batches_and_flushes_without_blocking_caller(tmp_path: Pat
     journal = ContractJournal(tmp_path / "world.sqlite3", max_records=500)
     asynchronous = AsyncContractJournal(journal, max_pending_batches=200)
     for sequence in range(100):
-        asynchronous.append_many([_payload(sequence)], recorded_at_us=2_000 + sequence)
+        receipt = asynchronous.append_many(
+            [_payload(sequence)],
+            recorded_at_us=2_000 + sequence,
+        )
+        assert receipt.payload_count == 1
+        assert receipt.max_pending_batches == 200
     asynchronous.close()
     assert len(journal.records()) == 100
 
@@ -684,6 +689,49 @@ def test_journal_append_hashes_match_canonical_core(tmp_path: Path) -> None:
     ]
     assert journal.records() == appended
     journal.close()
+
+
+def test_journal_reopens_additive_legacy_shape_without_mutating_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "world.sqlite3"
+    _seed_closed_journal(path)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        row = connection.execute(
+            "SELECT payload_json, previous_sha256 FROM records WHERE sequence = 0"
+        ).fetchone()
+        payload = json.loads(str(row[0]))
+        del payload["capabilities"][0]["blockers"]
+        payload_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        checksum = _stored_record_sha256(
+            sequence=0,
+            recorded_at_us=2_000,
+            payload=payload,
+            previous_sha256=str(row[1]),
+        )
+        connection.execute(
+            "UPDATE records SET payload_json = ?, record_sha256 = ? "
+            "WHERE sequence = 0",
+            (payload_json, checksum),
+        )
+
+    before = path.read_bytes()
+    journal = ContractJournal(path)
+    try:
+        records = journal.records()
+        assert "blockers" not in records[0].payload["capabilities"][0]
+        assert records[0].record_sha256 == checksum
+    finally:
+        journal.close()
+    after = path.read_bytes()
+
+    assert before == after
 
 
 def _assert_reopen_rejects_and_cleans_up(path: Path) -> None:

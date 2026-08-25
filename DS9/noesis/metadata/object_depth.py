@@ -86,6 +86,10 @@ class ObjectDepthResult:
     measurement_ts_us: Optional[int] = None
     measurement_age_us: Optional[int] = None
     measurement_cached: Optional[bool] = None
+    depth_tensor_frame_id: Optional[int] = None
+    depth_tensor_ts_us: Optional[int] = None
+    depth_tensor_age_frames: Optional[int] = None
+    depth_tensor_age_us: Optional[int] = None
     world_point: Optional[Sequence[float]] = None
     world_point_depth: Optional[Sequence[float]] = None
     world_point_floor: Optional[Sequence[float]] = None
@@ -147,6 +151,22 @@ class ObjectDepthResult:
             object.__setattr__(self, "measurement_age_us", max(0, int(self.measurement_age_us)))
         if self.measurement_cached is not None:
             object.__setattr__(self, "measurement_cached", bool(self.measurement_cached))
+        if self.depth_tensor_frame_id is not None:
+            object.__setattr__(self, "depth_tensor_frame_id", int(self.depth_tensor_frame_id))
+        if self.depth_tensor_ts_us is not None:
+            object.__setattr__(self, "depth_tensor_ts_us", int(self.depth_tensor_ts_us))
+        if self.depth_tensor_age_frames is not None:
+            object.__setattr__(
+                self,
+                "depth_tensor_age_frames",
+                max(0, int(self.depth_tensor_age_frames)),
+            )
+        if self.depth_tensor_age_us is not None:
+            object.__setattr__(
+                self,
+                "depth_tensor_age_us",
+                max(0, int(self.depth_tensor_age_us)),
+            )
         object.__setattr__(self, "world_point", _coerce_optional_point3(self.world_point))
         object.__setattr__(self, "world_point_depth", _coerce_optional_point3(self.world_point_depth))
         object.__setattr__(self, "world_point_floor", _coerce_optional_point3(self.world_point_floor))
@@ -203,6 +223,10 @@ class ObjectDepthResult:
             "measurement_ts_us": self.measurement_ts_us,
             "measurement_age_us": self.measurement_age_us,
             "measurement_cached": self.measurement_cached,
+            "depth_tensor_frame_id": self.depth_tensor_frame_id,
+            "depth_tensor_ts_us": self.depth_tensor_ts_us,
+            "depth_tensor_age_frames": self.depth_tensor_age_frames,
+            "depth_tensor_age_us": self.depth_tensor_age_us,
             "world_point": list(self.world_point) if self.world_point is not None else None,
             "world_point_depth": list(self.world_point_depth) if self.world_point_depth is not None else None,
             "world_point_floor": list(self.world_point_floor) if self.world_point_floor is not None else None,

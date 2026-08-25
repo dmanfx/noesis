@@ -275,6 +275,15 @@ def test_scene_prior_load_evaluate_and_live_wins_composition(tmp_path: Path) -> 
     assert diagnostic is not None
     assert diagnostic["status"] == "warning"
     assert diagnostic["reasons"] == ["inside_static_obstacle_candidate"]
+    assert diagnostic["extent_outside_distance_m"] == 0.0
+
+    outside = priors.evaluate("camera-a", (3.5, 0.0, 2.5))
+    assert outside is not None
+    assert outside["inside_extent"] is False
+    assert outside["extent_outside_distance_m"] == pytest.approx(
+        (1.5**2 + 0.5**2) ** 0.5,
+        abs=1e-6,
+    )
 
     live_height = np.asarray([[10.0, np.nan], [np.nan, np.nan]], dtype=np.float32)
     live_observed = np.asarray([[1.0, 0.0], [0.0, 0.0]], dtype=np.float32)

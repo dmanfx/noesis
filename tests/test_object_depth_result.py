@@ -40,6 +40,10 @@ def test_object_depth_result_roundtrip() -> None:
         measurement_ts_us=123456000,
         measurement_age_us=789,
         measurement_cached=True,
+        depth_tensor_frame_id=13,
+        depth_tensor_ts_us=123423000,
+        depth_tensor_age_frames=1,
+        depth_tensor_age_us=33000,
         world_point=(1.0, 0.0, 3.5),
         world_point_depth=(1.1, 0.2, 3.6),
         world_point_floor=(1.0, 0.0, 3.4),
@@ -69,6 +73,10 @@ def test_object_depth_result_roundtrip() -> None:
     assert as_dict["measurement_ts_us"] == 123456000
     assert as_dict["measurement_age_us"] == 789
     assert as_dict["measurement_cached"] is True
+    assert as_dict["depth_tensor_frame_id"] == 13
+    assert as_dict["depth_tensor_ts_us"] == 123423000
+    assert as_dict["depth_tensor_age_frames"] == 1
+    assert as_dict["depth_tensor_age_us"] == 33000
     assert as_dict["world_point"] == [1.0, 0.0, 3.5]
 
 

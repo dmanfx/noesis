@@ -1,6 +1,6 @@
 # Native DeepStream 9.1 runtime baseline
 
-Status: accepted application baseline, updated 2026-08-23.
+Status: accepted application baseline, updated 2026-08-25.
 
 ## Platform
 
@@ -29,12 +29,19 @@ does not use Docker, a deployment selector, or a container filesystem.
 - ReID: Swin Tiny, 256-dimensional embedding, GIE 3.
 - Pose: YOLO26-n pose, GIE 4.
 - Tracking depth: DepthAnythingV2 metric, always on, GIE 5.
+- Person world localization: universal typed floor/depth hypothesis resolver
+  with full covariance, conservative PCF evidence, then the shared
+  `PersonGroundState`; no room-specific localization policy.
 - Manual/full-frame depth: MapAnything FP32, request-gated, GIE 2.
 - Analytics: native ROI exclusion followed by `nvdsanalytics`.
 - Output: one 3840×720 H.264 mosaic through SHM/WebRTC.
 - RTSP: disabled.
 - BEV: JSON/metadata only in `camera_local_ground_m`; PCF is the canonical
   floorplan presentation source where a camera has an admitted Scene Prior.
+  The off-by-default dashboard `Localization details` overlay compares the
+  exact current hypotheses, uncertainty, and retired room-policy measurement
+  without changing the canonical dot. The old policy is diagnostic-only and
+  cannot become runtime localization authority.
 
 MV3DT, V3DT activation, and AMC are not part of this baseline. Assets/configs
 for future experiments do not constitute an enabled capability.
@@ -100,4 +107,8 @@ aggregate receiver FPS is not a substitute for those measurements.
   data through Menon.
 - Canonical PCF BEV frames admit the associated committed tracking cohort, so
   people appear as dots/trails on PCF-backed floorplans.
+- A revision-matched candidate well beyond the authored boundary or measured
+  prior extent is retained for diagnostics but quarantined as weak; agreement
+  between two equally contradictory sources cannot turn it into an accepted
+  fused position.
 - Empty occupancy is valid and does not require synthetic tracks.

@@ -24,7 +24,9 @@ flowchart LR
     WORLD -. object meta .-> FUSION[bounded exact-frame rendezvous + person ROI sampling]
     CAPTURE --> FUSION
     FUSION --> ODM[NOESIS.OBJECT_DEPTH]
-    ODM --> PERSON[PersonGroundState + strict observation]
+    ODM --> HYP[bounded floor / registered-depth hypotheses]
+    HYP --> RESOLVE[universal covariance-aware resolver]
+    RESOLVE --> PERSON[PersonGroundState + strict observation]
     MASGIE -. tensor meta .-> MAP[MapAnythingProcessor → DepthResult + Zarr]
   end
 
@@ -52,6 +54,15 @@ flowchart LR
 - **Canonical observation:** `depth_present` is true only for `status="ok"`
   with finite positive usable depth and no registration rejection. A raw anchor
   is not sufficient when registration status is `ok`.
+- **World localization:** the registered DAv2 anchor is one independent
+  `registered_depth` hypothesis; it does not replace or suppress an
+  independently valid floor ray. Each hypothesis carries covariance from
+  anchor support/spread, occupied-person registration residuals, ray geometry,
+  posture, and occlusion. The universal resolver genuinely combines only
+  compatible hypotheses, retains large disagreement, and feeds one current
+  ground-footprint measurement into the existing `PersonGroundState`.
+  Camera/room names do not select different algorithms. See
+  [`universal_world_localization.md`](universal_world_localization.md).
 - **MapAnything gating:** `mapanything_valve.drop` toggles through
   `DS8Pipeline.mark_depth_enabled()`; REST `/api/v1/depth/refresh` and
   `get_ma_depth` open the gate for a bounded window.
@@ -84,6 +95,13 @@ flowchart LR
 Successful status counters advance only after native user-meta attachment
 succeeds. Missing extensions/functions, native exceptions, and native rejection
 are visible failures, with rate-limited warnings.
+
+Every object-depth result separately publishes its object-geometry measurement
+cohort (`measurement_*`) and the sampled GPU tensor cohort (`depth_tensor_*`).
+An exact tensor has zero tensor age. A bounded lagged tensor remains available
+for diagnostics and cache continuity, but it is not eligible as a fresh
+registered-depth world hypothesis when sampled with current-frame object
+geometry.
 
 ## Storage & Calibration
 - Snapshots: `data/depth/<camera>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr` (Blosc/Zarr, managed by `DepthStorageManager`).

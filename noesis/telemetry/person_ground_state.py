@@ -353,6 +353,18 @@ class PersonGroundState:
     trail_break_required: bool = False
     trail_segment_id: int = 0
 
+    # Final canonical-output continuity.  The filter normally owns the same
+    # state, but this independent compact watermark protects the publication
+    # boundary when an alternate continuation path or duplicate SDK object
+    # mutates the process state between emitted observations.  Media PTS is
+    # preferred so file replay and a delayed callback obey physical stream
+    # time rather than processing speed.
+    last_output_world_x: Optional[float] = None
+    last_output_world_z: Optional[float] = None
+    last_output_media_pts_ns: Optional[int] = None
+    last_output_filter_ts: float = -1.0
+    last_output_trail_segment_id: int = 0
+
     # A live-source change is provisional until the physical measurement gate
     # accepts the corresponding point.  These fields never leave the process.
     pending_source_previous: Optional[
@@ -366,6 +378,13 @@ class PersonGroundState:
     rejection_anchor_x: Optional[float] = None
     rejection_anchor_z: Optional[float] = None
     rejection_anchor_ts: float = -1.0
+    # Exact state immediately before the current frame's rejection update.
+    # A second weak/projective hypothesis in the same frame uses this to prove
+    # continuity against the last process posterior, not merely against the
+    # older fixed rejection anchor.
+    rejection_previous_world_x: Optional[float] = None
+    rejection_previous_world_z: Optional[float] = None
+    rejection_previous_world_ts: float = -1.0
 
     def as_public_fields(self) -> Dict[str, Any]:
         return {
@@ -429,6 +448,9 @@ def _clear_rejection_anchor(state: PersonGroundState) -> None:
     state.rejection_anchor_x = None
     state.rejection_anchor_z = None
     state.rejection_anchor_ts = -1.0
+    state.rejection_previous_world_x = None
+    state.rejection_previous_world_z = None
+    state.rejection_previous_world_ts = -1.0
 
 
 def world_frame_binding_from_calibration(
@@ -680,6 +702,28 @@ def integrate_projective_ground_observation(
     except Exception:
         return None
 
+    previous_world_x = float(
+        state.rejection_previous_world_x
+        if state.rejection_previous_world_x is not None
+        else state.world_x
+    )
+    previous_world_z = float(
+        state.rejection_previous_world_z
+        if state.rejection_previous_world_z is not None
+        else state.world_z
+    )
+    previous_filtered_ts = float(
+        state.rejection_previous_world_ts
+        if math.isfinite(float(state.rejection_previous_world_ts))
+        and float(state.rejection_previous_world_ts) >= 0.0
+        else (
+            state.rejection_anchor_ts
+            if math.isfinite(float(state.rejection_anchor_ts))
+            and float(state.rejection_anchor_ts) >= 0.0
+            else state.filtered_ts
+        )
+    )
+
     # A rejected metric candidate may already have advanced the process state
     # to this exact frame timestamp.  Evaluate the independent image-motion
     # candidate from the fixed rejection anchor in that case; otherwise the
@@ -724,6 +768,20 @@ def integrate_projective_ground_observation(
         return None
 
     if rewound_from_rejection:
+        visible_dt = max(0.0, float(now_ts) - previous_filtered_ts)
+        visible_step = math.hypot(
+            float(result[0]) - previous_world_x,
+            float(result[2]) - previous_world_z,
+        )
+        if (
+            float(config.max_speed_mps) > 0.0
+            and visible_step
+            > float(config.max_speed_mps) * visible_dt + 1e-9
+        ):
+            # Leave the already-bounded rejected posterior untouched.  The
+            # caller will publish its hold/prediction instead of a projective
+            # point that would create an unreachable same-segment step.
+            return None
         state.__dict__.update(evaluation_state.__dict__)
 
     # This posterior is physically admissible but not a fresh metric/depth
@@ -1824,6 +1882,109 @@ def _clamp_speed(vx: float, vz: float, max_speed: float) -> Tuple[float, float]:
     return float(vx) * scale, float(vz) * scale
 
 
+def admit_human_ground_output(
+    state: PersonGroundState,
+    *,
+    candidate: np.ndarray,
+    floor_y: float,
+    now_ts: float,
+    media_pts_ns: Any,
+    config: HumanGroundConfig,
+) -> Tuple[np.ndarray, bool]:
+    """Enforce physical continuity at the canonical world-output boundary.
+
+    This is a fail-closed admission check, not a display smoother or a clamp.
+    A same-segment point that cannot be reached in exact source-media time is
+    quarantined and the prior canonical point is held.  A confirmed
+    reacquisition remains admissible because it carries an explicit trail
+    break/segment change from the measurement filter.
+    """
+
+    try:
+        point = np.asarray(candidate, dtype=np.float64).reshape(-1)
+        x = float(point[0])
+        z = float(point[2])
+        floor = float(floor_y)
+        filter_ts = float(now_ts)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return np.array([math.nan, math.nan, math.nan], dtype=np.float64), False
+    if not all(math.isfinite(value) for value in (x, z, floor, filter_ts)):
+        return np.array([math.nan, math.nan, math.nan], dtype=np.float64), False
+
+    try:
+        parsed_pts = int(media_pts_ns or 0)
+    except (TypeError, ValueError, OverflowError):
+        parsed_pts = 0
+    current_pts = (
+        parsed_pts
+        if 0 < parsed_pts < (1 << 64) - 1
+        else None
+    )
+    previous_x = state.last_output_world_x
+    previous_z = state.last_output_world_z
+    previous_pts = state.last_output_media_pts_ns
+    previous_filter_ts = float(state.last_output_filter_ts)
+    current_segment = int(state.trail_segment_id)
+    previous_segment = int(state.last_output_trail_segment_id)
+
+    if previous_x is None or previous_z is None:
+        accepted = True
+    elif bool(state.trail_break_required) or current_segment != previous_segment:
+        accepted = True
+    else:
+        if (
+            current_pts is not None
+            and previous_pts is not None
+            and int(current_pts) >= int(previous_pts)
+        ):
+            dt = (int(current_pts) - int(previous_pts)) / 1_000_000_000.0
+        else:
+            dt = max(0.0, filter_ts - previous_filter_ts)
+        if float(config.reset_after_s) > 0.0:
+            dt = min(float(dt), float(config.reset_after_s))
+        step = math.hypot(x - float(previous_x), z - float(previous_z))
+        allowed = float(config.max_speed_mps) * float(dt)
+        accepted = bool(
+            float(config.max_speed_mps) <= 0.0
+            or step <= allowed + 1e-9
+        )
+        if not accepted:
+            # Quarantine the divergent process result and make the prior
+            # canonical output the next filter origin.  Do not manufacture an
+            # intermediate point or update the accepted metric anchor.
+            state.world_x = float(previous_x)
+            state.world_z = float(previous_z)
+            state.vel_world_x = 0.0
+            state.vel_world_z = 0.0
+            state.filtered_ts = filter_ts
+            state.measurement_accepted = False
+            state.measurement_rejection_reason = "physical_output_continuity_exceeded"
+            state.measurement_innovation_m = float(step)
+            state.measurement_allowed_m = float(allowed)
+            state.trail_append_allowed = False
+            state.rejection_anchor_x = float(previous_x)
+            state.rejection_anchor_z = float(previous_z)
+            state.rejection_anchor_ts = filter_ts
+            state.rejection_previous_world_x = float(previous_x)
+            state.rejection_previous_world_z = float(previous_z)
+            state.rejection_previous_world_ts = filter_ts
+            # Advance the output timestamp while holding position so repeated
+            # rejected frames cannot accumulate an artificial speed budget.
+            state.last_output_media_pts_ns = current_pts
+            state.last_output_filter_ts = filter_ts
+            return (
+                np.array([float(previous_x), floor, float(previous_z)], dtype=np.float64),
+                False,
+            )
+
+    state.last_output_world_x = x
+    state.last_output_world_z = z
+    state.last_output_media_pts_ns = current_pts
+    state.last_output_filter_ts = filter_ts
+    state.last_output_trail_segment_id = current_segment
+    return np.array([x, floor, z], dtype=np.float64), True
+
+
 def _reject_with_cv_time_update(
     state: PersonGroundState,
     *,
@@ -1843,6 +2004,17 @@ def _reject_with_cv_time_update(
     whether this bounded prediction is displayable during the existing hold
     TTL.
     """
+
+    previous_world_x = (
+        float(state.world_x) if state.world_x is not None else None
+    )
+    previous_world_z = (
+        float(state.world_z) if state.world_z is not None else None
+    )
+    previous_filtered_ts = float(state.filtered_ts)
+    state.rejection_previous_world_x = previous_world_x
+    state.rejection_previous_world_z = previous_world_z
+    state.rejection_previous_world_ts = previous_filtered_ts
 
     # Keep one fixed origin for a run of rejected observations.  Reusing the
     # already-predicted state here would integrate velocity on every rejected
@@ -1905,11 +2077,37 @@ def _reject_with_cv_time_update(
         # normal runtime states use the bounded anchor above.
         bounded_x = float(pred_x)
         bounded_z = float(pred_z)
+    # The fixed anchor prevents cumulative drift, but a velocity update from
+    # an independent weak/projective observation can change the anchor-relative
+    # prediction between frames.  Two predictions may each be within the total
+    # horizon while the visible step between them is impossible.  Quarantine
+    # that transition as a hold; do not invent an intermediate slew.
+    continuity_rejected = False
+    if (
+        previous_world_x is not None
+        and previous_world_z is not None
+        and math.isfinite(previous_filtered_ts)
+        and float(now_ts) >= previous_filtered_ts
+        and float(config.max_speed_mps) > 0.0
+    ):
+        visible_dt = float(now_ts) - previous_filtered_ts
+        visible_step = math.hypot(
+            float(bounded_x) - previous_world_x,
+            float(bounded_z) - previous_world_z,
+        )
+        if visible_step > float(config.max_speed_mps) * visible_dt + 1e-9:
+            bounded_x = previous_world_x
+            bounded_z = previous_world_z
+            continuity_rejected = True
     state.world_x = float(bounded_x)
     state.world_z = float(bounded_z)
     state.filtered_ts = float(now_ts)
     state.measurement_accepted = False
-    state.measurement_rejection_reason = str(reason or "physical_measurement_rejected")
+    state.measurement_rejection_reason = (
+        "bounded_process_continuity_exceeded"
+        if continuity_rejected
+        else str(reason or "physical_measurement_rejected")
+    )
     state.trail_append_allowed = False
     return np.array([float(bounded_x), float(floor_y), float(bounded_z)], dtype=np.float64)
 
@@ -2506,6 +2704,7 @@ __all__ = [
     "PersonGroundState",
     "PersonGroundStateStore",
     "apply_source_hysteresis",
+    "admit_human_ground_output",
     "advance_human_cv_prediction",
     "assess_lower_body_occlusion",
     "bind_world_frame",

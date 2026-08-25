@@ -71,6 +71,7 @@ export type FrameHandlers = {
   onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
+  onLocalizationDetailsToggle?: (enabled: boolean) => void;
   onTrailSettings?: (config: Record<string, unknown>) => void;
   onCalibration?: (bundle: any) => void;
   onMADiagnostics?: (payload: any) => void;
@@ -321,6 +322,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             }
           } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
             currentHandlers.onTrailToggle?.(!!data.enabled);
+          } else if (data.type === 'toggle_update' && data.toggle_name === 'localization_details_enabled') {
+            currentHandlers.onLocalizationDetailsToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {
             currentHandlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_settings_update') {
@@ -464,6 +467,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     status,
     sendClearStats: () => sendJson({ type: 'clear_stats' }),
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
+    sendLocalizationDetailsToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'localization_details_enabled', enabled }),
     sendAutoCalibrate: (camId?: string) => sendJson({ type: 'auto_calibrate_pose', camera: camId }),
     requestMapAnythingDepth: (camId: string, strategy: DepthRequestStrategy = 'fresh', tsMaxOverride?: number) => {
       if (!camId) return false;

@@ -20,8 +20,13 @@ from noesis_core.contracts.observation import (
     ZoneSource,
 )
 from noesis_core.contracts.world import EntityLifecycle, WorldEntity, WorldEvent, WorldSnapshot
+from noesis_core.contracts.world_measurement import WorldMeasurementCandidateDiagnostic
 from noesis_core.depth_contract import usable_registered_depth_m
-from noesis_core.journal import AsyncContractJournal, ContractJournal
+from noesis_core.journal import (
+    AsyncContractJournal,
+    AsyncJournalAdmissionReceipt,
+    ContractJournal,
+)
 from noesis_core.world import GlobalWorldFusion
 
 
@@ -52,6 +57,7 @@ _WORLD_DIAGNOSTIC_TRACK_FIELDS = frozenset(
         "depth_used_m",
         "depth_registration_status",
         "depth_registration_id",
+        "world_resolver",
     }
 )
 
@@ -153,11 +159,6 @@ class CanonicalWorldService:
         clock_us: Callable[[], int] | None = None,
         journal: ContractJournal | AsyncContractJournal | None = None,
     ) -> None:
-        if isinstance(journal, AsyncContractJournal):
-            raise TypeError(
-                "canonical world authority requires a completion-proven "
-                "synchronous ContractJournal"
-            )
         self.producer = producer
         self._artifacts = artifacts
         self._fusion = (
@@ -180,6 +181,33 @@ class CanonicalWorldService:
             int,
             tuple[PreparedWorldPublication, _PreparedWorldState],
         ] = {}
+        self._persistence_rejected_cohorts = 0
+        self._persistence_last_error: str | None = None
+
+    def persistence_health(self) -> dict[str, Any]:
+        """Return bounded optional-persistence health without touching media."""
+
+        with self._lock:
+            journal = self._journal
+            rejected = int(self._persistence_rejected_cohorts)
+            last_error = self._persistence_last_error
+        if journal is None:
+            return {
+                "status": "disabled",
+                "rejected_cohorts": rejected,
+                "last_error": last_error,
+            }
+        snapshot_getter = getattr(journal, "health_snapshot", None)
+        snapshot = (
+            dict(snapshot_getter())
+            if callable(snapshot_getter)
+            else {"status": "synchronous"}
+        )
+        if rejected or last_error:
+            snapshot["status"] = "degraded"
+        snapshot["rejected_cohorts"] = rejected
+        snapshot["last_error"] = last_error or snapshot.get("last_error")
+        return snapshot
 
     @property
     def closed(self) -> bool:
@@ -381,18 +409,36 @@ class CanonicalWorldService:
                     state.journal_payloads,
                     recorded_at_us=state.recorded_at_us,
                 )
-                if len(appended) != expected_records:
+                if isinstance(self._journal, AsyncContractJournal):
+                    if (
+                        not isinstance(appended, AsyncJournalAdmissionReceipt)
+                        or int(appended.payload_count) != expected_records
+                    ):
+                        raise RuntimeError(
+                            "canonical world persistence admission did not confirm "
+                            f"the exact payload count: expected={expected_records}"
+                        )
+                elif len(appended) != expected_records:
                     raise RuntimeError(
                         "canonical world journal did not confirm the exact "
                         f"append count: expected={expected_records} "
                         f"actual={len(appended)}"
                     )
-            except Exception:
-                self._prepared_candidates.pop(
-                    prepared._candidate_id,
-                    None,
-                )
-                raise
+            except Exception as exc:
+                if isinstance(self._journal, AsyncContractJournal):
+                    # The journal is reconstructable persistence, not live
+                    # spatial authority.  Record its bounded failure and keep
+                    # the exact in-memory tracking/world/BEV cohort moving.
+                    self._persistence_rejected_cohorts += 1
+                    self._persistence_last_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    self._prepared_candidates.pop(
+                        prepared._candidate_id,
+                        None,
+                    )
+                    raise
         self._fusion = state.fusion
         self._sequence_by_source = state.sequence_by_source
         self._event_sequence = int(state.event_sequence)
@@ -420,8 +466,22 @@ class CanonicalWorldService:
             self._closed = True
             self._prepared_candidates.clear()
             close = getattr(self._journal, "close", None)
+            close_error: BaseException | None = None
             if callable(close):
-                close()
+                try:
+                    close()
+                except BaseException as exc:
+                    close_error = exc
+            if isinstance(self._journal, AsyncContractJournal):
+                durable_close = getattr(self._journal.journal, "close", None)
+                if callable(durable_close):
+                    try:
+                        durable_close()
+                    except BaseException as exc:
+                        if close_error is None:
+                            close_error = exc
+            if close_error is not None:
+                raise close_error
 
     def _events_for_state(
         self,
@@ -473,6 +533,10 @@ class CanonicalWorldService:
                     published_at_us=snapshot.published_at_us,
                     frame="backend_world_m",
                     units="meters",
+                    world_frame="backend_world_m",
+                    world_frame_revision=entity.world_frame_revision,
+                    world_transform_sha256=entity.world_transform_sha256,
+                    calibration_revision=entity.calibration_revision,
                     position=entity.position,
                     reason=reason,
                 )
@@ -536,7 +600,13 @@ class CanonicalWorldService:
         if not all(math.isfinite(value) for value in bbox_xywh) or size[0] <= 0 or size[1] <= 0:
             return None
 
-        world_observation = self._world_observation(track)
+        calibration_revision = track.get("calibration_revision")
+        if calibration_revision is None:
+            calibration_revision = artifacts.calibration.version
+        world_observation = self._world_observation(
+            track,
+            calibration_revision=calibration_revision,
+        )
         world_diagnostics = self._world_diagnostics(
             track,
             world_observation=world_observation,
@@ -613,12 +683,44 @@ class CanonicalWorldService:
     def _depth_present(track: Mapping[str, Any]) -> bool:
         return usable_registered_depth_m(track) is not None
 
-    def _world_observation(self, track: Mapping[str, Any]) -> WorldPositionObservation | None:
+    def _world_observation(
+        self,
+        track: Mapping[str, Any],
+        *,
+        calibration_revision: Any = None,
+    ) -> WorldPositionObservation | None:
         if track.get("world_valid") is not True:
+            return None
+        world_source = str(track.get("world_source") or "").strip().lower()
+        if world_source in {
+            "cv_prediction",
+            "anchor_hold",
+            "image_motion_prediction",
+        }:
+            # These values preserve display continuity in the tracking/BEV
+            # lane.  They are not fresh metric evidence for canonical world
+            # authority and must never be admitted as a new camera sample.
             return None
         frame = str(track.get("world_frame") or "")
         if frame != "backend_world_m":
             return None
+        world_frame_revision = self._required_revision(
+            track.get("world_frame_revision")
+        )
+        world_transform_sha256 = self._sha256_text(
+            track.get("world_transform_sha256")
+        )
+        if world_frame_revision is None or world_transform_sha256 is None:
+            # A world-valid row without a complete registration identity is
+            # display/debug data only.  The canonical backend must fail closed
+            # instead of joining it to another registration.
+            return None
+        if track.get("calibration_revision") is not None:
+            calibration_revision = self._required_revision(calibration_revision)
+            if calibration_revision is None:
+                return None
+        elif calibration_revision is not None:
+            calibration_revision = self._required_revision(calibration_revision)
         raw = track.get("world")
         if not isinstance(raw, (list, tuple)) or len(raw) < 3:
             return None
@@ -628,20 +730,71 @@ class CanonicalWorldService:
             return None
         if not all(math.isfinite(value) for value in position):
             return None
+        quantity_raw = track.get("world_quantity")
+        if quantity_raw is not None and str(quantity_raw) != "ground_footprint":
+            # The current canonical contract localizes the person's ground
+            # footprint.  A body root or other quantity must use a future
+            # explicit field/contract rather than masquerading as this point.
+            return None
         quality_raw = str(track.get("world_quality") or "estimated").strip().lower()
         quality = quality_raw if quality_raw in {"good", "estimated", "held"} else "estimated"
-        variance = {"good": 0.04, "estimated": 0.25, "held": 0.64}[quality]
+        covariance = self._world_covariance(track.get("world_covariance"))
+        if track.get("world_covariance") is not None and covariance is None:
+            # A resolver-owned observation must never be relabelled with a
+            # convenient legacy variance when its uncertainty contract is
+            # malformed.  Older producers that do not publish covariance keep
+            # the quality-bucket compatibility path below.
+            return None
+        if covariance is None:
+            variance = {"good": 0.04, "estimated": 0.25, "held": 0.64}[quality]
+            covariance = (
+                variance,
+                0.0,
+                0.0,
+                0.0,
+                variance,
+                0.0,
+                0.0,
+                0.0,
+                variance,
+            )
         confidence = {"good": 0.90, "estimated": 0.60, "held": 0.35}[quality]
+        resolver_confidence = self._confidence(
+            track.get("world_resolver_confidence")
+        )
+        if resolver_confidence is not None:
+            confidence = resolver_confidence
         measured_confidence = self._confidence(track.get("tracker_confidence"))
         if measured_confidence is not None:
             confidence = min(confidence, measured_confidence)
+        posture_raw = str(
+            track.get("world_posture") or track.get("posture") or "unknown"
+        ).strip().lower()
+        posture = (
+            posture_raw
+            if posture_raw in {"standing", "sitting", "lying", "unknown"}
+            else "unknown"
+        )
+        support_raw = str(
+            track.get("world_support_state") or "unknown"
+        ).strip().lower()
+        support_state = (
+            support_raw
+            if support_raw in {"floor", "seat", "couch", "unknown"}
+            else "unknown"
+        )
         return WorldPositionObservation(
             position=Vector3(x=position[0], y=position[1], z=position[2]),
-            covariance=Matrix3(
-                values=(variance, 0.0, 0.0, 0.0, variance, 0.0, 0.0, 0.0, variance)
-            ),
+            covariance=Matrix3(values=covariance),
             frame="backend_world_m",
+            world_frame="backend_world_m",
             units="meters",
+            world_frame_revision=world_frame_revision,
+            world_transform_sha256=world_transform_sha256,
+            calibration_revision=calibration_revision,
+            quantity="ground_footprint",
+            support_state=support_state,  # type: ignore[arg-type]
+            posture=posture,  # type: ignore[arg-type]
             source=str(track.get("world_source") or "unspecified"),
             quality=quality,  # type: ignore[arg-type]
             confidence=confidence,
@@ -651,6 +804,55 @@ class CanonicalWorldService:
                 else None
             ),
         )
+
+    @staticmethod
+    def _world_covariance(value: Any) -> tuple[float, ...] | None:
+        """Validate one row-major 3x3 covariance without importing NumPy.
+
+        The canonical boundary accepts the resolver's anisotropic covariance
+        only when it is finite, symmetric, and positive semidefinite.  The
+        positive diagonal requirement keeps downstream precision weighting
+        well defined while still allowing zero off-axis correlation.
+        """
+
+        if not isinstance(value, (list, tuple)) or len(value) != 9:
+            return None
+        try:
+            matrix = tuple(float(item) for item in value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(item) for item in matrix):
+            return None
+
+        scale = max(1.0, *(abs(item) for item in matrix))
+        tolerance = 1e-8 * scale
+        if any(matrix[index] <= 0.0 for index in (0, 4, 8)):
+            return None
+        if (
+            abs(matrix[1] - matrix[3]) > tolerance
+            or abs(matrix[2] - matrix[6]) > tolerance
+            or abs(matrix[5] - matrix[7]) > tolerance
+        ):
+            return None
+
+        # Every principal minor of a symmetric 3x3 PSD matrix is
+        # non-negative.  Evaluate them explicitly to keep this boundary small
+        # and dependency-free.
+        minors = (
+            matrix[0] * matrix[4] - matrix[1] * matrix[3],
+            matrix[0] * matrix[8] - matrix[2] * matrix[6],
+            matrix[4] * matrix[8] - matrix[5] * matrix[7],
+        )
+        if any(minor < -tolerance for minor in minors):
+            return None
+        determinant = (
+            matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7])
+            - matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6])
+            + matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6])
+        )
+        if determinant < -tolerance:
+            return None
+        return matrix
 
     def _world_diagnostics(
         self,
@@ -663,6 +865,7 @@ class CanonicalWorldService:
             and _WORLD_DIAGNOSTIC_TRACK_FIELDS.isdisjoint(track)
         ):
             return None
+        resolver_fields = self._resolver_diagnostics_fields(track)
         return WorldObservationDiagnostics(
             estimator_evaluated=self._optional_bool(
                 track.get("world_estimator_evaluated")
@@ -741,7 +944,182 @@ class CanonicalWorldService:
                 track.get("depth_registration_id"),
                 maximum=200,
             ),
+            **resolver_fields,
         )
+
+    def _resolver_diagnostics_fields(
+        self,
+        track: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize the bounded exact-cohort resolver summary.
+
+        The richer dashboard payload stays track-local.  The canonical world
+        contract retains only the decision and compact candidate diagnostics,
+        and only when the record identifies this exact track observation.
+        Malformed or stale optional diagnostics are omitted; they never alter
+        admission of the already-validated canonical world point.
+        """
+
+        source = track.get("world_resolver")
+        if not isinstance(source, Mapping):
+            return {}
+        if (
+            source.get("contract") != "noesis.world_resolver_diagnostics"
+            or source.get("version") != 1
+        ):
+            return {}
+
+        exact_integer_fields = (
+            ("source_id", "source_id"),
+            ("tracker_id", "tracker_id"),
+            ("frame_id", "frame_id"),
+            ("observed_at_us", "observed_at_us"),
+        )
+        for diagnostic_key, track_key in exact_integer_fields:
+            diagnostic_value = source.get(diagnostic_key)
+            track_value = track.get(track_key)
+            if (
+                isinstance(diagnostic_value, bool)
+                or isinstance(track_value, bool)
+                or not isinstance(diagnostic_value, int)
+            ):
+                return {}
+            try:
+                if int(diagnostic_value) != int(track_value):
+                    return {}
+            except (TypeError, ValueError, OverflowError):
+                return {}
+        if str(source.get("camera_id") or "") != str(track.get("camera_id") or ""):
+            return {}
+        if str(source.get("world_frame") or "") != str(track.get("world_frame") or ""):
+            return {}
+        if str(source.get("world_frame_revision") or "") != str(
+            track.get("world_frame_revision") or ""
+        ):
+            return {}
+
+        supported_kinds = {
+            "floor_ray",
+            "registered_depth",
+            "pose_scale",
+            "gravity_reconstruction",
+        }
+        selected_kind_raw = source.get("selected_kind")
+        selected_kind = (
+            str(selected_kind_raw)
+            if selected_kind_raw is not None
+            and str(selected_kind_raw) in supported_kinds
+            else None
+        )
+        selected_id = self._bounded_text(source.get("selected_id"), maximum=120)
+        contributor_source = source.get("contributor_ids")
+        if not isinstance(contributor_source, (list, tuple)) or len(contributor_source) > 4:
+            return {}
+        contributor_ids = tuple(
+            item
+            for item in (
+                self._bounded_text(value, maximum=120)
+                for value in contributor_source
+            )
+            if item is not None
+        )
+        if len(contributor_ids) != len(contributor_source):
+            return {}
+
+        raw_candidates = source.get("candidates")
+        if not isinstance(raw_candidates, (list, tuple)) or len(raw_candidates) > 4:
+            return {}
+        candidates: list[WorldMeasurementCandidateDiagnostic] = []
+        candidate_ids: set[str] = set()
+        for raw in raw_candidates:
+            if not isinstance(raw, Mapping):
+                return {}
+            candidate_id = self._bounded_text(raw.get("id"), maximum=120)
+            kind = str(raw.get("kind") or "")
+            score = self._finite_float(raw.get("score"))
+            pcf_score = self._finite_float(raw.get("pcf_score"))
+            if (
+                candidate_id is None
+                or candidate_id in candidate_ids
+                or kind not in supported_kinds
+                or score is None
+                or not 0.0 <= score <= 1.0
+                or pcf_score is None
+                or not 0.0 <= pcf_score <= 1.0
+            ):
+                return {}
+            selected = raw.get("selected")
+            compatible = raw.get("compatible_with_selected")
+            alternate = raw.get("retained_as_alternate")
+            if not all(isinstance(value, bool) for value in (selected, compatible, alternate)):
+                return {}
+            innovation = self._finite_float(raw.get("innovation_m"))
+            agreement = self._finite_float(raw.get("agreement_mahalanobis_sq"))
+            if innovation is not None and innovation < 0.0:
+                return {}
+            if agreement is not None and agreement < 0.0:
+                return {}
+            try:
+                candidates.append(
+                    WorldMeasurementCandidateDiagnostic(
+                        candidate_id=candidate_id,
+                        kind=kind,  # type: ignore[arg-type]
+                        score=score,
+                        pcf_score=pcf_score,
+                        innovation_m=innovation,
+                        agreement_mahalanobis_sq=agreement,
+                        compatible_with_selected=compatible,
+                        selected=selected,
+                        retained_as_alternate=alternate,
+                        rejection_reason=self._bounded_text(
+                            raw.get("rejection_reason"), maximum=200
+                        ),
+                    )
+                )
+            except ValueError:
+                return {}
+            candidate_ids.add(candidate_id)
+
+        if selected_id is not None and selected_id not in candidate_ids:
+            return {}
+        if any(item not in candidate_ids for item in contributor_ids):
+            return {}
+        alternate_id = self._bounded_text(source.get("alternate_id"), maximum=120)
+        if alternate_id is not None and alternate_id not in candidate_ids:
+            return {}
+        fused = source.get("fused")
+        if not isinstance(fused, bool):
+            return {}
+        confidence = self._finite_float(source.get("confidence"))
+        disagreement = source.get("disagreement")
+        disagreement_m = None
+        if disagreement is not None:
+            if not isinstance(disagreement, Mapping):
+                return {}
+            disagreement_m = self._finite_float(disagreement.get("distance_m"))
+            if disagreement_m is not None and disagreement_m < 0.0:
+                return {}
+        agreement = self._finite_float(source.get("agreement_mahalanobis_sq"))
+        pcf_score = self._finite_float(source.get("pcf_score"))
+        if confidence is not None and not 0.0 <= confidence <= 1.0:
+            return {}
+        if agreement is not None and agreement < 0.0:
+            return {}
+        if pcf_score is not None and not 0.0 <= pcf_score <= 1.0:
+            return {}
+        return {
+            "resolver_selected_kind": selected_kind,
+            "resolver_selected_candidate_id": selected_id,
+            "resolver_contributor_ids": contributor_ids,
+            "resolver_alternate_candidate_id": alternate_id,
+            "resolver_fused": fused,
+            "resolver_confidence": confidence,
+            "resolver_disagreement_m": disagreement_m,
+            "resolver_agreement_mahalanobis_sq": agreement,
+            "resolver_pcf_score": pcf_score,
+            "resolver_reason": self._bounded_text(source.get("reason"), maximum=240),
+            "resolver_candidate_diagnostics": tuple(candidates),
+        }
 
     def _world_first_divergence_reason(
         self,
@@ -754,6 +1132,17 @@ class CanonicalWorldService:
         if track.get("world_valid") is True:
             if str(track.get("world_frame") or "") != "backend_world_m":
                 return "world_frame_invalid"
+            source = str(track.get("world_source") or "").strip().lower()
+            if source in {
+                "cv_prediction",
+                "anchor_hold",
+                "image_motion_prediction",
+            }:
+                return "display_continuity_not_authoritative"
+            if self._required_revision(track.get("world_frame_revision")) is None:
+                return "world_frame_revision_missing"
+            if self._sha256_text(track.get("world_transform_sha256")) is None:
+                return "world_transform_sha256_missing"
             raw = track.get("world")
             if not isinstance(raw, (list, tuple)) or len(raw) < 3:
                 return "world_position_missing"
@@ -838,6 +1227,22 @@ class CanonicalWorldService:
             return None
         result = str(value).strip()
         return result[:maximum] if result else None
+
+    @staticmethod
+    def _required_revision(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        result = value.strip()
+        return result if 1 <= len(result) <= 200 else None
+
+    @staticmethod
+    def _sha256_text(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        result = value.strip().lower()
+        if len(result) != 64 or any(char not in "0123456789abcdef" for char in result):
+            return None
+        return result
 
     def _subject(self, observation: ObservationEnvelope, track: Mapping[str, Any]) -> SubjectRef:
         stable_id = self._positive_int(track.get("stable_id"))

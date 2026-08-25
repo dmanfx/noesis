@@ -1,5 +1,5 @@
 # DS9.1 WebSocket API contracts
-_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-23._
+_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-25._
 
 The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
@@ -93,15 +93,17 @@ and a valid shutdown receipt requires zero pending bytes.
 Canonical tracking/world/event admission is additionally release-gated. The
 admission receipt reserves the exact immutable bytes and event-loop ownership,
 but the scheduled coroutine waits on a one-shot authority decision. The runtime
-uses a synchronous completion-proven world journal, verifies the exact appended
-record count, commits private fusion authority, and only then releases the
+commits the exact prepared private fusion state and only then releases the
 batch. Commit failure resolves the gate as an explicit abort: no batch member
 begins client delivery, aborted submissions/bytes are counted separately, and
 the poisoned publisher emits no successor. A gate left unresolved remains an
-in-flight byte/future lease and prevents successful shutdown quiescence. The
-authority-gate dwell is domain persistence work, not WebSocket CPU dispatch, so
-it is excluded from the 3 ms serialization boundary and remains observable via
-the publication transaction tests.
+in-flight byte/future lease and prevents successful shutdown quiescence.
+Reconstructable world-journal persistence is a separate bounded asynchronous
+worker: its admission confirms only the exact queued payload count. Queue or
+durable-write failure degrades persistence health and counters but cannot wait
+on, abort, mutate, or poison canonical tracking/world/BEV. The authority-gate
+dwell is excluded from the 3 ms WebSocket serialization boundary and remains
+observable via the publication transaction tests.
 
 Canonical type routing is explicit and fail-closed:
 
@@ -448,6 +450,7 @@ Emitted by `BevRenderer`:
       "stableId": <int|null>,
       "trackerId": <int|null>,
       "trackerLifecycleGeneration": <int|null>,
+      "trackKey": "<source:tracker:generation>"|null,
       "frameId": <int>,
       "anchorSource": "<string|null>",
       "anchorQuality": "<string|null>",
@@ -456,6 +459,31 @@ Emitted by `BevRenderer`:
       "worldAdmission": "accepted"|"predicted"|"held"|null,
       "worldFrame": "backend_world_m"|null,
       "worldFrameRevision": "<revision>"|null,
+      "worldTransformSha256": "<sha256>"|null,
+      "resolverDiagnostics": {
+        "contract": "noesis.world_resolver_diagnostics",
+        "version": 1,
+        "frameId": <int>,
+        "sourceId": <raw source int>,
+        "sensorId": <mapped BEV sensor int>,
+        "trackKey": "<source:tracker:generation>",
+        "trackerLifecycleGeneration": <int>,
+        "worldFrame": "backend_world_m",
+        "worldFrameRevision": "<revision>",
+        "worldTransformSha256": "<sha256>",
+        "calibrationRevision": "<revision>",
+        "pcfRevision": "<PCF geometry/frame revision|null>",
+        "floorplanSnapshotId": "<Scene Prior artifact id|null>",
+        "floorplanWorldFrame": "backend_world_m"|null,
+        "floorplanWorldFrameRevision": "<revision>"|null,
+        "selectedId": "<candidate id|null>",
+        "selectedKind": "floor_ray"|"registered_depth"|"pose_scale"|"gravity_reconstruction"|null,
+        "decision": "<bounded decision|null>",
+        "reason": "<bounded reason|null>",
+        "resolved": {"world": {"x": <float>, "z": <float>}, "display": {"x": <float>, "z": <float>}, "covarianceXZ": [[<float>, <float>], [<float>, <float>]]}|null,
+        "candidates": [ /* at most four exact-cohort candidate records */ ],
+        "disagreement": {"distanceM": <float>, "reason": "<string>"}|null
+      }|null,
       "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
       "posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "trailAppendAllowed": <bool|null>,
@@ -519,6 +547,26 @@ Emitted by `BevRenderer`:
   that frame. A renderer that is not configured does not change tracking
   cadence.
 - `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
+- `footpoints[].resolverDiagnostics` is presentation-only output from the
+  universal resolver. The renderer admits it only when camera, raw source,
+  mapped sensor, tracker, tracker-lifecycle generation, exact track key, frame,
+  observation time, active world revision, source-to-world transform SHA-256,
+  camera-calibration revision, PCF geometry revision, and Scene Prior artifact
+  identity match the rendered point. The PCF geometry revision and Scene Prior
+  snapshot ID are separate namespaces and are never compared to each other. Candidate
+  positions and 2x2 X/Z covariance are transformed with the same world-to-view
+  Jacobian as the canonical point. The normal dashboard exposes this through
+  the off-by-default `Localization details` toggle. Candidates, uncertainty
+  ellipses, disagreement, and the optional `legacy` point cannot change the
+  canonical dot or trail. `legacy` is the retired room policy's current-frame
+  choice reconstructed from the same bounded candidates; it is not a second
+  filtered track and is never localization authority.
+  The toggle is a connection-scoped capability request: the server publishes
+  rich resolver details only while at least one connected dashboard requests
+  them. The server broadcasts the effective state to every dashboard, and
+  automatically disables the capability when the last requesting connection
+  disconnects. A normal dashboard therefore adds no rich resolver tree or
+  serialization cost unless it explicitly opts in.
 - `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. Every live tracker footpoint is marked canonical-world-required by the DS9 producer: its only admissible production display source is `world_to_camera_local`, projected from the producer-owned filtered `track.world`. `world_floor_fallback_to_camera_local` is a legacy/noncanonical diagnostic path emitted only for compatibility when a noncanonical world fallback is projected into the camera-local view; it is not permitted to move an active canonical tracked-person dot. Registered depth, floor-contact rays, and image anchors may appear in alignment diagnostics, but they cannot move a live canonical tracked-person dot. A live track without a finite canonical world point inside the producer-published `displayBounds` is omitted. The dashboard uses that exact metric display envelope for camera-local cohorts; it does not invent a second margin, auto-fit to tracks, clamp points, or remap raw metric coordinates. The active PCF raster remains the semantic `floorplanBounds`, not a live tracking validity gate: a finite canonical point in the display envelope may be emitted unchanged with `floorplanInside=false`. When `coverageInside=false` is carried on a canonical world point, it remains diagnostic and does not become a second dashboard-only rejection gate; legacy/noncanonical candidates still honor the configured coverage polygon. `canonical_world_outside_display_guard` is a bounded renderer-side presentation safety drop, not a replacement for the producer's world-validity decision. `registered_depth_anchor`, `floor_contact_ray`, `image_depth_anchor`, and `image_anchor` remain legacy/non-tracker or diagnostic source values only.
 - `camera_local_ground_m` uses the horizontal projection of the active camera's
   right and forward axes. Camera pitch and camera height must not contribute to
@@ -744,6 +792,7 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "stable_id": <int|null>,
       "tracker_id": <int>,
       "tracker_lifecycle_generation": <positive int>,
+      "track_key": "<source:tracker:generation>",
       "camera_id": "<string>",
       "bbox": [<float>, <float>, <float>, <float>],
       "center": [<float>, <float>],
@@ -766,11 +815,20 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "image_base": [<float>, <float>],
       "world": [<float>, <float>, <float>],
       "world_valid": <bool>,
-      "world_quality": "good"|"estimated"|"invalid",
+      "world_quality": "good"|"estimated"|"held"|"invalid",
       "world_quality_reason": "<string|null>",
       "world_frame": "backend_world_m"|null,
       "world_frame_revision": "<revision|null>",
+      "world_transform_sha256": "<lowercase sha256|null>",
+      "world_quantity": "ground_footprint"|null,
+      "world_covariance": [<9 row-major float values>]|null,
+      "world_support_state": "floor"|"seat"|"couch"|"unknown"|null,
+      "world_posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
+      "world_resolver_confidence": <float 0..1|null>,
+      "world_resolver_selected_id": "floor_ray"|"registered_depth"|"pose_scale"|"gravity_reconstruction"|"",
+      "world_resolver_fused": <bool|null>,
+      "world_resolver_disagreement_m": <float|null>,
       "world_floor_range_m": <float|null>,
       "world_floor_range_limit_m": <float|null>,
       "world_floor_incidence_sin": <float|null>,
@@ -902,6 +960,11 @@ Tracking telemetry has two world-source scopes:
   `world_prediction_provenance`.  If those gates fail after material bbox
   motion, the track is omitted for that frame rather than frozen at an old
   position.
+- `cv_prediction`, `image_motion_prediction`, and `anchor_hold` remain
+  tracking/BEV continuity and are never submitted as fresh global-world
+  observations. Canonical global observations require a complete
+  `world_frame_revision` plus `world_transform_sha256`; mixed target-frame
+  revisions are retained as conflict evidence instead of being averaged.
 
 The producer applies the human-speed limit to the proposed published filter
 state, not only to its stored velocity. An observation inside the measurement
@@ -993,14 +1056,15 @@ enforces its operational `0.05 < depth_registered_m < 50.0` meter guard.
 The nested `world_snapshot` is the exact canonical snapshot produced in that
 publication cycle. The tracking sequence, lifecycle/tombstone publication
 state, health progress, and world authority advance only after the ordered
-batch has bounded admission, the synchronous journal has acknowledged the
-exact observation/snapshot/event record count, and private fusion commits. A
-pre-admission failure discards the prepared world candidate and reuses the same
-tracking/observation/event sequence on retry. A journal/authority failure after
-admission aborts the unresolved gate before any client delivery and permanently
-poisons the publisher because the persistence outcome may be uncertain. A gate
-release failure after successful commit also poisons; no successor may conceal
-the missing cohort. The same committed snapshot is then emitted independently:
+batch has bounded admission and private fusion commits. A pre-admission failure
+discards the prepared world candidate and reuses the same
+tracking/observation/event sequence on retry. An authority failure after
+admission aborts the unresolved gate before any client delivery and poisons the
+publisher. Optional journal queue/write failure is different: it is reported
+as degraded reconstructable persistence and cannot block the canonical cohort.
+A gate release failure after successful commit also poisons; no successor may
+conceal the missing cohort. The same committed snapshot is then emitted
+independently:
 
 ```json
 {
@@ -1054,36 +1118,47 @@ derived from canonical snapshot transitions, not browser timers. Observations,
 snapshots, and events are retained in the bounded owner-only integrity-chained
 world journal configured by `NOESIS_WORLD_JOURNAL_PATH`,
 `NOESIS_WORLD_JOURNAL_MAX_RECORDS`, and
-`NOESIS_WORLD_JOURNAL_RETENTION_HOURS`. Canonical runtime publication rejects
-the non-blocking `AsyncContractJournal`: accepting a queue item is not retention
-proof. It also rejects a retention limit smaller than the complete current
-cohort before writing, so pruning cannot split the cohort being released.
-Fusion state is service-private; read consumers receive only the cached
-immutable last-committed snapshot, so inspection cannot consume a sequence,
-expire an entity, clear a source, or bypass the journal/revision boundary.
+`NOESIS_WORLD_JOURNAL_RETENTION_HOURS`. Canonical runtime uses a finite
+`AsyncContractJournal` only for reconstructable retention. Its typed admission
+receipt proves the exact payload count entered the bounded persistence queue;
+it is deliberately not durability or authority proof. The worker retains the
+synchronous hash-chained SQLite journal, exposes pending/capacity/failure
+health, and drains on orderly shutdown. Queue saturation or later durable
+failure degrades persistence without stalling the media or spatial-publication
+path. A configured retention limit smaller than one complete current cohort is
+rejected before queueing, so pruning cannot split a retained cohort. Fusion
+state is service-private; read consumers receive only the cached immutable
+last-committed snapshot, so inspection cannot consume a sequence, expire an
+entity, clear a source, or bypass the revision/authority boundary.
 
-The active baseline uses one canonical person-anchor estimator in
-`noesis/telemetry/person_ground_state.py` through the DS9.1 analytics hook:
-pose-derived image anchor when available (posture-aware ankles for standing,
-hip/body for sitting or lying), otherwise the person mask/depth image anchor
-from `NOESIS.OBJECT_DEPTH.anchor_uv`. Bent-leg ankle extrapolation
-(`pose_leg_floor`) is rejected. A concurrent DAv2 range observation is fused on
-that same current-anchor ray when valid. The canonical per-track values are:
+The active baseline uses one universal measurement resolver followed by the
+existing `PersonGroundState` in
+`noesis/telemetry/person_ground_state.py`. The analytics hook independently
+constructs current-frame floor-ray and registered-depth hypotheses at their own
+exact anchors, plus a weak gravity reconstruction only when the existing
+upright/occlusion state permits it. Seated or lying hips/torsos are not floor
+contacts, and bent-leg ankle extrapolation remains rejected.
 
-Before a floor intersection can seed height lock or person-ground filter state,
-the producer measures its horizontal camera-to-hit range in calibrated world
-meters and applies the active camera profile's strict
-`floor_ray_max_range_m`. Non-finite geometry and over-range near-horizon rays
-remain visible through the additive `world_floor_*` diagnostics but are not
-world observations. A valid registered-depth point remains independently
-admissible as a depth-only source. The current household policy uses a 22 m
-physical envelope for all cameras, keeps family-room floor-only placement
-available inside that envelope, and requires registered depth for living room
-and kitchen rather than publishing an unbounded floor fallback.
+Every candidate is independently range/geometry checked and carries full 3x3
+covariance derived from ray incidence, pixel/contact uncertainty, depth
+support/spread, occupied-person registration residuals, posture, and occlusion.
+No room or camera chooses a different strategy. Compatible hypotheses genuinely
+contribute through covariance intersection. Statistical compatibility alone is
+insufficient: candidates separated by more than the universal 1.25 m maximum
+remain primary/alternate rather than being averaged. PCF extent, authored
+boundary, observed confidence, and floor elevation are soft evidence only and
+never clamp the result. The selected current measurement then enters
+PersonGroundState, which remains the sole temporal filter and physical gate.
+The exact design is in
+[`universal_world_localization.md`](universal_world_localization.md).
 
-- `pose_depth_fused`: pose anchor and DAv2 anchor depth both contributed to the world-state update.
+- `pose_depth_fused`: compatible pose-floor and registered-depth hypotheses
+  both mathematically contributed to the current measurement before the
+  PersonGroundState update.
 - `pose_floor_only`: pose anchor updated the world-state filter without a usable DAv2 observation on that frame.
-- `person_anchor_depth_fused`: the person mask/depth anchor (`anchor_uv`) plus DAv2 anchor depth both contributed to the world-state update on a frame without usable pose.
+- `person_anchor_depth_fused`: compatible person-contact floor and registered
+  depth hypotheses both mathematically contributed on a frame without usable
+  pose.
 - `person_anchor_floor_only`: the person mask/depth anchor updated the world-state filter without a usable DAv2 observation on that frame.
 - `gravity_drop`: a stored upright height reference allowed a floor-consistent
   gravity drop. This is both the degraded path when no current person anchor is
@@ -1129,17 +1204,28 @@ Human pathing fields (producer-owned):
 
 Depth exposure:
 
-- `depth_used_m` is the DAv2 anchor depth that actually qualified for the fused estimator on that track update (`status="ok"` with sufficient support).
+- `depth_used_m` is the current registered DAv2 anchor range that qualified as
+  a resolver hypothesis. It may be present even when another hypothesis is
+  selected. `world_source` and the compact `world_resolver_*` fields explain
+  the authoritative decision; exact contributors and candidates are available
+  only through request-gated BEV `resolverDiagnostics`.
 - `depth_anchor_m` is the raw anchor depth carried by `NOESIS.OBJECT_DEPTH`; it may be present even when `depth_used_m` is null.
 - `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2→MapAnything mapping for that camera; this is the value projected on the current anchor ray when registration is active.
 - Registered-depth consumers use the coherence rule above. If
   `depth_used_m` is present but differs from `depth_registered_m` outside the
   `1e-6` relative/absolute tolerance, neither canonical semantic depth nor the
   camera-local registered-depth display path may accept it.
-- `depth_registration_status` is `ok` when the runtime used a valid registration mapping on that frame. A rejected metric sample is never projected, but an independent floor ray may still be admitted when the startup-bound camera policy explicitly permits floor-only placement; depth-required profiles remain fail-closed.
+- `depth_registration_status` is `ok` when the runtime used a valid
+  registration mapping on that frame. A rejected or stale metric sample is
+  never projected, but it cannot suppress an independently valid floor ray in
+  any camera.
 - `depth_registration_id` identifies the exact per-camera registration artifact entry used by the estimator.
 - `depth_status`, `depth_anchor_source`, `depth_sample_count`, and `depth_valid_fraction` are published on both `tracking.tracks[]` and `stats.payload.cameras[*].tracking.active_tracks[]` so the runtime OSD and dashboard can explain whether baseline depth is contributing on a given frame.
-- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` surface the support of the actual lower-body / torso anchor band that drove the fused update. These fields are the canonical explanation for why a track landed on `pose_depth_fused` / `person_anchor_depth_fused` versus `pose_floor_only` / `person_anchor_floor_only`; whole-mask support can be lower or noisier without disqualifying a good anchor-band sample.
+- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` surface support
+  of the exact lower-body/ankle depth band. Resolver candidate diagnostics and
+  covariance are the canonical explanation for whether it was selected,
+  fused, retained as an alternate, or rejected; whole-mask support is not a
+  substitute.
 - The on-screen `depth=` label is optical/registered range sourced from
   `depth_used_m`; it is not canonical world Z. The parser still removes or
   preserves legacy `z=` fragments during mixed-version transitions.

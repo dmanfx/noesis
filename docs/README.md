@@ -13,6 +13,7 @@ document and live source/config win.
 | System architecture and ownership | [`CODEBASE_DESCRIPTION.md`](CODEBASE_DESCRIPTION.md) |
 | Installed runtime, models, versions, ports, and performance | [`runtime_baseline.md`](runtime_baseline.md) |
 | Pipeline hot-path and performance invariants | [`performance_invariants.md`](performance_invariants.md) |
+| Universal person world localization | [`universal_world_localization.md`](universal_world_localization.md) |
 | Exact DeepStream graph | [`../DS9/PIPELINE_GRAPH.md`](../DS9/PIPELINE_GRAPH.md) |
 | Native runtime operation | [`../DS9/docs/runtime_host_boundary.md`](../DS9/docs/runtime_host_boundary.md) |
 | Focused validation | [`testing_guide.md`](testing_guide.md) |
@@ -31,6 +32,9 @@ document and live source/config win.
 - [`Telemetry_Schema.md`](Telemetry_Schema.md) and
   [`telemetry_contract.md`](telemetry_contract.md): telemetry shapes and depth
   publication boundary.
+- [`universal_world_localization.md`](universal_world_localization.md):
+  camera-agnostic floor/depth hypothesis resolution, covariance, conservative
+  PCF evidence, PersonGroundState boundary, and dashboard diagnostics.
 - [`depth_metadata.md`](depth_metadata.md) and
   [`DEPTH_STACK_FLOW_V2.md`](DEPTH_STACK_FLOW_V2.md): object and full-frame
   depth semantics.
@@ -82,6 +86,11 @@ but are not instructions for the current app.
 
 ## Documentation change log
 
+- **2026-08-25:** Replaced the active room-specific baseline localization
+  policy with one universal, uncertainty-aware world measurement resolver;
+  documented typed hypotheses, real compatible-source fusion, conservative
+  PCF evidence, exact-cohort diagnostics, and the normal-dashboard
+  `Localization details` toggle.
 - **2026-08-23:** Made the occupied-scene performance recovery durable through
   one canonical hot-path policy covering GPU/NVMM ownership, bounded optional
   work, exact publication cohorts, pooled reuse, occupancy-amplification caps,

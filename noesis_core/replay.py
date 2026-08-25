@@ -86,6 +86,69 @@ def validate_contract_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     return validated.model_dump(mode="json")
 
 
+def _project_validated_payload(
+    raw: Any,
+    validated: Any,
+    *,
+    path: str = "payload",
+) -> Any:
+    """Return current normalized values without inventing absent stored keys.
+
+    Public contract models may gain optional fields with defaults while a
+    journal or replay remains integrity-bound to the exact bytes written by an
+    earlier binary.  Model validation must still reject malformed or unknown
+    data, but comparing a full current ``model_dump`` to those historical bytes
+    would mistake an additive default for corruption.  Projecting the fully
+    validated value onto the stored JSON shape preserves both properties.
+    """
+
+    if isinstance(raw, Mapping):
+        if not isinstance(validated, Mapping):
+            raise ReplayValidationError(f"validated {path} changed JSON shape")
+        projected: dict[str, Any] = {}
+        for key, raw_value in raw.items():
+            if key not in validated:
+                raise ReplayValidationError(
+                    f"validated {path} omitted stored key {key!r}"
+                )
+            projected[str(key)] = _project_validated_payload(
+                raw_value,
+                validated[key],
+                path=f"{path}.{key}",
+            )
+        return projected
+    if isinstance(raw, list):
+        if not isinstance(validated, list) or len(raw) != len(validated):
+            raise ReplayValidationError(f"validated {path} changed list shape")
+        return [
+            _project_validated_payload(
+                raw_value,
+                validated[index],
+                path=f"{path}[{index}]",
+            )
+            for index, raw_value in enumerate(raw)
+        ]
+    return validated
+
+
+def validate_stored_contract_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an integrity-bound historical payload without rewriting it.
+
+    New writes use :func:`validate_contract_payload` and therefore contain the
+    complete current normalized schema.  Reads use this compatibility path so
+    additive optional defaults do not invalidate an otherwise canonical hash
+    chain.  Existing stored values are still normalized and compared exactly,
+    so whitespace coercion, type coercion, unknown keys, and malformed values
+    remain rejected.
+    """
+
+    validated = validate_contract_payload(raw)
+    projected = _project_validated_payload(dict(raw), validated)
+    if not isinstance(projected, dict):  # pragma: no cover - root is guarded
+        raise ReplayValidationError("validated replay payload is not an object")
+    return projected
+
+
 def _header_wrapper(header: ReplayHeader) -> dict[str, Any]:
     return {"record_type": "header", "header": header.model_dump(mode="json")}
 
@@ -245,7 +308,7 @@ def read_replay(path: str | Path) -> ReplayArchive:
         payload = wrapper.get("payload")
         if not isinstance(payload, Mapping):
             raise ReplayValidationError(f"replay payload is not an object at sequence {expected_sequence}")
-        validated = validate_contract_payload(payload)
+        validated = validate_stored_contract_payload(payload)
         if validated != payload:
             raise ReplayValidationError(f"replay payload is not canonical at sequence {expected_sequence}")
         records.append(

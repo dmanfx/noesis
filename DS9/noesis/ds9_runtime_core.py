@@ -2844,13 +2844,25 @@ def _load_world_measurement_fusion_policy(
     camera_labels: Mapping[int, str],
     depth_registration: DepthRegistrationManager,
     logger: logging.Logger,
-) -> WorldFusionPolicy:
+    configured_path: str | Path | None = None,
+) -> WorldFusionPolicy | None:
     policy_cfg = pipeline_cfg.get("world_measurement_fusion")
-    if not isinstance(policy_cfg, Mapping) or not str(policy_cfg.get("path") or "").strip():
-        raise WorldFusionPolicyError(
-            "baseline tracking requires world_measurement_fusion.path"
+    raw_path = (
+        str(configured_path).strip()
+        if configured_path is not None
+        else (
+            str(policy_cfg.get("path") or "").strip()
+            if isinstance(policy_cfg, Mapping)
+            else ""
         )
-    path = Path(str(policy_cfg["path"]).strip()).expanduser()
+    )
+    if not raw_path:
+        logger.info(
+            "Canonical universal world resolver is active; historical "
+            "world_measurement_fusion policy is not loaded"
+        )
+        return None
+    path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = (REPO_ROOT / path).resolve()
     active = [
@@ -2867,7 +2879,7 @@ def _load_world_measurement_fusion_policy(
         depth_registration=depth_registration,
     )
     logger.info(
-        "Loaded calibrated world fusion policy %s id=%s cameras=%d",
+        "Loaded non-authoritative legacy comparison policy %s id=%s cameras=%d",
         path,
         policy.policy_id,
         len(policy.cameras),
@@ -3639,6 +3651,17 @@ def _build_stats_callback(
                 "status": "not_configured",
             }
         )
+        world_service = getattr(pipeline, "world_service", None)
+        persistence_health_getter = getattr(
+            world_service,
+            "persistence_health",
+            None,
+        )
+        world_persistence_health = (
+            dict(persistence_health_getter())
+            if callable(persistence_health_getter)
+            else {"status": "not_configured"}
+        )
         response_model_started_ns = time.perf_counter_ns()
         stats_payload = {
             "timestamp": now,
@@ -3688,6 +3711,7 @@ def _build_stats_callback(
                         None,
                     ),
                 },
+                "world_persistence": world_persistence_health,
                 "zero_copy_profile": str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "strict") or "strict"),
                 "zero_copy_core_enabled": True,
                 "zero_copy_violations": core_violations,
@@ -5474,6 +5498,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         logger.debug("Unable to seed calibration bundle on storage manager", exc_info=True)
     depth_registration_manager: DepthRegistrationManager | None = None
     world_fusion_policy: WorldFusionPolicy | None = None
+    legacy_world_fusion_policy: WorldFusionPolicy | None = None
     depthless_reid_smoke = _allow_depthless_reid_smoke(pipeline.config)
     if tracking_mode == "baseline" and not depthless_reid_smoke:
         try:
@@ -5485,12 +5510,50 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                 camera_labels=camera_labels,
                 logger=logger,
             )
-            world_fusion_policy = _load_world_measurement_fusion_policy(
+            canonical_world_cfg = pipeline.config.get("canonical_world", {})
+            resolver_cfg = (
+                canonical_world_cfg.get("measurement_resolver")
+                if isinstance(canonical_world_cfg, Mapping)
+                else None
+            )
+            if not isinstance(resolver_cfg, Mapping):
+                raise WorldFusionPolicyError(
+                    "baseline tracking requires canonical_world.measurement_resolver"
+                )
+            if resolver_cfg.get("enabled") is not True:
+                raise WorldFusionPolicyError(
+                    "baseline tracking requires the canonical universal world resolver"
+                )
+            legacy_comparison_path = resolver_cfg.get(
+                "legacy_comparison_policy_path"
+            )
+            if (
+                not isinstance(legacy_comparison_path, str)
+                or not legacy_comparison_path.strip()
+            ):
+                raise WorldFusionPolicyError(
+                    "canonical resolver requires a diagnostic-only legacy comparison policy path"
+                )
+            legacy_world_fusion_policy = _load_world_measurement_fusion_policy(
                 pipeline_cfg=pipeline.config,
                 camera_labels=camera_labels,
                 depth_registration=depth_registration_manager,
                 logger=logger,
+                configured_path=legacy_comparison_path,
             )
+            if legacy_world_fusion_policy is None:
+                raise WorldFusionPolicyError(
+                    "legacy comparison policy could not be loaded"
+                )
+            # The universal resolver is the only active baseline world
+            # authority. The historical room policy is retained solely to
+            # reconstruct a same-frame dashboard comparison from candidates
+            # the resolver already built; it cannot feed track.world.
+            logger.info(
+                "Using canonical universal world resolver; historical "
+                "world fusion policy is diagnostic-only"
+            )
+            world_fusion_policy = None
         except (DepthRegistrationError, WorldFusionPolicyError) as exc:
             logger.error("Baseline tracking calibration policy is invalid: %s", exc)
             return _abort_startup("world_measurement_policy_invalid")
@@ -5645,6 +5708,37 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     bev_renderer: Optional[BevRenderer] = None
 
     def _toggle_handler(toggle_name: str, enabled: bool) -> None:
+        if toggle_name == ws_server.LOCALIZATION_DETAILS_TOGGLE:
+            # The WebSocket boundary is constructed before the analytics hook
+            # is attached later in startup.  Resolve the processor at toggle
+            # time rather than capturing the pre-attachment ``None`` value.
+            # This also keeps a future analytics reload from leaving the
+            # request-gated diagnostics callback bound to a retired instance.
+            analytics_component = pipeline.components.get("analytics")
+            analytics_processor = (
+                analytics_component.config.get("_analytics_processor")
+                if analytics_component is not None
+                else None
+            )
+            setter = getattr(
+                analytics_processor,
+                "set_world_resolver_diagnostics_enabled",
+                None,
+            )
+            if callable(setter):
+                try:
+                    setter(bool(enabled))
+                except Exception:
+                    logger.exception(
+                        "Failed to toggle localization details to %s",
+                        enabled,
+                    )
+            else:
+                logger.warning(
+                    "Localization details toggle received but analytics processor "
+                    "does not expose the diagnostics setter"
+                )
+            return
         if toggle_name != "trail_visualization_enabled":
             return
         if trail_processor is not None:
@@ -6025,6 +6119,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         ),
         lambda service: service.close(),
     )
+    setattr(pipeline, "world_service", world_service)
     capability_monitor = create_runtime_capability_monitor(world_service)
     from noesis.server import health_api
 
@@ -6258,6 +6353,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         bev_calibration=calibration_provider,
         depth_registration=depth_registration_manager,
         world_fusion_policy=world_fusion_policy,
+        legacy_world_fusion_policy=legacy_world_fusion_policy,
         scene_priors=scene_prior_set,
         diagnostics_logger=diagnostics_logger,
         publication_gate=runtime_publication_gate,

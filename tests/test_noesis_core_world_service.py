@@ -75,6 +75,9 @@ def _track(
                 "world": [x, 0.0, 2.0],
                 "world_valid": True,
                 "world_frame": "backend_world_m",
+                "world_frame_revision": "world-rev",
+                "world_transform_sha256": "d" * 64,
+                "calibration_revision": "calibration-rev",
                 "world_quality": "good",
                 "world_source": "pose_depth_fused",
             }
@@ -122,6 +125,232 @@ def test_resident_observations_across_cameras_fuse_into_one_entity() -> None:
     assert entity.position is not None
     assert entity.position.x == pytest.approx(1.1)
     assert {source.camera_id for source in entity.sources} == {"kitchen", "hall"}
+
+
+def test_world_observation_preserves_resolver_anisotropic_covariance() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    covariance = [
+        0.09,
+        0.0,
+        0.03,
+        0.0,
+        0.01,
+        0.0,
+        0.03,
+        0.0,
+        0.25,
+    ]
+    track["world_covariance"] = covariance
+    track["world_resolver_confidence"] = 0.72
+    track["world_quantity"] = "ground_footprint"
+    track["world_support_state"] = "floor"
+    track["world_posture"] = "standing"
+    track["source_id"] = 0
+    track["world_resolver"] = {
+        "contract": "noesis.world_resolver_diagnostics",
+        "version": 1,
+        "camera_id": "kitchen",
+        "source_id": 0,
+        "tracker_id": 7,
+        "frame_id": 1,
+        "observed_at_us": 1_900_000,
+        "world_frame": "backend_world_m",
+        "world_frame_revision": "world-rev",
+        "selected_id": "floor_ray",
+        "selected_kind": "floor_ray",
+        "contributor_ids": ["floor_ray"],
+        "alternate_id": None,
+        "fused": False,
+        "confidence": 0.72,
+        "pcf_score": 0.9,
+        "agreement_mahalanobis_sq": None,
+        "reason": "selected_single_valid_hypothesis",
+        "candidates": [
+            {
+                "id": "floor_ray",
+                "kind": "floor_ray",
+                "score": 0.72,
+                "pcf_score": 0.9,
+                "innovation_m": None,
+                "agreement_mahalanobis_sq": None,
+                "compatible_with_selected": True,
+                "selected": True,
+                "retained_as_alternate": False,
+                "rejection_reason": None,
+            }
+        ],
+    }
+    track["world_frame_revision"] = "world-rev"
+
+    publication = service.publish(0, [track], metadata={})
+
+    world = publication.observations[0].payload.world
+    assert world is not None
+    assert world.covariance.values == pytest.approx(tuple(covariance))
+    assert world.quantity == "ground_footprint"
+    assert world.support_state == "floor"
+    assert world.posture == "standing"
+    diagnostics = publication.observations[0].payload.world_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.resolver_selected_kind == "floor_ray"
+    assert diagnostics.resolver_contributor_ids == ("floor_ray",)
+    assert diagnostics.resolver_candidate_diagnostics[0].selected is True
+    # Tracker confidence remains an independent upper bound.
+    assert world.confidence == pytest.approx(0.72)
+    entity = publication.snapshot.entities[0]
+    assert entity.position_quantity == "ground_footprint"
+    assert entity.support_state == "floor"
+    assert entity.posture == "standing"
+
+
+def test_world_observation_drops_stale_resolver_diagnostics_only() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["source_id"] = 0
+    track["world_frame_revision"] = "world-rev"
+    track["world_resolver"] = {
+        "contract": "noesis.world_resolver_diagnostics",
+        "version": 1,
+        "camera_id": "kitchen",
+        "source_id": 0,
+        "tracker_id": 7,
+        "frame_id": 2,
+        "observed_at_us": 1_900_000,
+        "world_frame": "backend_world_m",
+        "world_frame_revision": "world-rev",
+        "selected_id": None,
+        "selected_kind": None,
+        "contributor_ids": [],
+        "alternate_id": None,
+        "fused": False,
+        "confidence": 0.0,
+        "candidates": [],
+    }
+
+    publication = service.publish(0, [track], metadata={})
+
+    world = publication.observations[0].payload.world
+    assert world is not None
+    diagnostics = publication.observations[0].payload.world_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.resolver_selected_kind is None
+    assert diagnostics.resolver_candidate_diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "covariance",
+    (
+        [0.1] * 8,
+        [0.1, 0.2, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1],
+        [-0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1],
+        [0.1, 0.0, 0.2, 0.0, 0.1, 0.0, 0.2, 0.0, 0.1],
+    ),
+)
+def test_world_observation_rejects_malformed_resolver_covariance(
+    covariance: list[float],
+) -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_covariance"] = covariance
+
+    publication = service.publish(0, [track], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities == ()
+
+
+def test_world_observation_rejects_a_non_ground_quantity_in_world_field() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_quantity"] = "body_root_3d"
+
+    publication = service.publish(0, [track], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities == ()
+
+
+@pytest.mark.parametrize("missing_field", ("world_frame_revision", "world_transform_sha256"))
+def test_canonical_world_observation_requires_registration_identity(
+    missing_field: str,
+) -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track.pop(missing_field)
+
+    publication = service.publish(0, [track], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.observations[0].payload.world_diagnostics is not None
+    assert publication.observations[0].payload.world_diagnostics.first_divergence_reason == (
+        f"{missing_field}_missing"
+    )
+    assert publication.snapshot.entities == ()
+
+
+@pytest.mark.parametrize(
+    "continuity_source",
+    ("cv_prediction", "anchor_hold", "image_motion_prediction"),
+)
+def test_display_continuity_never_enters_authoritative_world_fusion(
+    continuity_source: str,
+) -> None:
+    service = _service()
+    authoritative = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    service.publish(0, [authoritative], metadata={})
+    continuation = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_950_000,
+        x=99.0,
+    )
+    continuation["world_source"] = continuity_source
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is None
+    assert observation.coordinate_frame == "image_px"
+    assert publication.snapshot.entities[0].position is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
 
 
 def test_visitor_generation_prevents_recycled_id_aliasing() -> None:
@@ -1461,18 +1690,77 @@ def test_injected_fusion_is_detached_from_later_caller_mutation() -> None:
     assert publication.snapshot.sequence == 1
 
 
-def test_world_authority_rejects_async_journal(tmp_path: Path) -> None:
+def test_world_authority_accepts_async_optional_journal(tmp_path: Path) -> None:
+    path = tmp_path / "world.sqlite3"
     asynchronous = AsyncContractJournal(
-        ContractJournal(tmp_path / "world.sqlite3")
+        ContractJournal(path)
     )
+    service = _service(journal=asynchronous)
+
+    publication = service.publish(
+        0,
+        [
+            _track(
+                camera_id="kitchen",
+                tracker_id=7,
+                frame_id=1,
+                observed_at_us=1_900_000,
+                x=1.0,
+            )
+        ],
+        metadata={"camera_id": "kitchen"},
+    )
+
+    assert publication.snapshot.sequence == 1
+    assert service.persistence_health()["status"] == "healthy"
+    service.close()
+    reopened = ContractJournal(path)
     try:
-        with pytest.raises(
-            TypeError,
-            match="completion-proven synchronous ContractJournal",
-        ):
-            _service(journal=asynchronous)
+        assert len(reopened.records()) == len(publication.observations) + 2
     finally:
-        asynchronous.close()
+        reopened.close()
+
+
+def test_async_world_persistence_never_waits_in_live_publication() -> None:
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+
+    class SlowJournal:
+        max_records = 10_000
+
+        def append_entries(self, entries: Any) -> None:
+            tuple(entries)
+            persistence_started.set()
+            assert release_persistence.wait(timeout=5.0)
+
+        def close(self) -> None:
+            return None
+
+    asynchronous = AsyncContractJournal(SlowJournal())  # type: ignore[arg-type]
+    service = _service(journal=asynchronous)
+
+    started = time.perf_counter()
+    publication = service.publish(
+        0,
+        [
+            _track(
+                camera_id="kitchen",
+                tracker_id=7,
+                frame_id=1,
+                observed_at_us=1_900_000,
+                x=1.0,
+            )
+        ],
+        metadata={"camera_id": "kitchen"},
+    )
+    elapsed_s = time.perf_counter() - started
+
+    assert publication.snapshot.sequence == 1
+    assert persistence_started.wait(timeout=1.0)
+    assert not release_persistence.is_set()
+    assert elapsed_s < 0.1
+    release_persistence.set()
+    service.close()
 
 
 def test_world_commit_rejects_false_journal_append_acknowledgement() -> None:

@@ -21,6 +21,21 @@ from .observation import ObservationEnvelope
 from .scene import SceneRelease
 from .scene_prior import ScenePriorCatalog, ScenePriorRevision
 from .world import WorldEvent, WorldSnapshot
+from .world_measurement import (
+    MeasurementKind,
+    MeasurementKindName,
+    MeasurementQuality,
+    MeasurementStatus,
+    PostureKind,
+    ResolvedGroundMeasurement,
+    WorldMeasurementCandidateDiagnostic,
+    WorldMeasurementCohort,
+    WorldMeasurementHypothesis,
+    WorldMeasurementSet,
+    WorldPriorEvidence,
+    WorldProcessContinuation,
+    SupportState,
+)
 
 CONTRACT_MODELS = {
     "action_approval": ActionApproval,
@@ -103,5 +118,18 @@ __all__ = [
     "ShadowIdentityEvidenceRecord",
     "WorldSnapshot",
     "WorldEvent",
+    "MeasurementKindName",
+    "MeasurementKind",
+    "MeasurementQuality",
+    "MeasurementStatus",
+    "PostureKind",
+    "SupportState",
+    "ResolvedGroundMeasurement",
+    "WorldMeasurementCandidateDiagnostic",
+    "WorldMeasurementCohort",
+    "WorldMeasurementHypothesis",
+    "WorldMeasurementSet",
+    "WorldPriorEvidence",
+    "WorldProcessContinuation",
     "WebSocketDeploymentHealth",
 ]

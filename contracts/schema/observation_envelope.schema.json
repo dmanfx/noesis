@@ -400,6 +400,102 @@
       "title": "Vector3",
       "type": "object"
     },
+    "WorldMeasurementCandidateDiagnostic": {
+      "additionalProperties": false,
+      "description": "Bounded per-candidate explanation for telemetry and dashboard tooling.",
+      "properties": {
+        "agreement_mahalanobis_sq": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agreement Mahalanobis Sq"
+        },
+        "candidate_id": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "compatible_with_selected": {
+          "default": false,
+          "title": "Compatible With Selected",
+          "type": "boolean"
+        },
+        "innovation_m": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Innovation M"
+        },
+        "kind": {
+          "enum": [
+            "floor_ray",
+            "registered_depth",
+            "pose_scale",
+            "gravity_reconstruction"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "pcf_score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Pcf Score",
+          "type": "number"
+        },
+        "rejection_reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rejection Reason"
+        },
+        "retained_as_alternate": {
+          "default": false,
+          "title": "Retained As Alternate",
+          "type": "boolean"
+        },
+        "score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Score",
+          "type": "number"
+        },
+        "selected": {
+          "default": false,
+          "title": "Selected",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "kind",
+        "score",
+        "pcf_score"
+      ],
+      "title": "WorldMeasurementCandidateDiagnostic",
+      "type": "object"
+    },
     "WorldObservationDiagnostics": {
       "additionalProperties": false,
       "description": "Bounded non-biometric evidence for one world-placement decision.",
@@ -718,6 +814,147 @@
             }
           ],
           "default": null
+        },
+        "resolver_agreement_mahalanobis_sq": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Agreement Mahalanobis Sq"
+        },
+        "resolver_alternate_candidate_id": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Alternate Candidate Id"
+        },
+        "resolver_candidate_diagnostics": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorldMeasurementCandidateDiagnostic"
+          },
+          "maxItems": 4,
+          "title": "Resolver Candidate Diagnostics",
+          "type": "array"
+        },
+        "resolver_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Confidence"
+        },
+        "resolver_contributor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4,
+          "title": "Resolver Contributor Ids",
+          "type": "array"
+        },
+        "resolver_disagreement_m": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Disagreement M"
+        },
+        "resolver_fused": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Fused"
+        },
+        "resolver_pcf_score": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Pcf Score"
+        },
+        "resolver_reason": {
+          "anyOf": [
+            {
+              "maxLength": 240,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Reason"
+        },
+        "resolver_selected_candidate_id": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Selected Candidate Id"
+        },
+        "resolver_selected_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "floor_ray",
+                "registered_depth",
+                "pose_scale",
+                "gravity_reconstruction"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolver Selected Kind"
         }
       },
       "title": "WorldObservationDiagnostics",
@@ -726,6 +963,20 @@
     "WorldPositionObservation": {
       "additionalProperties": false,
       "properties": {
+        "calibration_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Revision"
+        },
         "confidence": {
           "maximum": 1.0,
           "minimum": 0.0,
@@ -737,11 +988,23 @@
         },
         "frame": {
           "const": "backend_world_m",
+          "default": "backend_world_m",
           "title": "Frame",
           "type": "string"
         },
         "position": {
           "$ref": "#/$defs/Vector3"
+        },
+        "posture": {
+          "default": "unknown",
+          "enum": [
+            "standing",
+            "sitting",
+            "lying",
+            "unknown"
+          ],
+          "title": "Posture",
+          "type": "string"
         },
         "quality": {
           "enum": [
@@ -750,6 +1013,12 @@
             "held"
           ],
           "title": "Quality",
+          "type": "string"
+        },
+        "quantity": {
+          "const": "ground_footprint",
+          "default": "ground_footprint",
+          "title": "Quantity",
           "type": "string"
         },
         "reason": {
@@ -771,17 +1040,60 @@
           "title": "Source",
           "type": "string"
         },
+        "support_state": {
+          "default": "unknown",
+          "enum": [
+            "floor",
+            "seat",
+            "couch",
+            "unknown"
+          ],
+          "title": "Support State",
+          "type": "string"
+        },
         "units": {
           "const": "meters",
+          "default": "meters",
           "title": "Units",
           "type": "string"
+        },
+        "world_frame": {
+          "const": "backend_world_m",
+          "default": "backend_world_m",
+          "title": "World Frame",
+          "type": "string"
+        },
+        "world_frame_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Frame Revision"
+        },
+        "world_transform_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Transform Sha256"
         }
       },
       "required": [
         "position",
         "covariance",
-        "frame",
-        "units",
         "source",
         "quality",
         "confidence"

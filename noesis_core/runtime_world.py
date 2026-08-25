@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from noesis_core.contracts.base import ProducerRef
 from noesis_core.health import CapabilityMonitor, CapabilityPolicy
-from noesis_core.journal import ContractJournal
+from noesis_core.journal import AsyncContractJournal, ContractJournal
 from noesis_core.runtime_secrets import public_pipeline_config
 from noesis_core.world_service import (
     CanonicalWorldService,
@@ -166,7 +166,7 @@ def create_runtime_world_service(
             else Path.home() / ".local" / "state" / "noesis" / f"world_{runtime}.sqlite3"
         )
     )
-    journal = ContractJournal(
+    durable_journal = ContractJournal(
         resolved_journal,
         max_records=max(
             1,
@@ -183,6 +183,17 @@ def create_runtime_world_service(
                 )
                 * 3_600_000_000
             ),
+        ),
+    )
+    journal = AsyncContractJournal(
+        durable_journal,
+        max_pending_batches=max(
+            1,
+            int(os.environ.get("NOESIS_WORLD_JOURNAL_MAX_PENDING_BATCHES", "256")),
+        ),
+        max_transaction_batches=max(
+            1,
+            int(os.environ.get("NOESIS_WORLD_JOURNAL_TRANSACTION_BATCHES", "32")),
         ),
     )
     return CanonicalWorldService(producer=producer, artifacts=artifacts, journal=journal)

@@ -38,11 +38,15 @@ def _observation(
     x: float,
     *,
     variance: float = 0.04,
+    covariance: tuple[float, ...] | None = None,
     confidence: float = 0.9,
     run_id: str = "source-run",
     zone: str | None = None,
     zone_source: str | None = None,
     zone_authoritative: bool = False,
+    world_frame_revision: str | None = None,
+    world_transform_sha256: str | None = None,
+    calibration_revision: str | None = None,
 ) -> ObservationEnvelope:
     fingerprint = ArtifactFingerprint(role="input", sha256=SHA)
     tracklet = TrackletRef(
@@ -77,9 +81,15 @@ def _observation(
             zone_authoritative=zone_authoritative,
             world=WorldPositionObservation(
                 position=Vector3(x=x, y=0.0, z=2.0),
-                covariance=Matrix3(values=(variance, 0.0, 0.0, 0.0, variance, 0.0, 0.0, 0.0, variance)),
+                covariance=Matrix3(
+                    values=covariance
+                    or (variance, 0.0, 0.0, 0.0, variance, 0.0, 0.0, 0.0, variance)
+                ),
                 frame="backend_world_m",
                 units="meters",
+                world_frame_revision=world_frame_revision,
+                world_transform_sha256=world_transform_sha256,
+                calibration_revision=calibration_revision,
                 source="pose_depth_fused",
                 quality="good",
                 confidence=confidence,
@@ -101,6 +111,176 @@ def test_fuses_compatible_contemporaneous_camera_observations() -> None:
     assert entity.position.x == pytest.approx(1.1)
     assert len(entity.sources) == 2
     assert all(source.accepted for source in entity.sources)
+
+
+def test_covariance_precision_is_not_multiplied_by_duplicate_confidence() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation(
+            "kitchen",
+            0,
+            1,
+            1_000_000,
+            0.0,
+            variance=0.04,
+            confidence=0.1,
+        ),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation(
+            "family-room",
+            1,
+            1,
+            1_050_000,
+            1.0,
+            variance=0.04,
+            confidence=0.9,
+        ),
+        _subject(),
+    )
+
+    entity = fusion.snapshot(published_at_us=1_100_000).entities[0]
+
+    assert entity.position is not None
+    assert entity.position.x == pytest.approx(0.5)
+    assert entity.covariance is not None
+    # CI deliberately does not claim independent camera errors; equal inputs
+    # retain their original uncertainty instead of becoming overconfident.
+    assert entity.covariance.values[0] == pytest.approx(0.04)
+
+
+def test_correlated_covariance_is_preserved_by_full_matrix_fusion() -> None:
+    covariance = (0.09, 0.03, 0.0, 0.03, 0.04, 0.0, 0.0, 0.0, 0.16)
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation("kitchen", 0, 1, 1_000_000, 1.0, covariance=covariance),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation("hall", 1, 1, 1_050_000, 1.2, covariance=covariance),
+        _subject(),
+    )
+
+    entity = fusion.snapshot(published_at_us=1_100_000).entities[0]
+
+    assert entity.covariance is not None
+    assert entity.covariance.values[1] == pytest.approx(0.03)
+    assert entity.covariance.values[3] == pytest.approx(0.03)
+    assert entity.covariance.values[0] == pytest.approx(0.09)
+
+
+def test_mixed_target_frame_revisions_are_conflict_evidence_not_fused() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation(
+            "kitchen",
+            0,
+            1,
+            1_000_000,
+            1.0,
+            world_frame_revision="world-r1",
+            world_transform_sha256="a" * 64,
+            calibration_revision="calibration-k",
+        ),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation(
+            "family-room",
+            1,
+            1,
+            1_050_000,
+            1.2,
+            world_frame_revision="world-r2",
+            world_transform_sha256="b" * 64,
+            calibration_revision="calibration-f",
+        ),
+        _subject(),
+    )
+
+    entity = fusion.snapshot(published_at_us=1_100_000).entities[0]
+
+    assert entity.conflict is True
+    assert sum(source.accepted for source in entity.sources) == 1
+    assert {
+        source.world_frame_revision for source in entity.sources
+    } == {"world-r1", "world-r2"}
+    assert any(
+        source.rejection_reason == "registration_identity_conflict"
+        for source in entity.sources
+    )
+
+
+def test_distinct_camera_edges_can_fuse_when_the_target_revision_matches() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation(
+            "kitchen",
+            0,
+            1,
+            1_000_000,
+            1.0,
+            world_frame_revision="world-r1",
+            world_transform_sha256="a" * 64,
+            calibration_revision="calibration-k",
+        ),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation(
+            "family-room",
+            1,
+            1,
+            1_050_000,
+            1.2,
+            world_frame_revision="world-r1",
+            world_transform_sha256="b" * 64,
+            calibration_revision="calibration-f",
+        ),
+        _subject(),
+    )
+
+    entity = fusion.snapshot(published_at_us=1_100_000).entities[0]
+
+    assert entity.conflict is False
+    assert all(source.accepted for source in entity.sources)
+    assert entity.world_frame_revision == "world-r1"
+    assert entity.world_transform_sha256 is None
+    assert entity.calibration_revision is None
+    assert {source.world_transform_sha256 for source in entity.sources} == {
+        "a" * 64,
+        "b" * 64,
+    }
+
+
+def test_missing_target_frame_identity_is_not_fused_with_canonical_evidence() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation(
+            "kitchen",
+            0,
+            1,
+            1_000_000,
+            1.0,
+            world_frame_revision="world-r1",
+            world_transform_sha256="a" * 64,
+        ),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation("hall", 1, 1, 1_050_000, 1.2),
+        _subject(),
+    )
+
+    entity = fusion.snapshot(published_at_us=1_100_000).entities[0]
+
+    assert entity.conflict is True
+    assert sum(source.accepted for source in entity.sources) == 1
+    assert any(
+        source.rejection_reason == "registration_identity_missing"
+        for source in entity.sources
+    )
 
 
 def test_conflicting_cameras_are_not_averaged() -> None:

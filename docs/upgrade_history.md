@@ -3,6 +3,36 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-25 — Universal uncertainty-aware person localization
+
+- Replaced the active Family/Kitchen/Living room-specific measurement policy
+  with one camera-agnostic resolver. Floor-ray, registered-depth, and eligible
+  gravity hypotheses now retain their own evidence, full covariance, anatomical
+  anchor, posture/occlusion state, revision identity, and PCF diagnostics until
+  the resolver makes one current-frame decision.
+- Made compatible measurements contribute through covariance intersection;
+  mutually incompatible candidates remain explicit alternates instead of being
+  averaged. `PersonGroundState` remains the only temporal filter and separately
+  owns physical admission, stationary lock, prediction, reacquisition, and
+  trail continuity.
+- Carried full covariance and exact calibration/world-transform provenance into
+  canonical world fusion. Mixed revisions fail closed, and held/predicted rows
+  remain display continuity rather than fresh global evidence.
+- Kept BEV as a pure projection of the canonical ground footprint and added a
+  request-gated dashboard `Localization details` overlay for candidates,
+  covariance, disagreement, selected source, legacy comparison, and exact PCF
+  evidence. The normal disabled state adds no rich diagnostic payload.
+- Paced three-MP4 validation exercised occupied Living, Kitchen, and Family
+  scenes with exact tracking/BEV cohort matching, no duplicate lifecycle rows,
+  no continuous step above the 4 m/s physical contract, no canonical queue
+  overflow, no pipeline error, and zero host-copy violations. Resolver work
+  averaged approximately 0.04 ms per evaluated track; the 20 FPS Living source
+  and 30 FPS Kitchen/Family sources retained their recorded pacing.
+- Confirmed that a remaining Family-raster exterior sample represented a person
+  visible in the adjacent kitchen at the same recorded timestamp. It stays an
+  honest predicted cross-room coordinate with explicit outside-PCF evidence;
+  it is not snapped into Family space or silently dropped.
+
 ## 2026-08-23 — Revision-exact PCF tracking and trail projection
 
 - Bound Living Room and Kitchen, as well as Family Room, to their exact active

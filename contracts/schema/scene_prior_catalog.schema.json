@@ -10,6 +10,17 @@
           "title": "Camera Id",
           "type": "string"
         },
+        "frame_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScenePriorFrameBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "include_floorplan_layers": {
           "default": true,
           "title": "Include Floorplan Layers",
@@ -87,6 +98,145 @@
         "manifest_size_bytes"
       ],
       "title": "ScenePriorCatalogEntry",
+      "type": "object"
+    },
+    "ScenePriorFloorPlane": {
+      "additionalProperties": false,
+      "properties": {
+        "frame": {
+          "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "normal": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Normal",
+          "type": "array"
+        },
+        "offset_m": {
+          "title": "Offset M",
+          "type": "number"
+        }
+      },
+      "required": [
+        "frame",
+        "normal",
+        "offset_m"
+      ],
+      "title": "ScenePriorFloorPlane",
+      "type": "object"
+    },
+    "ScenePriorFrameBinding": {
+      "additionalProperties": false,
+      "description": "Immutable raw-to-active world revision edge for one camera binding.",
+      "properties": {
+        "contract": {
+          "const": "noesis.scene_prior.frame_binding",
+          "title": "Contract",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "source_camera_calibration_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Camera Calibration Sha256",
+          "type": "string"
+        },
+        "source_floor_plane": {
+          "$ref": "#/$defs/ScenePriorFloorPlane"
+        },
+        "source_frame": {
+          "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "source_world_alignment_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source World Alignment Sha256",
+          "type": "string"
+        },
+        "target_floor_plane": {
+          "$ref": "#/$defs/ScenePriorFloorPlane"
+        },
+        "target_frame": {
+          "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "target_from_source_col_major": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 16,
+          "minItems": 16,
+          "title": "Target From Source Col Major",
+          "type": "array"
+        },
+        "target_from_source_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Target From Source Sha256",
+          "type": "string"
+        },
+        "target_revision_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$",
+          "title": "Target Revision Id",
+          "type": "string"
+        },
+        "target_revision_metadata_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Target Revision Metadata Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract",
+        "contract_version",
+        "source_frame",
+        "target_frame",
+        "source_camera_calibration_sha256",
+        "source_world_alignment_sha256",
+        "target_revision_id",
+        "target_revision_metadata_sha256",
+        "target_from_source_col_major",
+        "target_from_source_sha256",
+        "source_floor_plane",
+        "target_floor_plane"
+      ],
+      "title": "ScenePriorFrameBinding",
+      "type": "object"
+    },
+    "ScenePriorFrameRef": {
+      "additionalProperties": false,
+      "properties": {
+        "frame_id": {
+          "const": "backend_world_m",
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$",
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "frame_id",
+        "revision"
+      ],
+      "title": "ScenePriorFrameRef",
       "type": "object"
     }
   },

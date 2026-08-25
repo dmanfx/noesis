@@ -56,6 +56,33 @@ def test_replay_is_deterministic_validated_and_owner_only(tmp_path: Path) -> Non
     assert loaded.records[0].payload["contract"] == "noesis.capability.health"
 
 
+def test_replay_reads_additive_legacy_shape_without_rewriting_hashes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.noesis-replay.ndjson"
+    write_replay(path, header=_header(), payloads=[_health_payload()])
+    lines = path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])
+    wrapper = json.loads(lines[1])
+    del wrapper["payload"]["capabilities"][0]["blockers"]
+    core = {key: value for key, value in wrapper.items() if key != "record_sha256"}
+    wrapper["record_sha256"] = replay_module._sha256(core)
+    path.write_text(
+        "\n".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in (header, wrapper)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    loaded = read_replay(path)
+
+    assert "blockers" not in loaded.records[0].payload["capabilities"][0]
+    assert loaded.records[0].record_sha256 == wrapper["record_sha256"]
+
+
 def test_replay_detects_tampering(tmp_path: Path) -> None:
     path = tmp_path / "tampered.ndjson"
     write_replay(path, header=_header(), payloads=[_health_payload()])

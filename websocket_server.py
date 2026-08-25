@@ -426,6 +426,11 @@ class WebSocketStartupError(RuntimeError):
 class WebSocketServer:
     """Manages WebSocket server for broadcasting data to clients"""
 
+    # Resolver comparison is an explicitly opt-in presentation capability.  It
+    # is tracked per connection so one dashboard cannot accidentally turn the
+    # rich diagnostic payload on for every client indefinitely.
+    LOCALIZATION_DETAILS_TOGGLE = "localization_details_enabled"
+
     HEALTH_PATH = "/healthz"
     AUTHORITY_GATED_MESSAGE_TYPES = frozenset(
         {"tracking", "world_snapshot", "world_event"}
@@ -519,6 +524,7 @@ class WebSocketServer:
         self.stats_callback = stats_callback
         self.toggle_callback = toggle_callback
         self.initial_trail_state = initial_trail_state
+        self.localization_details_enabled = False
         self.health_payload_getter = health_payload_getter
         self.boundary_failure_callback: Optional[Callable[[BaseException], None]] = None
         self.lifecycle_failure_callback: Optional[Callable[[BaseException], None]] = None
@@ -528,6 +534,7 @@ class WebSocketServer:
         self._internal_auth_mode = auth_config.mode
         self._internal_auth_token = auth_config.token
         self.connected_clients = set()
+        self._localization_details_requesters: Set[Any] = set()
         self.server = None
         self.server_task = None
         self.running = True
@@ -2310,7 +2317,7 @@ class WebSocketServer:
             client_ip = websocket.remote_address if hasattr(websocket, 'remote_address') else "Unknown"
             self.logger.debug("Failed to send message to %s: %s", client_ip, exc)
             try:
-                self.connected_clients.discard(websocket)
+                self._discard_connected_client(websocket)
             except Exception:
                 pass
 
@@ -2633,6 +2640,80 @@ class WebSocketServer:
         cfg["enabled"] = bool(self.initial_trail_state)
         return cfg
 
+    def _set_localization_details_state(self, enabled: bool) -> bool:
+        """Apply the effective resolver-diagnostics state.
+
+        The state is derived from connected-client preferences, never from a
+        single client's last message.  Returning whether it changed keeps the
+        callback and broadcasts bounded when a client repeats its preference.
+        """
+
+        effective = bool(enabled)
+        changed = effective != bool(self.localization_details_enabled)
+        self.localization_details_enabled = effective
+        if not changed:
+            return False
+        callback = self.toggle_callback
+        if callable(callback):
+            try:
+                callback(self.LOCALIZATION_DETAILS_TOGGLE, effective)
+            except Exception:
+                self.logger.exception(
+                    "Error applying effective localization details state: %s",
+                    effective,
+                )
+        return True
+
+    def _set_localization_details_preference(
+        self,
+        websocket: Any,
+        enabled: bool,
+    ) -> bool:
+        """Record one client's preference and return whether effective state changed."""
+
+        if bool(enabled):
+            self._localization_details_requesters.add(websocket)
+        else:
+            self._localization_details_requesters.discard(websocket)
+        return self._set_localization_details_state(
+            bool(self._localization_details_requesters)
+        )
+
+    def _remove_localization_details_client(self, websocket: Any) -> bool:
+        """Forget a client and disable diagnostics when it was the last requester."""
+
+        was_requester = websocket in self._localization_details_requesters
+        self._localization_details_requesters.discard(websocket)
+        if not was_requester:
+            return False
+        return self._set_localization_details_state(
+            bool(self._localization_details_requesters)
+        )
+
+    def _discard_connected_client(self, websocket: Any) -> bool:
+        """Remove one client from both registries and return state-change status."""
+
+        self.connected_clients.discard(websocket)
+        return self._remove_localization_details_client(websocket)
+
+    def _localization_details_message(self) -> Dict[str, Any]:
+        return {
+            "type": "toggle_update",
+            "toggle_name": self.LOCALIZATION_DETAILS_TOGGLE,
+            "enabled": bool(self.localization_details_enabled),
+        }
+
+    async def _broadcast_localization_details_state(self) -> None:
+        if not self.connected_clients:
+            return
+        response_model_started_ns = time.perf_counter_ns()
+        await self.broadcast(
+            self._localization_details_message(),
+            response_model_timing=self.response_model_timing_since(
+                response_model_started_ns
+            ),
+        )
+
     # ---------------- WebRTC gateway signaling ----------------
 
     def register_webrtc_gateway(self, gateway: Any) -> None:
@@ -2833,12 +2914,18 @@ class WebSocketServer:
                     stale_clients.add(client)
 
             if stale_clients:
+                localization_details_changed = False
                 for client in stale_clients:
                     if client in self.connected_clients:
-                        self.connected_clients.remove(client)
+                        localization_details_changed = (
+                            self._discard_connected_client(client)
+                            or localization_details_changed
+                        )
                         client_ip = getattr(client, 'remote_address', 'Unknown') if hasattr(client, 'remote_address') else "Unknown"
                         self.logger.info(f"Cleaned up stale connection for client {client_ip}")
                 self.logger.debug(f"Cleaned up {len(stale_clients)} stale connections")
+                if localization_details_changed:
+                    await self._broadcast_localization_details_state()
 
         except Exception as e:
             self.logger.error(f"Error during connection cleanup: {e}")
@@ -3131,7 +3218,10 @@ class WebSocketServer:
                         "WebSocket client close handlers remained active after transport abort"
                     )
                 await asyncio.gather(*close_tasks, return_exceptions=True)
-                self.connected_clients.clear()
+                for client in list(self.connected_clients):
+                    self._discard_connected_client(client)
+                self._localization_details_requesters.clear()
+                self._set_localization_details_state(False)
                 self.logger.info("Closed %d client connections", len(close_tasks))
 
             if listener_wait_task is not None:
@@ -3247,6 +3337,27 @@ class WebSocketServer:
                 self.logger.info(f"Sent initial trail visualization state ({self.initial_trail_state}) to {client_ip}")
             except Exception as e:
                 self.logger.warning(f"Could not send initial trail visualization state to {client_ip}: {e}")
+
+            # Resolver comparison is off by default and connection-scoped.
+            # Send the effective state (not this client's preference) so a
+            # newly connected dashboard cannot render a stale local toggle.
+            try:
+                response_model_started_ns = time.perf_counter_ns()
+                await self._send_json_with_boundary_metrics(
+                    websocket,
+                    self._localization_details_message(),
+                    route="initial_localization_details_state",
+                    message_type="toggle_update",
+                    response_model_timing=self.response_model_timing_since(
+                        response_model_started_ns
+                    ),
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "Could not send initial localization details state to %s: %s",
+                    client_ip,
+                    e,
+                )
 
             # Send initial trail settings so UI trail tuning can mirror backend config.
             try:
@@ -3371,7 +3482,21 @@ class WebSocketServer:
                         if toggle_name is not None and isinstance(enabled, bool):
                             self.logger.info(f"Received set_vis_toggle from {client_ip}: {toggle_name} = {enabled}")
 
-                            # Call toggle callback if available
+                            if toggle_name == self.LOCALIZATION_DETAILS_TOGGLE:
+                                # This is a capability request, not a global
+                                # preference.  Keep rich resolver fields out
+                                # of the normal hot path unless at least one
+                                # connected dashboard explicitly asks for
+                                # them, then broadcast the effective state to
+                                # every connected dashboard.
+                                self._set_localization_details_preference(
+                                    websocket,
+                                    enabled,
+                                )
+                                await self._broadcast_localization_details_state()
+                                continue
+
+                            # Preserve existing global trail toggle behavior.
                             if self.toggle_callback:
                                 try:
                                     self.toggle_callback(toggle_name, enabled)
@@ -4369,6 +4494,9 @@ class WebSocketServer:
         finally:
             # Ensure client is removed from set - use discard to avoid KeyError if already removed
             try:
+                localization_details_changed = self._remove_localization_details_client(
+                    websocket
+                )
                 self.connected_clients.discard(websocket)
                 self._clear_gateway_owner_for_client(websocket)
                 if self._webrtc_owner is websocket:
@@ -4376,6 +4504,17 @@ class WebSocketServer:
                     self._webrtc_owner_ip = None
                 self.logger.info(f"Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
                 print(f"👋 Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
+                if localization_details_changed:
+                    # The final requesting client may disconnect without
+                    # sending an explicit off command.  Revoke the capability
+                    # immediately and tell every remaining dashboard.
+                    try:
+                        await self._broadcast_localization_details_state()
+                    except Exception:
+                        self.logger.debug(
+                            "Failed to broadcast localization details disable on disconnect",
+                            exc_info=True,
+                        )
             except Exception as e:
                 self.logger.warning(f"Error removing client {client_ip} from connected clients: {e}")
     
@@ -4633,12 +4772,17 @@ class WebSocketServer:
         finally:
             # Immediately clean up disconnected clients from the set
             if disconnected_clients:
+                localization_details_changed = False
                 for client in disconnected_clients:
-                    if client in self.connected_clients:
-                        self.connected_clients.remove(client)
-                        client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
-                        self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
+                    localization_details_changed = (
+                        self._discard_connected_client(client)
+                        or localization_details_changed
+                    )
+                    client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                    self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
                 self.logger.debug(f"Cleaned up {len(disconnected_clients)} disconnected clients during broadcast")
+                if localization_details_changed:
+                    await self._broadcast_localization_details_state()
     
     async def _broadcast_from_sync_submission(
         self,
@@ -5226,11 +5370,16 @@ class WebSocketServer:
                     self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
         # Cleanup
         if disconnected_clients:
+            localization_details_changed = False
             for client in disconnected_clients:
-                if client in self.connected_clients:
-                    self.connected_clients.remove(client)
-                    client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
-                    self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
+                localization_details_changed = (
+                    self._discard_connected_client(client)
+                    or localization_details_changed
+                )
+                client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
+            if localization_details_changed:
+                await self._broadcast_localization_details_state()
 
     async def _flush_binary_queue(self) -> None:
         """Flush latest binary frames per camera to all clients, dropping superseded frames."""

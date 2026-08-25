@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
+
 from noesis.pipelines import hooks
 
 
@@ -10,6 +12,8 @@ def _processor() -> object:
     processor._world_state_by_track = {}
     processor._world_state_ghost_by_track = {}
     processor._world_state_ghost_ttl_s = 0.75
+    processor._world_output_watermarks = hooks.OrderedDict()
+    processor._world_output_watermark_capacity = 8
     return processor
 
 
@@ -96,6 +100,28 @@ def test_reused_tracker_id_with_distant_bbox_starts_cold() -> None:
     assert replacement.last_good_world is None
 
 
+def test_same_lifecycle_generation_restores_ground_state_without_second_bbox_authority() -> None:
+    processor = _processor()
+    prior = _ground_state_for_bbox()
+    prior.tracker_lifecycle_generation = 7
+    prior.last_output_world_x = 1.0
+    prior.last_output_world_z = 2.0
+    processor._world_state_by_track[(2, 7)] = prior
+    processor._clear_absent_world_state(2, [], now_ts=10.0)
+
+    restored, was_restored = processor._world_state_for_observation(
+        (2, 7),
+        now_ts=10.2,
+        bbox=[100.0, 100.0, 200.0, 200.0],
+        lifecycle_generation=7,
+    )
+
+    assert was_restored is True
+    assert restored is prior
+    assert restored.last_output_world_x == 1.0
+    assert restored.last_output_world_z == 2.0
+
+
 def test_reused_tracker_id_with_new_lifecycle_generation_starts_cold() -> None:
     processor = _processor()
     prior = _ground_state_for_bbox()
@@ -112,6 +138,85 @@ def test_reused_tracker_id_with_new_lifecycle_generation_starts_cold() -> None:
     assert was_restored is False
     assert replacement is not prior
     assert replacement.last_good_world is None
+
+
+def test_same_public_lifecycle_retains_output_gate_when_measurement_state_is_recreated() -> None:
+    processor = _processor()
+    track = {
+        "tracker_id": 7,
+        "tracker_lifecycle_generation": 3,
+    }
+    key = processor._world_output_watermark_key(
+        2,
+        track,
+        world_frame_id="backend_world_m",
+        world_frame_revision="rev-a",
+        world_transform_sha256="transform-a",
+    )
+    assert key is not None
+
+    prior = hooks._WorldAnchorState()
+    prior.last_output_world_x = 1.0
+    prior.last_output_world_z = 2.0
+    prior.last_output_media_pts_ns = 1_000_000_000
+    prior.last_output_filter_ts = 10.0
+    prior.last_output_trail_segment_id = 0
+    processor._save_world_output_watermark(prior, key)
+
+    recreated = hooks._WorldAnchorState()
+    assert processor._restore_world_output_watermark(recreated, key) is True
+    emitted, accepted = hooks.admit_human_ground_output(
+        recreated,
+        candidate=np.array([2.0, 0.0, 2.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=10.033,
+        media_pts_ns=1_033_000_000,
+        config=hooks.HumanGroundConfig(max_speed_mps=4.0),
+    )
+
+    assert accepted is False
+    assert emitted.tolist() == [1.0, 0.0, 2.0]
+    assert recreated.measurement_rejection_reason == "physical_output_continuity_exceeded"
+
+
+def test_output_watermark_does_not_cross_generation_or_world_revision() -> None:
+    processor = _processor()
+    prior_key = processor._world_output_watermark_key(
+        2,
+        {"tracker_id": 7, "tracker_lifecycle_generation": 3},
+        world_frame_id="backend_world_m",
+        world_frame_revision="rev-a",
+        world_transform_sha256="transform-a",
+    )
+    assert prior_key is not None
+    prior = hooks._WorldAnchorState()
+    prior.last_output_world_x = 1.0
+    prior.last_output_world_z = 2.0
+    prior.last_output_filter_ts = 10.0
+    processor._save_world_output_watermark(prior, prior_key)
+
+    next_generation = processor._world_output_watermark_key(
+        2,
+        {"tracker_id": 7, "tracker_lifecycle_generation": 4},
+        world_frame_id="backend_world_m",
+        world_frame_revision="rev-a",
+        world_transform_sha256="transform-a",
+    )
+    next_revision = processor._world_output_watermark_key(
+        2,
+        {"tracker_id": 7, "tracker_lifecycle_generation": 3},
+        world_frame_id="backend_world_m",
+        world_frame_revision="rev-b",
+        world_transform_sha256="transform-b",
+    )
+    assert processor._restore_world_output_watermark(
+        hooks._WorldAnchorState(),
+        next_generation,
+    ) is False
+    assert processor._restore_world_output_watermark(
+        hooks._WorldAnchorState(),
+        next_revision,
+    ) is False
 
 
 def test_world_frame_revision_change_resets_filter_before_rejected_hold() -> None:

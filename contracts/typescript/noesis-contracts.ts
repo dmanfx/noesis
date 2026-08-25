@@ -598,6 +598,7 @@ export type ScenePriorCameraBinding = {
   readonly prior_id: string;
   readonly mode: "shadow";
   readonly include_floorplan_layers?: boolean;
+  readonly frame_binding?: ScenePriorFrameBinding | null;
 };
 
 export type ScenePriorCatalog = {
@@ -624,6 +625,32 @@ export type ScenePriorDerivation = {
   readonly obstacle_max_height_m: number;
   readonly obstacle_min_support: number;
   readonly max_source_height_m: number;
+};
+
+export type ScenePriorFloorPlane = {
+  readonly frame: ScenePriorFrameRef;
+  readonly normal: readonly [number, number, number];
+  readonly offset_m: number;
+};
+
+export type ScenePriorFrameBinding = {
+  readonly contract: "noesis.scene_prior.frame_binding";
+  readonly contract_version: 1;
+  readonly source_frame: ScenePriorFrameRef;
+  readonly target_frame: ScenePriorFrameRef;
+  readonly source_camera_calibration_sha256: string;
+  readonly source_world_alignment_sha256: string;
+  readonly target_revision_id: string;
+  readonly target_revision_metadata_sha256: string;
+  readonly target_from_source_col_major: ReadonlyArray<number>;
+  readonly target_from_source_sha256: string;
+  readonly source_floor_plane: ScenePriorFloorPlane;
+  readonly target_floor_plane: ScenePriorFloorPlane;
+};
+
+export type ScenePriorFrameRef = {
+  readonly frame_id: "backend_world_m";
+  readonly revision: string;
 };
 
 export type ScenePriorGrid = {
@@ -849,6 +876,13 @@ export type WorldEntity = {
   readonly lifecycle: EntityLifecycle;
   readonly position?: Vector3 | null;
   readonly covariance?: Matrix3 | null;
+  readonly world_frame?: "backend_world_m";
+  readonly world_frame_revision?: string | null;
+  readonly world_transform_sha256?: string | null;
+  readonly calibration_revision?: string | null;
+  readonly position_quantity?: "ground_footprint";
+  readonly support_state?: "floor" | "seat" | "couch" | "unknown";
+  readonly posture?: "standing" | "sitting" | "lying" | "unknown";
   readonly velocity_mps?: Vector3 | null;
   readonly room_id?: string | null;
   readonly observed_at_us: number;
@@ -871,8 +905,25 @@ export type WorldEvent = {
   readonly published_at_us: number;
   readonly frame: "backend_world_m";
   readonly units: "meters";
+  readonly world_frame?: "backend_world_m";
+  readonly world_frame_revision?: string | null;
+  readonly world_transform_sha256?: string | null;
+  readonly calibration_revision?: string | null;
   readonly position?: Vector3 | null;
   readonly reason?: string | null;
+};
+
+export type WorldMeasurementCandidateDiagnostic = {
+  readonly candidate_id: string;
+  readonly kind: "floor_ray" | "registered_depth" | "pose_scale" | "gravity_reconstruction";
+  readonly score: number;
+  readonly pcf_score: number;
+  readonly innovation_m?: number | null;
+  readonly agreement_mahalanobis_sq?: number | null;
+  readonly compatible_with_selected?: boolean;
+  readonly selected?: boolean;
+  readonly retained_as_alternate?: boolean;
+  readonly rejection_reason?: string | null;
 };
 
 export type WorldObservationDiagnostics = {
@@ -902,13 +953,31 @@ export type WorldObservationDiagnostics = {
   readonly depth_used_m?: number | null;
   readonly depth_registration_status?: string | null;
   readonly depth_registration_id?: string | null;
+  readonly resolver_selected_kind?: "floor_ray" | "registered_depth" | "pose_scale" | "gravity_reconstruction" | null;
+  readonly resolver_selected_candidate_id?: string | null;
+  readonly resolver_contributor_ids?: ReadonlyArray<string>;
+  readonly resolver_alternate_candidate_id?: string | null;
+  readonly resolver_fused?: boolean | null;
+  readonly resolver_confidence?: number | null;
+  readonly resolver_disagreement_m?: number | null;
+  readonly resolver_agreement_mahalanobis_sq?: number | null;
+  readonly resolver_pcf_score?: number | null;
+  readonly resolver_reason?: string | null;
+  readonly resolver_candidate_diagnostics?: ReadonlyArray<WorldMeasurementCandidateDiagnostic>;
 };
 
 export type WorldPositionObservation = {
   readonly position: Vector3;
   readonly covariance: Matrix3;
-  readonly frame: "backend_world_m";
-  readonly units: "meters";
+  readonly frame?: "backend_world_m";
+  readonly world_frame?: "backend_world_m";
+  readonly units?: "meters";
+  readonly world_frame_revision?: string | null;
+  readonly world_transform_sha256?: string | null;
+  readonly calibration_revision?: string | null;
+  readonly quantity?: "ground_footprint";
+  readonly support_state?: "floor" | "seat" | "couch" | "unknown";
+  readonly posture?: "standing" | "sitting" | "lying" | "unknown";
   readonly source: string;
   readonly quality: "good" | "estimated" | "held";
   readonly confidence: number;
@@ -938,6 +1007,10 @@ export type WorldSourceEvidence = {
   readonly observed_at_us: number;
   readonly position: Vector3;
   readonly covariance: Matrix3;
+  readonly world_frame?: "backend_world_m";
+  readonly world_frame_revision?: string | null;
+  readonly world_transform_sha256?: string | null;
+  readonly calibration_revision?: string | null;
   readonly accepted: boolean;
   readonly rejection_reason?: string | null;
 };

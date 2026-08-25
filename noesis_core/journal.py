@@ -10,14 +10,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 from noesis_core.private_paths import (
     PrivatePathError,
     prepare_private_writable_file,
     validate_private_file,
 )
-from noesis_core.replay import ReplayValidationError, validate_contract_payload
+from noesis_core.replay import (
+    ReplayValidationError,
+    validate_contract_payload,
+    validate_stored_contract_payload,
+)
 from noesis_core.strict_json import StrictJSONError, strict_json_loads
 
 
@@ -32,6 +36,14 @@ class JournalRecord:
     payload: Mapping[str, Any]
     previous_sha256: str
     record_sha256: str
+
+
+class AsyncJournalAdmissionReceipt(NamedTuple):
+    """Bounded non-durable admission receipt for optional persistence."""
+
+    payload_count: int
+    pending_batches: int
+    max_pending_batches: int
 
 
 def _canonical_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -631,7 +643,7 @@ class ContractJournal:
                     f"journal contract column mismatch at sequence {sequence}"
                 )
             try:
-                validated = validate_contract_payload(payload)
+                validated = validate_stored_contract_payload(payload)
             except ReplayValidationError as exc:
                 raise ContractJournalError(
                     f"journal payload contract is invalid at sequence {sequence}"
@@ -1103,12 +1115,35 @@ class AsyncContractJournal:
         )
         self._thread.start()
 
+    @property
+    def max_records(self) -> int | None:
+        value = getattr(self.journal, "max_records", None)
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def health_snapshot(self) -> dict[str, Any]:
+        with self._failure_lock:
+            failure = self._failure
+        with self._state_lock:
+            closed = bool(self._closed)
+            pending = int(self._queue.qsize())
+        return {
+            "status": "failed" if failure is not None else ("closed" if closed else "healthy"),
+            "pending_batches": pending,
+            "max_pending_batches": int(self._queue.maxsize),
+            "worker_alive": bool(self._thread.is_alive()),
+            "last_error": (
+                f"{type(failure).__name__}: {failure}"
+                if failure is not None
+                else None
+            ),
+        }
+
     def append_many(
         self,
         payloads: Iterable[Mapping[str, Any]],
         *,
         recorded_at_us: int,
-    ) -> tuple[JournalRecord, ...]:
+    ) -> AsyncJournalAdmissionReceipt:
         self._raise_if_failed()
         timestamp = int(recorded_at_us)
         if timestamp <= 0:
@@ -1122,14 +1157,22 @@ class AsyncContractJournal:
             if self._closed:
                 raise ContractJournalError("async contract journal is closed")
             if not validated:
-                return ()
+                return AsyncJournalAdmissionReceipt(
+                    payload_count=0,
+                    pending_batches=int(self._queue.qsize()),
+                    max_pending_batches=int(self._queue.maxsize),
+                )
             try:
                 self._queue.put_nowait((validated, timestamp))
             except Full as exc:
                 raise ContractJournalError(
                     "async contract journal queue is full; persistence is not keeping up"
                 ) from exc
-        return ()
+            return AsyncJournalAdmissionReceipt(
+                payload_count=len(validated),
+                pending_batches=int(self._queue.qsize()),
+                max_pending_batches=int(self._queue.maxsize),
+            )
 
     def _run(self) -> None:
         while True:
@@ -1200,6 +1243,7 @@ class AsyncContractJournal:
 
 
 __all__ = [
+    "AsyncJournalAdmissionReceipt",
     "AsyncContractJournal",
     "ContractJournal",
     "ContractJournalError",

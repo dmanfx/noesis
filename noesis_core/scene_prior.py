@@ -364,6 +364,17 @@ class LoadedScenePrior:
         sampled = self.sample(np.asarray(world[0]), np.asarray(world[2]))
         inside_extent = bool(np.asarray(sampled["inside_extent"]).item())
         if not inside_extent:
+            bounds = self.manifest.grid.bounds
+            outside_x_m = max(
+                float(bounds.min_x) - world[0],
+                0.0,
+                world[0] - float(bounds.max_x),
+            )
+            outside_z_m = max(
+                float(bounds.min_z) - world[2],
+                0.0,
+                world[2] - float(bounds.max_z),
+            )
             return {
                 "contract": "noesis.scene_prior.track_diagnostic",
                 "contract_version": 1,
@@ -374,6 +385,9 @@ class LoadedScenePrior:
                 "status": "unknown",
                 "inside_extent": False,
                 "inside_authored_space": False,
+                "extent_outside_distance_m": round(
+                    math.hypot(outside_x_m, outside_z_m), 6
+                ),
                 "evidence_observed": False,
                 "evidence_confidence": 0.0,
                 "reasons": ["outside_prior_extent"],
@@ -418,6 +432,7 @@ class LoadedScenePrior:
             "status": status,
             "inside_extent": True,
             "inside_authored_space": inside_authored,
+            "extent_outside_distance_m": 0.0,
             "evidence_observed": observed,
             "evidence_confidence": round(confidence, 6),
             "boundary_signed_distance_m": round(boundary, 6),

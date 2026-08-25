@@ -82,9 +82,12 @@ An approved PCF candidate is sealed as a room-scan bundle and converted into an
 immutable, camera-bound Scene Prior before Noesis may load it. For that admitted
 Scene Prior, the depth drawer and BEV floorplan use the PCF reconstruction.
 Full measured reconstruction extent is distinct from authored semantic room
-membership. Live tracking authority is paired into the PCF BEV payload; PCF
-does not create, move, or replace tracks. The canonical lifecycle and gates are
-in [`PCF_Workflow.md`](PCF_Workflow.md).
+membership. Live tracking authority is paired into the PCF BEV payload. PCF
+does not create or replace tracks, manufacture measurements, or clamp points.
+Under ADR-024, revision-matched reliable PCF fields may act only as soft
+likelihood evidence when the universal resolver adjudicates independently
+generated person hypotheses. The canonical lifecycle and gates are in
+[`PCF_Workflow.md`](PCF_Workflow.md).
 
 **Why:** Phone coverage produces the clearest room geometry observed so far;
 DA3 supplies the stable metric pose carrier, sparse DA3 depth constrains
@@ -555,3 +558,92 @@ observation/session SQLite mutations dominated that tail. Sharing the exact
 publication worker therefore accumulated backlog until its finite queue
 failed. Shadow comparison and visitor persistence are reconstructable evidence;
 tracking/world/BEV are the product authority and must remain independent.
+
+## ADR-024 — One universal uncertainty-aware person localization resolver
+
+**Accepted:** 2026-08-25
+
+The canonical baseline no longer selects a floor-only, depth-only, or nominally
+fused algorithm by camera or room. It constructs a bounded exact-cohort set of
+independent `floor_ray`, `registered_depth`, optional `pose_scale`, and
+`gravity_reconstruction` hypotheses and resolves them with one camera-agnostic
+algorithm. Camera-specific calibration and registration residuals enter as
+measurement evidence and covariance; camera, room, site, and home identity
+never select estimator behavior. The historical
+`world_measurement_fusion_policy.json` remains non-authoritative comparison
+material. The native baseline validates and loads it into a separate
+diagnostic-only field, then consults it only while a dashboard requests
+`Localization details`. It reconstructs the retired current-frame selection
+from the resolver's already-built compact candidates; it cannot feed
+`track.world`, PersonGroundState, or any canonical consumer.
+
+Every candidate carries a finite 3x3 PSD covariance derived from its geometry
+and evidence. A mutually compatible contributor set combines through
+covariance intersection. Compatibility requires both statistical agreement
+and a bounded absolute metric separation against every contributor, not only
+the primary. Substantially disagreeing candidates are not averaged: the best
+supported candidate remains primary, one incompatible alternate is retained,
+and output covariance is inflated. Prediction and hold are explicit process
+continuations, never measurements or fresh global-fusion evidence.
+
+`PersonGroundState` remains the only temporal filter, physical gate,
+stationary lock, reacquisition, and trail-state authority. The resolver feeds
+one current `ground_footprint` measurement into that existing state; it does
+not introduce another tracker or smoother. Public covariance is attached only
+after the current measurement is physically accepted and is enlarged by any
+resolver-to-filter displacement. Body root and semantic support surfaces are
+separate future quantities, not aliases of ground footprint.
+
+Revision-matched PCF contributes soft extent, authored-boundary,
+observed-confidence, and floor-height evidence. It never clamps or snaps a
+track. A strong authored-boundary or measured-extent contradiction keeps the
+candidate unchanged for diagnostics but makes it weak before temporal
+admission; two agreeing candidates cannot reinforce the same contradiction
+into an accepted fusion. Unlabeled obstacle/furniture evidence is diagnostic
+only. BEV, OSD, the dashboard, canonical world service, and later Menon views
+consume the same filtered revision-bound world point. The normal dashboard's
+off-by-default `Localization details` overlay may draw exact-cohort candidates,
+uncertainty, and disagreement, but cannot affect the dot or trail.
+
+Every canonical spatial handoff preserves tracker lifecycle, target-frame
+revision, and source-to-world transform SHA-256. BEV fails closed on any
+mismatch. The global service refuses incomplete or mixed target revisions and
+uses full-matrix covariance intersection for compatible cameras; it never
+promotes `cv_prediction`, `image_motion_prediction`, or `anchor_hold` into a
+fresh global measurement.
+
+The exact contract and practical tests are specified in
+[`universal_world_localization.md`](universal_world_localization.md).
+
+**Why:** The prior path calculated several useful geometric signals but
+collapsed them through different per-room policies before the canonical world
+layer could compare their support or uncertainty. Some outputs labeled
+"fused" numerically used only depth X/Z. Preserving typed hypotheses and
+honest covariance connects the existing camera-local human estimator to the
+existing canonical world service without duplicating PersonGroundState or
+making a depth model the organizing authority.
+
+## ADR-025 — Reconstructable world persistence is isolated from spatial authority
+
+**Accepted:** 2026-08-25
+
+The exact tracking, world-snapshot/event, and BEV cohort remains ordered and
+release-gated on its in-memory canonical world commit. The world journal is
+reconstructable retention, not localization authority. Runtime therefore
+admits the exact already-validated journal payload tuple to one finite
+`AsyncContractJournal`; its receipt proves the queued payload count, not
+durability. The worker batches writes into the existing private,
+integrity-chained synchronous SQLite journal and exposes pending, capacity,
+worker, and failure health.
+
+Queue saturation or durable-write failure degrades only persistence and cannot
+wait on, mutate, abort, or poison the media or canonical spatial-publication
+path. An authority commit or WebSocket release-gate failure remains fail-closed
+for the whole exact cohort. Orderly shutdown drains the persistence worker and
+then closes the durable journal.
+
+**Why:** Paced occupied replay showed that durable SQLite work on the exact
+publication worker creates backlog even after query-level optimization. The
+journal can be reconstructed from canonical publications; making live tracking
+wait for disk violates the accepted hot-path boundary without improving the
+world estimate.

@@ -166,7 +166,11 @@ For a bound camera:
 - `tracks[].scene_prior` reports pass, warning, fail, unknown, or error against
   the exact backend-world prior. It includes room containment, observed-state,
   confidence, boundary distance, obstacle clearance, static height, and stable
-  reason codes. It cannot alter the adjacent world fields.
+  reason codes. The revision-matched universal localization resolver may use
+  extent, authored-boundary, observed-confidence, and floor-height values as
+  soft evidence when adjudicating independently generated person hypotheses.
+  The prior cannot manufacture a measurement, clamp a point, or replace the
+  adjacent canonical world fields.
 - A normal fresh `floorplan_response` retains every live layer and adds static
   and composite layers in the same current `camera_local_ground_m` grid. Live
   observed cells always win; the prior fills only live unknown cells. This
@@ -196,8 +200,10 @@ For a bound camera:
   the exact prior identity.
 
 V1 deliberately does not infer named furniture, doorway topology, navigation
-policy, occlusion correction, or tracking authority. Those require separate
-reviewed contracts and evidence before promotion beyond shadow diagnostics.
+policy, occlusion correction, or independent tracking authority. Unlabeled
+obstacle/furniture evidence remains diagnostic for person localization. Named
+supports and stronger semantic factors require separate reviewed contracts and
+evidence.
 
 ## Current deployed revisions
 

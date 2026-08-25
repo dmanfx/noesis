@@ -40,6 +40,7 @@ import {
   bevMatchesFloorplan,
   clearBevForStatus,
 } from './lib/bevPayloadAdmission.js';
+import { requestLocalizationDetailsChange } from './lib/bevResolverDiagnostics';
 
 const WS_URL = noesisWebSocketUrl();
 const REST_URL = NOESIS_REST_BASE;
@@ -201,6 +202,9 @@ function Dashboard() {
   }, [tracksByCamera]);
 
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
+  // Resolver comparison is a connection-scoped backend capability.  Keep one
+  // dashboard-wide state so all BEV instances request/release it together.
+  const [localizationDetailsEnabled, setLocalizationDetailsEnabled] = useState<boolean>(false);
   const [bevTrailConfig, setBevTrailConfig] = useState<Partial<BevTrailConfig>>({});
   const trailStoreRef = useRef(new TrailStore());
   const prevActiveRef = useRef<Record<CameraKey, Set<string>>>(
@@ -1331,6 +1335,7 @@ function Dashboard() {
     status,
     sendClearStats,
     sendTrailToggle,
+    sendLocalizationDetailsToggle,
     requestMapAnythingDepth,
     requestFloorplan,
     sendAutoCalibrate,
@@ -1342,6 +1347,9 @@ function Dashboard() {
     onTrailToggle: (en) => {
       setTrailEnabled(en);
       setBevTrailConfig((prev) => ({ ...prev, enabled: en }));
+    },
+    onLocalizationDetailsToggle: (en) => {
+      setLocalizationDetailsEnabled(en);
     },
     onTrailSettings: (config) => {
       if (!config || typeof config !== 'object') return;
@@ -1375,6 +1383,14 @@ function Dashboard() {
       setWebrtcError(error);
     },
   });
+
+  const handleLocalizationDetailsChange = useCallback((enabled: boolean) => {
+    requestLocalizationDetailsChange(
+      enabled,
+      sendLocalizationDetailsToggle,
+      setLocalizationDetailsEnabled,
+    );
+  }, [sendLocalizationDetailsToggle]);
 
   const requestFloorplanRef = useRef(requestFloorplan);
   useEffect(() => {
@@ -1776,6 +1792,8 @@ function Dashboard() {
                 trailEnabled={trailEnabled}
                 trailConfig={bevTrailConfig}
                 debug={bevDebugEnabled}
+                resolverComparisonEnabled={localizationDetailsEnabled}
+                onResolverComparisonChange={handleLocalizationDetailsChange}
                 variant="inline"
               />
             ))}
@@ -1791,6 +1809,8 @@ function Dashboard() {
                   trailEnabled={trailEnabled}
                   trailConfig={bevTrailConfig}
                   debug={bevDebugEnabled}
+                  resolverComparisonEnabled={localizationDetailsEnabled}
+                  onResolverComparisonChange={handleLocalizationDetailsChange}
                   variant="inline"
                 />
               ))}
@@ -1905,6 +1925,8 @@ function Dashboard() {
                 trailEnabled={trailEnabled}
                 trailConfig={bevTrailConfig}
                 debug={bevDebugEnabled}
+                resolverComparisonEnabled={localizationDetailsEnabled}
+                onResolverComparisonChange={handleLocalizationDetailsChange}
                 variant="inline"
               />
             </div>

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from noesis_core.runtime_world import create_runtime_world_service
-from noesis_core.journal import ContractJournal
+from noesis_core.journal import AsyncContractJournal, ContractJournal
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,10 @@ def test_runtime_world_service_fingerprints_real_file_content(tmp_path: Path) ->
         journal_path=tmp_path / "journal-a.sqlite3",
     )
     first = service_a.publish(0, [_track("kitchen")], metadata={"camera_id": "kitchen"})
-    assert isinstance(service_a._journal, ContractJournal)
-    assert len(ContractJournal(tmp_path / "journal-a.sqlite3").records()) == 2
+    assert isinstance(service_a._journal, AsyncContractJournal)
+    service_a._journal.flush()
+    assert isinstance(service_a._journal.journal, ContractJournal)
+    assert len(service_a._journal.journal.records()) == 2
 
     model.write_bytes(b"model-b")
     service_b = create_runtime_world_service(
@@ -73,11 +75,15 @@ def test_runtime_world_service_fingerprints_real_file_content(tmp_path: Path) ->
 
     assert first.observations[0].model.sha256 != second.observations[0].model.sha256
     assert first.observations[0].calibration.role == "camera_calibration"
-    persisted = ContractJournal(tmp_path / "journal-a.sqlite3").records()
-    assert [record.payload["contract"] for record in persisted] == [
-        "noesis.observation.person",
-        "noesis.world.snapshot",
-    ]
+    reopened = ContractJournal(tmp_path / "journal-a.sqlite3")
+    try:
+        persisted = reopened.records()
+        assert [record.payload["contract"] for record in persisted] == [
+            "noesis.observation.person",
+            "noesis.world.snapshot",
+        ]
+    finally:
+        reopened.close()
 
 
 def test_missing_calibration_is_explicit_in_provenance(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import pytest
 from noesis.telemetry.person_ground_state import (
     HumanGroundConfig,
     PersonGroundState,
+    admit_human_ground_output,
     apply_source_hysteresis,
     advance_human_cv_prediction,
     assess_lower_body_occlusion,
@@ -622,6 +623,77 @@ def test_phase4_same_segment_output_never_exceeds_human_speed() -> None:
     assert state.trail_break_required is False
 
 
+def test_canonical_output_gate_quarantines_hidden_process_jump_in_media_time() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, reset_after_s=1.25)
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=10.0,
+        motion_mode="walk",
+    )
+    first, admitted = admit_human_ground_output(
+        state,
+        candidate=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=10.0,
+        media_pts_ns=1_000_000_000,
+        config=cfg,
+    )
+    assert admitted is True
+    assert first == pytest.approx([0.0, 0.0, 0.0])
+
+    # Simulate an alternate process path drifting farther than a person can
+    # travel over two 30fps media frames.  The boundary holds the prior point;
+    # it never emits a post-hoc slew toward the divergent candidate.
+    state.world_x = 0.64
+    state.world_z = 0.0
+    held, admitted = admit_human_ground_output(
+        state,
+        candidate=np.array([0.64, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=10.3,
+        media_pts_ns=1_066_666_667,
+        config=cfg,
+    )
+    assert admitted is False
+    assert held == pytest.approx([0.0, 0.0, 0.0])
+    assert state.world_x == pytest.approx(0.0)
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "physical_output_continuity_exceeded"
+    assert state.measurement_allowed_m == pytest.approx(4.0 * 0.066666667)
+    assert state.trail_append_allowed is False
+
+
+def test_canonical_output_gate_accepts_explicit_reanchor_with_trail_break() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0)
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=5.0,
+    )
+    admit_human_ground_output(
+        state,
+        candidate=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=5.0,
+        media_pts_ns=2_000_000_000,
+        config=cfg,
+    )
+    state.trail_break_required = True
+    state.trail_segment_id = 1
+    relocated, admitted = admit_human_ground_output(
+        state,
+        candidate=np.array([3.0, 0.0, 2.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=5.033,
+        media_pts_ns=2_033_333_333,
+        config=cfg,
+    )
+    assert admitted is True
+    assert relocated == pytest.approx([3.0, 0.0, 2.0])
+    assert state.last_output_trail_segment_id == 1
+
+
 def test_phase4_normalizes_restored_overspeed_velocity_before_prior() -> None:
     """A direct reader cannot observe an over-speed CV prior after update."""
 
@@ -822,6 +894,71 @@ def test_phase4_rejected_measurement_is_pure_cv_time_update() -> None:
     assert state.measurement_rejection_reason == "physical_innovation_exceeded"
     assert state.last_good_world == pytest.approx((0.0, 0.0, 0.0))
     assert state.last_good_ts == pytest.approx(0.0)
+
+
+def test_bounded_process_velocity_change_cannot_jump_from_previous_posterior() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, rejected_prediction_horizon_s=1.0)
+    state = PersonGroundState(
+        world_x=0.4,
+        world_z=0.0,
+        vel_world_x=-4.0,
+        vel_world_z=0.0,
+        filtered_ts=0.1,
+        last_good_world=(0.0, 0.0, 0.0),
+        last_good_ts=0.0,
+        rejection_anchor_x=0.0,
+        rejection_anchor_z=0.0,
+        rejection_anchor_ts=0.0,
+    )
+
+    out = advance_human_cv_prediction(
+        state,
+        floor_y=0.0,
+        now_ts=0.2,
+        config=cfg,
+    )
+
+    # The anchor-relative candidate would be -0.8 m, a 1.2 m visible jump in
+    # 100 ms.  Quarantine it as a hold rather than publishing a synthetic slew.
+    assert out == pytest.approx([0.4, 0.0, 0.0])
+    assert state.measurement_accepted is False
+    assert state.measurement_rejection_reason == "bounded_process_continuity_exceeded"
+    assert state.trail_append_allowed is False
+
+
+def test_rewound_projective_update_cannot_move_again_at_same_frame_timestamp() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, max_jump_m=0.75)
+    state = PersonGroundState(
+        world_x=0.2,
+        world_z=0.0,
+        vel_world_x=1.0,
+        vel_world_z=0.0,
+        filtered_ts=0.2,
+        last_good_world=(0.0, 0.0, 0.0),
+        last_good_ts=0.0,
+        rejection_anchor_x=0.0,
+        rejection_anchor_z=0.0,
+        rejection_anchor_ts=0.0,
+        rejection_previous_world_x=0.4,
+        rejection_previous_world_z=0.0,
+        rejection_previous_world_ts=0.1,
+        measurement_accepted=False,
+        measurement_rejection_reason="physical_innovation_exceeded",
+    )
+
+    out = integrate_projective_ground_observation(
+        state,
+        measurement=np.array([-0.5, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.2,
+        config=cfg,
+    )
+
+    assert out is None
+    assert state.world_x == pytest.approx(0.2)
+    assert state.world_z == pytest.approx(0.0)
+    assert state.filtered_ts == pytest.approx(0.2)
+    assert state.measurement_rejection_reason == "physical_innovation_exceeded"
 
 
 def test_phase4_rejected_prediction_is_bounded_and_reacquirable() -> None:

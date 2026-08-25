@@ -21,6 +21,7 @@ from .base import (
     Vector3,
 )
 from .identity import TrackletRef
+from .world_measurement import WorldMeasurementCandidateDiagnostic
 
 
 ZoneSource = Literal["nvdsanalytics_roi", "camera_default"]
@@ -29,12 +30,63 @@ ZoneSource = Literal["nvdsanalytics_roi", "camera_default"]
 class WorldPositionObservation(ContractModel):
     position: Vector3
     covariance: Matrix3
-    frame: Literal["backend_world_m"]
-    units: Literal["meters"]
+    # ``frame``/``units`` are retained as the v1 envelope-facing names.
+    # ``world_frame`` and the revisioned identity below are the canonical
+    # registration identity and must travel with a world-valid observation.
+    frame: Literal["backend_world_m"] = "backend_world_m"
+    world_frame: Literal["backend_world_m"] = "backend_world_m"
+    units: Literal["meters"] = "meters"
+    world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    world_transform_sha256: Sha256 | None = None
+    calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    # The world position published by the tracking path is a ground
+    # footprint.  Body-root geometry is intentionally not implied by this
+    # contract, especially for seated or occluded people.
+    quantity: Literal["ground_footprint"] = "ground_footprint"
+    support_state: Literal["floor", "seat", "couch", "unknown"] = "unknown"
+    posture: Literal["standing", "sitting", "lying", "unknown"] = "unknown"
     source: str = Field(min_length=1, max_length=120)
     quality: Literal["good", "estimated", "held"]
     confidence: Confidence
     reason: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _registration_identity_is_coherent(self) -> "WorldPositionObservation":
+        if self.frame != self.world_frame:
+            raise ValueError("world frame aliases must agree")
+        if (self.world_frame_revision is None) != (
+            self.world_transform_sha256 is None
+        ):
+            raise ValueError(
+                "world frame revision and transform fingerprint must be provided together"
+            )
+        values = tuple(float(value) for value in self.covariance.values)
+        if len(values) != 9 or not all(math.isfinite(value) for value in values):
+            raise ValueError("world covariance must be finite and 3x3")
+        scale = max(1.0, *(abs(value) for value in values))
+        tolerance = 1e-8 * scale
+        if any(
+            abs(values[left] - values[right]) > tolerance
+            for left, right in ((1, 3), (2, 6), (5, 7))
+        ):
+            raise ValueError("world covariance must be symmetric")
+        if any(values[index] < -tolerance for index in (0, 4, 8)):
+            raise ValueError("world covariance must be positive semidefinite")
+        minors = (
+            values[0] * values[4] - values[1] * values[3],
+            values[0] * values[8] - values[2] * values[6],
+            values[4] * values[8] - values[5] * values[7],
+        )
+        if any(minor < -tolerance for minor in minors):
+            raise ValueError("world covariance must be positive semidefinite")
+        determinant = (
+            values[0] * (values[4] * values[8] - values[5] * values[7])
+            - values[1] * (values[3] * values[8] - values[5] * values[6])
+            + values[2] * (values[3] * values[7] - values[4] * values[6])
+        )
+        if determinant < -tolerance:
+            raise ValueError("world covariance must be positive semidefinite")
+        return self
 
 
 class WorldObservationDiagnostics(ContractModel):
@@ -66,6 +118,27 @@ class WorldObservationDiagnostics(ContractModel):
     depth_used_m: float | None = None
     depth_registration_status: str | None = Field(default=None, max_length=120)
     depth_registration_id: str | None = Field(default=None, max_length=200)
+    # Universal resolver summary.  Candidate diagnostics are deliberately
+    # bounded and carry no raw image/depth data, so this can travel with the
+    # canonical observation/world cohort and later feed BEV debug rendering.
+    resolver_selected_kind: Literal[
+        "floor_ray",
+        "registered_depth",
+        "pose_scale",
+        "gravity_reconstruction",
+    ] | None = None
+    resolver_selected_candidate_id: str | None = Field(default=None, max_length=120)
+    resolver_contributor_ids: tuple[str, ...] = Field(default=(), max_length=4)
+    resolver_alternate_candidate_id: str | None = Field(default=None, max_length=120)
+    resolver_fused: bool | None = None
+    resolver_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    resolver_disagreement_m: float | None = Field(default=None, ge=0.0)
+    resolver_agreement_mahalanobis_sq: float | None = Field(default=None, ge=0.0)
+    resolver_pcf_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    resolver_reason: str | None = Field(default=None, max_length=240)
+    resolver_candidate_diagnostics: tuple[WorldMeasurementCandidateDiagnostic, ...] = Field(
+        default=(), max_length=4
+    )
 
     @model_validator(mode="after")
     def _numeric_evidence_is_finite(self) -> "WorldObservationDiagnostics":
@@ -92,6 +165,8 @@ class WorldObservationDiagnostics(ContractModel):
             self.depth_anchor_m,
             self.depth_registered_m,
             self.depth_used_m,
+            self.resolver_disagreement_m,
+            self.resolver_agreement_mahalanobis_sq,
         ):
             if value is not None and not math.isfinite(value):
                 raise ValueError("world diagnostic scalar values must be finite")

@@ -12,7 +12,7 @@ import re
 import time
 import threading
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -68,6 +68,18 @@ from noesis_core.servicemaker_shutdown import is_synthetic_stub_pipeline
 from noesis_core.depth_contract import usable_registered_depth_m
 from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
 from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
+from noesis_core.contracts.base import Matrix3, Vector3
+from noesis_core.contracts.world_measurement import (
+    ResolvedGroundMeasurement,
+    WorldMeasurementCohort,
+    WorldMeasurementHypothesis,
+    WorldMeasurementSet,
+    WorldPriorEvidence,
+)
+from noesis_core.world.resolver import (
+    UniversalWorldMeasurementResolver,
+    WorldMeasurementResolverConfig,
+)
 from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
     TrackingContinuityUpdate,
@@ -84,6 +96,7 @@ from noesis.telemetry.person_ground_state import (
     HumanGroundConfig,
     PersonGroundState,
     PoseAnchorCandidate,
+    admit_human_ground_output,
     assess_lower_body_occlusion,
     advance_human_cv_prediction,
     bind_world_frame,
@@ -1444,6 +1457,7 @@ def attach_analytics_telemetry_hook(
     bev_calibration: Any | None = None,
     depth_registration: DepthRegistrationManager | None = None,
     world_fusion_policy: WorldFusionPolicy | None = None,
+    legacy_world_fusion_policy: WorldFusionPolicy | None = None,
     scene_priors: ScenePriorSet | None = None,
     diagnostics_logger: "TrackingDiagnosticsLogger" | None = None,
     publication_gate: RuntimePublicationGate,
@@ -1472,6 +1486,7 @@ def attach_analytics_telemetry_hook(
         bev_calibration=bev_calibration,
         depth_registration=depth_registration,
         world_fusion_policy=world_fusion_policy,
+        legacy_world_fusion_policy=legacy_world_fusion_policy,
         scene_priors=scene_priors,
         diagnostics_logger=diagnostics_logger,
         publication_gate=publication_gate,
@@ -3742,6 +3757,17 @@ class _WorldClockState:
     logical_ts: Optional[float] = None
     last_observed_ts: Optional[float] = None
     basis: str = "observed_clock"
+
+
+@dataclass(frozen=True)
+class _WorldOutputWatermark:
+    """Last canonical point emitted for one exact tracker lifecycle."""
+
+    world_x: float
+    world_z: float
+    media_pts_ns: Optional[int]
+    filter_ts: float
+    trail_segment_id: int
 
 
 # Product-owned person-ground state and scoring stay single-source. DS9 only
@@ -8237,7 +8263,7 @@ class _ObjectDepthFusionProcessor:
             samples_remaining -= 1
             sample_start_ns = time.perf_counter_ns()
             if not depth_frame_resolved:
-                depth_frame, _age_frames, _age_ms = self.depth_store.resolve(
+                depth_frame, depth_tensor_age_frames, _age_ms = self.depth_store.resolve(
                     source_id=source_id,
                     frame_id=frame_id,
                     pts_us=pts_us,
@@ -8271,6 +8297,14 @@ class _ObjectDepthFusionProcessor:
                 result = self._sample_person_result(frame_meta, obj_meta, depth_frame)
             if result is None:
                 continue
+            depth_tensor_age_us = max(0, int(pts_us) - int(depth_frame.pts_us))
+            result = replace(
+                result,
+                depth_tensor_frame_id=int(depth_frame.frame_id),
+                depth_tensor_ts_us=int(depth_frame.pts_us),
+                depth_tensor_age_frames=max(0, int(depth_tensor_age_frames)),
+                depth_tensor_age_us=int(depth_tensor_age_us),
+            )
             _record_core_stage_timing("object_depth.sample_person", sample_start_ns)
             _increment_core_counter("detection_wake.object_depth_sampled")
             track_key = self._track_key(source_id, obj_meta)
@@ -8993,6 +9027,10 @@ class _AnalyticsTelemetryProcessor:
     bev_calibration: Any = None
     depth_registration: DepthRegistrationManager | None = None
     world_fusion_policy: WorldFusionPolicy | None = None
+    # Retired room-specific selection policy retained only for the
+    # request-gated dashboard comparison. Canonical resolution never consults
+    # this field.
+    legacy_world_fusion_policy: WorldFusionPolicy | None = None
     scene_priors: ScenePriorSet | None = None
     diagnostics_logger: Any = None
     osd_label_processor: Any = None
@@ -9054,6 +9092,16 @@ class _AnalyticsTelemetryProcessor:
     _world_state_ghost_by_track: Dict[
         Tuple[int, int], Tuple[_WorldAnchorState, float]
     ] = field(default_factory=dict, init=False, repr=False)
+    _world_output_watermarks: "OrderedDict[Tuple[int, int, int, str, str, str], _WorldOutputWatermark]" = field(
+        default_factory=OrderedDict,
+        init=False,
+        repr=False,
+    )
+    _world_output_watermark_capacity: int = field(
+        default=4096,
+        init=False,
+        repr=False,
+    )
     _world_state_ghost_ttl_s: float = field(default=0.75, init=False, repr=False)
     _world_state_ttl_s: float = field(default=3.0, init=False, repr=False)
     _world_state_prune_interval_s: float = field(default=1.0, init=False, repr=False)
@@ -9074,6 +9122,27 @@ class _AnalyticsTelemetryProcessor:
     _world_height_max_m: float = field(default=2.40, init=False, repr=False)
     _world_anchor_hold_ttl_s: float = field(default=0.40, init=False, repr=False)
     _world_stationary_hold_ttl_s: float = field(default=2.0, init=False, repr=False)
+    # The canonical DS9 config explicitly enables this resolver.  A processor
+    # constructed without the canonical block remains a legacy fixture; the
+    # active native baseline never relies on that omission.
+    _world_resolver_enabled: bool = field(default=False, init=False, repr=False)
+    _world_resolver_max_range_m: float = field(default=22.0, init=False, repr=False)
+    _world_resolver_max_disagreement_m: float = field(default=1.25, init=False, repr=False)
+    _world_resolver_diag_max_candidates: int = field(default=4, init=False, repr=False)
+    # Rich candidate diagnostics are optional presentation work.  Canonical
+    # resolution and the compact public summary remain enabled independently;
+    # keeping this false avoids recursively copying and serializing the full
+    # hypothesis tree on every exact tracking/BEV cohort.
+    _world_resolver_diagnostics_enabled: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
+    _world_resolver: UniversalWorldMeasurementResolver | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _reid_embeds_per_frame_max: int = field(default=2, init=False, repr=False)
     _pose_anchor_native_per_frame_max: int = field(default=1, init=False, repr=False)
     _pose_anchor_native_remaining: int = field(default=1, init=False, repr=False)
@@ -9329,6 +9398,95 @@ class _AnalyticsTelemetryProcessor:
                 self._world_anchor_hold_ttl_s,
                 2.0,
             )
+        # Universal world measurement resolution is an explicit canonical
+        # baseline capability.  It consumes one generic config block rather
+        # than selecting behavior from camera or room names.  Environment
+        # overrides are intentionally absent: changing estimator behavior is a
+        # config/replay decision, not a hot-path process toggle.
+        pipeline_cfg = getattr(self.pipeline, "config", {}) or {}
+        canonical_cfg = (
+            pipeline_cfg.get("canonical_world", {})
+            if isinstance(pipeline_cfg, Mapping)
+            else {}
+        )
+        resolver_cfg = (
+            canonical_cfg.get("measurement_resolver")
+            if isinstance(canonical_cfg, Mapping)
+            else None
+        )
+        if resolver_cfg is not None:
+            if not isinstance(resolver_cfg, Mapping):
+                raise ValueError("canonical_world.measurement_resolver must be a mapping")
+            try:
+                required_resolver_keys = {
+                    "enabled",
+                    "max_range_m",
+                    "max_disagreement_m",
+                    "max_candidates",
+                }
+                allowed_resolver_keys = {
+                    *required_resolver_keys,
+                    "legacy_comparison_policy_path",
+                }
+                if (
+                    not required_resolver_keys.issubset(resolver_cfg)
+                    or not set(resolver_cfg).issubset(allowed_resolver_keys)
+                ):
+                    raise ValueError("resolver fields do not match the exact contract")
+                enabled = resolver_cfg.get("enabled", False)
+                raw_max_range = resolver_cfg.get("max_range_m", 22.0)
+                raw_max_disagreement = resolver_cfg.get("max_disagreement_m", 1.25)
+                raw_max_candidates = resolver_cfg.get("max_candidates", 4)
+                legacy_comparison_policy_path = resolver_cfg.get(
+                    "legacy_comparison_policy_path"
+                )
+                if not isinstance(enabled, bool):
+                    raise ValueError("resolver enabled must be boolean")
+                if isinstance(raw_max_range, bool) or isinstance(raw_max_disagreement, bool):
+                    raise ValueError("resolver distance limits must be numeric")
+                if isinstance(raw_max_candidates, bool) or not isinstance(raw_max_candidates, int):
+                    raise ValueError("resolver max_candidates must be an integer")
+                if (
+                    legacy_comparison_policy_path is not None
+                    and (
+                        not isinstance(legacy_comparison_policy_path, str)
+                        or not legacy_comparison_policy_path.strip()
+                    )
+                ):
+                    raise ValueError(
+                        "resolver legacy_comparison_policy_path must be a non-empty string"
+                    )
+                max_range = float(raw_max_range)
+                max_disagreement = float(raw_max_disagreement)
+                max_candidates = int(raw_max_candidates)
+                if not math.isfinite(max_range) or not 1.0 <= max_range <= 100.0:
+                    raise ValueError("resolver max_range_m is outside [1, 100]")
+                if (
+                    not math.isfinite(max_disagreement)
+                    or not 0.05 <= max_disagreement <= 10.0
+                ):
+                    raise ValueError(
+                        "resolver max_disagreement_m is outside [0.05, 10]"
+                    )
+                if not 1 <= max_candidates <= 4:
+                    raise ValueError("resolver max_candidates is outside [1, 4]")
+                self._world_resolver_enabled = enabled
+                self._world_resolver_max_range_m = max_range
+                self._world_resolver_max_disagreement_m = max_disagreement
+                self._world_resolver_diag_max_candidates = max_candidates
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("canonical_world.measurement_resolver is invalid") from exc
+        if self._world_resolver_enabled:
+            # An enabled canonical resolver must fail construction loudly
+            # rather than silently returning to legacy room-policy behavior.
+            self._world_resolver = UniversalWorldMeasurementResolver(
+                config=WorldMeasurementResolverConfig(
+                    max_hypotheses=int(self._world_resolver_diag_max_candidates),
+                    max_compatible_distance_m=float(
+                        self._world_resolver_max_disagreement_m
+                    ),
+                )
+            )
         self._human_ground_cfg = HumanGroundConfig(
             static_px_threshold=float(self._world_static_px_threshold),
             max_speed_mps=float(self._world_max_speed_scene_per_s),
@@ -9370,6 +9528,11 @@ class _AnalyticsTelemetryProcessor:
             min_value=0.1,
         )
         self._shadow_identity_publish_interval_s = 1.0 / float(shadow_max_hz)
+
+    def set_world_resolver_diagnostics_enabled(self, enabled: bool) -> None:
+        """Enable bounded resolver comparison details for presentation only."""
+
+        self._world_resolver_diagnostics_enabled = bool(enabled)
 
     def _tracking_interval_for_frame(self, track_count: int) -> float:
         return pair_safe_publication_interval_s(
@@ -9637,6 +9800,10 @@ class _AnalyticsTelemetryProcessor:
         for key in tuple(self._world_state_ghost_by_track):
             if int(key[0]) == source_id:
                 self._world_state_ghost_by_track.pop(key, None)
+        output_watermarks = getattr(self, "_world_output_watermarks", {})
+        for key in tuple(output_watermarks):
+            if int(key[0]) == source_id:
+                output_watermarks.pop(key, None)
 
     def _begin_source_frame_timeline(
         self,
@@ -9899,7 +10066,17 @@ class _AnalyticsTelemetryProcessor:
         copied_tracks: List[Dict[str, Any]] = []
         copied_track_by_original_id: Dict[int, Dict[str, Any]] = {}
         for track in tracks:
-            copied = _copy_public_scalar(track)
+            # The rich resolver tree is a request-gated BEV presentation
+            # diagnostic, never part of the canonical tracking publication.
+            # Filter it before the recursive scalar copy so normal cohorts do
+            # not pay to duplicate candidates, covariance matrices and PCF
+            # evidence only to discard them later.
+            public_track = {
+                key: value
+                for key, value in track.items()
+                if key != "world_resolver"
+            }
+            copied = _copy_public_scalar(public_track)
             if isinstance(copied, Mapping):
                 copied_track = dict(copied)
                 copied_tracks.append(copied_track)
@@ -10755,6 +10932,7 @@ class _AnalyticsTelemetryProcessor:
                         bbox=raw.get("bbox"),
                     ),
                     "camera_id": camera_id,
+                    "source_id": int(source_id),
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
                     "class_id": 0,
@@ -11234,6 +11412,7 @@ class _AnalyticsTelemetryProcessor:
                         bbox=raw.get("bbox"),
                     ),
                     "camera_id": camera_id,
+                    "source_id": int(source_id),
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
                     "class_id": 0,
@@ -11879,6 +12058,19 @@ class _AnalyticsTelemetryProcessor:
             )
         except Exception:
             lifecycle_generation_int = None
+        track_key_value = str(track.get("track_key") or "").strip() or None
+        if track_key_value is None and tracker_id_int is not None:
+            try:
+                source_value = int(track.get("source_id"))
+            except (TypeError, ValueError):
+                source_value = None
+            if source_value is not None and lifecycle_generation_int is not None:
+                track_key_value = (
+                    f"{source_value}:{tracker_id_int}:{lifecycle_generation_int}"
+                )
+        world_transform_sha256 = str(
+            track.get("world_transform_sha256") or ""
+        ).strip() or None
         idle_jitter_raw = track.get("idle_jitter_m")
         try:
             idle_jitter = (
@@ -11892,6 +12084,7 @@ class _AnalyticsTelemetryProcessor:
             method=method or "bbox",
             stable_id=stable_id_int,
             tracker_id=tracker_id_int,
+            track_key=track_key_value,
             tracker_lifecycle_generation=lifecycle_generation_int,
             world_x=world_x,
             world_z=world_z,
@@ -11917,6 +12110,7 @@ class _AnalyticsTelemetryProcessor:
                 if track.get("world_frame_revision") not in (None, "")
                 else None
             ),
+            world_transform_sha256=world_transform_sha256,
             motion_mode=str(track.get("motion_mode")) if track.get("motion_mode") not in (None, "") else None,
             posture=str(track.get("posture")) if track.get("posture") not in (None, "") else None,
             trail_append_allowed=trail_append_bool,
@@ -11988,6 +12182,11 @@ class _AnalyticsTelemetryProcessor:
                 "depth_registered_m": track.get("depth_registered_m"),
                 "depth_registration_status": track.get("depth_registration_status"),
                 "depth_registration_id": track.get("depth_registration_id"),
+                "world_resolver": track.get("world_resolver"),
+                "world_resolver_confidence": track.get("world_resolver_confidence"),
+                "world_quantity": track.get("world_quantity"),
+                "world_support_state": track.get("world_support_state"),
+                "world_posture": track.get("world_posture"),
             },
         )
 
@@ -11999,6 +12198,7 @@ class _AnalyticsTelemetryProcessor:
         """Bind BEV trail identity to the lifecycle stamped for this frame."""
 
         generation_by_tracker: Dict[int, int] = {}
+        generation_by_track_key: Dict[str, int] = {}
         for track in tracks:
             try:
                 tracker_id = int(track.get("tracker_id", track.get("track_id")))
@@ -12007,7 +12207,19 @@ class _AnalyticsTelemetryProcessor:
                 continue
             if tracker_id >= 0 and generation >= 0:
                 generation_by_tracker[tracker_id] = generation
+                key = str(track.get("track_key") or "").strip()
+                if key:
+                    generation_by_track_key[key] = generation
         for footpoint in footpoints:
+            if footpoint.tracker_lifecycle_generation is not None:
+                # Preserve the exact stamp copied from the public track.  A
+                # tracker-id-only lookup can be ambiguous when a reconnect
+                # reuses the numeric tracker ID in one cohort.
+                continue
+            track_key = str(footpoint.track_key or "").strip()
+            if track_key and track_key in generation_by_track_key:
+                footpoint.tracker_lifecycle_generation = generation_by_track_key[track_key]
+                continue
             try:
                 tracker_id = int(footpoint.tracker_id)
             except (TypeError, ValueError):
@@ -12055,6 +12267,121 @@ class _AnalyticsTelemetryProcessor:
             if identity >= 0:
                 return int(sensor_id), identity
         return None
+
+    def _world_output_watermark_key(
+        self,
+        sensor_id: int,
+        track: Mapping[str, Any],
+        *,
+        world_frame_id: Optional[str],
+        world_frame_revision: Optional[str],
+        world_transform_sha256: Optional[str],
+    ) -> Optional[Tuple[int, int, int, str, str, str]]:
+        """Return the exact public lifecycle/revision continuity key."""
+
+        track_key = self._world_track_key(sensor_id, track)
+        if track_key is None:
+            return None
+        try:
+            generation = int(track.get("tracker_lifecycle_generation"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        frame_id = str(world_frame_id or "").strip()
+        revision = str(world_frame_revision or "").strip()
+        transform = str(world_transform_sha256 or "").strip()
+        if generation < 0 or not frame_id or not revision or not transform:
+            return None
+        return (
+            int(track_key[0]),
+            int(track_key[1]),
+            generation,
+            frame_id,
+            revision,
+            transform,
+        )
+
+    def _restore_world_output_watermark(
+        self,
+        state: _WorldAnchorState,
+        key: Optional[Tuple[int, int, int, str, str, str]],
+    ) -> bool:
+        """Bind a recreated measurement state to its last public output."""
+
+        if key is None:
+            return False
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return False
+        watermark = store.get(key)
+        if watermark is None:
+            return False
+        state_has_output = bool(
+            state.last_output_world_x is not None
+            and state.last_output_world_z is not None
+        )
+        if state_has_output:
+            state_pts = state.last_output_media_pts_ns
+            if (
+                state_pts is not None
+                and watermark.media_pts_ns is not None
+                and int(state_pts) >= int(watermark.media_pts_ns)
+            ):
+                return False
+            if float(state.last_output_filter_ts) >= float(watermark.filter_ts):
+                return False
+        store.move_to_end(key)
+        state.last_output_world_x = float(watermark.world_x)
+        state.last_output_world_z = float(watermark.world_z)
+        state.last_output_media_pts_ns = watermark.media_pts_ns
+        state.last_output_filter_ts = float(watermark.filter_ts)
+        state.last_output_trail_segment_id = int(watermark.trail_segment_id)
+        return True
+
+    def _save_world_output_watermark(
+        self,
+        state: _WorldAnchorState,
+        key: Optional[Tuple[int, int, int, str, str, str]],
+    ) -> None:
+        """Persist the final admission watermark with an explicit hard cap."""
+
+        if key is None:
+            return
+        x = state.last_output_world_x
+        z = state.last_output_world_z
+        if x is None or z is None:
+            return
+        try:
+            world_x = float(x)
+            world_z = float(z)
+            filter_ts = float(state.last_output_filter_ts)
+            segment = int(state.last_output_trail_segment_id)
+            media_pts = (
+                int(state.last_output_media_pts_ns)
+                if state.last_output_media_pts_ns is not None
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not all(math.isfinite(value) for value in (world_x, world_z, filter_ts)):
+            return
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            store = OrderedDict()
+            self._world_output_watermarks = store
+        store[key] = _WorldOutputWatermark(
+            world_x=world_x,
+            world_z=world_z,
+            media_pts_ns=media_pts,
+            filter_ts=filter_ts,
+            trail_segment_id=segment,
+        )
+        store.move_to_end(key)
+        capacity = max(
+            1,
+            int(getattr(self, "_world_output_watermark_capacity", 4096) or 4096),
+        )
+        while len(store) > capacity:
+            store.popitem(last=False)
 
     def _maybe_prune_world_state(self, now_ts: float) -> None:
         if not self._world_state_by_track and not self._world_state_ghost_by_track:
@@ -12117,70 +12444,86 @@ class _AnalyticsTelemetryProcessor:
                 candidate = None
         if ghost is not None and candidate is not None:
             gap_s = float(now_ts) - float(absent_ts)
+            lifecycle_proves_continuity = bool(
+                lifecycle_generation is not None
+                and prior_generation is not None
+                and int(prior_generation) == int(lifecycle_generation)
+                and 0.0 <= gap_s <= float(self._world_state_ghost_ttl_s)
+            )
+            if lifecycle_proves_continuity:
+                # TrackingLifecycleRegistry already validated the return gap,
+                # normalized bbox displacement, and size ratio before reusing
+                # this generation.  Ground state must not impose a second,
+                # stricter association rule: doing so starts the filter cold
+                # under the same public trail identity and permits an
+                # un-gated jump.  A generation change was rejected above.
+                restored = True
             try:
-                left, top, width, height = (
-                    float(value) for value in bbox[:4]  # type: ignore[index]
-                )
-                prior_left, prior_top, prior_width, prior_height = (
-                    float(value) for value in candidate.bbox_geometry  # type: ignore[union-attr]
-                )
-                if (
-                    width <= 1.0
-                    or height <= 1.0
-                    or prior_width <= 1.0
-                    or prior_height <= 1.0
-                ):
-                    raise ValueError("bbox geometry is not usable")
-                inter_left = max(left, prior_left)
-                inter_top = max(top, prior_top)
-                inter_right = min(left + width, prior_left + prior_width)
-                inter_bottom = min(top + height, prior_top + prior_height)
-                inter_width = max(0.0, inter_right - inter_left)
-                inter_height = max(0.0, inter_bottom - inter_top)
-                intersection = inter_width * inter_height
-                union = (
-                    (width * height)
-                    + (prior_width * prior_height)
-                    - intersection
-                )
-                iou = intersection / union if union > 1e-6 else 0.0
-                center_u = left + width * 0.5
-                center_v = top + height * 0.5
-                prior_center_u = prior_left + prior_width * 0.5
-                prior_center_v = prior_top + prior_height * 0.5
-                diagonal = max(
-                    1.0,
-                    math.hypot(width, height),
-                    math.hypot(prior_width, prior_height),
-                )
-                center_ratio = math.hypot(
-                    center_u - prior_center_u,
-                    center_v - prior_center_v,
-                ) / diagonal
-                area_ratio = max(
-                    (width * height) / (prior_width * prior_height),
-                    (prior_width * prior_height) / (width * height),
-                )
-                restored = bool(
-                    0.0 <= gap_s <= float(self._world_state_ghost_ttl_s)
-                    and width > 1.0
-                    and height > 1.0
-                    and prior_width > 1.0
-                    and prior_height > 1.0
-                    and all(
-                        math.isfinite(value)
-                        for value in (
-                            iou,
-                            center_ratio,
-                            area_ratio,
-                        )
+                if not restored:
+                    left, top, width, height = (
+                        float(value) for value in bbox[:4]  # type: ignore[index]
                     )
-                    and iou >= 0.75
-                    and center_ratio <= 0.25
-                    and area_ratio <= 1.75
-                )
+                    prior_left, prior_top, prior_width, prior_height = (
+                        float(value) for value in candidate.bbox_geometry  # type: ignore[union-attr]
+                    )
+                    if (
+                        width <= 1.0
+                        or height <= 1.0
+                        or prior_width <= 1.0
+                        or prior_height <= 1.0
+                    ):
+                        raise ValueError("bbox geometry is not usable")
+                    inter_left = max(left, prior_left)
+                    inter_top = max(top, prior_top)
+                    inter_right = min(left + width, prior_left + prior_width)
+                    inter_bottom = min(top + height, prior_top + prior_height)
+                    inter_width = max(0.0, inter_right - inter_left)
+                    inter_height = max(0.0, inter_bottom - inter_top)
+                    intersection = inter_width * inter_height
+                    union = (
+                        (width * height)
+                        + (prior_width * prior_height)
+                        - intersection
+                    )
+                    iou = intersection / union if union > 1e-6 else 0.0
+                    center_u = left + width * 0.5
+                    center_v = top + height * 0.5
+                    prior_center_u = prior_left + prior_width * 0.5
+                    prior_center_v = prior_top + prior_height * 0.5
+                    diagonal = max(
+                        1.0,
+                        math.hypot(width, height),
+                        math.hypot(prior_width, prior_height),
+                    )
+                    center_ratio = math.hypot(
+                        center_u - prior_center_u,
+                        center_v - prior_center_v,
+                    ) / diagonal
+                    area_ratio = max(
+                        (width * height) / (prior_width * prior_height),
+                        (prior_width * prior_height) / (width * height),
+                    )
+                    restored = bool(
+                        0.0 <= gap_s <= float(self._world_state_ghost_ttl_s)
+                        and width > 1.0
+                        and height > 1.0
+                        and prior_width > 1.0
+                        and prior_height > 1.0
+                        and all(
+                            math.isfinite(value)
+                            for value in (
+                                iou,
+                                center_ratio,
+                                area_ratio,
+                            )
+                        )
+                        and iou >= 0.75
+                        and center_ratio <= 0.25
+                        and area_ratio <= 1.75
+                    )
             except (TypeError, ValueError, IndexError, ZeroDivisionError):
-                restored = False
+                if not lifecycle_proves_continuity:
+                    restored = False
             if restored:
                 state = candidate
         if state is None:
@@ -12447,10 +12790,51 @@ class _AnalyticsTelemetryProcessor:
         )
 
     @staticmethod
+    def _anchor_is_verified_ground_contact(
+        anchor: Optional[_PoseAnchorCandidate],
+    ) -> bool:
+        """Return whether an anchor is safe to use for a floor ray.
+
+        A depth anchor can be a useful range observation without identifying
+        the person's ground contact.  In particular, ``torso_core`` is a
+        body-depth sample and must never be projected to the floor as if it
+        were an ankle.  Only observed lower-body/ankle support (or the pose
+        leg-floor construction, which has its own admission checks) may
+        generate a floor-ray hypothesis.
+        """
+
+        if anchor is None:
+            return False
+        source = str(anchor.source or "").strip().lower()
+        basis = str(anchor.contact_basis or "").strip().lower()
+        if source in {
+            "pose_ankle_floor",
+            "pose_single_ankle_floor",
+            "pose_ankle_support",
+            "pose_leg_floor",
+        }:
+            return True
+        if source != "person_mask_floor":
+            return False
+        return basis in {
+            "depth:lower_body_band",
+            "depth:pose_ankle_support",
+        }
+
+    @staticmethod
     def _depth_measurement_is_current(
         depth_result: Optional[ObjectDepthResult],
+        *,
+        track: Optional[Mapping[str, Any]] = None,
     ) -> bool:
-        """Return whether metric depth belongs to this exact object frame."""
+        """Return whether metric depth belongs to this exact object cohort.
+
+        The depth result carries its own frame metadata, but that metadata is
+        not sufficient when a cached object-depth row is attached to a new
+        tracker row.  Require the source, tracker/object id, frame id, and
+        source media timestamp to match the current track whenever those
+        values are available.
+        """
         if depth_result is None or depth_result.measurement_cached is True:
             return False
         if (
@@ -12468,6 +12852,65 @@ class _AnalyticsTelemetryProcessor:
             and depth_result.ts_us is not None
             and int(depth_result.measurement_ts_us) != int(depth_result.ts_us)
         ):
+            return False
+        if (
+            depth_result.depth_tensor_age_frames is not None
+            and int(depth_result.depth_tensor_age_frames) > 0
+        ):
+            return False
+        if (
+            depth_result.depth_tensor_age_us is not None
+            and int(depth_result.depth_tensor_age_us) > 0
+        ):
+            return False
+        measurement_frame_id = (
+            int(depth_result.measurement_frame_id)
+            if depth_result.measurement_frame_id is not None
+            else int(depth_result.frame_id)
+        )
+        if (
+            depth_result.depth_tensor_frame_id is not None
+            and int(depth_result.depth_tensor_frame_id) != measurement_frame_id
+        ):
+            return False
+        measurement_ts_us = (
+            int(depth_result.measurement_ts_us)
+            if depth_result.measurement_ts_us is not None
+            else (
+                int(depth_result.ts_us)
+                if depth_result.ts_us is not None
+                else None
+            )
+        )
+        if (
+            depth_result.depth_tensor_ts_us is not None
+            and measurement_ts_us is not None
+            and int(depth_result.depth_tensor_ts_us) != measurement_ts_us
+        ):
+            return False
+        if track is None:
+            return True
+        try:
+            source_id = track.get("source_id")
+            if source_id is not None and int(depth_result.source_id) != int(source_id):
+                return False
+            tracker_id = track.get("tracker_id", track.get("track_id"))
+            if tracker_id is not None and int(depth_result.object_id) != int(tracker_id):
+                return False
+            frame_id = track.get("frame_id")
+            if frame_id is not None and int(depth_result.frame_id) != int(frame_id):
+                return False
+            media_pts_ns = track.get("media_pts_ns")
+            if media_pts_ns is not None and int(media_pts_ns) > 0:
+                expected_ts_us = int(media_pts_ns) // 1_000
+                if depth_result.ts_us is None or int(depth_result.ts_us) != expected_ts_us:
+                    return False
+                if (
+                    depth_result.measurement_ts_us is None
+                    or int(depth_result.measurement_ts_us) != expected_ts_us
+                ):
+                    return False
+        except (TypeError, ValueError, OverflowError):
             return False
         return True
 
@@ -12972,6 +13415,7 @@ class _AnalyticsTelemetryProcessor:
         depth_result: Optional[ObjectDepthResult],
         flip_u: bool,
         flip_v: bool,
+        track: Optional[Mapping[str, Any]] = None,
     ) -> _DepthObservationResult:
         if depth_result is None:
             return _DepthObservationResult(None, 0.0, "depth_meta_missing")
@@ -12987,7 +13431,7 @@ class _AnalyticsTelemetryProcessor:
             and float(anchor_depth_m) > 0.0
             else None
         )
-        if not self._depth_measurement_is_current(depth_result):
+        if not self._depth_measurement_is_current(depth_result, track=track):
             # Cached range remains available through the public depth
             # provenance fields, but it is not a current-frame metric
             # observation and must never update/reacquire the world filter.
@@ -13100,6 +13544,888 @@ class _AnalyticsTelemetryProcessor:
             registration_id=registration_id,
         )
 
+    @staticmethod
+    def _covariance_matrix_from_projection(
+        center: Optional[np.ndarray],
+        perturbations: Sequence[Tuple[float, Optional[np.ndarray]]],
+        *,
+        floor_y_variance: float = 0.0025,
+    ) -> Optional[Matrix3]:
+        """Propagate bounded input uncertainty through a world projection.
+
+        ``perturbations`` contains (input sigma, perturbed world point) pairs.
+        The function is intentionally small and allocation-bounded: a floor
+        hypothesis uses two UV perturbations and a depth hypothesis uses one
+        additional range perturbation.  Failed finite differences simply add
+        no information; the caller can then reject the candidate rather than
+        inventing a position or covariance.
+        """
+
+        if center is None:
+            return None
+        try:
+            center_arr = np.asarray(center, dtype=np.float64).reshape(-1)
+        except Exception:
+            return None
+        if center_arr.size < 3 or not np.all(np.isfinite(center_arr[:3])):
+            return None
+        covariance = np.zeros((3, 3), dtype=np.float64)
+        used = 0
+        for sigma_raw, perturbed in perturbations:
+            try:
+                sigma = float(sigma_raw)
+                point = np.asarray(perturbed, dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            if (
+                not math.isfinite(sigma)
+                or sigma <= 1e-6
+                or point.size < 3
+                or not np.all(np.isfinite(point[:3]))
+            ):
+                continue
+            jacobian = (point[:3] - center_arr[:3]) / sigma
+            covariance += np.outer(jacobian, jacobian) * (sigma * sigma)
+            used += 1
+        # The calibrated floor is not exact.  Keep a conservative bounded
+        # vertical variance even though the resolver uses X/Z for display.
+        covariance[1, 1] += max(1e-5, min(1.0, float(floor_y_variance)))
+        if used == 0:
+            return None
+        covariance = 0.5 * (covariance + covariance.T)
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            eigenvalues = np.clip(eigenvalues, 1e-4, 25.0)
+            covariance = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+        except Exception:
+            return None
+        values = tuple(float(value) for value in covariance.reshape(-1))
+        try:
+            return Matrix3(values=values)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    def _floor_candidate_covariance(
+        self,
+        calib: Any,
+        *,
+        anchor_uv: Sequence[float],
+        floor_candidate: np.ndarray,
+        incidence_sin: float,
+        posture: str,
+        occlusion_fraction: float,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Matrix3]:
+        """Estimate floor-ray covariance from image contact uncertainty."""
+
+        try:
+            u, v = float(anchor_uv[0]), float(anchor_uv[1])
+            incidence = max(0.02, min(1.0, float(incidence_sin)))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        sigma_px = 2.0 + 4.0 * (1.0 - incidence)
+        sigma_px *= 1.0 + min(1.0, max(0.0, float(occlusion_fraction)))
+        if str(posture) in ("sitting", "lying"):
+            sigma_px *= 1.5
+        sigma_px = max(1.5, min(24.0, float(sigma_px)))
+        width, height = self._normalize_image_size(getattr(calib, "image_size", None)) or (0, 0)
+        if width <= 0 or height <= 0:
+            return None
+        def _project(du: float, dv: float) -> Optional[np.ndarray]:
+            pu = min(float(width - 1), max(0.0, float(u) + float(du)))
+            pv = min(float(height - 1), max(0.0, float(v) + float(dv)))
+            return self._project_pixel_to_floor_world(
+                calib,
+                pu,
+                pv,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+
+        return self._covariance_matrix_from_projection(
+            floor_candidate,
+            ((sigma_px, _project(sigma_px, 0.0)), (sigma_px, _project(0.0, sigma_px))),
+            floor_y_variance=0.01 + 0.04 * (1.0 - incidence),
+        )
+
+    def _depth_registration_sigma_m(self, calib: Any) -> float:
+        """Read robust occupied-anchor residual evidence from registration."""
+
+        manager = self.depth_registration
+        if manager is None:
+            return 0.15
+        try:
+            bundle = getattr(manager, "bundle", None)
+            entries = getattr(bundle, "entries", None)
+            entry = entries.get(str(getattr(calib, "camera_id", ""))) if isinstance(entries, Mapping) else None
+            evidence = getattr(entry, "occupied_anchor_validation", None)
+            if not isinstance(evidence, Mapping):
+                return 0.15
+            median = float(evidence.get("median_abs_error_m", 0.0) or 0.0)
+            p95 = float(evidence.get("p95_abs_error_m", 0.0) or 0.0)
+            if not math.isfinite(median) or not math.isfinite(p95):
+                return 0.15
+            # Convert robust absolute residuals to a bounded one-sigma floor;
+            # retain p95 as a guard against overconfident registered depth.
+            return max(0.05, min(2.5, median / 0.6745, p95 / 1.96))
+        except Exception:
+            return 0.15
+
+    def _depth_candidate_covariance(
+        self,
+        calib: Any,
+        *,
+        anchor_uv: Sequence[float],
+        registered_depth_m: float,
+        depth_result: Optional[ObjectDepthResult],
+        depth_candidate: np.ndarray,
+        posture: str,
+        occlusion_fraction: float,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Matrix3]:
+        """Propagate UV, depth-spread, and registration uncertainty."""
+
+        try:
+            u, v = float(anchor_uv[0]), float(anchor_uv[1])
+            range_m = float(registered_depth_m)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if not math.isfinite(range_m) or range_m <= 0.0:
+            return None
+        support_fraction = float(
+            depth_result.anchor_valid_fraction
+            if depth_result is not None and depth_result.anchor_valid_fraction is not None
+            else (depth_result.valid_fraction if depth_result is not None else 0.0)
+        )
+        spread = float(
+            depth_result.anchor_depth_spread_m
+            if depth_result is not None and depth_result.anchor_depth_spread_m is not None
+            else 0.0
+        )
+        if not math.isfinite(support_fraction):
+            support_fraction = 0.0
+        if not math.isfinite(spread) or spread < 0.0:
+            spread = 0.0
+        sigma_depth = max(
+            self._depth_registration_sigma_m(calib),
+            0.05,
+            spread / max(0.35, math.sqrt(max(0.01, support_fraction))),
+        )
+        sigma_depth *= 1.0 + min(1.0, max(0.0, float(occlusion_fraction)))
+        if str(posture) in ("sitting", "lying"):
+            sigma_depth *= 1.25
+        sigma_depth = min(2.5, float(sigma_depth))
+        sigma_px = max(1.5, min(16.0, 2.0 + 5.0 * (1.0 - max(0.0, min(1.0, support_fraction)))))
+        width, height = self._normalize_image_size(getattr(calib, "image_size", None)) or (0, 0)
+        if width <= 0 or height <= 0:
+            return None
+        def _project(du: float, dv: float, depth_delta: float = 0.0) -> Optional[np.ndarray]:
+            pu = min(float(width - 1), max(0.0, float(u) + float(du)))
+            pv = min(float(height - 1), max(0.0, float(v) + float(dv)))
+            point = self._project_pixel_to_world_observation(
+                calib,
+                pu,
+                pv,
+                depth_m=max(0.01, range_m + float(depth_delta)),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if point is None:
+                return None
+            grounded = np.asarray(point, dtype=np.float64).copy()
+            grounded[1] = float(calib.floor_y)
+            return grounded
+
+        return self._covariance_matrix_from_projection(
+            depth_candidate,
+            (
+                (sigma_px, _project(sigma_px, 0.0)),
+                (sigma_px, _project(0.0, sigma_px)),
+                (sigma_depth, _project(0.0, 0.0, sigma_depth)),
+            ),
+            floor_y_variance=0.02 + 0.08 * (1.0 - max(0.0, min(1.0, support_fraction))),
+        )
+
+    def _append_universal_world_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        sensor_id: int,
+        track: Mapping[str, Any],
+        camera_id: str,
+        calib: Any,
+        floor_candidate: Optional[np.ndarray],
+        floor_ray_admitted: bool,
+        anchor_candidate: Optional[_PoseAnchorCandidate],
+        pose_uv: Optional[Tuple[float, float]],
+        contact_basis: Optional[str],
+        posture: str,
+        occlusion_fraction: float,
+        image_motion_supported: bool,
+        depth_obs: Optional[np.ndarray],
+        depth_weight: float,
+        depth_observation: _DepthObservationResult,
+        depth_result: Optional[ObjectDepthResult],
+        person_anchor: Optional[_PoseAnchorCandidate],
+        reject_current_geometry: bool,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> None:
+        """Append the bounded, camera-agnostic geometric hypotheses.
+
+        This method is deliberately independent of the legacy policy.  Floor
+        and registered-depth evidence are admitted separately, and each
+        candidate carries its own support semantics and covariance.  A depth
+        sample may come from a torso or body band, so its raw ray point is
+        retained only as diagnostic data; the hypothesis quantity is always a
+        ground footprint at the calibrated floor elevation.
+        """
+
+        floor_anchor = (
+            anchor_candidate
+            if self._anchor_is_verified_ground_contact(anchor_candidate)
+            else None
+        )
+        if floor_candidate is not None and floor_ray_admitted and pose_uv is not None and floor_anchor is not None:
+            floor_covariance = self._floor_candidate_covariance(
+                calib,
+                anchor_uv=pose_uv,
+                floor_candidate=floor_candidate,
+                incidence_sin=float(track.get("world_floor_incidence_sin", 0.0) or 0.0),
+                posture=str(posture),
+                occlusion_fraction=float(occlusion_fraction),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if floor_covariance is not None:
+                floor_support_state = (
+                    "unknown" if str(posture) in ("sitting", "lying") else "floor"
+                )
+                candidates.append(
+                    {
+                        "candidate_id": "floor_ray",
+                        "kind": "floor_ray",
+                        "position": floor_candidate,
+                        "covariance": floor_covariance,
+                        "anchor": str(floor_anchor.source),
+                        "contact_basis": contact_basis,
+                        "support_state": floor_support_state,
+                        "confidence": 0.95 if floor_anchor.quality == "good" else 0.75,
+                        "posture": str(posture),
+                        "occlusion": float(occlusion_fraction),
+                        "motion_consistency": 1.0 if image_motion_supported else 0.75,
+                        "support_score": 0.95 if floor_anchor.height_lock_eligible else 0.72,
+                        "posture_compatibility": 0.75 if posture in ("sitting", "lying") else 1.0,
+                        "source_reliability": 1.0,
+                        "ray_incidence_sin": float(track.get("world_floor_incidence_sin", 0.0) or 0.0),
+                        "pixel_uncertainty_px": 2.0,
+                        "correlation_group": f"floor_ray:{int(sensor_id)}:{int(track.get('tracker_id', -1))}",
+                        "pcf": self._world_prior_evidence(camera_id, floor_candidate),
+                    }
+                )
+
+        if (
+            not reject_current_geometry
+            and depth_obs is not None
+            and float(depth_weight) > 0.0
+            and person_anchor is not None
+            and depth_observation.registered_depth_m is not None
+        ):
+            depth_position = np.asarray(depth_obs, dtype=np.float64).copy()
+            try:
+                depth_position[1] = float(calib.floor_y)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return
+            depth_covariance = self._depth_candidate_covariance(
+                calib,
+                anchor_uv=(float(person_anchor.u), float(person_anchor.v)),
+                registered_depth_m=float(depth_observation.registered_depth_m),
+                depth_result=depth_result,
+                depth_candidate=depth_position,
+                posture=str(posture),
+                occlusion_fraction=float(occlusion_fraction),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if depth_covariance is None:
+                return
+            depth_support_fraction = float(
+                depth_result.anchor_valid_fraction
+                if depth_result is not None and depth_result.anchor_valid_fraction is not None
+                else (depth_result.valid_fraction if depth_result is not None else 0.0)
+            )
+            depth_support_fraction = max(0.0, min(1.0, depth_support_fraction))
+            depth_support_state = (
+                "floor"
+                if str(posture) in ("standing", "unknown")
+                and str(depth_observation.registration_status or "") in ("ok", "raw_passthrough")
+                and str(depth_result.anchor_source if depth_result is not None else "")
+                in ("lower_body_band", "pose_ankle_support")
+                else "unknown"
+            )
+            candidates.append(
+                {
+                    "candidate_id": "registered_depth",
+                    "kind": "registered_depth",
+                    "position": depth_position,
+                    "covariance": depth_covariance,
+                    "anchor": str(person_anchor.source),
+                    "contact_basis": str(person_anchor.contact_basis or person_anchor.source),
+                    "support_state": depth_support_state,
+                    "confidence": max(0.35, min(1.0, 0.45 + 0.55 * float(depth_weight))),
+                    "posture": str(posture),
+                    "occlusion": float(occlusion_fraction),
+                    "motion_consistency": 1.0 if image_motion_supported else 0.75,
+                    "support_score": depth_support_fraction,
+                    "posture_compatibility": 0.80 if posture in ("sitting", "lying") else 1.0,
+                    "source_reliability": 1.0,
+                    "depth_support_fraction": depth_support_fraction,
+                    # This is registration uncertainty, not the measured
+                    # disagreement between the registered-depth and floor-ray
+                    # hypotheses. Keep the two quantities distinct.
+                    "depth_registration_sigma_m": self._depth_registration_sigma_m(calib),
+                    "floor_depth_disagreement_m": (
+                        float(
+                            math.hypot(
+                                float(depth_position[0]) - float(floor_candidate[0]),
+                                float(depth_position[2]) - float(floor_candidate[2]),
+                            )
+                        )
+                        if floor_candidate is not None
+                        and np.asarray(floor_candidate).reshape(-1).size >= 3
+                        and np.all(np.isfinite(np.asarray(floor_candidate).reshape(-1)[:3]))
+                        else None
+                    ),
+                    "correlation_group": f"registered_depth:{int(sensor_id)}:{int(track.get('tracker_id', -1))}",
+                    "pcf": self._world_prior_evidence(camera_id, depth_position),
+                }
+            )
+
+    def _world_prior_evidence(
+        self,
+        camera_id: str,
+        position: Sequence[float],
+    ) -> Optional[WorldPriorEvidence]:
+        """Convert revision-matched Scene Prior evidence into the contract."""
+
+        priors = self.scene_priors
+        if priors is None:
+            return None
+        revision = priors.revision_for_camera(str(camera_id))
+        if revision is None:
+            return None
+        frame_binding = priors.frame_binding(str(camera_id))
+        revision_id = str(
+            getattr(frame_binding, "target_revision_id", None)
+            or revision.manifest.prior_id
+        ).strip()
+        if not revision_id:
+            return None
+        try:
+            diagnostic = priors.evaluate(str(camera_id), position)
+        except ScenePriorError:
+            return None
+        if not isinstance(diagnostic, Mapping):
+            return None
+        try:
+            observed_confidence = float(diagnostic.get("evidence_confidence", 0.0) or 0.0)
+            boundary = diagnostic.get("boundary_signed_distance_m")
+            extent_outside_distance = diagnostic.get("extent_outside_distance_m")
+            floor_height = diagnostic.get("floor_height_m")
+            obstacle_clearance = diagnostic.get("obstacle_signed_clearance_m")
+            return WorldPriorEvidence(
+                prior_id=str(diagnostic.get("prior_id") or revision.manifest.prior_id),
+                revision_id=revision_id,
+                status=str(diagnostic.get("status") or "unknown"),
+                inside_extent=(
+                    bool(diagnostic.get("inside_extent"))
+                    if diagnostic.get("inside_extent") is not None
+                    else None
+                ),
+                inside_authored_space=(
+                    bool(diagnostic.get("inside_authored_space"))
+                    if diagnostic.get("inside_authored_space") is not None
+                    else None
+                ),
+                extent_outside_distance_m=(
+                    float(extent_outside_distance)
+                    if extent_outside_distance is not None
+                    else None
+                ),
+                evidence_observed=bool(diagnostic.get("evidence_observed", False)),
+                observed_confidence=max(0.0, min(1.0, observed_confidence)),
+                boundary_signed_distance_m=(
+                    float(boundary) if boundary is not None else None
+                ),
+                floor_height_m=(float(floor_height) if floor_height is not None else None),
+                obstacle_clearance_m=(
+                    float(obstacle_clearance) if obstacle_clearance is not None else None
+                ),
+                reasons=tuple(str(reason)[:160] for reason in (diagnostic.get("reasons") or ())[:8]),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _world_measurement_cohort(
+        self,
+        sensor_id: int,
+        camera_id: str,
+        track: Mapping[str, Any],
+        *,
+        calib: Any,
+        world_frame_revision: Optional[str],
+        world_transform_sha256: Optional[str],
+    ) -> Optional[WorldMeasurementCohort]:
+        """Build one exact cohort identity for all current-frame hypotheses."""
+
+        try:
+            tracker_id = int(track.get("tracker_id", track.get("track_id")))
+            frame_id = int(track.get("frame_id", -1))
+        except (TypeError, ValueError):
+            return None
+        if tracker_id < 0 or frame_id < 0:
+            return None
+        world_revision = str(world_frame_revision or "").strip()
+        calibration_revision = str(
+            getattr(calib, "camera_calibration_sha256", None) or ""
+        ).strip()
+        transform_sha256 = str(world_transform_sha256 or "").strip()
+        if not world_revision or not calibration_revision or not transform_sha256:
+            return None
+        try:
+            observed_at_us = int(track.get("observed_at_us"))
+            source_contract_id = int(track.get("source_id"))
+        except (TypeError, ValueError):
+            return None
+        if observed_at_us <= 0 or source_contract_id < 0:
+            return None
+        raw_generation = track.get("tracker_lifecycle_generation")
+        if (
+            isinstance(raw_generation, bool)
+            or not isinstance(raw_generation, int)
+            or int(raw_generation) < 0
+        ):
+            # A canonical cohort must never synthesize lifecycle generation 0
+            # for a row that did not carry the tracker registry stamp.
+            return None
+        generation = int(raw_generation)
+        track_key_value = str(track.get("track_key") or "").strip()
+        if not track_key_value:
+            track_key_value = f"{source_contract_id}:{tracker_id}:{generation}"
+        pcf_revision: Optional[str] = None
+        if self.scene_priors is not None:
+            revision = self.scene_priors.revision_for_camera(str(camera_id))
+            binding = self.scene_priors.frame_binding(str(camera_id))
+            pcf_revision = str(
+                getattr(binding, "target_revision_id", None)
+                or (revision.manifest.prior_id if revision is not None else "")
+            ).strip() or None
+        try:
+            return WorldMeasurementCohort(
+                track_key=track_key_value,
+                tracker_lifecycle_generation=generation,
+                camera_id=str(camera_id),
+                source_id=source_contract_id,
+                tracker_id=tracker_id,
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                world_frame="backend_world_m",
+                world_revision=world_revision,
+                calibration_revision=calibration_revision,
+                world_transform_sha256=transform_sha256,
+                pcf_revision=pcf_revision,
+            )
+        except Exception:
+            return None
+
+    def _build_world_measurement_set(
+        self,
+        *,
+        cohort: Optional[WorldMeasurementCohort],
+        candidates: Sequence[Mapping[str, Any]],
+        continuation: Any = None,
+    ) -> Optional[WorldMeasurementSet]:
+        """Validate and bound camera-local hypotheses before resolver entry."""
+
+        if cohort is None:
+            return None
+        hypotheses: List[WorldMeasurementHypothesis] = []
+        for candidate in candidates[: int(self._world_resolver_diag_max_candidates)]:
+            position = candidate.get("position")
+            covariance = candidate.get("covariance")
+            try:
+                position_values = np.asarray(position, dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            if position_values.size < 3 or not np.all(np.isfinite(position_values[:3])):
+                continue
+            if not isinstance(covariance, Matrix3):
+                continue
+            try:
+                point = Vector3(
+                    x=float(position_values[0]),
+                    y=float(position_values[1]),
+                    z=float(position_values[2]),
+                )
+                hypothesis = WorldMeasurementHypothesis(
+                    candidate_id=str(candidate.get("candidate_id") or candidate.get("kind") or "candidate"),
+                    cohort=cohort,
+                    kind=str(candidate.get("kind") or "floor_ray"),  # type: ignore[arg-type]
+                    position=point,
+                    covariance=covariance,
+                    anchor=str(candidate.get("anchor") or candidate.get("contact_basis") or "unknown"),
+                    confidence=max(0.0, min(1.0, float(candidate.get("confidence", 0.5) or 0.5))),
+                    posture=str(candidate.get("posture") or "unknown"),  # type: ignore[arg-type]
+                    support_state=str(candidate.get("support_state") or "unknown"),  # type: ignore[arg-type]
+                    occlusion=max(0.0, min(1.0, float(candidate.get("occlusion", 0.0) or 0.0))),
+                    motion_consistency=max(0.0, min(1.0, float(candidate.get("motion_consistency", 1.0) or 1.0))),
+                    support_score=max(0.0, min(1.0, float(candidate.get("support_score", 1.0) or 1.0))),
+                    posture_compatibility=max(0.0, min(1.0, float(candidate.get("posture_compatibility", 1.0) or 1.0))),
+                    source_reliability=max(0.0, min(1.0, float(candidate.get("source_reliability", 1.0) or 1.0))),
+                    ray_incidence_sin=(
+                        float(candidate["ray_incidence_sin"])
+                        if candidate.get("ray_incidence_sin") is not None
+                        else None
+                    ),
+                    depth_support_fraction=(
+                        float(candidate["depth_support_fraction"])
+                        if candidate.get("depth_support_fraction") is not None
+                        else None
+                    ),
+                    depth_registration_sigma_m=(
+                        float(candidate["depth_registration_sigma_m"])
+                        if candidate.get("depth_registration_sigma_m") is not None
+                        else None
+                    ),
+                    floor_depth_disagreement_m=(
+                        float(candidate["floor_depth_disagreement_m"])
+                        if candidate.get("floor_depth_disagreement_m") is not None
+                        else None
+                    ),
+                    pixel_uncertainty_px=(
+                        float(candidate["pixel_uncertainty_px"])
+                        if candidate.get("pixel_uncertainty_px") is not None
+                        else None
+                    ),
+                    correlation_group=(
+                        str(candidate["correlation_group"])
+                        if candidate.get("correlation_group")
+                        else None
+                    ),
+                    pcf=(
+                        candidate.get("pcf")
+                        if isinstance(candidate.get("pcf"), WorldPriorEvidence)
+                        else None
+                    ),
+                    valid=bool(candidate.get("valid", True)),
+                    rejection_reason=(
+                        str(candidate["rejection_reason"])
+                        if candidate.get("rejection_reason")
+                        else None
+                    ),
+                )
+            except Exception:
+                # Contract construction is the boundary: malformed evidence
+                # cannot enter the resolver or become dashboard telemetry.
+                continue
+            hypotheses.append(hypothesis)
+        try:
+            return WorldMeasurementSet(
+                cohort=cohort,
+                hypotheses=tuple(hypotheses),
+                continuation=continuation,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _world_vector_payload(value: Vector3) -> Dict[str, float]:
+        payload = {
+            "x": float(value.x),
+            "y": float(value.y),
+            "z": float(value.z),
+        }
+        if not all(math.isfinite(component) for component in payload.values()):
+            raise RuntimeError("canonical world resolver returned a non-finite vector")
+        return payload
+
+    @staticmethod
+    def _world_covariance_payload(value: Matrix3) -> Dict[str, List[float]]:
+        try:
+            values = [float(item) for item in value.values]
+        except Exception as exc:
+            raise RuntimeError("canonical world resolver returned invalid covariance") from exc
+        if len(values) != 9 or not all(math.isfinite(item) for item in values):
+            raise RuntimeError("canonical world resolver returned invalid covariance")
+        return {"values": values}
+
+    def _legacy_world_measurement_comparison(
+        self,
+        measurement_set: WorldMeasurementSet,
+    ) -> Optional[Dict[str, Any]]:
+        """Reconstruct the retired room-policy measurement without authority.
+
+        The historical path selected the registered-depth X/Z wholesale when
+        that camera's depth weight was nonzero, even when it called the result
+        "fused"; otherwise it selected an admitted floor ray only where the
+        room profile allowed floor-only output. This helper intentionally
+        reproduces only that current-frame measurement decision. It does not
+        run another temporal filter, mutate PersonGroundState, or feed any
+        canonical consumer.
+        """
+
+        policy = self.legacy_world_fusion_policy
+        if policy is None or not self._world_resolver_diagnostics_enabled:
+            return None
+        try:
+            profile = policy.profile(str(measurement_set.cohort.camera_id))
+        except Exception:
+            return None
+        floor_candidate = next(
+            (
+                candidate
+                for candidate in measurement_set.hypotheses
+                if str(candidate.kind) == "floor_ray" and candidate.valid
+            ),
+            None,
+        )
+        depth_candidate = next(
+            (
+                candidate
+                for candidate in measurement_set.hypotheses
+                if str(candidate.kind) == "registered_depth" and candidate.valid
+            ),
+            None,
+        )
+        selected: Optional[WorldMeasurementHypothesis] = None
+        source: Optional[str] = None
+        if depth_candidate is not None and float(profile.depth_weight_scale) > 0.0:
+            selected = depth_candidate
+            source = (
+                "historical_depth_labeled_fused"
+                if floor_candidate is not None
+                and float(profile.floor_weight_scale) > 0.0
+                else "historical_registered_depth_only"
+            )
+        elif (
+            floor_candidate is not None
+            and float(profile.floor_weight_scale) > 0.0
+            and bool(profile.floor_only_allowed)
+        ):
+            selected = floor_candidate
+            source = "historical_floor_ray_only"
+        if selected is None or source is None:
+            return None
+        return {
+            "id": "legacy_room_policy",
+            "kind": "legacy_policy",
+            "position": self._world_vector_payload(selected.position),
+            "covariance": self._world_covariance_payload(selected.covariance),
+            "source": source,
+            "policy_id": str(policy.policy_id),
+        }
+
+    def _apply_resolved_world_measurement(
+        self,
+        track: Dict[str, Any],
+        measurement_set: WorldMeasurementSet,
+    ) -> Tuple[Optional[np.ndarray], Optional[ResolvedGroundMeasurement]]:
+        """Resolve one exact cohort and publish bounded diagnostics."""
+
+        resolver = self._world_resolver
+        if resolver is None:
+            raise RuntimeError("canonical world resolver is not constructed")
+        # A track mapping can be reused by synthetic/replay callers.  Resolver
+        # compact fields are current-cohort state, not durable identity state;
+        # clear every one before resolution so a rejected/empty result cannot
+        # inherit the prior frame's selected candidate or confidence.
+        for field_name in (
+            "world_quantity",
+            "world_posture",
+            "world_support_state",
+            "world_resolver_confidence",
+            "world_resolver_selected_id",
+            "world_resolver_fused",
+            "world_resolver_disagreement_m",
+            "world_resolver_contact_basis",
+            "world_resolver_source_continuity_match",
+            "world_resolver",
+            "world_covariance",
+        ):
+            track.pop(field_name, None)
+        # A resolver covariance describes the raw current measurement.  It is
+        # not valid for a later PGS prediction/hold or for a filtered point
+        # displaced by the physical admission gate.  Clear any stale public
+        # value here; the caller publishes an outer-error-inflated covariance
+        # only after the current measurement is accepted.
+        resolve_start_ns = time.perf_counter_ns()
+        try:
+            result = resolver.resolve(measurement_set)
+        finally:
+            _record_core_stage_timing(
+                "world_resolver.resolve",
+                resolve_start_ns,
+                item_count=len(measurement_set.hypotheses),
+            )
+        track["world_quantity"] = "ground_footprint"
+        track["world_posture"] = str(result.posture)
+        track["world_support_state"] = str(result.support_state)
+        diagnostics_enabled = bool(self._world_resolver_diagnostics_enabled)
+        # Tracks are normally newly constructed, but explicit removal keeps a
+        # reused synthetic/test mapping from leaking a previously requested
+        # diagnostic into the compact path.
+        selected_hypothesis = {
+            candidate.candidate_id: candidate
+            for candidate in measurement_set.hypotheses
+        }.get(result.selected_candidate_id or "")
+        candidates: List[Dict[str, Any]] = []
+        diagnostic_by_id = {
+            item.candidate_id: item for item in result.diagnostics
+        }
+        for candidate in (
+            measurement_set.hypotheses[: int(self._world_resolver_diag_max_candidates)]
+            if diagnostics_enabled
+            else ()
+        ):
+            diagnostic = diagnostic_by_id.get(candidate.candidate_id)
+            payload: Dict[str, Any] = {
+                "id": str(candidate.candidate_id),
+                "kind": str(candidate.kind),
+                "position": self._world_vector_payload(candidate.position),
+                "covariance": self._world_covariance_payload(candidate.covariance),
+                "anchor": str(candidate.anchor),
+                "contact_basis": str(candidate.anchor),
+                "support_state": str(candidate.support_state),
+                "posture": str(candidate.posture),
+                "confidence": float(candidate.confidence),
+                "support_score": float(candidate.support_score),
+                "posture_compatibility": float(candidate.posture_compatibility),
+                "occlusion": float(candidate.occlusion),
+                "motion_consistency": float(candidate.motion_consistency),
+                "ray_incidence_sin": candidate.ray_incidence_sin,
+                "depth_support_fraction": candidate.depth_support_fraction,
+                "depth_registration_sigma_m": candidate.depth_registration_sigma_m,
+                "floor_depth_disagreement_m": candidate.floor_depth_disagreement_m,
+                "pixel_uncertainty_px": candidate.pixel_uncertainty_px,
+                "selected": bool(diagnostic.selected) if diagnostic is not None else False,
+                "status": "selected" if diagnostic is not None and diagnostic.selected else (
+                    "alternate" if diagnostic is not None and diagnostic.retained_as_alternate else "candidate"
+                ),
+            }
+            if diagnostic is not None:
+                payload.update(
+                    {
+                        "score": float(diagnostic.score),
+                        "pcf_score": float(diagnostic.pcf_score),
+                        "innovation_m": diagnostic.innovation_m,
+                        "agreement_mahalanobis_sq": diagnostic.agreement_mahalanobis_sq,
+                        "compatible_with_selected": bool(diagnostic.compatible_with_selected),
+                        "retained_as_alternate": bool(diagnostic.retained_as_alternate),
+                        "rejection_reason": diagnostic.rejection_reason,
+                    }
+                )
+            if candidate.pcf is not None:
+                payload["pcf"] = {
+                    "prior_id": str(candidate.pcf.prior_id),
+                    "revision_id": str(candidate.pcf.revision_id),
+                    "status": str(candidate.pcf.status),
+                    "inside_extent": candidate.pcf.inside_extent,
+                    "inside_authored_space": candidate.pcf.inside_authored_space,
+                    "extent_outside_distance_m": candidate.pcf.extent_outside_distance_m,
+                    "evidence_observed": bool(candidate.pcf.evidence_observed),
+                    "observed_confidence": float(candidate.pcf.observed_confidence),
+                    "boundary_signed_distance_m": candidate.pcf.boundary_signed_distance_m,
+                    "floor_height_m": candidate.pcf.floor_height_m,
+                    "obstacle_clearance_m": candidate.pcf.obstacle_clearance_m,
+                    "reasons": [str(reason)[:160] for reason in candidate.pcf.reasons[:8]],
+                }
+            candidates.append(payload)
+
+        if diagnostics_enabled:
+            legacy_comparison = self._legacy_world_measurement_comparison(
+                measurement_set
+            )
+            diagnostic_payload: Dict[str, Any] = {
+                "contract": "noesis.world_resolver_diagnostics",
+                "version": 1,
+                "camera_id": str(measurement_set.cohort.camera_id),
+                "source_id": int(measurement_set.cohort.source_id),
+                "tracker_id": int(measurement_set.cohort.tracker_id),
+                "track_key": str(measurement_set.cohort.track_key),
+                "tracker_lifecycle_generation": int(
+                    measurement_set.cohort.tracker_lifecycle_generation
+                ),
+                "frame_id": int(measurement_set.cohort.frame_id),
+                "observed_at_us": int(measurement_set.cohort.observed_at_us),
+                "world_frame": str(measurement_set.cohort.world_frame),
+                "world_frame_revision": str(measurement_set.cohort.world_revision),
+                "calibration_revision": str(measurement_set.cohort.calibration_revision),
+                "world_transform_sha256": (
+                    str(measurement_set.cohort.world_transform_sha256)
+                    if measurement_set.cohort.world_transform_sha256 is not None
+                    else None
+                ),
+                "pcf_revision": measurement_set.cohort.pcf_revision,
+                "selected_id": result.selected_candidate_id,
+                "selected_kind": (
+                    str(result.selected_kind)
+                    if result.selected_kind is not None
+                    else None
+                ),
+                "contributor_ids": [str(item) for item in result.contributor_ids[:4]],
+                "alternate_id": result.alternate_candidate_id,
+                "fused": bool(result.fused),
+                "confidence": float(result.confidence),
+                "pcf_score": result.pcf_score,
+                "agreement_mahalanobis_sq": result.agreement_mahalanobis_sq,
+                "decision": (
+                    "weak"
+                    if str(result.quality) == "weak"
+                    else ("fused" if result.fused else str(result.quality))
+                ),
+                "reason": str(result.reason),
+                "candidates": candidates,
+            }
+            if legacy_comparison is not None:
+                diagnostic_payload["legacy"] = legacy_comparison
+            if result.position is not None and result.covariance is not None:
+                diagnostic_payload["resolved"] = {
+                    "position": self._world_vector_payload(result.position),
+                    "covariance": self._world_covariance_payload(result.covariance),
+                }
+            if result.disagreement_m is not None:
+                diagnostic_payload["disagreement"] = {
+                    "distance_m": float(result.disagreement_m),
+                    "agreement_mahalanobis_sq": (
+                        float(result.agreement_mahalanobis_sq)
+                        if result.agreement_mahalanobis_sq is not None
+                        else None
+                    ),
+                    "reason": "incompatible_alternate_preserved",
+                }
+            track["world_resolver"] = diagnostic_payload
+        track["world_resolver_confidence"] = float(result.confidence)
+        if result.status != "measured" or result.position is None:
+            return None, result
+        point = np.asarray(
+            [float(result.position.x), float(result.position.y), float(result.position.z)],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(point)):
+            raise RuntimeError("canonical world resolver returned a non-finite point")
+        if result.covariance is None or len(result.covariance.values) != 9:
+            raise RuntimeError("canonical world resolver returned no covariance")
+        track["world_resolver_selected_id"] = str(result.selected_candidate_id or "")
+        track["world_resolver_fused"] = bool(result.fused)
+        track["world_resolver_disagreement_m"] = (
+            float(result.disagreement_m) if result.disagreement_m is not None else None
+        )
+        if selected_hypothesis is not None:
+            track["world_resolver_contact_basis"] = str(selected_hypothesis.anchor)
+        return point, result
+
     def _predict_world_state(
         self,
         state: _WorldAnchorState,
@@ -13111,6 +14437,60 @@ class _AnalyticsTelemetryProcessor:
         pred_x = float(state.world_x) + float(state.vel_world_x) * dt
         pred_z = float(state.world_z) + float(state.vel_world_z) * dt
         return pred_x, pred_z, dt
+
+    @staticmethod
+    def _publish_filtered_world_covariance(
+        track: Dict[str, Any],
+        *,
+        resolved: Optional[ResolvedGroundMeasurement],
+        resolved_point: Optional[np.ndarray],
+        emitted_point: Optional[np.ndarray],
+    ) -> None:
+        """Publish covariance only for an accepted current measurement.
+
+        PersonGroundState may reject a geometrically valid resolver result and
+        emit a bounded prediction/hold instead.  The resolver covariance must
+        not follow that continuation.  When the current sample is accepted,
+        add the outer product of the resolver-to-emitted displacement so the
+        published covariance describes the actual point consumed downstream.
+        """
+
+        track.pop("world_covariance", None)
+        if resolved is None or resolved.status != "measured":
+            return
+        if resolved_point is None or emitted_point is None or resolved.covariance is None:
+            raise RuntimeError("accepted canonical measurement has no covariance")
+        try:
+            center = np.asarray(resolved_point, dtype=np.float64).reshape(-1)[:3]
+            emitted = np.asarray(emitted_point, dtype=np.float64).reshape(-1)[:3]
+            covariance = np.asarray(resolved.covariance.values, dtype=np.float64).reshape(3, 3)
+        except Exception as exc:
+            raise RuntimeError("accepted canonical measurement covariance is invalid") from exc
+        if (
+            center.size != 3
+            or emitted.size != 3
+            or covariance.shape != (3, 3)
+            or not np.all(np.isfinite(center))
+            or not np.all(np.isfinite(emitted))
+            or not np.all(np.isfinite(covariance))
+        ):
+            raise RuntimeError("accepted canonical measurement covariance is non-finite")
+        covariance = 0.5 * (covariance + covariance.T)
+        displacement = emitted - center
+        covariance += np.outer(displacement, displacement)
+        covariance = 0.5 * (covariance + covariance.T)
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        except Exception as exc:
+            raise RuntimeError("accepted canonical measurement covariance decomposition failed") from exc
+        if not np.all(np.isfinite(eigenvalues)) or not np.all(np.isfinite(eigenvectors)):
+            raise RuntimeError("accepted canonical measurement covariance is invalid")
+        covariance = eigenvectors @ np.diag(np.clip(eigenvalues, 1e-6, 1e6)) @ eigenvectors.T
+        covariance = 0.5 * (covariance + covariance.T)
+        values = [float(value) for value in covariance.reshape(-1)]
+        if len(values) != 9 or not all(math.isfinite(value) for value in values):
+            raise RuntimeError("accepted canonical measurement covariance is invalid")
+        track["world_covariance"] = values
 
     def _update_world_state(
         self,
@@ -13226,6 +14606,40 @@ class _AnalyticsTelemetryProcessor:
             authoritative=bool(authoritative),
         )
 
+    def _observe_resolver_source_continuity(
+        self,
+        track: Dict[str, Any],
+        state: Optional[_WorldAnchorState],
+        *,
+        candidate_source: str,
+        quality: str,
+        depth_weight: float,
+        posture: str,
+    ) -> bool:
+        """Update PersonGroundState source continuity without vetoing resolution.
+
+        The universal resolver has already compared every current geometric
+        hypothesis.  The older source hysteresis remains useful as bounded
+        continuity evidence, but applying it as a second admission authority
+        makes intermittent depth cadence permanently suppress valid floor-ray
+        measurements.  Record whether the resolved source matches that sticky
+        preference, let the physical filter decide admission, and commit a
+        pending source switch only when the physical measurement is accepted.
+        """
+
+        continuity_match = self._admit_live_world_source(
+            state,
+            candidate_source=str(candidate_source),
+            quality=str(quality),
+            depth_weight=float(depth_weight),
+            posture=str(posture),
+        )
+        track["world_resolver_source_continuity_match"] = bool(continuity_match)
+        diagnostics = track.get("world_resolver")
+        if isinstance(diagnostics, MutableMapping):
+            diagnostics["source_continuity_match"] = bool(continuity_match)
+        return bool(continuity_match)
+
     def _world_fusion_weights(
         self,
         camera_id: str,
@@ -13234,6 +14648,18 @@ class _AnalyticsTelemetryProcessor:
         depth_weight: float,
         track: Dict[str, Any],
     ) -> Tuple[float, float, bool]:
+        if bool(getattr(self, "_world_resolver_enabled", False)):
+            # Camera-specific policy weights are retained below for historical
+            # comparison only.  The canonical resolver receives both
+            # hypotheses and their evidence in every room.
+            effective_floor = max(0.0, float(floor_weight))
+            effective_depth = max(0.0, float(depth_weight))
+            track["world_fusion_policy_id"] = "legacy_compatibility_only"
+            track["world_floor_weight_scale"] = 1.0
+            track["world_depth_weight_scale"] = 1.0
+            track["world_floor_weight_effective"] = effective_floor
+            track["world_depth_weight_effective"] = effective_depth
+            return effective_floor, effective_depth, True
         policy = self.world_fusion_policy
         if policy is None:
             return float(floor_weight), float(depth_weight), True
@@ -13257,6 +14683,10 @@ class _AnalyticsTelemetryProcessor:
         the same point could be authoritative on its own.
         """
 
+        if bool(getattr(self, "_world_resolver_enabled", False)):
+            track["world_projective_continuation_allowed"] = True
+            track["world_projective_authoritative_allowed"] = True
+            return True
         policy = self.world_fusion_policy
         if policy is None:
             allowed = True
@@ -13388,7 +14818,9 @@ class _AnalyticsTelemetryProcessor:
         flip_v: bool = False,
     ) -> bool:
         policy = self.world_fusion_policy
-        if policy is None:
+        if bool(getattr(self, "_world_resolver_enabled", False)):
+            limit_m: Optional[float] = float(self._world_resolver_max_range_m)
+        elif policy is None:
             limit_m: Optional[float] = None
         else:
             profile = policy.profile(str(camera_id))
@@ -13493,10 +14925,13 @@ class _AnalyticsTelemetryProcessor:
         This is an estimator-side rejection, never a PCF/display crop.
         """
         policy = self.world_fusion_policy
-        if policy is None:
+        if bool(getattr(self, "_world_resolver_enabled", False)):
+            limit_m = float(self._world_resolver_max_range_m)
+        elif policy is None:
             return True
-        profile = policy.profile(str(camera_id))
-        limit_m = float(profile.floor_ray_max_range_m)
+        else:
+            profile = policy.profile(str(camera_id))
+            limit_m = float(profile.floor_ray_max_range_m)
         track["world_observation_range_limit_m"] = limit_m
         admitted = False
         rejection_reason = "world_observation_range_invalid"
@@ -14131,6 +15566,13 @@ class _AnalyticsTelemetryProcessor:
                 )
             )
             world_key = self._world_track_key(sensor_id, track)
+            output_watermark_key = self._world_output_watermark_key(
+                sensor_id,
+                track,
+                world_frame_id=world_frame_id,
+                world_frame_revision=world_frame_revision,
+                world_transform_sha256=world_transform_sha256,
+            )
             self._maybe_prune_world_state(now_ts)
             state: Optional[_WorldAnchorState] = None
             if world_key is not None:
@@ -14158,6 +15600,14 @@ class _AnalyticsTelemetryProcessor:
                     # holds/predictions before evaluating this frame.
                     track["world_state_continuity"] = "reset_world_frame"
                     state.ts = float(now_ts)
+                if self._restore_world_output_watermark(
+                    state,
+                    output_watermark_key,
+                ):
+                    track.setdefault(
+                        "world_state_continuity",
+                        "restored_lifecycle_output",
+                    )
 
             try:
                 current_frame_id = int(track.get("frame_id", -1))
@@ -14281,7 +15731,7 @@ class _AnalyticsTelemetryProcessor:
                     and not force_occlusion_gravity
                     and (
                         pose_anchor is not None
-                        or self._depth_measurement_is_current(depth_result)
+                        or self._depth_measurement_is_current(depth_result, track=track)
                     )
                 )
                 try:
@@ -14311,6 +15761,81 @@ class _AnalyticsTelemetryProcessor:
             floor_ray_admitted = True
             floor_ray_rejection_reason: Optional[str] = None
             depth_measurement_not_current = False
+            depth_observation = _DepthObservationResult(
+                None,
+                0.0,
+                "depth_anchor_unavailable",
+            )
+            depth_obs: Optional[np.ndarray] = None
+            depth_weight = 0.0
+            depth_reason = "depth_anchor_unavailable"
+            pose_uv_for_candidate: Optional[Tuple[float, float]] = None
+            universal_candidates: List[Dict[str, Any]] = []
+            canonical_resolved: Optional[ResolvedGroundMeasurement] = None
+            canonical_resolved_point: Optional[np.ndarray] = None
+            occlusion_fraction = (
+                0.75
+                if force_occlusion_gravity
+                else (
+                    0.35
+                    if occlusion_assessment is not None and occlusion_assessment.active
+                    else 0.0
+                )
+            )
+
+            # Lower-body occlusion disables floor-ray construction, but it
+            # must not discard an independently valid registered-depth
+            # observation.  The resolver can adjudicate that depth sample
+            # against the separate gravity reconstruction hypothesis.
+            if force_occlusion_gravity and person_anchor is not None:
+                depth_observation = self._depth_observation_from_anchor(
+                    calib=calib,
+                    anchor=person_anchor,
+                    depth_result=depth_result,
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                    track=track,
+                )
+                depth_obs = depth_observation.world_point
+                depth_weight = float(depth_observation.weight)
+                depth_reason = str(depth_observation.reason)
+                depth_measurement_not_current = (
+                    depth_reason == "depth_measurement_not_current"
+                )
+                registration_status = depth_observation.registration_status
+                reject_current_geometry = bool(
+                    registration_status is not None
+                    and registration_status not in ("ok", "raw_passthrough")
+                )
+                if depth_observation.raw_depth_m is not None:
+                    track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
+                track["depth_registered_m"] = (
+                    float(depth_observation.registered_depth_m)
+                    if depth_observation.registered_depth_m is not None
+                    else None
+                )
+                track["depth_used_m"] = track.get("depth_registered_m")
+                track["depth_registration_status"] = depth_observation.registration_status
+                track["depth_registration_id"] = depth_observation.registration_id
+                if depth_obs is not None:
+                    track["world_depth_candidate"] = [
+                        float(depth_obs[0]),
+                        float(depth_obs[1]),
+                        float(depth_obs[2]),
+                    ]
+                    if not self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(depth_obs, dtype=np.float64),
+                        track=track,
+                    ):
+                        track["world_depth_rejection_reason"] = str(
+                            track.get("world_observation_range_rejection_reason")
+                            or "world_observation_range_exceeded"
+                        )
+                        depth_obs = None
+                        depth_weight = 0.0
+                        depth_reason = str(track["world_depth_rejection_reason"])
 
             if anchor_candidate is not None and not force_occlusion_gravity:
                 track["image_foot"] = [float(anchor_candidate.u), float(anchor_candidate.v)]
@@ -14327,13 +15852,81 @@ class _AnalyticsTelemetryProcessor:
                     float(pose_u),
                     float(pose_v),
                 ]
-                hit = self._project_pixel_to_floor_world(
-                    calib,
-                    float(pose_u),
-                    float(pose_v),
-                    flip_u=flip_u,
-                    flip_v=flip_v,
+                pose_uv_for_candidate = (float(pose_u), float(pose_v))
+                hit = (
+                    self._project_pixel_to_floor_world(
+                        calib,
+                        float(pose_u),
+                        float(pose_v),
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                    )
+                    if self._anchor_is_verified_ground_contact(anchor_candidate)
+                    else None
                 )
+                # A registered range is valid only at the UV/support
+                # location that produced that range.  Pose and depth
+                # anchors are independent hypotheses; never project a
+                # person-mask range through the pose ankle UV merely
+                # because pose was selected as the floor anchor.  Extract
+                # this candidate independently of floor-ray success so a
+                # failed floor intersection cannot suppress valid depth.
+                depth_observation = (
+                    self._depth_observation_from_anchor(
+                        calib=calib,
+                        anchor=person_anchor,
+                        depth_result=depth_result,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                        track=track,
+                    )
+                    if person_anchor is not None
+                    else _DepthObservationResult(
+                        None,
+                        0.0,
+                        "depth_anchor_unavailable",
+                    )
+                )
+                depth_obs = depth_observation.world_point
+                depth_weight = float(depth_observation.weight)
+                depth_reason = str(depth_observation.reason)
+                depth_measurement_not_current = (
+                    depth_reason == "depth_measurement_not_current"
+                )
+                registration_status = depth_observation.registration_status
+                reject_current_geometry = bool(
+                    registration_status is not None
+                    and registration_status not in ("ok", "raw_passthrough")
+                )
+                if depth_observation.raw_depth_m is not None:
+                    track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
+                track["depth_registered_m"] = (
+                    float(depth_observation.registered_depth_m)
+                    if depth_observation.registered_depth_m is not None
+                    else None
+                )
+                track["depth_used_m"] = track.get("depth_registered_m")
+                track["depth_registration_status"] = depth_observation.registration_status
+                track["depth_registration_id"] = depth_observation.registration_id
+                if depth_obs is not None:
+                    track["world_depth_candidate"] = [
+                        float(depth_obs[0]),
+                        float(depth_obs[1]),
+                        float(depth_obs[2]),
+                    ]
+                    if not self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(depth_obs, dtype=np.float64),
+                        track=track,
+                    ):
+                        track["world_depth_rejection_reason"] = str(
+                            track.get("world_observation_range_rejection_reason")
+                            or "world_observation_range_exceeded"
+                        )
+                        depth_obs = None
+                        depth_weight = 0.0
+                        depth_reason = str(track["world_depth_rejection_reason"])
                 if hit is not None:
                     floor_candidate = np.asarray(hit, dtype=np.float64).copy()
                     track["world_floor_candidate"] = [
@@ -14341,55 +15934,17 @@ class _AnalyticsTelemetryProcessor:
                         float(floor_candidate[1]),
                         float(floor_candidate[2]),
                     ]
-                    depth_observation = self._depth_observation_from_anchor(
-                        calib=calib,
-                        anchor=anchor_candidate,
-                        depth_result=depth_result,
-                        flip_u=flip_u,
-                        flip_v=flip_v,
-                    )
-                    depth_obs = depth_observation.world_point
-                    depth_weight = float(depth_observation.weight)
-                    depth_reason = str(depth_observation.reason)
-                    depth_measurement_not_current = (
-                        depth_reason == "depth_measurement_not_current"
-                    )
-                    if depth_observation.raw_depth_m is not None:
-                        track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
-                    track["depth_registered_m"] = (
-                        float(depth_observation.registered_depth_m)
-                        if depth_observation.registered_depth_m is not None
-                        else None
-                    )
-                    track["depth_used_m"] = track.get("depth_registered_m")
-                    track["depth_registration_status"] = depth_observation.registration_status
-                    track["depth_registration_id"] = depth_observation.registration_id
-                    if depth_obs is not None:
-                        track["world_depth_candidate"] = [
-                            float(depth_obs[0]),
-                            float(depth_obs[1]),
-                            float(depth_obs[2]),
-                        ]
-                        if not self._admit_world_observation_range(
-                            camera_id,
-                            calib=calib,
-                            world_candidate=np.asarray(depth_obs, dtype=np.float64),
-                            track=track,
-                        ):
-                            track["world_depth_rejection_reason"] = str(
-                                track.get("world_observation_range_rejection_reason")
-                                or "world_observation_range_exceeded"
-                            )
-                            depth_obs = None
-                            depth_weight = 0.0
-                            depth_reason = str(track["world_depth_rejection_reason"])
                     base_floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
-                    floor_weight, effective_depth_weight, floor_only_allowed = self._world_fusion_weights(
-                        camera_id,
-                        floor_weight=base_floor_weight,
-                        depth_weight=depth_weight,
-                        track=track,
-                    )
+                    floor_weight = 0.0
+                    effective_depth_weight = float(depth_weight)
+                    floor_only_allowed = False
+                    if not self._world_resolver_enabled:
+                        floor_weight, effective_depth_weight, floor_only_allowed = self._world_fusion_weights(
+                            camera_id,
+                            floor_weight=base_floor_weight,
+                            depth_weight=depth_weight,
+                            track=track,
+                        )
                     floor_ray_admitted = self._admit_floor_ray_range(
                         camera_id,
                         calib=calib,
@@ -14408,11 +15963,6 @@ class _AnalyticsTelemetryProcessor:
                         floor_weight = 0.0
                         floor_only_allowed = False
                         track["world_floor_weight_effective"] = 0.0
-                    registration_status = depth_observation.registration_status
-                    reject_current_geometry = bool(
-                        registration_status is not None
-                        and registration_status not in ("ok", "raw_passthrough")
-                    )
                     if reject_current_geometry:
                         # Reject the unusable metric range without discarding an
                         # independently permitted floor-ray observation.  The
@@ -14439,7 +15989,7 @@ class _AnalyticsTelemetryProcessor:
                             flip_v=flip_v,
                             pose_kpts_abs=pose_kpts_project,
                         )
-                    if not reject_current_geometry and depth_obs is not None and effective_depth_weight > 0.0:
+                    if not self._world_resolver_enabled and not reject_current_geometry and depth_obs is not None and effective_depth_weight > 0.0:
                         fused = np.array(
                             [float(depth_obs[0]), float(calib.floor_y), float(depth_obs[2])],
                             dtype=np.float64,
@@ -14550,6 +16100,225 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     hit = None
 
+            if self._world_resolver_enabled:
+                self._append_universal_world_candidates(
+                    universal_candidates,
+                    sensor_id=int(sensor_id),
+                    track=track,
+                    camera_id=camera_id,
+                    calib=calib,
+                    floor_candidate=floor_candidate,
+                    floor_ray_admitted=bool(floor_ray_admitted),
+                    anchor_candidate=(
+                        anchor_candidate
+                        if anchor_candidate is not None and not force_occlusion_gravity
+                        else None
+                    ),
+                    pose_uv=pose_uv_for_candidate,
+                    contact_basis=contact_basis,
+                    posture=str(posture),
+                    occlusion_fraction=float(occlusion_fraction),
+                    image_motion_supported=bool(image_motion_supported),
+                    depth_obs=depth_obs,
+                    depth_weight=float(depth_weight),
+                    depth_observation=depth_observation,
+                    depth_result=depth_result,
+                    person_anchor=person_anchor,
+                    reject_current_geometry=bool(reject_current_geometry),
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                )
+                quality_reason = (
+                    f"universal_candidates={len(universal_candidates)},"
+                    f"depth={depth_reason}"
+                )
+                # Keep ``hit`` unset until the resolver has returned a typed
+                # result.  PersonGroundState remains the only temporal filter
+                # after that result is selected.
+                hit = None
+                # Gravity reconstruction is an additional, deliberately weak
+                # hypothesis for upright lower-body occlusion or a missing
+                # current metric contact.  It remains separate from the
+                # process prediction/hold handled below.
+                allow_gravity_hypothesis = posture not in ("sitting", "lying")
+                if depth_reports_no_ground_contact:
+                    # ``no_ground_contact`` rejects the depth capsule and any
+                    # extrapolated leg-floor anchor.  It does not invalidate
+                    # an independently learned upright body-scale hypothesis.
+                    # Require positive upright/motion/occlusion evidence so an
+                    # unknown seated newcomer can never be gravity-dropped to
+                    # the floor merely because its ankles are unavailable.
+                    allow_gravity_hypothesis = bool(
+                        posture == "standing"
+                        or force_occlusion_gravity
+                        or (
+                            state is not None
+                            and str(state.motion_mode) == "walk"
+                        )
+                    )
+                if state is not None and str(state.motion_mode) in ("sit", "lie"):
+                    allow_gravity_hypothesis = False
+                if (
+                    allow_gravity_hypothesis
+                    and state is not None
+                    and state.height_ref_scene is not None
+                    and (force_occlusion_gravity or not universal_candidates)
+                ):
+                    gravity_candidate = self._gravity_drop_world(
+                        calib,
+                        bbox_project,
+                        float(state.height_ref_scene),
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                        pose_kpts_abs=pose_kpts_project,
+                        state=state,
+                    )
+                    if gravity_candidate is not None and self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(gravity_candidate, dtype=np.float64),
+                        track=track,
+                    ):
+                        try:
+                            gravity_covariance = Matrix3(
+                                values=(
+                                    0.64,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.25,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.64,
+                                )
+                            )
+                        except Exception:
+                            gravity_covariance = None
+                        if gravity_covariance is not None:
+                            universal_candidates.append(
+                                {
+                                    "candidate_id": "gravity_reconstruction",
+                                    "kind": "gravity_reconstruction",
+                                    "position": np.asarray(gravity_candidate, dtype=np.float64),
+                                    "covariance": gravity_covariance,
+                                    "anchor": "learned_body_height",
+                                    "contact_basis": "gravity_drop",
+                                    "confidence": 0.45,
+                                    "posture": str(posture),
+                                    "occlusion": float(occlusion_fraction),
+                                    "motion_consistency": 0.65,
+                                    "support_score": 0.45,
+                                    "posture_compatibility": 1.0,
+                                    "source_reliability": 0.80,
+                                    "correlation_group": f"gravity_reconstruction:{int(sensor_id)}:{int(track.get('tracker_id', -1))}",
+                                    "pcf": self._world_prior_evidence(camera_id, gravity_candidate),
+                                }
+                            )
+
+                cohort = self._world_measurement_cohort(
+                    sensor_id,
+                    camera_id,
+                    track,
+                    calib=calib,
+                    world_frame_revision=world_frame_revision,
+                    world_transform_sha256=world_transform_sha256,
+                )
+                measurement_set = self._build_world_measurement_set(
+                    cohort=cohort,
+                    candidates=universal_candidates,
+                )
+                if measurement_set is None:
+                    raise RuntimeError("unable to construct exact world measurement cohort")
+                resolved_hit, resolved = self._apply_resolved_world_measurement(
+                    track,
+                    measurement_set,
+                )
+                canonical_resolved = resolved
+                canonical_resolved_point = resolved_hit
+                if (
+                    resolved_hit is not None
+                    and resolved is not None
+                    and str(resolved.quality) != "weak"
+                ):
+                    selected_kind = str(resolved.selected_kind or "")
+                    contributor_kinds = {
+                        str(candidate.kind)
+                        for candidate in measurement_set.hypotheses
+                        if candidate.candidate_id in set(resolved.contributor_ids)
+                    }
+                    if resolved.fused and {"floor_ray", "registered_depth"}.issubset(contributor_kinds):
+                        world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
+                    elif selected_kind == "registered_depth":
+                        world_source = "person_anchor_depth_only"
+                    elif selected_kind == "floor_ray":
+                        world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
+                    elif selected_kind == "gravity_reconstruction":
+                        world_source = "gravity_drop"
+                    else:
+                        world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
+                    quality = str(resolved.quality)
+                    if quality not in ("good", "estimated"):
+                        quality = "estimated"
+                    depth_weight_for_admission = float(
+                        next(
+                            (
+                                candidate.get("confidence", 0.0)
+                                for candidate in universal_candidates
+                                if candidate.get("kind") == "registered_depth"
+                            ),
+                            0.0,
+                        )
+                    )
+                    self._observe_resolver_source_continuity(
+                        track,
+                        state,
+                        candidate_source=world_source,
+                        quality=quality,
+                        depth_weight=depth_weight_for_admission,
+                        posture=str(posture),
+                    )
+                    hit = self._update_track_world_state(
+                        track,
+                        state,
+                        measurement=resolved_hit,
+                        floor_y=float(calib.floor_y),
+                        now_ts=float(now_ts),
+                        alpha=(
+                            float(self._world_smooth_alpha_good)
+                            if quality == "good"
+                            else float(self._world_smooth_alpha_weak)
+                        ),
+                        beta=0.15,
+                        quality=quality,
+                        contact_basis=(
+                            str(track.get("world_resolver_contact_basis"))
+                            if track.get("world_resolver_contact_basis")
+                            else contact_basis
+                        ),
+                        image_motion_supported=image_motion_supported,
+                    )
+                    quality_reason = str(resolved.reason)
+                elif resolved_hit is not None and resolved is not None:
+                    # A weak resolver result remains visible in the bounded
+                    # diagnostic payload, but it is not a current metric
+                    # observation.  Leave PersonGroundState untouched so the
+                    # continuation path below can emit its existing bounded
+                    # prediction/hold instead of training on weak geometry.
+                    hit = None
+                    source_measurement_rejected = True
+                    quality = "invalid"
+                    quality_reason = "world_resolver_weak_measurement"
+                else:
+                    hit = None
+                    source_measurement_rejected = True
+                    quality = "invalid"
+                    quality_reason = (
+                        str(resolved.reason)
+                        if resolved is not None
+                        else "world_resolver_rejected_measurement"
+                    )
+
             # Gravity-drop assumes upright height. Skip confirmed non-upright
             # postures/motion modes. A short box alone can be lower-body
             # occlusion of a standing person — height lock is exactly for that case.
@@ -14571,10 +16340,13 @@ class _AnalyticsTelemetryProcessor:
                 and not reject_current_geometry
             )
             if (
+                not self._world_resolver_enabled
+                and (
                 (force_occlusion_gravity or gravity_fallback_requested)
                 and allow_gravity
                 and state is not None
                 and state.height_ref_scene is not None
+                )
             ):
                 gravity_hit = self._gravity_drop_world(
                     calib,
@@ -14649,19 +16421,24 @@ class _AnalyticsTelemetryProcessor:
 
             fallback_reason = self._fallback_quality_reason(pose_kpts_abs, pose_anchor, person_anchor, depth_result, state)
             if source_measurement_rejected:
-                fallback_reason = (
-                    quality_reason
-                    if quality_reason in (
-                        "fusion_policy_requires_registered_depth",
-                        "depth_measurement_not_current",
-                        "world_observation_range_exceeded",
-                        "floor_ray_range_exceeded",
-                        "floor_ray_geometry_invalid",
-                        "bbox_contact_gap_near_horizon",
-                        "bbox_contact_range_disagreement_near_horizon",
+                if self._world_resolver_enabled:
+                    fallback_reason = str(
+                        quality_reason or "world_resolver_rejected_measurement"
                     )
-                    else "source_hysteresis_rejected_current_measurement"
-                )
+                else:
+                    fallback_reason = (
+                        quality_reason
+                        if quality_reason in (
+                            "fusion_policy_requires_registered_depth",
+                            "depth_measurement_not_current",
+                            "world_observation_range_exceeded",
+                            "floor_ray_range_exceeded",
+                            "floor_ray_geometry_invalid",
+                            "bbox_contact_gap_near_horizon",
+                            "bbox_contact_range_disagreement_near_horizon",
+                        )
+                        else "source_hysteresis_rejected_current_measurement"
+                    )
 
             measurement_rejected = bool(
                 state is not None
@@ -14959,6 +16736,23 @@ class _AnalyticsTelemetryProcessor:
                                 track[key] = value
                     return
                 track["world_estimator_evaluated"] = True
+                if self._world_resolver_enabled:
+                    current_world_sources = {
+                        "pose_floor_only",
+                        "person_anchor_floor_only",
+                        "pose_depth_fused",
+                        "person_anchor_depth_fused",
+                        "person_anchor_depth_only",
+                        "gravity_drop",
+                    }
+                    accepted_current = bool(
+                        canonical_resolved is not None
+                        and canonical_resolved.status == "measured"
+                        and world_source in current_world_sources
+                        and (state is None or bool(state.measurement_accepted))
+                    )
+                else:
+                    accepted_current = False
                 if (
                     world_source == "gravity_drop"
                     and state is not None
@@ -15045,6 +16839,55 @@ class _AnalyticsTelemetryProcessor:
                             state.vel_world_x = 0.0
                             state.vel_world_z = 0.0
 
+                    hit, output_continuous = admit_human_ground_output(
+                        state,
+                        candidate=np.asarray(hit, dtype=np.float64),
+                        floor_y=float(calib.floor_y),
+                        now_ts=float(now_ts),
+                        media_pts_ns=track.get("media_pts_ns", 0),
+                        config=self._human_ground_cfg,
+                    )
+                    self._save_world_output_watermark(
+                        state,
+                        output_watermark_key,
+                    )
+                    if not output_continuous:
+                        world_source = "anchor_hold"
+                        quality = "held"
+                        quality_reason = str(
+                            state.measurement_rejection_reason
+                            or "physical_output_continuity_exceeded"
+                        )
+
+                if world_source in (
+                    "anchor_hold",
+                    "cv_prediction",
+                    "image_motion_prediction",
+                ):
+                    # Process continuation is a valid display point but not a
+                    # current metric observation. Keep its quality explicit so
+                    # downstream covariance fallback remains conservative.
+                    quality = "held"
+                if self._world_resolver_enabled:
+                    accepted_current = bool(
+                        canonical_resolved is not None
+                        and canonical_resolved.status == "measured"
+                        and world_source not in (
+                            "anchor_hold",
+                            "cv_prediction",
+                            "image_motion_prediction",
+                        )
+                        and (state is None or bool(state.measurement_accepted))
+                    )
+                if accepted_current:
+                    self._publish_filtered_world_covariance(
+                        track,
+                        resolved=canonical_resolved,
+                        resolved_point=canonical_resolved_point,
+                        emitted_point=np.asarray(hit, dtype=np.float64),
+                    )
+                else:
+                    track.pop("world_covariance", None)
                 self._set_track_image_base_from_world(track, calib=calib, world_point=hit, flip_u=flip_u, flip_v=flip_v)
                 wx = float(hit[0])
                 wy = float(hit[1])
@@ -15907,6 +17750,10 @@ class _AnalyticsTelemetryProcessor:
             "depth_measurement_ts_us",
             "depth_measurement_age_us",
             "depth_measurement_cached",
+            "depth_tensor_frame_id",
+            "depth_tensor_ts_us",
+            "depth_tensor_age_frames",
+            "depth_tensor_age_us",
         )
         if depth_result is None:
             track["depth_status"] = None
@@ -15948,7 +17795,7 @@ class _AnalyticsTelemetryProcessor:
         if track.get("depth_used_m") is None:
             track["depth_used_m"] = (
                 _depth_used_m(depth_result)
-                if self._depth_measurement_is_current(depth_result)
+                if self._depth_measurement_is_current(depth_result, track=track)
                 else None
             )
         track["depth_registered_m"] = track.get("depth_registered_m")
@@ -15988,6 +17835,26 @@ class _AnalyticsTelemetryProcessor:
         track["depth_measurement_cached"] = (
             bool(depth_result.measurement_cached)
             if depth_result.measurement_cached is not None
+            else None
+        )
+        track["depth_tensor_frame_id"] = (
+            max(0, int(depth_result.depth_tensor_frame_id))
+            if depth_result.depth_tensor_frame_id is not None
+            else None
+        )
+        track["depth_tensor_ts_us"] = (
+            max(0, int(depth_result.depth_tensor_ts_us))
+            if depth_result.depth_tensor_ts_us is not None
+            else None
+        )
+        track["depth_tensor_age_frames"] = (
+            max(0, int(depth_result.depth_tensor_age_frames))
+            if depth_result.depth_tensor_age_frames is not None
+            else None
+        )
+        track["depth_tensor_age_us"] = (
+            max(0, int(depth_result.depth_tensor_age_us))
+            if depth_result.depth_tensor_age_us is not None
             else None
         )
 

@@ -1,6 +1,6 @@
 # Canonical pipeline performance invariants
 
-Status: current for the native DeepStream 9.1 baseline, accepted 2026-08-23.
+Status: current for the native DeepStream 9.1 baseline, accepted 2026-08-25.
 
 These constraints preserve the occupied-scene behavior of the canonical
 three-camera application. They apply to pipeline construction, native bridges,
@@ -39,6 +39,11 @@ interchangeable:
 - Bound work that scales with detections, tracks, cameras, clients, or retained
   records. An optimization is incomplete if it performs well only in empty
   rooms and develops unbounded tails in occupied scenes.
+- Universal world localization is bounded to four compact scalar hypotheses
+  per admitted person. It reuses existing pose/object-depth metadata and may
+  perform only bounded matrix arithmetic and revision-matched PCF scalar
+  lookups. It may not retain/copy a frame, mask, tensor, SDK object, or raw
+  depth map; invoke another model; synchronize CUDA; or perform I/O.
 - Durable and external I/O runs outside the media callback through bounded
   workers. Failure is reported through health/counters and cannot silently
   switch algorithms or block video.
@@ -56,6 +61,10 @@ and does not authorize host staging in an always-on path.
   observation without waiting on the frame path.
 - Optional evidence/persistence queues discard or coalesce stale work according
   to their explicit contract. They never grow without bound.
+- Reconstructable world-journal persistence uses a finite asynchronous queue
+  and batches durable transactions off the publication worker. Admission proves
+  only the exact queued payload count; queue or write failure degrades
+  persistence health and never blocks or poisons the canonical spatial cohort.
 - Diagnostic Identity-v2 shadow scoring and visitor persistence use one
   isolated worker with at most one pending scalar snapshot per source and 64
   pending sources. A newer pending cohort replaces the older one for that
@@ -82,7 +91,7 @@ transparent performance fixes. They require user approval and matched quality
 evidence.
 
 World and ground estimation remain single-authority computations under
-ADR-020. Dashboard BEV, OSD trails, Menon, and other views may apply only the
+ADR-020 and ADR-024. Dashboard BEV, OSD trails, Menon, and other views may apply only the
 revision-checked transform appropriate to their view; they may not create a
 second estimator or smoother to make presentation cheaper.
 

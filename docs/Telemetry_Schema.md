@@ -139,10 +139,12 @@ Emitted per source on the tracking publish gate. Non-empty frames are bounded by
 **Empty frames are first-class:** when a camera has zero people, Noesis still publishes `tracks: []` with an advancing top-level `frame_id` (count transitions to zero always force a publish, followed by the bounded empty heartbeat). Downstream clients such as Menon use empty lists to clear presence immediately and use the frame sequence to distinguish zero occupancy from a stalled producer. An empty source frame also removes that camera's evidence from the canonical world immediately; tracker shadow age already owns brief detector occlusion.
 
 The tracking envelope, its world snapshot, and its world events are one
-release-gated cohort. Bounded sender admission freezes the bytes, synchronous
-exact-count journal acknowledgement and private world commit happen next, and
-only then may client delivery begin. Commit failure aborts the complete cohort
-with no partial visibility.
+release-gated cohort. Bounded sender admission freezes the bytes, private world
+commit happens next, and only then may client delivery begin. Reconstructable
+journal persistence receives the same exact payload count through its own
+finite asynchronous queue; its failure is surfaced as degraded persistence and
+cannot stall or partially mutate canonical tracking/world/BEV. Authority commit
+failure still aborts the complete cohort with no partial visibility.
 
 ```json
 {
@@ -169,6 +171,8 @@ with no partial visibility.
     {
       "stable_id": <int|null>,
       "tracker_id": <int>,
+      "track_key": "<source:tracker:generation>",
+      "tracker_lifecycle_generation": <int>,
       "camera_id": "<camera>",
       "bbox": [<float left>, <float top>, <float width>, <float height>],
       "center": [<float cx>, <float cy>],
@@ -186,11 +190,20 @@ with no partial visibility.
       "image_base": [<float u>, <float v>],
       "world": [<float x>, <float y>, <float z>],
       "world_valid": <bool>,
-      "world_quality": "good"|"estimated"|"invalid",
+      "world_quality": "good"|"estimated"|"held"|"invalid",
       "world_quality_reason": "<string|null>",
       "world_frame": "backend_world_m"|null,
       "world_frame_revision": "<revision|null>",
+      "world_transform_sha256": "<lowercase sha256|null>",
+      "world_quantity": "ground_footprint"|null,
+      "world_covariance": [<9 row-major float values>]|null,
+      "world_support_state": "floor"|"seat"|"couch"|"unknown"|null,
+      "world_posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"pose_depth_only"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_depth_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
+      "world_resolver_confidence": <float 0..1|null>,
+      "world_resolver_selected_id": "floor_ray"|"registered_depth"|"pose_scale"|"gravity_reconstruction"|"",
+      "world_resolver_fused": <bool|null>,
+      "world_resolver_disagreement_m": <float|null>,
       "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
       "world_prediction_image_foot": [<float u>, <float v>]|null,
       "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
@@ -245,13 +258,23 @@ with no partial visibility.
   durably appended. They are absent when evidence capture is off, append fails,
   or identity is only continuity-held. Partial triads are invalid, and no raw
   embedding vector is public.
-- Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame. `world_frame_revision` identifies the exact active calibration/Scene Prior revision and must be preserved by every spatial consumer.
-- In the active baseline, `world` is produced by the shared
-  `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`):
-  posture-aware pose contact when available, otherwise the person mask/depth
-  anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`, with human CV filtering and
-  stationary lock. Tracks may also carry `motion_mode`, `posture`,
-  `trail_append_allowed`, and `idle_jitter_m`.
+- Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame. `world_frame_revision` plus `world_transform_sha256` identify the exact active calibration/Scene Prior transform and must be preserved by every spatial consumer.
+- In the active baseline, one universal resolver independently preserves the
+  current floor-ray, registered-depth, optional pose-scale, and weak gravity
+  hypotheses with full covariance. It uses no room/camera strategy, genuinely
+  fuses only a mutually compatible contributor set, and retains a
+  substantially disagreeing candidate as an alternate instead of averaging
+  it. The selected current
+  measurement feeds the existing `PersonGroundState`, which remains the sole
+  human CV filter, physical gate, stationary lock, source hysteresis, and
+  reacquisition authority. See
+  [`universal_world_localization.md`](universal_world_localization.md).
+- `world` is explicitly a `ground_footprint`. `world_covariance` is present
+  only for an accepted current measurement and describes the emitted filtered
+  point after displacement inflation. Normal tracking and stats rows retain
+  only compact `world_resolver_*` decision scalars. The full candidate tree is
+  request-gated BEV presentation evidence and cannot move a downstream dot or
+  trail.
 - `cv_prediction` is a bounded constant-velocity continuation of the
   canonical filtered world point when the current metric observation is
   missing, stale, or physically rejected. It is not a fresh measurement:
@@ -274,13 +297,24 @@ with no partial visibility.
   `world_prediction_provenance` expose its non-authoritative basis. If image,
   ray, metric-speed, or TTL gates fail, the producer fails closed instead of
   publishing a frozen point.
+- `cv_prediction`, `image_motion_prediction`, and `anchor_hold` are display
+  continuity only. They are never admitted as fresh observations by the
+  canonical global-world fusion service. That service also refuses to average
+  incomplete or mixed target-frame revisions and preserves full covariance
+  through conservative covariance intersection.
 - World/filter/lock state is discarded on the first exact processed frame that
   omits a tracker key. A later reuse of the same numeric tracker ID starts a new
   world lifecycle and cannot inherit the prior position or velocity.
-- `depth_used_m` is the DAv2 anchor depth that actually contributed to the fused baseline world update on that frame; `depth_anchor_m` remains the raw anchor carried by `NOESIS.OBJECT_DEPTH`.
+- `depth_used_m` is the current registered DAv2 anchor range admitted as a
+  resolver candidate; `world_source` and compact `world_resolver_*` fields
+  describe the normal decision, while request-gated BEV diagnostics expose
+  exact contributors. `depth_anchor_m` remains the raw anchor carried by
+  `NOESIS.OBJECT_DEPTH`.
 - `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2->MapAnything mapping for that camera; this is the value the estimator projects when registration is active.
 - `depth_registration_status` and `depth_registration_id` make the registration path observable on both tracks and active-tracks without changing the raw `NOESIS.OBJECT_DEPTH` payload semantics.
-- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that drove the fused update; they are more authoritative than whole-mask support when diagnosing why a far-camera track fused depth or stayed floor-only.
+- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` describe the
+  exact depth-band support. Candidate covariance, score, compatibility, and
+  rejection fields explain selection more completely than whole-mask support.
 - `stats.payload.cameras[*].tracking.active_tracks[]` mirrors the same depth-registration fields for the current camera, and the runtime OSD `depth=` label uses `depth_used_m` / registered depth rather than raw `depth_anchor_m`.
 - `observations[].payload.depth_present` is true only for `depth_status="ok"`,
   `depth_registration_status="ok"`, and a finite positive

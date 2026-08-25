@@ -172,6 +172,50 @@ def test_ds9_depth_bridge_rendezvous_and_counters_match_canonical_contract() -> 
         assert bbox_payload["evidence_reason"] == "bbox_only_without_person_contact_support"
         assert "anchor_uv" not in bbox_payload
         assert "anchor_depth_m" not in bbox_payload
+        assert bbox_payload["depth_tensor_frame_id"] == 50
+        assert bbox_payload["depth_tensor_ts_us"] == 2_000_000
+        assert bbox_payload["depth_tensor_age_frames"] == 0
+        assert bbox_payload["depth_tensor_age_us"] == 0
+
+        processor.handle_frame_ds8(
+            batch_meta,
+            SimpleNamespace(
+                source_id=0,
+                frame_number=51,
+                frame_width=1920,
+                frame_height=1080,
+                buf_pts=2_033_333_000,
+                object_items=[
+                    SimpleNamespace(
+                        object_id=8,
+                        class_id=0,
+                        confidence=0.9,
+                        rect_params=SimpleNamespace(
+                            left=10.0,
+                            top=20.0,
+                            width=30.0,
+                            height=40.0,
+                        ),
+                    )
+                ],
+            )
+        )
+        lagged_payload = attached_payloads[1]
+        assert lagged_payload["frame_id"] == 51
+        assert lagged_payload["measurement_frame_id"] == 51
+        assert lagged_payload["depth_tensor_frame_id"] == 50
+        assert lagged_payload["depth_tensor_ts_us"] == 2_000_000
+        assert lagged_payload["depth_tensor_age_frames"] == 1
+        assert lagged_payload["depth_tensor_age_us"] == 33_333
+        assert hooks._AnalyticsTelemetryProcessor._depth_measurement_is_current(
+            hooks.ObjectDepthResult.from_dict(lagged_payload),
+            track={
+                "source_id": 0,
+                "tracker_id": 8,
+                "frame_id": 51,
+                "media_pts_ns": 2_033_333_000,
+            },
+        ) is False
 
         device = SimpleNamespace(depth_width=518, depth_height=294)
         hooks.noesis_depth_tracking_tensor_ext = SimpleNamespace(
@@ -196,15 +240,16 @@ def test_ds9_depth_bridge_rendezvous_and_counters_match_canonical_contract() -> 
         )
 
         counters = hooks.get_core_path_instrumentation_snapshot()["counters"]
-        assert counters["depth_bridge_wait_bypassed_total"] == 1
+        assert counters["depth_bridge_wait_bypassed_total"] == 2
         assert counters["depth_bridge_pending_exact_total"] == 1
         assert counters["depth_bridge_pending_lagged_skipped_total"] == 1
         assert counters["depth_bridge_exact_resolve_total"] == 2
+        assert counters["depth_bridge_lagged_resolve_total"] == 4
         assert counters["object_depth_attach_failure_total"] == 1
         assert counters["object_depth_attach_failure_total.native_rejected"] == 1
-        assert counters["object_depth_gpu_roi_copies_total"] == 1
-        assert counters["object_depth_attach_total"] == 1
-        assert counters["object_depth_status_total.no_ground_contact"] == 1
+        assert counters["object_depth_gpu_roi_copies_total"] == 2
+        assert counters["object_depth_attach_total"] == 2
+        assert counters["object_depth_status_total.no_ground_contact"] == 2
         assert counters["depth_tracking_device_frames_total"] == 1
         """
     )

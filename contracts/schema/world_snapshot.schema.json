@@ -198,6 +198,20 @@
     "WorldEntity": {
       "additionalProperties": false,
       "properties": {
+        "calibration_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Revision"
+        },
         "conflict": {
           "default": false,
           "title": "Conflict",
@@ -252,6 +266,23 @@
           ],
           "default": null
         },
+        "position_quantity": {
+          "const": "ground_footprint",
+          "default": "ground_footprint",
+          "title": "Position Quantity",
+          "type": "string"
+        },
+        "posture": {
+          "default": "unknown",
+          "enum": [
+            "standing",
+            "sitting",
+            "lying",
+            "unknown"
+          ],
+          "title": "Posture",
+          "type": "string"
+        },
         "room_id": {
           "anyOf": [
             {
@@ -282,6 +313,17 @@
         "subject": {
           "$ref": "#/$defs/SubjectRef"
         },
+        "support_state": {
+          "default": "unknown",
+          "enum": [
+            "floor",
+            "seat",
+            "couch",
+            "unknown"
+          ],
+          "title": "Support State",
+          "type": "string"
+        },
         "velocity_mps": {
           "anyOf": [
             {
@@ -292,6 +334,39 @@
             }
           ],
           "default": null
+        },
+        "world_frame": {
+          "const": "backend_world_m",
+          "default": "backend_world_m",
+          "title": "World Frame",
+          "type": "string"
+        },
+        "world_frame_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Frame Revision"
+        },
+        "world_transform_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Transform Sha256"
         }
       },
       "required": [
@@ -311,6 +386,20 @@
         "accepted": {
           "title": "Accepted",
           "type": "boolean"
+        },
+        "calibration_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Revision"
         },
         "camera_id": {
           "maxLength": 160,
@@ -347,6 +436,39 @@
           ],
           "default": null,
           "title": "Rejection Reason"
+        },
+        "world_frame": {
+          "const": "backend_world_m",
+          "default": "backend_world_m",
+          "title": "World Frame",
+          "type": "string"
+        },
+        "world_frame_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Frame Revision"
+        },
+        "world_transform_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "World Transform Sha256"
         },
         "zone": {
           "anyOf": [

@@ -19,6 +19,12 @@ import {
   resolveBevDisplayBounds,
   resolveBevMetricPoint,
 } from '../lib/bevDisplayGeometry';
+import {
+  admitResolverDiagnostics,
+  resolverDiagnosticDisplayPoint,
+  type ResolverCandidate,
+  type ResolverDiagnostics,
+} from '../lib/bevResolverDiagnostics';
 
 export type BevMeta = {
   type?: string;
@@ -82,6 +88,7 @@ export type BevMeta = {
       }>;
       chosen?: { x?: number; z?: number; normX?: number; normY?: number; insideBounds?: boolean; floorplanInside?: boolean; displaySource?: string };
     };
+    resolverDiagnostics?: ResolverDiagnostics;
   }>;
   trails?: Array<{
     stableId?: number | null;
@@ -167,6 +174,9 @@ type BevViewProps = {
   trailEnabled?: boolean;
   trailConfig?: Partial<BevTrailConfig>;
   debug?: boolean;
+  /** Global dashboard capability state, synchronized by the WebSocket server. */
+  resolverComparisonEnabled?: boolean;
+  onResolverComparisonChange?: (enabled: boolean) => void;
   variant?: 'drawer' | 'inline';
 };
 
@@ -532,6 +542,8 @@ export const BevView: React.FC<BevViewProps> = ({
   trailEnabled = true,
   trailConfig,
   debug = false,
+  resolverComparisonEnabled: resolverComparisonEnabledProp,
+  onResolverComparisonChange,
   variant = 'drawer'
 }) => {
   const label = cameraLabel(cam);
@@ -540,6 +552,19 @@ export const BevView: React.FC<BevViewProps> = ({
   const [lookPanelOpen, setLookPanelOpen] = useState(false);
   const [heightRenderTuning, setHeightRenderTuning] = useState<HeightRenderTuning>(DEFAULT_HEIGHT_RENDER_TUNING);
   const [floorPlaneEnabled, setFloorPlaneEnabled] = useState(true);
+  // The resolver comparison is deliberately presentation-only.  Query-param
+  // debug remains a useful initial override for development, while a normal
+  // dashboard user can toggle the bounded overlay without changing runtime
+  // estimation, publication cadence, or trails.
+  const [localResolverComparisonEnabled, setLocalResolverComparisonEnabled] = useState(() => Boolean(debug));
+  const resolverComparisonEnabled = resolverComparisonEnabledProp ?? localResolverComparisonEnabled;
+  const setResolverComparisonEnabled = (enabled: boolean) => {
+    if (resolverComparisonEnabledProp !== undefined) {
+      onResolverComparisonChange?.(enabled);
+      return;
+    }
+    setLocalResolverComparisonEnabled(enabled);
+  };
 
   const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number; worldAdmission?: string }>>(new Map());
   const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
@@ -1381,6 +1406,215 @@ export const BevView: React.FC<BevViewProps> = ({
         ctx.restore();
       };
 
+      const resolverCandidateColor = (candidate: ResolverCandidate): string => {
+        switch (String(candidate.kind || '').toLowerCase()) {
+          case 'floor_ray': return 'rgba(77, 220, 255, 0.95)';
+          case 'registered_depth': return 'rgba(255, 119, 95, 0.95)';
+          case 'pose_scale': return 'rgba(210, 153, 255, 0.95)';
+          case 'gravity_reconstruction': return 'rgba(168, 230, 106, 0.95)';
+          default: return 'rgba(255, 215, 64, 0.95)';
+        }
+      };
+
+      const drawResolverCovariance = (
+        point: { x: number; z: number },
+        covariance: [[number, number], [number, number]] | undefined,
+        color: string,
+      ) => {
+        if (!covariance) return;
+        const projected = projectForBounds(activeDrawBounds, point.x, point.z, false);
+        if (!projected) return;
+        const a = Number(covariance[0][0]);
+        const b = Number(covariance[0][1]);
+        const d = Number(covariance[1][1]);
+        if (![a, b, d].every(Number.isFinite)) return;
+        const halfTrace = (a + d) * 0.5;
+        const discriminant = Math.sqrt(Math.max(0, ((a - d) * 0.5) ** 2 + b ** 2));
+        const lambdaMajor = Math.max(0, halfTrace + discriminant);
+        const lambdaMinor = Math.max(0, halfTrace - discriminant);
+        let vx = 1;
+        let vz = 0;
+        if (Math.abs(b) > 1e-8) {
+          vx = lambdaMajor - d;
+          vz = b;
+        } else if (d > a) {
+          vx = 0;
+          vz = 1;
+        }
+        const vectorLength = Math.hypot(vx, vz) || 1;
+        vx /= vectorLength;
+        vz /= vectorLength;
+        const pxPerX = contentRect.w / Math.max(1e-6, xMax - xMin);
+        const pxPerZ = contentRect.h / Math.max(1e-6, zMax - zMin);
+        const radiusMajor = clampNumber(Math.sqrt(lambdaMajor) * 2 * Math.max(pxPerX, pxPerZ), 2, 72);
+        const radiusMinor = clampNumber(Math.sqrt(lambdaMinor) * 2 * Math.min(pxPerX, pxPerZ), 2, 72);
+        if (!Number.isFinite(radiusMajor) || !Number.isFinite(radiusMinor)) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = 0.52;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.ellipse(
+          projected.px,
+          projected.py,
+          radiusMajor,
+          radiusMinor,
+          Math.atan2(-vz * pxPerZ, vx * pxPerX),
+          0,
+          2 * Math.PI,
+        );
+        ctx.stroke();
+        ctx.restore();
+      };
+
+      const drawResolverComparison = () => {
+        if (!resolverComparisonEnabled || !metaNow) return;
+        let drawn = false;
+        const legendRows: Array<{ text: string; color: string }> = [
+          { text: 'solid canonical', color: 'rgba(255,255,255,0.95)' },
+          { text: 'candidate', color: 'rgba(77,220,255,0.95)' },
+          { text: 'legacy', color: 'rgba(255,255,255,0.9)' },
+          { text: '2σ covariance', color: 'rgba(168,230,106,0.9)' },
+        ];
+
+        for (const point of footpoints) {
+          const diagnostics = admitResolverDiagnostics(point, metaNow);
+          if (!diagnostics) continue;
+          const canonical = resolvePayloadPoint(point);
+          // The comparison layer may only decorate an already-rendered
+          // canonical point.  It must never manufacture a dot from a
+          // diagnostic when the canonical BEV point is absent.
+          const canonicalPoint = canonical;
+          if (!canonicalPoint) continue;
+          const canonicalProjection = projectForBounds(activeDrawBounds, canonicalPoint.x, canonicalPoint.y, false);
+          if (!canonicalProjection) continue;
+          drawn = true;
+
+          const selectedId = diagnostics.selectedId;
+          const selectedKind = diagnostics.selectedKind;
+          const selectedCandidate = (diagnostics.candidates ?? []).find((candidate) => (
+            candidate.selected === true
+            || (selectedId !== null && candidate.id === selectedId)
+          ));
+
+          ctx.save();
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(canonicalProjection.px, canonicalProjection.py, 7, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+
+          for (const candidate of diagnostics.candidates ?? []) {
+            const candidatePoint = resolverDiagnosticDisplayPoint(candidate);
+            if (!candidatePoint) continue;
+            const candidateProjection = projectForBounds(activeDrawBounds, candidatePoint.x, candidatePoint.z, false);
+            if (!candidateProjection) continue;
+            const color = resolverCandidateColor(candidate);
+            const isSelected = Boolean(candidate.selected)
+              || (selectedId !== null && candidate.id === selectedId)
+              || (selectedId === null && selectedKind !== null && candidate.kind === selectedKind);
+            ctx.save();
+            ctx.strokeStyle = color;
+            ctx.fillStyle = isSelected ? color : 'rgba(0,0,0,0.12)';
+            ctx.lineWidth = isSelected ? 2 : 1.5;
+            ctx.beginPath();
+            ctx.arc(candidateProjection.px, candidateProjection.py, isSelected ? 5 : 4, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.stroke();
+            if (candidateProjection.px !== canonicalProjection.px || candidateProjection.py !== canonicalProjection.py) {
+              ctx.strokeStyle = color;
+              ctx.globalAlpha = 0.5;
+              ctx.lineWidth = 1;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(candidateProjection.px, candidateProjection.py);
+              ctx.lineTo(canonicalProjection.px, canonicalProjection.py);
+              ctx.stroke();
+            }
+            ctx.restore();
+            drawResolverCovariance(candidatePoint, candidate.covarianceXZ, color);
+          }
+
+          const legacyPoint = resolverDiagnosticDisplayPoint(diagnostics.legacy);
+          if (legacyPoint) {
+            const legacyProjection = projectForBounds(activeDrawBounds, legacyPoint.x, legacyPoint.z, false);
+            if (legacyProjection) {
+              ctx.save();
+              ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+              ctx.lineWidth = 2;
+              ctx.setLineDash([5, 3]);
+              ctx.beginPath();
+              ctx.arc(legacyProjection.px, legacyProjection.py, 8, 0, 2 * Math.PI);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.moveTo(legacyProjection.px, legacyProjection.py);
+              ctx.lineTo(canonicalProjection.px, canonicalProjection.py);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+
+          const resolvedDiagnostic = resolverDiagnosticDisplayPoint(diagnostics.resolved);
+          if (resolvedDiagnostic) {
+            drawResolverCovariance(resolvedDiagnostic, diagnostics.resolved?.covarianceXZ, 'rgba(168, 230, 106, 0.95)');
+          }
+
+          const pcf = selectedCandidate?.pcf;
+          const pcfText = pcf
+            ? `pcf=${pcf.insideExtent === false && pcf.extentOutsideDistanceM !== undefined
+              ? `extent+${pcf.extentOutsideDistanceM.toFixed(2)}m`
+              : pcf.insideAuthoredSpace === false
+                ? 'outside'
+                : pcf.observedConfidence !== undefined
+                  ? pcf.observedConfidence.toFixed(2)
+                  : 'ok'}`
+            : null;
+          const labelParts = [
+            selectedKind || selectedId,
+            diagnostics.decision || diagnostics.reason,
+            diagnostics.disagreement?.distanceM !== undefined
+              ? `Δ=${diagnostics.disagreement.distanceM.toFixed(2)}m`
+              : null,
+            pcfText,
+          ].filter((value): value is string => Boolean(value));
+          if (labelParts.length) {
+            const labelText = labelParts.join(' • ').slice(0, 120);
+            ctx.save();
+            ctx.font = '10px monospace';
+            const labelWidth = Math.min(260, ctx.measureText(labelText).width + 10);
+            const labelX = clampNumber(canonicalProjection.px + 10, contentRect.x + 3, contentRect.x + contentRect.w - labelWidth - 3);
+            const labelY = clampNumber(canonicalProjection.py - 10, contentRect.y + 13, contentRect.y + contentRect.h - 3);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.74)';
+            ctx.fillRect(labelX, labelY - 11, labelWidth, 14);
+            ctx.fillStyle = '#f3f6ff';
+            ctx.fillText(labelText, labelX + 5, labelY - 1);
+            ctx.restore();
+          }
+        }
+
+        if (drawn) {
+          const pad = 5;
+          const lineH = 12;
+          const legendW = 122;
+          const legendH = pad * 2 + legendRows.length * lineH;
+          const legendX = contentRect.x + contentRect.w - legendW - 8;
+          const legendY = contentRect.y + 8;
+          ctx.save();
+          ctx.fillStyle = 'rgba(0,0,0,0.66)';
+          ctx.fillRect(legendX, legendY, legendW, legendH);
+          ctx.font = '10px monospace';
+          legendRows.forEach((row, index) => {
+            ctx.fillStyle = row.color;
+            ctx.fillText(row.text, legendX + pad, legendY + pad + ((index + 1) * lineH) - 3);
+          });
+          ctx.restore();
+        }
+      };
+
       const footpoints = Array.isArray(metaNow?.footpoints) ? metaNow.footpoints : [];
       const droppedFootpoints = Array.isArray(metaNow?.droppedFootpoints) ? metaNow.droppedFootpoints : [];
       let finitePointCount = 0;
@@ -1554,6 +1788,11 @@ export const BevView: React.FC<BevViewProps> = ({
           }
         }
       }
+
+      // Resolver comparison is a bounded, exact-cohort overlay.  It is
+      // intentionally drawn after the canonical point/trail inputs have been
+      // resolved and cannot mutate either path.
+      drawResolverComparison();
 
       // Time-based pruning must run even when BEV meta updates stop, otherwise
       // the last-seen trail head can stick around indefinitely.
@@ -1828,7 +2067,7 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, coverageEnvelope, debug, displayBounds, floorPlaneEnabled, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
+  }, [coordMode, coverageEnvelope, debug, displayBounds, floorPlaneEnabled, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolverComparisonEnabled, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
@@ -1937,6 +2176,21 @@ export const BevView: React.FC<BevViewProps> = ({
         Floor plane
       </label>
     ) : null;
+  const resolverComparisonToggleLabel = (
+    <label
+      className="bev-grid-toggle"
+      title="Show the current resolver candidates and uncertainty without changing the canonical BEV point"
+    >
+      <input
+        type="checkbox"
+        checked={resolverComparisonEnabled}
+        onChange={(event) => setResolverComparisonEnabled(event.target.checked)}
+        style={{ marginRight: 6 }}
+        aria-label="Localization details"
+      />
+      Localization details
+    </label>
+  );
   const lookControls = hasHeightLookControls ? (
     <div className="bev-look-control-wrap">
       <button
@@ -2038,6 +2292,7 @@ export const BevView: React.FC<BevViewProps> = ({
           <div className="bev-grid-toggle-wrap">
             {floorPlaneToggleLabel}
             {toggleLabel}
+            {resolverComparisonToggleLabel}
           </div>
         </div>
       </div>
@@ -2055,6 +2310,7 @@ export const BevView: React.FC<BevViewProps> = ({
         {canvasContent}
         <div style={{ position: 'absolute', bottom: 8, right: 8 }}>
           {toggleLabel}
+          {resolverComparisonToggleLabel}
         </div>
       </div>
     </div>

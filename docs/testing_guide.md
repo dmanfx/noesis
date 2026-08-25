@@ -1,6 +1,6 @@
 # Noesis testing guide
 
-Status: direct native-host validation policy, 2026-08-15.
+Status: direct native-host validation policy, 2026-08-25.
 
 ## Principle
 
@@ -87,6 +87,41 @@ or camera-to-PCF change, use this small independent test:
 A recorded motion clip is useful for determinism, continuity, lifecycle, and
 performance checks, but it does not replace the measured floor marks for
 absolute real-world accuracy.
+
+For the universal resolver, keep the goals separate and direct:
+
+1. At one exact frame, assert every independently valid floor/depth source
+   survives into the bounded hypothesis set with the same camera, source,
+   tracker, lifecycle generation, track key, frame, observation time,
+   calibration revision, world revision, and transform SHA-256.
+2. Feed a close floor/depth pair and prove both contributor IDs are present and
+   the result differs numerically from both inputs. Feed a pair more than the
+   generic compatibility distance apart and prove it is primary/alternate,
+   never fused or clamped. Feed three candidates where each secondary agrees
+   with the primary but the secondaries disagree with each other; prove only a
+   mutually compatible subset can contribute.
+3. Perturb a floor anchor by its pixel sigma and a depth anchor by its residual
+   sigma; verify the reported anisotropic covariance remains finite/PSD and
+   grows for shallow incidence, weak support, or occlusion.
+4. Put one candidate outside an authored PCF wall and one inside. Verify PCF
+   changes preference/quality while leaving every candidate coordinate
+   unchanged. Put two compatible candidates well beyond the same boundary or
+   measured extent and prove their agreement cannot fuse away that strong
+   conflict: the result remains diagnostic and weak. Do not use unlabeled
+   obstacle cells to reposition seated people.
+5. After PersonGroundState, verify an accepted filtered point carries
+   displacement-inflated covariance. A rejected measurement followed by
+   prediction/hold must not inherit the current measurement covariance.
+6. Toggle `Localization details` on the normal dashboard. The overlay must use
+   the exact current cohort and revision, show no last-seen candidates, and
+   leave the canonical dot/trail byte-for-byte unaffected. Where the retired
+   room policy has a usable current-frame candidate, its dashed legacy point
+   must match that historical selection rule; toggling details off must remove
+   the comparison payload without changing the canonical point.
+7. Give canonical global fusion a held/predicted row, a missing transform hash,
+   and two different target-frame revisions. Prove none becomes fresh fused
+   evidence. Then fuse two same-target observations with correlated covariance
+   and prove the off-diagonal terms survive conservatively.
 
 ## Native runtime checks
 

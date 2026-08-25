@@ -7,7 +7,15 @@ from pydantic import Field, field_validator, model_validator
 
 from noesis_core.analytics_zones import is_exact_zone_label
 
-from .base import ContractModel, Matrix3, ProducerRef, SequenceNumber, TimestampUs, Vector3
+from .base import (
+    ContractModel,
+    Matrix3,
+    ProducerRef,
+    SequenceNumber,
+    Sha256,
+    TimestampUs,
+    Vector3,
+)
 from .identity import SubjectRef
 from .observation import ZoneSource
 
@@ -27,6 +35,10 @@ class WorldSourceEvidence(ContractModel):
     observed_at_us: TimestampUs
     position: Vector3
     covariance: Matrix3
+    world_frame: Literal["backend_world_m"] = "backend_world_m"
+    world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    world_transform_sha256: Sha256 | None = None
+    calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
     accepted: bool
     rejection_reason: str | None = Field(default=None, max_length=200)
 
@@ -41,6 +53,12 @@ class WorldSourceEvidence(ContractModel):
 
     @model_validator(mode="after")
     def _zone_provenance_is_coherent(self) -> "WorldSourceEvidence":
+        if (self.world_frame_revision is None) != (
+            self.world_transform_sha256 is None
+        ):
+            raise ValueError(
+                "world frame revision and transform fingerprint must be provided together"
+            )
         if self.zone is None:
             if self.zone_source is not None or self.zone_authoritative:
                 raise ValueError("zone provenance requires a zone label")
@@ -71,6 +89,13 @@ class WorldEntity(ContractModel):
     lifecycle: EntityLifecycle
     position: Vector3 | None = None
     covariance: Matrix3 | None = None
+    world_frame: Literal["backend_world_m"] = "backend_world_m"
+    world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    world_transform_sha256: Sha256 | None = None
+    calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    position_quantity: Literal["ground_footprint"] = "ground_footprint"
+    support_state: Literal["floor", "seat", "couch", "unknown"] = "unknown"
+    posture: Literal["standing", "sitting", "lying", "unknown"] = "unknown"
     velocity_mps: Vector3 | None = None
     room_id: str | None = Field(default=None, min_length=1, max_length=160)
     observed_at_us: TimestampUs
@@ -119,6 +144,41 @@ class WorldEntity(ContractModel):
             raise ValueError(
                 "conflicting authoritative source zones require conflict=true"
             )
+        if self.world_frame != "backend_world_m":
+            raise ValueError("world entities must use backend_world_m")
+        if self.world_transform_sha256 is not None and self.world_frame_revision is None:
+            raise ValueError(
+                "world entity transform fingerprint requires a frame revision"
+            )
+        accepted_sources = tuple(source for source in self.sources if source.accepted)
+        # Every accepted source must reach the same target revision.  Source
+        # transform digests and calibration revisions can legitimately differ
+        # by camera and remain preserved on WorldSourceEvidence.  Entity-level
+        # transform/calibration fields are populated only when all accepted
+        # sources share that exact provenance value.
+        if self.world_frame_revision is not None:
+            for source in accepted_sources:
+                if (
+                    source.world_frame != self.world_frame
+                    or source.world_frame_revision != self.world_frame_revision
+                ):
+                    raise ValueError(
+                        "entity target-frame identity disagrees with an accepted source"
+                    )
+                if (
+                    self.world_transform_sha256 is not None
+                    and source.world_transform_sha256 != self.world_transform_sha256
+                ):
+                    raise ValueError(
+                        "entity common transform fingerprint disagrees with an accepted source"
+                    )
+                if (
+                    self.calibration_revision is not None
+                    and source.calibration_revision != self.calibration_revision
+                ):
+                    raise ValueError(
+                        "entity common calibration revision disagrees with an accepted source"
+                    )
         return self
 
 
@@ -165,11 +225,19 @@ class WorldEvent(ContractModel):
     published_at_us: TimestampUs
     frame: Literal["backend_world_m"]
     units: Literal["meters"]
+    world_frame: Literal["backend_world_m"] = "backend_world_m"
+    world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    world_transform_sha256: Sha256 | None = None
+    calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
     position: Vector3 | None = None
     reason: str | None = Field(default=None, max_length=240)
 
     @model_validator(mode="after")
     def _time_is_coherent(self) -> "WorldEvent":
+        if self.world_transform_sha256 is not None and self.world_frame_revision is None:
+            raise ValueError(
+                "world event transform fingerprint requires a frame revision"
+            )
         if self.observed_at_us > self.published_at_us:
             raise ValueError("world event observed_at_us cannot follow published_at_us")
         if self.event_type == "conflict_started" and not self.reason:

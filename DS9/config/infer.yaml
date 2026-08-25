@@ -6,9 +6,6 @@ version: 1
 depth_registration:
   path: DS9/config/depth_registration.json
 
-world_measurement_fusion:
-  path: config/world_measurement_fusion_policy.json
-
 # Immutable scan-derived evidence, bound to cameras in explicit shadow mode.
 # Runtime world positions remain producer-owned; the prior adds diagnostics and
 # static/composite floorplan layers without replacing live observations.
@@ -158,6 +155,18 @@ analytics:
     config-file: config/config_nvdsanalytics_exclude.ini
 
 canonical_world:
+  # One camera-agnostic resolver receives every credible floor/depth/pose
+  # hypothesis.  The historical per-room policy is not part of the active
+  # canonical baseline.
+  measurement_resolver:
+    enabled: true
+    max_range_m: 22.0
+    max_disagreement_m: 1.25
+    max_candidates: 4
+    # Diagnostic-only reconstruction of the retired room policy. It is
+    # evaluated from the resolver's existing compact candidates only while a
+    # dashboard requests Localization details; it never feeds track.world.
+    legacy_comparison_policy_path: config/world_measurement_fusion_policy.json
   person_admission:
     min_unposed_detection_confidence: 0.50
   provisional_handoff:

@@ -105,6 +105,7 @@ class CalibrationSnapshot:
     world_frame_id: Optional[str] = None
     world_frame_revision: Optional[str] = None
     frame_transform_sha256: Optional[str] = None
+    camera_calibration_sha256: Optional[str] = None
 
 
 @dataclass
@@ -130,6 +131,10 @@ class FloorplanSpace:
     floorplan_ts_us: Optional[int] = None
     snapshot_id: Optional[str] = None
     snapshot_content_sha256: Optional[str] = None
+    # Keep the presentation artifact identity separate from the world frame
+    # identity in which the floorplan/PCF geometry is expressed.
+    world_frame: Optional[str] = None
+    world_frame_revision: Optional[str] = None
     calibration_fingerprint: Optional[str] = None
     ray_to_floorplan_alignment: Optional[Mapping[str, Any]] = None
     source: str = "active_floorplan"
@@ -257,6 +262,7 @@ class Footpoint:
     method: str = "bbox"
     stable_id: Optional[int] = None
     tracker_id: Optional[int] = None
+    track_key: Optional[str] = None
     tracker_lifecycle_generation: Optional[int] = None
     world_x: Optional[float] = None
     world_z: Optional[float] = None
@@ -271,6 +277,7 @@ class Footpoint:
     canonical_world_required: bool = False
     world_frame: Optional[str] = None
     world_frame_revision: Optional[str] = None
+    world_transform_sha256: Optional[str] = None
     motion_mode: Optional[str] = None
     posture: Optional[str] = None
     trail_append_allowed: Optional[bool] = None
@@ -453,6 +460,14 @@ class HomographyCache:
 
 
 class BevRenderer:
+    # Resolver diagnostics are intentionally a compact, presentation-facing
+    # contract.  The resolver may retain richer evidence internally, but the
+    # BEV cohort must never grow with masks, histories, or unbounded reason
+    # strings.  Keep this limit in the producer as well as the dashboard so a
+    # client toggle cannot change runtime work or payload size.
+    _MAX_RESOLVER_CANDIDATES = 4
+    _MAX_RESOLVER_TEXT = 96
+
     def __init__(
         self,
         ws_server,
@@ -598,6 +613,11 @@ class BevRenderer:
             str(floorplan_space.frame or ""),
             int(floorplan_space.snapshot_ts_us) if floorplan_space.snapshot_ts_us is not None else None,
             int(floorplan_space.floorplan_ts_us) if floorplan_space.floorplan_ts_us is not None else None,
+            str(floorplan_space.snapshot_id or ""),
+            str(floorplan_space.snapshot_content_sha256 or ""),
+            str(floorplan_space.world_frame or ""),
+            str(floorplan_space.world_frame_revision or ""),
+            str(floorplan_space.calibration_fingerprint or ""),
             (
                 (
                     round(float(coverage_envelope.boundary_tolerance_m), 6),
@@ -1284,6 +1304,23 @@ class BevRenderer:
             raise ValueError("active floorplan predates its source snapshot")
         snapshot_id = _required_text("snapshot_id")
         snapshot_content_sha256 = _required_sha256("snapshot_content_sha256")
+        raw_world_frame = bounds_payload.get("world_frame")
+        raw_world_revision = bounds_payload.get("world_frame_revision")
+        if (raw_world_frame is None) != (raw_world_revision is None):
+            raise ValueError(
+                "active floorplan world frame identity must include both frame and revision"
+            )
+        world_frame = None
+        world_frame_revision = None
+        if raw_world_frame is not None:
+            if not isinstance(raw_world_frame, str) or not raw_world_frame.strip():
+                raise ValueError("active floorplan world_frame must be non-empty text")
+            if not isinstance(raw_world_revision, str) or not raw_world_revision.strip():
+                raise ValueError(
+                    "active floorplan world_frame_revision must be non-empty text"
+                )
+            world_frame = raw_world_frame.strip()
+            world_frame_revision = raw_world_revision.strip()
         calibration_fingerprint = _required_sha256("calibration_fingerprint")
         source = str(bounds_payload.get("source") or "").strip()
         if source != "active_floorplan":
@@ -1300,6 +1337,8 @@ class BevRenderer:
             floorplan_ts_us=floorplan_ts_us,
             snapshot_id=snapshot_id,
             snapshot_content_sha256=snapshot_content_sha256,
+            world_frame=world_frame,
+            world_frame_revision=world_frame_revision,
             calibration_fingerprint=calibration_fingerprint,
             ray_to_floorplan_alignment=(
                 dict(bounds_payload.get("ray_to_floorplan_alignment"))
@@ -1758,6 +1797,511 @@ class BevRenderer:
         if not math.isfinite(out):
             return None
         return float(out)
+
+    @classmethod
+    def _resolver_text(cls, value: Any) -> Optional[str]:
+        """Return a bounded diagnostic label without copying arbitrary data."""
+
+        if value is None or isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text[: cls._MAX_RESOLVER_TEXT]
+
+    @classmethod
+    def _resolver_identity_text(cls, value: Any) -> Optional[str]:
+        """Validate an exact contract identity without coercion or truncation."""
+
+        if not isinstance(value, str) or not value or value != value.strip():
+            return None
+        if len(value) > cls._MAX_RESOLVER_TEXT:
+            return None
+        return value
+
+    @classmethod
+    def _resolver_world_xz(cls, value: Any) -> Optional[Tuple[float, float]]:
+        """Extract X/Z from the resolver contract's Vector3 position."""
+
+        if not isinstance(value, Mapping):
+            return None
+        position = value.get("position")
+        if not isinstance(position, Mapping):
+            return None
+        x = cls._json_number(position.get("x"))
+        z = cls._json_number(position.get("z"))
+        if x is None or z is None:
+            return None
+        return float(x), float(z)
+
+    @classmethod
+    def _resolver_covariance_xz(cls, value: Any) -> Optional[List[List[float]]]:
+        """Extract the XZ block from the resolver's flat row-major 3x3."""
+
+        if not isinstance(value, Mapping):
+            return None
+        raw = value.get("covariance")
+        if not isinstance(raw, Mapping):
+            return None
+        raw = raw.get("values")
+        if not isinstance(raw, (list, tuple)) or len(raw) != 9:
+            return None
+        values = [cls._json_number(item) for item in raw]
+        if any(item is None for item in values):
+            return None
+        # Keep this admission check scalar and allocation-free.  The resolver
+        # already validated the full 3x3; BEV only needs the X/Z block and
+        # should not put an eigendecomposition on the per-track render path.
+        xx, xz, zx, zz = (
+            float(values[0]),
+            float(values[2]),
+            float(values[6]),
+            float(values[8]),
+        )
+        if abs(xz - zx) > 1e-4:
+            return None
+        if xx < -1e-5 or zz < -1e-5 or xx * zz - xz * zx < -1e-5:
+            return None
+        return [[xx, xz], [zx, zz]]
+
+    @staticmethod
+    def _resolver_covariance_to_display(
+        covariance_xz: List[List[float]],
+        *,
+        frame_mode: str,
+        R_wc: np.ndarray,
+        C_world: np.ndarray,
+        camera_ground_frame: Optional[CameraGroundFrame],
+        floorplan_alignment: Optional[np.ndarray],
+    ) -> Optional[List[List[float]]]:
+        """Express world X/Z covariance in the BEV display frame.
+
+        The resolver covariance is authored in ``backend_world_m``.  A
+        camera-local BEV is a linear horizontal projection followed by the
+        optional affine floorplan alignment, so its ellipse must be pushed
+        through that same Jacobian.  World-mode BEV can retain the block
+        unchanged.  This is intentionally bounded scalar/matrix work for the
+        already-admitted diagnostic record; it never feeds tracking.
+        """
+
+        if str(frame_mode) == "world":
+            return covariance_xz
+        try:
+            ground_frame = camera_ground_frame
+            if ground_frame is None:
+                ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
+            right = np.asarray(ground_frame.camera_right_world, dtype=np.float64)
+            forward = np.asarray(ground_frame.camera_forward_world, dtype=np.float64)
+            horizontal_jacobian = np.asarray(
+                [[right[0], right[2]], [forward[0], forward[2]]],
+                dtype=np.float64,
+            )
+            jacobian = horizontal_jacobian
+            if floorplan_alignment is not None:
+                alignment = np.asarray(floorplan_alignment, dtype=np.float64)
+                if alignment.shape != (2, 3):
+                    return None
+                jacobian = alignment[:, :2] @ horizontal_jacobian
+            covariance = np.asarray(covariance_xz, dtype=np.float64)
+            transformed = jacobian @ covariance @ jacobian.T
+            if transformed.shape != (2, 2) or not np.all(np.isfinite(transformed)):
+                return None
+            transformed = 0.5 * (transformed + transformed.T)
+            return [
+                [float(transformed[0, 0]), float(transformed[0, 1])],
+                [float(transformed[1, 0]), float(transformed[1, 1])],
+            ]
+        except (TypeError, ValueError, IndexError, np.linalg.LinAlgError):
+            return None
+
+    @classmethod
+    def _resolver_pcf_summary(cls, value: Any) -> Optional[Dict[str, Any]]:
+        """Copy only the compact Scene Prior evaluation fields."""
+
+        if not isinstance(value, Mapping):
+            return None
+        out: Dict[str, Any] = {}
+        for output_key, input_key in (
+            ("observedConfidence", "observed_confidence"),
+            ("boundarySignedDistanceM", "boundary_signed_distance_m"),
+            ("extentOutsideDistanceM", "extent_outside_distance_m"),
+            ("floorHeightM", "floor_height_m"),
+            ("obstacleClearanceM", "obstacle_clearance_m"),
+        ):
+            number = cls._json_number(value.get(input_key))
+            if number is not None:
+                out[output_key] = float(number)
+        for output_key, input_key in (
+            ("insideExtent", "inside_extent"),
+            ("insideAuthoredSpace", "inside_authored_space"),
+            ("evidenceObserved", "evidence_observed"),
+        ):
+            if isinstance(value.get(input_key), bool):
+                out[output_key] = bool(value[input_key])
+        for output_key, input_key in (("priorId", "prior_id"), ("revisionId", "revision_id"), ("status", "status")):
+            text = cls._resolver_text(value.get(input_key))
+            if text is not None:
+                out[output_key] = text
+        reasons = value.get("reasons")
+        if isinstance(reasons, (list, tuple)):
+            bounded_reasons = [
+                text
+                for text in (cls._resolver_text(item) for item in reasons[:8])
+                if text is not None
+            ]
+            if bounded_reasons:
+                out["reasons"] = bounded_reasons
+        return out or None
+
+    @classmethod
+    def _normalize_resolver_diagnostics(
+        cls,
+        *,
+        fp: Footpoint,
+        source: Any,
+        expected_camera_id: str,
+        expected_source_id: Optional[int],
+        expected_observed_at_us: Optional[int],
+        expected_world_frame: str,
+        expected_world_revision: str,
+        frame_mode: str,
+        calib: CalibrationSnapshot,
+        R_wc: np.ndarray,
+        C_world: np.ndarray,
+        camera_ground_frame: Optional[CameraGroundFrame],
+        floorplan_alignment: Optional[np.ndarray],
+        floorplan_space: Optional[FloorplanSpace],
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize the exact resolver diagnostics contract for BEV.
+
+        ``world_resolver`` is a track-local snake-case record.  It must already
+        carry all cohort identity needed for comparison; this boundary only
+        projects its finite world positions into the selected BEV frame and
+        refuses malformed or revision-incompatible records.
+        """
+
+        if not isinstance(source, Mapping):
+            return None
+        if source.get("contract") != "noesis.world_resolver_diagnostics":
+            return None
+        if source.get("version") != 1:
+            return None
+        if str(source.get("camera_id") or "") != str(expected_camera_id):
+            return None
+        # ``source_id`` in the resolver cohort is the raw DeepStream source
+        # identity.  The BEV renderer is called with the mapped sensor id, so
+        # comparing those two values directly drops every mapped-camera
+        # diagnostic.  Preserve both identities at this boundary and, when a
+        # producer supplies the optional mapped ``sensor_id``, require it to
+        # match the BEV publication source.
+        raw_source_id = source.get("source_id")
+        if isinstance(raw_source_id, bool) or not isinstance(raw_source_id, int):
+            return None
+        if int(raw_source_id) < 0:
+            return None
+        sensor_id = source.get("sensor_id")
+        if sensor_id is not None:
+            if (
+                isinstance(sensor_id, bool)
+                or not isinstance(sensor_id, int)
+                or expected_source_id is None
+                or int(sensor_id) != int(expected_source_id)
+            ):
+                return None
+        exact_integer_pairs = (
+            (source.get("tracker_id"), fp.tracker_id),
+            (source.get("observed_at_us"), expected_observed_at_us),
+        )
+        for observed, expected in exact_integer_pairs:
+            if (
+                expected is None
+                or isinstance(observed, bool)
+                or not isinstance(observed, int)
+            ):
+                return None
+            try:
+                if int(observed) != int(expected):
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                return None
+        expected_track_key = str(fp.track_key or "").strip() or None
+        source_track_key = source.get("track_key")
+        if expected_track_key is not None:
+            if not isinstance(source_track_key, str) or source_track_key != expected_track_key:
+                return None
+        elif source_track_key is not None:
+            # Do not accept a resolver identity that cannot be tied back to
+            # this exact Footpoint lifecycle.
+            return None
+        expected_generation = fp.tracker_lifecycle_generation
+        source_generation = source.get("tracker_lifecycle_generation")
+        if expected_generation is not None:
+            if (
+                isinstance(source_generation, bool)
+                or not isinstance(source_generation, int)
+                or int(source_generation) != int(expected_generation)
+                or int(source_generation) < 0
+            ):
+                return None
+        elif source_generation is not None:
+            return None
+        world_frame = cls._resolver_identity_text(source.get("world_frame"))
+        world_revision = cls._resolver_identity_text(source.get("world_frame_revision"))
+        if not world_frame or not world_revision:
+            return None
+        if world_frame != expected_world_frame or world_revision != expected_world_revision:
+            return None
+        # The active floorplan's artifact/prior id is not the world-frame
+        # revision.  If the provider exposes its frame identity, bind it to
+        # the same live world frame; leave older depth-snapshot payloads
+        # without these optional fields compatible.
+        if floorplan_space is not None:
+            floorplan_world_frame = cls._resolver_identity_text(
+                floorplan_space.world_frame
+            )
+            floorplan_world_revision = cls._resolver_identity_text(
+                floorplan_space.world_frame_revision
+            )
+            if (
+                floorplan_world_frame is not None
+                and floorplan_world_frame != world_frame
+            ) or (
+                floorplan_world_revision is not None
+                and floorplan_world_revision != world_revision
+            ):
+                return None
+        calibration_revision = cls._resolver_identity_text(
+            source.get("calibration_revision")
+        )
+        expected_calibration_revision = cls._resolver_identity_text(
+            getattr(calib, "camera_calibration_sha256", None)
+        )
+        if (
+            calibration_revision is None
+            or expected_calibration_revision is None
+            or calibration_revision != expected_calibration_revision
+        ):
+            return None
+        observed_transform = cls._resolver_identity_text(
+            source.get("world_transform_sha256")
+        )
+        expected_transform = cls._resolver_identity_text(
+            getattr(calib, "frame_transform_sha256", None)
+            or getattr(getattr(calib, "calibration_frame", None), "transform_sha256", None)
+            or getattr(calib, "world_alignment_sha256", None)
+        )
+        footpoint_transform = cls._resolver_identity_text(fp.world_transform_sha256)
+        if footpoint_transform is not None and observed_transform != footpoint_transform:
+            return None
+        if expected_transform is not None or footpoint_transform is not None:
+            if (
+                expected_transform is None
+                or observed_transform is None
+                or observed_transform != expected_transform
+            ):
+                return None
+        pcf_revision = cls._resolver_identity_text(source.get("pcf_revision"))
+        source_frame_id = source.get("frame_id")
+        if source_frame_id is None or fp.frame_id is None:
+            return None
+        if (
+            isinstance(source_frame_id, bool)
+            or not isinstance(source_frame_id, int)
+            or source_frame_id != fp.frame_id
+        ):
+            return None
+
+        def _display_point(world_x: float, world_z: float) -> Optional[Tuple[float, float]]:
+            if str(frame_mode) == "world":
+                return float(world_x), float(world_z)
+            local_x, local_z = cls._world_to_camera_local_ground(
+                float(world_x),
+                float(calib.floor_y),
+                float(world_z),
+                R_wc,
+                C_world,
+                camera_ground_frame,
+            )
+            return cls._apply_floorplan_alignment(floorplan_alignment, local_x, local_z)[:2]
+
+        def _point_payload(
+            item: Any,
+            *,
+            selected: bool = False,
+            require_covariance: bool = False,
+        ) -> Optional[Dict[str, Any]]:
+            if not isinstance(item, Mapping):
+                return None
+            world = cls._resolver_world_xz(item)
+            if world is None:
+                return None
+            display = _display_point(*world)
+            if display is None or not all(math.isfinite(float(value)) for value in (*world, *display)):
+                return None
+            candidate: Dict[str, Any] = {
+                "id": cls._resolver_text(item.get("id")),
+                "kind": cls._resolver_text(item.get("kind")),
+                "world": {"x": float(world[0]), "z": float(world[1])},
+                "display": {"x": float(display[0]), "z": float(display[1])},
+                "selected": bool(item.get("selected", selected)),
+            }
+            status = cls._resolver_text(item.get("status"))
+            if status is not None:
+                candidate["status"] = status
+            covariance = cls._resolver_covariance_xz(item)
+            if require_covariance and covariance is None:
+                return None
+            if covariance is not None:
+                display_covariance = cls._resolver_covariance_to_display(
+                    covariance,
+                    frame_mode=frame_mode,
+                    R_wc=R_wc,
+                    C_world=C_world,
+                    camera_ground_frame=camera_ground_frame,
+                    floorplan_alignment=floorplan_alignment,
+                )
+                if display_covariance is None:
+                    return None
+                candidate["covarianceXZ"] = display_covariance
+            for output_key, input_key in (
+                ("depthRegistrationSigmaM", "depth_registration_sigma_m"),
+                ("floorDepthDisagreementM", "floor_depth_disagreement_m"),
+            ):
+                number = cls._json_number(item.get(input_key))
+                if number is not None and number >= 0.0:
+                    candidate[output_key] = float(number)
+            pcf = cls._resolver_pcf_summary(item.get("pcf"))
+            if pcf is not None:
+                candidate["pcf"] = pcf
+            return candidate
+
+        resolved_source = source.get("resolved")
+        resolved_payload = _point_payload(resolved_source, selected=True, require_covariance=True)
+        candidates_source = source.get("candidates")
+        if not isinstance(candidates_source, (list, tuple)):
+            return None
+        if len(candidates_source) > cls._MAX_RESOLVER_CANDIDATES:
+            return None
+        candidates: List[Dict[str, Any]] = []
+        for candidate in candidates_source:
+            normalized = _point_payload(candidate, require_covariance=True)
+            if normalized is None:
+                return None
+            candidates.append(normalized)
+        if resolved_payload is None and not candidates:
+            return None
+
+        # Candidate PCF evidence carries the resolver's PCF revision, while
+        # ``floorplan_space.snapshot_id`` identifies the active presentation
+        # artifact/prior.  Validate each identity against its own namespace;
+        # never compare the PCF revision to the floorplan snapshot id.
+        candidate_pcf_revisions = {
+            str(item["pcf"]["revisionId"])
+            for item in candidates
+            if isinstance(item.get("pcf"), Mapping)
+            and item["pcf"].get("revisionId") is not None
+        }
+        candidate_pcf_prior_ids = {
+            str(item["pcf"]["priorId"])
+            for item in candidates
+            if isinstance(item.get("pcf"), Mapping)
+            and item["pcf"].get("priorId") is not None
+        }
+        if pcf_revision is not None and candidate_pcf_revisions:
+            if candidate_pcf_revisions != {pcf_revision}:
+                return None
+        if floorplan_space is not None and floorplan_space.snapshot_id is not None:
+            expected_prior_id = str(floorplan_space.snapshot_id)
+            if candidate_pcf_prior_ids and candidate_pcf_prior_ids != {expected_prior_id}:
+                return None
+
+        legacy_payload = None
+        if source.get("legacy") is not None:
+            legacy_payload = _point_payload(source.get("legacy"))
+            if legacy_payload is None:
+                return None
+            legacy_source = cls._resolver_text(source["legacy"].get("source"))
+            if legacy_source is not None:
+                legacy_payload["source"] = legacy_source
+
+        disagreement = source.get("disagreement")
+        disagreement_payload: Optional[Dict[str, Any]] = None
+        if disagreement is not None:
+            if not isinstance(disagreement, Mapping):
+                return None
+            disagreement_payload = {}
+            for output_key, input_key in (
+                ("distanceM", "distance_m"),
+                ("floorDepthDeltaM", "floor_depth_delta_m"),
+                ("innovationM", "innovation_m"),
+            ):
+                number = cls._json_number(disagreement.get(input_key))
+                if number is not None:
+                    disagreement_payload[output_key] = float(number)
+            reason = cls._resolver_text(disagreement.get("reason"))
+            if reason is not None:
+                disagreement_payload["reason"] = reason
+            if not disagreement_payload:
+                return None
+
+        output: Dict[str, Any] = {
+            "contract": "noesis.world_resolver_diagnostics",
+            "version": 1,
+            "frameId": int(fp.frame_id) if fp.frame_id is not None else None,
+            # Keep raw source identity separate from the mapped sensor id used
+            # by BEV publication and dashboard grouping.
+            "sourceId": int(raw_source_id),
+            "sensorId": int(expected_source_id) if expected_source_id is not None else None,
+            "worldFrame": world_frame,
+            "worldFrameRevision": world_revision,
+            "trackKey": expected_track_key,
+            "trackerLifecycleGeneration": (
+                int(expected_generation) if expected_generation is not None else None
+            ),
+            "worldTransformSha256": observed_transform,
+            "pcfRevision": pcf_revision,
+            "selectedId": cls._resolver_text(source.get("selected_id")),
+            "selectedKind": cls._resolver_text(source.get("selected_kind")),
+            "decision": cls._resolver_text(source.get("decision")),
+            "reason": cls._resolver_text(source.get("reason")),
+            "candidates": candidates,
+        }
+        if resolved_payload is not None:
+            output["resolved"] = resolved_payload
+        if legacy_payload is not None:
+            output["legacy"] = legacy_payload
+        if disagreement_payload is not None:
+            output["disagreement"] = disagreement_payload
+        if floorplan_space is not None:
+            output["floorplanSnapshotId"] = (
+                str(floorplan_space.snapshot_id) if floorplan_space.snapshot_id is not None else None
+            )
+            output["floorplanWorldFrame"] = (
+                str(floorplan_space.world_frame)
+                if floorplan_space.world_frame is not None
+                else None
+            )
+            output["floorplanWorldFrameRevision"] = (
+                str(floorplan_space.world_frame_revision)
+                if floorplan_space.world_frame_revision is not None
+                else None
+            )
+            output["floorplanSnapshotContentSha256"] = (
+                str(floorplan_space.snapshot_content_sha256)
+                if floorplan_space.snapshot_content_sha256 is not None
+                else None
+            )
+            output["floorplanCalibrationFingerprint"] = (
+                str(floorplan_space.calibration_fingerprint)
+                if floorplan_space.calibration_fingerprint is not None
+                else None
+            )
+            output["floorplanTsUs"] = (
+                int(floorplan_space.floorplan_ts_us)
+                if floorplan_space.floorplan_ts_us is not None
+                else None
+            )
+        return output
 
     def _candidate_anchors_for_footpoint(self, fp: Footpoint, calib: CalibrationSnapshot) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
@@ -2835,6 +3379,18 @@ class BevRenderer:
             getattr(calib, "world_frame_revision", "")
             or getattr(calibration_frame, "revision", "")
         ).strip()
+        expected_world_transform_sha256 = str(
+            getattr(calib, "frame_transform_sha256", "")
+            or getattr(calibration_frame, "transform_sha256", "")
+            or getattr(calib, "world_alignment_sha256", "")
+            or ""
+        ).strip()
+        expected_frame_id = frame_id
+        canonical_identity_binding_required = bool(
+            explicit_expected_world_frame
+            or expected_world_revision
+            or expected_world_transform_sha256
+        )
         max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
         # A disabled config distance is not permission to publish an
         # unbounded projection.  With an active PCF, use the fixed display
@@ -2902,6 +3458,7 @@ class BevRenderer:
             payload: Dict[str, Any] = {
                 "stableId": int(fp.stable_id) if fp.stable_id is not None else None,
                 "trackerId": int(fp.tracker_id) if fp.tracker_id is not None else None,
+                "trackKey": fp.track_key,
                 "trackerLifecycleGeneration": (
                     int(fp.tracker_lifecycle_generation)
                     if fp.tracker_lifecycle_generation is not None
@@ -2971,14 +3528,51 @@ class BevRenderer:
                 observed_world_revision = str(
                     fp.world_frame_revision or ""
                 ).strip()
+                observed_world_transform_sha256 = str(
+                    fp.world_transform_sha256 or ""
+                ).strip()
+                try:
+                    observed_frame_id = (
+                        None
+                        if fp.frame_id is None or isinstance(fp.frame_id, bool)
+                        else int(fp.frame_id)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    observed_frame_id = None
+                if expected_frame_id is not None and (
+                    observed_frame_id is None
+                    or observed_frame_id != int(expected_frame_id)
+                ):
+                    _break_canonical_trail(fp)
+                    dropped_footpoints.append(
+                        {
+                            "stableId": fp.stable_id,
+                            "trackerId": fp.tracker_id,
+                            "trackKey": fp.track_key,
+                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
+                            "trailSegmentId": fp.trail_segment_id,
+                            "reason": "canonical_world_frame_id_mismatch",
+                            "frameId": fp.frame_id,
+                            "expectedFrameId": int(expected_frame_id),
+                        }
+                    )
+                    continue
                 if (
                     (
-                        bool(explicit_expected_world_frame)
-                        and observed_world_frame != expected_world_frame
+                        canonical_identity_binding_required
+                        and (
+                            not observed_world_frame
+                            or not explicit_expected_world_frame
+                            or observed_world_frame != expected_world_frame
+                        )
                     )
                     or (
-                        bool(expected_world_revision)
-                        and observed_world_revision != expected_world_revision
+                        canonical_identity_binding_required
+                        and (
+                            not expected_world_revision
+                            or not observed_world_revision
+                            or observed_world_revision != expected_world_revision
+                        )
                     )
                 ):
                     _break_canonical_trail(fp)
@@ -2986,6 +3580,7 @@ class BevRenderer:
                         {
                             "stableId": fp.stable_id,
                             "trackerId": fp.tracker_id,
+                            "trackKey": fp.track_key,
                             "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
                             "trailSegmentId": fp.trail_segment_id,
                             "reason": "canonical_world_revision_mismatch",
@@ -2993,6 +3588,35 @@ class BevRenderer:
                             "worldFrameRevision": observed_world_revision or None,
                             "expectedWorldFrame": expected_world_frame,
                             "expectedWorldFrameRevision": expected_world_revision or None,
+                            "worldTransformSha256": fp.world_transform_sha256,
+                            "expectedWorldTransformSha256": expected_world_transform_sha256 or None,
+                        }
+                    )
+                    continue
+                # A transform digest is an independent binding, not a proxy
+                # for the frame revision.  When either side carries one, both
+                # sides must carry the same digest; otherwise this canonical
+                # point is not safe to reproject.  Legacy SDK-neutral fixtures
+                # with neither optional digest remain usable.
+                if (
+                    expected_world_transform_sha256
+                    or observed_world_transform_sha256
+                ) and (
+                    not expected_world_transform_sha256
+                    or observed_world_transform_sha256
+                    != expected_world_transform_sha256
+                ):
+                    _break_canonical_trail(fp)
+                    dropped_footpoints.append(
+                        {
+                            "stableId": fp.stable_id,
+                            "trackerId": fp.tracker_id,
+                            "trackKey": fp.track_key,
+                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
+                            "trailSegmentId": fp.trail_segment_id,
+                            "reason": "canonical_world_transform_mismatch",
+                            "worldTransformSha256": observed_world_transform_sha256 or None,
+                            "expectedWorldTransformSha256": expected_world_transform_sha256 or None,
                         }
                     )
                     continue
@@ -3496,6 +4120,33 @@ class BevRenderer:
                     selection_debug=selection_debug,
                 )
 
+            # Resolver diagnostics are a separate, bounded observation of the
+            # same track/cohort.  They never participate in BEV admission,
+            # smoothing, trail state, or the canonical point selected above.
+            # The upstream tracker stores the record under ``world_resolver``;
+            # omit it rather than carrying stale or revision-incompatible
+            # evidence into the dashboard.
+            resolver_diagnostics: Optional[Dict[str, Any]] = None
+            fp_debug = fp.debug if isinstance(fp.debug, Mapping) else None
+            if fp_debug is not None:
+                resolver_source = fp_debug.get("world_resolver")
+                resolver_diagnostics = self._normalize_resolver_diagnostics(
+                    fp=fp,
+                    source=resolver_source,
+                    expected_camera_id=str(camera_id),
+                    expected_source_id=source_id,
+                    expected_observed_at_us=observed_at_us,
+                    expected_world_frame=expected_world_frame,
+                    expected_world_revision=expected_world_revision,
+                    frame_mode=frame_mode,
+                    calib=calib,
+                    R_wc=R_wc,
+                    C_world=C_world,
+                    camera_ground_frame=camera_ground_frame,
+                    floorplan_alignment=floorplan_alignment,
+                    floorplan_space=active_floorplan_space,
+                )
+
             try:
                 stable_id = int(fp.stable_id) if fp.stable_id is not None else None
             except Exception:
@@ -3540,6 +4191,7 @@ class BevRenderer:
                     "method": str(fp.method),
                     "stable_id": stable_id,
                     "tracker_id": tracker_id,
+                    "track_key": fp.track_key,
                     "tracker_lifecycle_generation": tracker_lifecycle_generation,
                     "frame_id": int(fp.frame_id) if fp.frame_id is not None else None,
                     "anchor_source": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
@@ -3557,6 +4209,7 @@ class BevRenderer:
                         )
                     ),
                     "alignment_debug": alignment_debug,
+                    "resolver_diagnostics": resolver_diagnostics,
                     "motion_mode": str(fp.motion_mode) if fp.motion_mode not in (None, "") else None,
                     "posture": str(fp.posture) if fp.posture not in (None, "") else None,
                     "trail_append_allowed": (
@@ -3573,6 +4226,11 @@ class BevRenderer:
                     "world_frame_revision": (
                         str(fp.world_frame_revision)
                         if fp.world_frame_revision
+                        else None
+                    ),
+                    "world_transform_sha256": (
+                        str(fp.world_transform_sha256)
+                        if fp.world_transform_sha256
                         else None
                     ),
                 }
@@ -3646,6 +4304,7 @@ class BevRenderer:
                     'method': method,
                     'stableId': int(stable_id) if stable_id is not None else None,
                     'trackerId': int(tracker_id) if tracker_id is not None else None,
+                    'trackKey': item.get("track_key"),
                     'trackerLifecycleGeneration': item.get(
                         "tracker_lifecycle_generation"
                     ),
@@ -3664,6 +4323,7 @@ class BevRenderer:
                     'idleJitterM': item.get("idle_jitter_m"),
                     'worldFrame': item.get("world_frame"),
                     'worldFrameRevision': item.get("world_frame_revision"),
+                    'worldTransformSha256': item.get("world_transform_sha256"),
                 }
                 point_payload.update(
                     self._floorplan_point_fields(
@@ -3689,12 +4349,18 @@ class BevRenderer:
                     point_payload["smoothed"] = bool(apply_backend_smoothing)
                     if isinstance(item.get("alignment_debug"), dict):
                         point_payload["alignmentDebug"] = item["alignment_debug"]
+                if isinstance(item.get("resolver_diagnostics"), Mapping):
+                    # This field is intentionally not gated by the legacy
+                    # alignment-debug environment switch.  It is the compact
+                    # comparison contract used by the normal dashboard toggle.
+                    point_payload["resolverDiagnostics"] = item["resolver_diagnostics"]
                 bev_points.append(point_payload)
                 current_by_history[history_key] = {
                     "x": float(lx),
                     "z": float(lz),
                     "stable_id": int(stable_id) if stable_id is not None else None,
                     "tracker_id": int(tracker_id) if tracker_id is not None else None,
+                    "track_key": item.get("track_key"),
                     "tracker_lifecycle_generation": item.get(
                         "tracker_lifecycle_generation"
                     ),

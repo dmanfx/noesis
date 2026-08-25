@@ -406,6 +406,10 @@ def test_cached_depth_is_diagnostic_only_for_current_world_observation() -> None
         measurement_ts_us=2_000_000,
         measurement_age_us=100_000,
         measurement_cached=True,
+        depth_tensor_frame_id=49,
+        depth_tensor_ts_us=1_966_667,
+        depth_tensor_age_frames=1,
+        depth_tensor_age_us=33_333,
         ts_us=2_100_000,
     )
 
@@ -483,6 +487,10 @@ def test_fresh_cached_fresh_depth_publishes_bounded_monotonic_cv_prediction(
             is_metric=True,
             sample_count=96,
             valid_fraction=0.96,
+            anchor_uv=(
+                float((keypoints[15, 0] + keypoints[16, 0]) * 0.5),
+                float((keypoints[15, 1] + keypoints[16, 1]) * 0.5),
+            ),
             anchor_source="pose_ankle_support",
             anchor_depth_m=range_m,
             anchor_sample_count=96,
@@ -632,6 +640,10 @@ def test_public_depth_fields_expose_and_clear_evidence_provenance() -> None:
         measurement_ts_us=2_000_000,
         measurement_age_us=100_000,
         measurement_cached=True,
+        depth_tensor_frame_id=49,
+        depth_tensor_ts_us=1_966_667,
+        depth_tensor_age_frames=1,
+        depth_tensor_age_us=33_333,
     )
     track: dict[str, Any] = {}
 
@@ -645,6 +657,10 @@ def test_public_depth_fields_expose_and_clear_evidence_provenance() -> None:
     assert track["depth_measurement_ts_us"] == 2_000_000
     assert track["depth_measurement_age_us"] == 100_000
     assert track["depth_measurement_cached"] is True
+    assert track["depth_tensor_frame_id"] == 49
+    assert track["depth_tensor_ts_us"] == 1_966_667
+    assert track["depth_tensor_age_frames"] == 1
+    assert track["depth_tensor_age_us"] == 33_333
 
     processor._apply_public_depth_fields(track, None)
 
@@ -656,6 +672,10 @@ def test_public_depth_fields_expose_and_clear_evidence_provenance() -> None:
     assert track["depth_measurement_ts_us"] is None
     assert track["depth_measurement_age_us"] is None
     assert track["depth_measurement_cached"] is None
+    assert track["depth_tensor_frame_id"] is None
+    assert track["depth_tensor_ts_us"] is None
+    assert track["depth_tensor_age_frames"] is None
+    assert track["depth_tensor_age_us"] is None
 
 
 def test_seated_pose_without_ankles_does_not_reuse_upright_gravity_drop(
@@ -778,6 +798,92 @@ def test_no_ground_contact_drops_leg_extension_anchor_even_when_posture_unknown(
     assert "world" not in track
     assert "world_source" not in track
     assert state.last_good_world is None
+
+
+def test_universal_resolver_keeps_independent_upright_body_scale_when_depth_has_no_contact(
+    monkeypatch,
+) -> None:
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    calibration.camera_calibration_sha256 = "b" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(
+            config={
+                "models": {"pose": {"kpt_threshold": 0.35}},
+                "canonical_world": {
+                    "measurement_resolver": {
+                        "enabled": True,
+                        "max_range_m": 22.0,
+                        "max_disagreement_m": 1.25,
+                        "max_candidates": 4,
+                    }
+                },
+            }
+        ),
+        tracking_pub=SimpleNamespace(),
+        camera_labels={0: "cam0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(
+            snapshot=lambda _sensor_id, _camera_id: calibration
+        ),
+    )
+    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    keypoints[hooks._POSE_KPT_INDEX["left_ankle"], 2] = 0.0
+    keypoints[hooks._POSE_KPT_INDEX["right_ankle"], 2] = 0.0
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=79,
+        class_id=0,
+        bbox=bbox,
+        score=0.95,
+        sampling_mode="pose_capsule_native",
+        status="no_ground_contact",
+        unit="m",
+        is_metric=True,
+        sample_count=400,
+        valid_fraction=1.0,
+        depth_median=8.0,
+        depth_center=8.0,
+    )
+    state = hooks._WorldAnchorState(
+        height_ref_scene=1.8,
+        motion_mode="walk",
+        posture="standing",
+    )
+    processor._world_state_by_track[(0, 79)] = state
+    monkeypatch.setattr(
+        processor,
+        "_gravity_drop_world",
+        lambda *_args, **_kwargs: np.asarray([0.0, 0.0, 6.0]),
+    )
+    track = {
+        "tracker_id": 79,
+        "frame_id": 1,
+        "source_id": 0,
+        "observed_at_us": 1_000_000,
+        "tracker_lifecycle_generation": 1,
+        "bbox": bbox,
+        "image_size": [1280, 720],
+    }
+
+    processor._augment_track_with_world(
+        0,
+        "cam0",
+        track,
+        pose_kpts_abs=keypoints,
+        depth_result=depth_result,
+        world_now_ts=1.0,
+    )
+
+    assert track["world_valid"] is True
+    assert track["world_source"] == "gravity_drop"
+    assert track["world_quality"] == "estimated"
+    assert track["world"] == pytest.approx([0.0, 0.0, 6.0])
+    assert track["world_resolver_selected_id"] == "gravity_reconstruction"
 
 
 def test_stationary_seated_hold_extends_only_for_trusted_lifecycle(monkeypatch) -> None:

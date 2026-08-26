@@ -1,4 +1,4 @@
-"""Diagnostics helpers for DS8 V3DT/SV3DT forensics."""
+"""Diagnostics helpers for DS9.1 V3DT/SV3DT forensics."""
 
 from .telemetry_log import TrackingDiagnosticsLogger
 from .v3dt_forensics import (

@@ -1,8 +1,8 @@
 # ChArUco intrinsics calibration
-_Status: native DS9.1 workflow, updated 2026-08-15._
+_Status: native DS9.1 workflow, updated 2026-08-26._
 
 This guide shows how to calibrate camera intrinsics using a ChArUco board and
-apply the results to both `intrinsics.json` and `config/cameras.yaml`.
+apply the results to canonical `config/cameras.yaml`.
 
 ## Board parameters (your print)
 
@@ -47,7 +47,7 @@ python3 scripts/charuco_calibrate_intrinsics.py \
 The script writes a JSON report under `diagnostics/` and prints the intrinsics.
 Aim for median reprojection error around 0.5 to 1.5 px; lower is better.
 
-## Update calibrated intrinsics
+## Update canonical intrinsics
 
 To update the canonical intrinsics file:
 
@@ -59,33 +59,14 @@ python3 scripts/charuco_calibrate_intrinsics.py \
   --square-length-mm 30 \
   --marker-length-mm 22 \
   --dictionary DICT_4X4_50 \
-  --update-intrinsics-json intrinsics.json \
-  --json-model-key unifi_protect_g4_instant \
-  --json-model-name UVC-G4-INS
-```
-
-This updates the model entry in `intrinsics.json` with the new K matrix and
-distortion coefficients.
-
-## Update config/cameras.yaml (SV3DT camInfo generation)
-
-To update the intrinsics used by camInfo generation:
-
-```
-python3 scripts/charuco_calibrate_intrinsics.py \
-  --image-dir /tmp/charuco \
-  --squares-x 7 \
-  --squares-y 5 \
-  --square-length-mm 30 \
-  --marker-length-mm 22 \
-  --dictionary DICT_4X4_50 \
   --update-cameras-yaml config/cameras.yaml \
-  --yaml-model-key unifi_g4_instant
+  --yaml-model-key unifi_g4_instant_charuco_720_raw_fisheye
 ```
 
-Note: `config/cameras.yaml` only stores k1/k2/k3 (no p1/p2), but the intrinsics
-model is primarily used for K (fx, fy, cx, cy). Distortion is not consumed by
-SV3DT camInfo generation today.
+This updates the selected model entry in `config/cameras.yaml` with its measured
+resolution, K parameters, radial coefficients, and calibration metadata. Review
+the diff before binding a camera to the new model. DeepStream camInfo generation
+uses K but does not consume distortion coefficients.
 
 ## Distortion handling (SV3DT)
 
@@ -118,6 +99,8 @@ Note: the dewarper config now includes `dst-focal-length` and
    the changed camera.
 3. Restart the managed runtime only when accepting the new intrinsics.
 
-MV3DT is currently disabled. If its geometry work resumes, regenerate its
-camInfo with `scripts/generate_v3dt_caminfo.py` and validate the explicit
-candidate config; do not enable it as part of ordinary intrinsics calibration.
+Baseline tracking remains the default. The accepted Kitchen/Family Room MV3DT
+lane is a separate explicit opt-in; ordinary intrinsics calibration must not
+select it or widen its peer topology. If calibration changes either accepted
+peer camera, regenerate its camInfo with `scripts/generate_v3dt_caminfo.py` and
+revalidate the bound MV3DT profile before selecting that lane.

@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DS9_ROOT = REPO_ROOT / "DS9"
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=1)
 def _characterize(adapter_root: Path) -> dict[str, object]:
     script = r'''
 import json
@@ -173,7 +173,7 @@ print(json.dumps({
     return json.loads(result.stdout)
 
 
-class PersonGroundParityTests(unittest.TestCase):
+class PersonGroundContractTests(unittest.TestCase):
     def test_ds9_adapter_uses_shared_product_state_without_local_clone(self) -> None:
         path = DS9_ROOT / "noesis" / "pipelines" / "hooks.py"
         text = path.read_text(encoding="utf-8")
@@ -193,18 +193,14 @@ class PersonGroundParityTests(unittest.TestCase):
         self.assertNotIn("apply_source_hysteresis(", text)
         self.assertIn("update_motion_mode(", text)
 
-    def test_ds8_and_ds9_ground_adapter_characterization_matches(self) -> None:
-        ds8 = _characterize(REPO_ROOT)
+    def test_ds91_ground_adapter_characterization_matches_product_contract(self) -> None:
         ds9 = _characterize(DS9_ROOT)
-        self.assertEqual(ds9, ds8)
         self.assertEqual(ds9["candidate_source"], "pose_ankle_floor")
         self.assertEqual(ds9["state_owner"], "noesis.telemetry.person_ground_state")
         self.assertEqual(ds9["prediction"]["prior"], [1.1, 0.0, 1.95])
 
     def test_world_key_prefers_tracker_lifecycle_over_stable_identity(self) -> None:
-        ds8 = _characterize(REPO_ROOT)
         ds9 = _characterize(DS9_ROOT)
-        self.assertEqual(ds9["world_key"], ds8["world_key"])
         self.assertEqual(ds9["world_key"], [4, 77])
 
     def test_long_gap_impossible_measurement_is_rejected(self) -> None:

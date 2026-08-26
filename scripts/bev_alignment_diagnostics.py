@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect and summarize DS8 BEV alignment diagnostics from MP4/file sources."""
+"""Collect and summarize DS9.1 BEV alignment diagnostics from MP4/file sources."""
 
 from __future__ import annotations
 
@@ -626,7 +626,7 @@ def _spawn_runtime(args: argparse.Namespace, config_path: Path) -> subprocess.Po
     ws_port = parsed.port or 6008
     cmd = [
         sys.executable,
-        "noesis/ds8_runtime.py",
+        "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
         str(config_path),
         "--cameras-config",
@@ -646,7 +646,7 @@ def _spawn_runtime(args: argparse.Namespace, config_path: Path) -> subprocess.Po
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pipeline-config", default="config/infer.yaml")
+    parser.add_argument("--pipeline-config", default="DS9/config/infer.yaml")
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
     parser.add_argument("--output-root", default="diagnostics/bev_alignment")
     parser.add_argument("--run-id", default="")

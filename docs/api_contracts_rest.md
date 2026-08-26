@@ -965,6 +965,8 @@ DS9.1 expose the same owner-private batch capture contract for the OAI2
 Sem-seg diagnostic. A browser starts capture only through Menon's coordinated
 `POST /api/diagnostics/semantic-seg/captures` action; Menon supplies internal
 authentication, idempotency, audit, and exact latest-result readback.
+The shared implementation lives in `noesis/semantic_capture/`; its bounded
+runner is invoked as `python3 -m noesis.semantic_capture.main`.
 
 - **POST** `/api/v1/semantic-seg/captures`
   - Accepts exactly `{ "model": "s" | "l" }`.

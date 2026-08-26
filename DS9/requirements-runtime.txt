@@ -1,5 +1,5 @@
-# Minimal Python dependencies missing from the NVIDIA DeepStream 9 container
-# for the Noesis DS9 runtime and smoke-test control plane.
+# Python dependencies for the native-host Noesis DS9.1 runtime and focused
+# application validation.
 PyYAML
 websockets
 requests

@@ -314,7 +314,7 @@ class LatencyCollector:
                     # Defensive: never let a single bad sample break telemetry.
                     continue
 
-    # -------------------- DS8 Service Maker path --------------------
+    # -------------------- Service Maker path --------------------
 
     def record_from_sm_buffer(self, buffer: object) -> None:
         """Extract latency samples from a Service Maker Buffer via native shim."""

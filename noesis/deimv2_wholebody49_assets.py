@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DS9_ROOT = REPO_ROOT / "DS9"
 
 WHOLEBODY49_SIZES = ("s", "x")
 
@@ -65,7 +66,7 @@ def _engine_dir() -> Path:
 
 
 def _pipeline_dir() -> Path:
-    return Path(os.environ.get("NOESIS_PIPELINE_DIR", REPO_ROOT / "pipelines")).expanduser().resolve()
+    return Path(os.environ.get("NOESIS_PIPELINE_DIR", DS9_ROOT / "pipelines")).expanduser().resolve()
 
 
 def _build_dir() -> Path:
@@ -117,7 +118,7 @@ def _require_property(props: Mapping[str, str], key: str, expected: str, *, labe
 def validate_wholebody49_preprocess_properties(
     props: Mapping[str, str], *, batch_size: int = 3
 ) -> None:
-    """Validate the fixed tensor contract consumed by both DS8 and DS9."""
+    """Validate the fixed tensor contract consumed by DS9.1."""
 
     label = "Wholebody49 preprocess"
     _require_property(props, "tensor-name", "images", label=label)

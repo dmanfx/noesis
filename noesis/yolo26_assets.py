@@ -7,6 +7,7 @@ from typing import Dict, Iterable
 import logging
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DS9_ROOT = REPO_ROOT / "DS9"
 
 
 def _build_dir() -> Path:
@@ -18,12 +19,12 @@ def resolve_yolo26_assets(size: str) -> Dict[str, Path]:
     if size_norm not in ("n", "s", "m"):
         raise ValueError(f"YOLO26 size must be one of n/s/m (got: {size})")
     return {
-        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo26_seg.template.ini").resolve(),
-        "preproc_template": (REPO_ROOT / "pipelines" / "config_preproc.ini").resolve(),
+        "template": (DS9_ROOT / "pipelines" / "config_infer_primary_yolo26_seg.template.ini").resolve(),
+        "preproc_template": (DS9_ROOT / "pipelines" / "config_preproc.ini").resolve(),
         "onnx": (REPO_ROOT / "models" / f"yolo26{size_norm}-seg_fused.onnx").resolve(),
         "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_fused_b3_fp16.engine").resolve(),
         "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
-        "parser": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
+        "parser": (DS9_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
         "output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
         "default_output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
     }

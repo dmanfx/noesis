@@ -28,7 +28,7 @@ from noesis.server.boundary_metrics import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Noesis DS8 Analytics API")
+app = FastAPI(title="Noesis DS9 Analytics API")
 app.router.route_class = BoundaryMetricsRoute
 
 ANALYTICS_CONFIG_ENV = "NOESIS_ANALYTICS_CONFIG"
@@ -335,12 +335,12 @@ def _resolve_exclude_config_path() -> Path:
     if env_path:
         return Path(env_path).expanduser()
     try:
-        from noesis.pipelines import ds8_pipeline
+        from noesis.pipelines import deepstream_pipeline
     except Exception as exc:
         raise RuntimeError("Analytics pipeline module is unavailable") from exc
 
     try:
-        graph = ds8_pipeline.get_pipeline()
+        graph = deepstream_pipeline.get_pipeline()
     except Exception as exc:
         raise RuntimeError(
             "Analytics exclusion path is unavailable before pipeline construction"
@@ -476,7 +476,7 @@ def _persist_exclude_ini(stage_cfg: Dict[str, Any], path: Path) -> None:
 
 
 def _sync_exclude_stage(stage_name: str, stage_cfg: Dict[str, Any]) -> Optional[Path]:
-    """Keep the exclusion INI in sync with the DS8 analytics YAML."""
+    """Keep the exclusion INI in sync with the canonical analytics YAML."""
     if stage_name != "exclude":
         return None
     target = _resolve_exclude_config_path()
@@ -701,9 +701,9 @@ def _trigger_reload(stage_name: str, stage_cfg: Dict[str, Any]) -> Dict[str, Any
         raise RuntimeError("Analytics reload did not produce an exclusion config")
     reload_context = _build_exclude_reload_context(exclude_path)
 
-    from noesis.pipelines import ds8_pipeline
+    from noesis.pipelines import deepstream_pipeline
 
-    graph = ds8_pipeline.get_pipeline()
+    graph = deepstream_pipeline.get_pipeline()
 
     if graph is None:
         raise RuntimeError("Analytics pipeline is unavailable")

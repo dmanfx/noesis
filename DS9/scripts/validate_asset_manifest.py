@@ -12,9 +12,8 @@ import os
 import re
 import stat
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import yaml
 
@@ -26,7 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import nvml_gpu_memory_sampler as gpu_sampler  # noqa: E402
+import legacy_gpu_memory_guard_receipt as legacy_gpu_guard  # noqa: E402
 from noesis_core.strict_json import (  # noqa: E402
     StrictJSONError,
     strict_json_loads,
@@ -114,23 +113,54 @@ WHOLEBODY_LOGGER_POLICY = {
     "captured_message_truncation": "fatal",
     "error_state": "sticky_fatal",
 }
-# DeepStream 9.1 admits no pre-guard DS9.0 engine receipts. Every newly
-# realized engine must carry the sealed NVML guard emitted by maintenance.
+# Historical container receipts may carry a sealed NVML guard. Native-host
+# maintenance never emits this legacy proof; the verifier below is read-only.
 LEGACY_GPU_MEMORY_GUARD_EXEMPTIONS: dict[str, dict[str, str]] = {}
 UNCONDITIONALLY_GUARD_REQUIRED_ARTIFACT_IDS = {
     "engine.wholebody49_s_masks",
     "engine.wholebody49_x_boxes",
 }
-RUNTIME_IMAGE_AUTHORITY = {
-    "reference": "noesis-ds9-runtime:9.1-20260812",
-    "image_id": "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e",
-    "parent_reference": "noesis-ds9-dev:9.1-20260812",
-    "parent_image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
+NATIVE_HOST_AUTHORITY = {
+    "operating_system": "ubuntu-24.04",
+    "architecture": "x86_64",
+    "driver_minimum": "595.58.03",
+    "gstreamer": "1.24.2",
+    "sdk_root": "/opt/nvidia/deepstream/deepstream-9.1",
+    "cuda_root": "/usr/local/cuda-13.2",
+    "native_root_env": "NOESIS_DS91_NATIVE_ROOT",
+}
+NATIVE_RUNTIME_AUTHORITY = {
+    "backend": "native_host",
+    "supervisor": "DS9/scripts/run_canonical_runtime_host.py",
+    "artifact_root_env": "NOESIS_DS9_ARTIFACT_ROOT",
+    "runtime_root_env": "NOESIS_DS9_RUNTIME_ROOT",
+}
+# Read-only compatibility for immutable engine receipts created before the
+# native-host cutover. This does not authorize a build or runtime backend.
+LEGACY_ENGINE_RECEIPT_PLATFORM = {
+    "image": "noesis-ds9-dev:9.1-20260812",
+    "image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
     "base_digest": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994",
     "tensorrt_version": "10.16.0.72",
     "cuda_version": "13.2.0.046",
-    "dockerfile": "DS9/docker/Dockerfile.runtime",
-    "dockerfile_sha256": "4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133",
+}
+NATIVE_ENGINE_RECEIPT_PLATFORM = {
+    "image": "native_host",
+    "image_id": "native_host",
+    "base_digest": "native_host",
+    "tensorrt_version": "10.16.0.72",
+    "cuda_version": "13.2",
+}
+NATIVE_HOST_BUILD_AUTHORITY_KEYS = {
+    "backend",
+    "deepstream",
+    "cuda",
+    "tensorrt",
+    "compiler",
+    "python_abi",
+    "source_sha256",
+    "output_sha256",
+    "command",
 }
 
 
@@ -485,8 +515,8 @@ def validate_manifest(
     missing_root = sorted(REQUIRED_ROOT_KEYS - set(manifest))
     if missing_root:
         errors.append(f"manifest is missing root keys: {', '.join(missing_root)}")
-    if manifest.get("schema_version") != 2:
-        errors.append("schema_version must be 2")
+    if manifest.get("schema_version") != 3:
+        errors.append("schema_version must be 3")
 
     schema_raw = str(manifest.get("schema", ""))
     try:
@@ -506,9 +536,9 @@ def validate_manifest(
             errors.append(f"schema file is not valid JSON: {exc}")
         else:
             if not isinstance(schema, Mapping) or schema.get("$id") != (
-                "https://noesis.local/schemas/ds9-asset-manifest-v2.json"
+                "https://noesis.local/schemas/ds9-native-asset-manifest-v3.json"
             ):
-                errors.append("schema $id is not the DS9 manifest v2 identifier")
+                errors.append("schema $id is not the native DS9 manifest v3 identifier")
 
     target = manifest.get("target")
     if not isinstance(target, Mapping):
@@ -527,67 +557,19 @@ def validate_manifest(
         errors.append("target.tensorrt must be 10.16.0.72")
     if target.get("python") != "3.12":
         errors.append("target.python must be 3.12")
-    build_image = target.get("build_image")
-    expected_build_image = {
-        "reference": "noesis-ds9-dev:9.1-20260812",
-        "image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
-        "base_digest": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994",
-        "tensorrt_version": "10.16.0.72",
-        "cuda_version": "13.2.0.046",
-        "dockerfile": "DS9/docker/Dockerfile",
-        "dockerfile_sha256": "9f5f63a18c41256e06cab5514dcb6c5b47d290b8ea06a172490026776c56f01a",
-        "requirements": "DS9/docker/requirements.lock.txt",
-        "requirements_sha256": "de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48",
-    }
-    if (
-        not isinstance(build_image, Mapping)
-        or dict(build_image) != expected_build_image
-    ):
+    native_host = target.get("native_host")
+    if not isinstance(native_host, Mapping) or dict(native_host) != NATIVE_HOST_AUTHORITY:
         errors.append(
-            "target.build_image does not match the reviewed DS9 image authority"
+            "target.native_host does not match the reviewed native DS9.1 authority"
         )
-    else:
-        for path_key, digest_key in (
-            ("dockerfile", "dockerfile_sha256"),
-            ("requirements", "requirements_sha256"),
-        ):
-            authority_path = REPO_ROOT / str(build_image[path_key])
-            if (
-                not authority_path.is_file()
-                or _hash_file(authority_path) != build_image[digest_key]
-            ):
-                errors.append(
-                    f"target.build_image {path_key} bytes differ from the declared digest"
-                )
 
     runtime = manifest.get("runtime")
     if not isinstance(runtime, Mapping):
         errors.append("runtime must be a mapping")
         runtime = {}
-    runtime_image = runtime.get("image")
-    if (
-        not isinstance(runtime_image, Mapping)
-        or dict(runtime_image) != RUNTIME_IMAGE_AUTHORITY
-    ):
-        errors.append(
-            "runtime.image does not match the reviewed DS9 runtime-image authority"
-        )
-    else:
-        if (
-            not isinstance(build_image, Mapping)
-            or runtime_image["parent_reference"] != build_image.get("reference")
-            or runtime_image["parent_image_id"] != build_image.get("image_id")
-        ):
-            errors.append("runtime.image parent does not match target.build_image")
-        runtime_dockerfile = REPO_ROOT / str(runtime_image["dockerfile"])
-        if (
-            not runtime_dockerfile.is_file()
-            or runtime_dockerfile.is_symlink()
-            or _hash_file(runtime_dockerfile) != runtime_image["dockerfile_sha256"]
-        ):
-            errors.append(
-                "runtime.image Dockerfile bytes differ from the declared digest"
-            )
+    for key, expected in NATIVE_RUNTIME_AUTHORITY.items():
+        if runtime.get(key) != expected:
+            errors.append(f"runtime.{key} must be {expected!r}")
     runtime_paths = {
         "entrypoint": ("DS9/",),
         "implementation": ("DS9/",),
@@ -1074,118 +1056,7 @@ ENGINE_NAME_BY_ARTIFACT_ID = {
     "engine.v3dt_bodypose": "bodypose3dnet",
     "engine.v3dt_tracker_reid": "v3dt_tracker_reid",
 }
-SOURCE_CONTRACT_REBASE_ROOT = "source_contract_rebase"
-SOURCE_CONTRACT_REBASE_INPUT_ROOT = "inputs"
-SOURCE_CONTRACT_REBASE_EVIDENCE_FILENAME = "source_contract_rebase_evidence.json"
-SOURCE_CONTRACT_REBASE_CONTRACT = "noesis.ds9.source_contract_realization_rebase"
-SOURCE_CONTRACT_REBASE_MAX_TRANSACTIONS = 4096
-SOURCE_CONTRACT_PATH = "DS9/config/engine_source_contracts.json"
-BASE_MANIFEST_PATH = "DS9/asset_manifest.yaml"
-MANIFEST_REBASE_ROOT = "manifest_rebase"
-MANIFEST_REBASE_EVIDENCE_FILENAME = "rebase_evidence.json"
-MANIFEST_REBASE_CONTRACT = "noesis.ds9.asset_realization_rebase"
-MANIFEST_REBASE_MAX_TRANSACTIONS = 4096
-MANIFEST_REBASE_MAX_DIFF_PATHS = 4096
-MAPANYTHING_TRANSITION_ROOT = "mapanything_authority_transition"
-MAPANYTHING_TRANSITION_EVIDENCE_FILENAME = "transition_evidence.json"
-MAPANYTHING_TRANSITION_CONTRACT = "noesis.ds9.mapanything_authority_transition"
-MAPANYTHING_TRANSITION_PLAN_CONTRACT = (
-    "noesis.ds9.mapanything_authority_transition.plan.v1"
-)
-MAPANYTHING_TRANSITION_MAX_TRANSACTIONS = 4096
-MAPANYTHING_ARTIFACT_ID = "engine.mapanything"
-MAPANYTHING_CONTRACT_NAME = "mapanything"
-MAPANYTHING_OLD_MANIFEST_SHA256 = (
-    "eed4340c1af587f903541f364824e643377b6149c5249e8314fc1d77fa12e789"
-)
-MAPANYTHING_NEW_MANIFEST_SHA256 = (
-    "10e15351382e8a693a6acc048a05df3adff96a906fde50f0fa371fb0a8455198"
-)
-MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256 = (
-    "7ddd449c82e80d5c3195c0ccfb4ba4c3d4d542c654234f5d1f31d4ea549a20e0"
-)
-MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256 = (
-    "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
-)
-MAPANYTHING_OLD_REALIZED_RECORD_SHA256 = (
-    "24504cc670bbeeb325f361c05ba360b749e1c4bb98465aeb636c5d7800fbd6d0"
-)
-MAPANYTHING_OLD_OUTPUT = "DS9/models/engines/mapanything_images_294x518_b3_fp16.plan"
-MAPANYTHING_NEW_OUTPUT = "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan"
-MAPANYTHING_OLD_OUTPUT_SHA256 = (
-    "aeb7140a56c31b8e420c7a1d31fb21ef4590c38d85e9eb41299dfe0d55b6891d"
-)
-MAPANYTHING_OLD_OUTPUT_SIZE_BYTES = 1_850_829_956
-_MAPANYTHING_TRANSITION_SNAPSHOT_FILENAMES = {
-    "old_asset_manifest.yaml",
-    "new_asset_manifest.yaml",
-    "old_engine_source_contracts.json",
-    "new_engine_source_contracts.json",
-    "asset_realization.before.json",
-    "asset_realization.after.json",
-}
-_MAPANYTHING_TRANSITION_INVENTORY = _MAPANYTHING_TRANSITION_SNAPSHOT_FILENAMES | {
-    MAPANYTHING_TRANSITION_EVIDENCE_FILENAME
-}
-_MAPANYTHING_TRANSITION_TERMINAL_ABORT_STATES = {
-    "aborted_before_commit",
-    "aborted_by_recovery",
-    "rolled_back_after_evidence_failure",
-}
 _SOURCE_CONTRACT_DOCUMENT_KEYS = {"schema_version", "contracts"}
-_SOURCE_REBASE_REQUIRED_EVIDENCE_KEYS = {
-    "schema_version",
-    "contract",
-    "transaction_id",
-    "state",
-    "prepared_at_utc",
-    "committed_at_utc",
-    "old_source_contracts",
-    "new_source_contracts",
-    "base_manifest",
-    "realization",
-    "changed_contracts",
-    "mapped_unrealized_artifact_ids",
-    "realized_engine_ids",
-    "mutation_paths",
-    "semantic_checks",
-}
-_SOURCE_REBASE_OPTIONAL_EVIDENCE_KEYS = {"realization_replace_recovery"}
-_SOURCE_REBASE_SEMANTIC_CHECK_KEYS = {
-    "source_contract_schema_unchanged",
-    "source_contract_membership_unchanged",
-    "changed_contracts_exact_allowlist",
-    "changed_contracts_map_only_to_unrealized_engines",
-    "base_manifest_unchanged",
-    "realized_artifact_records_unchanged",
-    "proposal_mutation_is_exact",
-}
-_MANIFEST_REBASE_REQUIRED_EVIDENCE_KEYS = {
-    "schema_version",
-    "contract",
-    "transaction_id",
-    "state",
-    "prepared_at_utc",
-    "committed_at_utc",
-    "old_manifest",
-    "new_manifest",
-    "source_contracts",
-    "realization",
-    "mutation_paths",
-    "realized_engine_ids",
-    "semantic_checks",
-    "manifest_diff",
-}
-_MANIFEST_REBASE_OPTIONAL_EVIDENCE_KEYS = {
-    "runtime_image_authority",
-    "realization_replace_recovery",
-}
-_MANIFEST_REBASE_REQUIRED_SEMANTIC_CHECK_KEYS = {
-    "target_unchanged",
-    "source_contracts_unchanged",
-    "all_engine_artifacts_unchanged",
-    "realized_artifacts_unchanged",
-}
 
 
 def _read_regular_owned_bytes(path: Path, label: str) -> bytes:
@@ -1262,45 +1133,6 @@ def _require_sha256(value: object, label: str) -> str:
     return result
 
 
-def _parse_explicit_utc(value: object, label: str) -> datetime:
-    raw = str(value or "").strip()
-    if not raw.endswith("Z"):
-        raise ValueError(f"{label} must be an explicit UTC timestamp")
-    try:
-        parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
-    except ValueError as exc:
-        raise ValueError(f"{label} is not a valid UTC timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise ValueError(f"{label} must use UTC")
-    return parsed
-
-
-def _require_private_directory(path: Path, label: str) -> Path:
-    candidate = _lexical_absolute(path)
-    try:
-        info = candidate.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError(f"{label} is missing: {candidate}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise ValueError(f"{label} must be a real directory: {candidate}")
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError(f"{label} must be owned by the current uid with mode 0700")
-    return candidate
-
-
-def _validate_private_parent_chain(path: Path, root: Path, label: str) -> None:
-    candidate = _lexical_absolute(path)
-    root = _require_private_directory(root, f"{label} root")
-    try:
-        relative = candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"{label} escapes its private root") from exc
-    current = root
-    for component in relative.parts[:-1]:
-        current /= component
-        _require_private_directory(current, f"{label} parent")
-
-
 def _validate_source_contract_document(
     payload: Mapping[str, Any], label: str
 ) -> Mapping[str, Any]:
@@ -1318,1968 +1150,6 @@ def _validate_source_contract_document(
         if not isinstance(value, Mapping) or not value:
             raise ValueError(f"{label} contract {key!r} must be a nonempty mapping")
     return contracts
-
-
-def _require_exact_record(
-    value: object, expected_keys: set[str], label: str
-) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != expected_keys:
-        raise ValueError(f"{label} has unexpected or missing fields")
-    return value
-
-
-def _require_sorted_unique_strings(
-    value: object,
-    label: str,
-    *,
-    allow_empty: bool,
-) -> tuple[str, ...]:
-    if (
-        not isinstance(value, list)
-        or (not allow_empty and not value)
-        or any(not isinstance(item, str) or not item for item in value)
-        or value != sorted(value)
-        or len(set(value)) != len(value)
-    ):
-        qualifier = "possibly empty" if allow_empty else "nonempty"
-        raise ValueError(f"{label} must be a sorted, unique, {qualifier} string list")
-    return tuple(value)
-
-
-def _validate_replace_recovery(value: object, label: str) -> None:
-    recovery = _require_exact_record(
-        value,
-        {"outcome", "recovered_at_utc"},
-        label,
-    )
-    if recovery.get("outcome") != "proposal_exact_bytes_refsynced":
-        raise ValueError(f"{label} outcome is invalid")
-    _parse_explicit_utc(recovery.get("recovered_at_utc"), f"{label} timestamp")
-
-
-def _load_source_contract_snapshot(
-    artifact_root: Path,
-    evidence_root: Path,
-    record: Mapping[str, Any],
-    *,
-    label: str,
-) -> tuple[Mapping[str, Any], bytes, str]:
-    relative = _relative_path(record.get("path"))
-    if tuple(relative.parts[:2]) != (
-        SOURCE_CONTRACT_REBASE_ROOT,
-        SOURCE_CONTRACT_REBASE_INPUT_ROOT,
-    ):
-        raise ValueError(f"{label} path is outside the reviewed input evidence root")
-    path = _bounded_private_path(
-        artifact_root / relative,
-        evidence_root,
-        label,
-    )
-    _validate_private_parent_chain(path, evidence_root, label)
-    payload, raw = _load_private_json_with_bytes(path, label)
-    observed_hash = _sha256_bytes(raw)
-    expected_hash = _require_sha256(record.get("sha256"), f"{label} SHA-256")
-    if observed_hash != expected_hash:
-        raise ValueError(
-            f"{label} digest mismatch: expected={expected_hash} observed={observed_hash}"
-        )
-    _validate_source_contract_document(payload, label)
-    return payload, raw, observed_hash
-
-
-def _require_owned_nonwritable_directory(path: Path, label: str) -> Path:
-    candidate = _lexical_absolute(path)
-    try:
-        info = candidate.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError(f"{label} is missing: {candidate}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise ValueError(f"{label} must be a real directory: {candidate}")
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
-        raise ValueError(
-            f"{label} must be owned by the current uid and not group/world writable"
-        )
-    return candidate
-
-
-def _validate_manifest_snapshot_parent_chain(
-    path: Path, root: Path, label: str
-) -> None:
-    candidate = _lexical_absolute(path)
-    root = _require_owned_nonwritable_directory(root, f"{label} root")
-    try:
-        relative = candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"{label} escapes its evidence root") from exc
-    current = root
-    for component in relative.parts[:-1]:
-        current /= component
-        _require_private_directory(current, f"{label} parent")
-
-
-def _load_manifest_snapshot(
-    artifact_root: Path,
-    evidence_root: Path,
-    record: Mapping[str, Any],
-    *,
-    label: str,
-) -> tuple[Mapping[str, Any], bytes, str]:
-    relative = _relative_path(record.get("path"))
-    if not relative.parts or relative.parts[0] != MANIFEST_REBASE_ROOT:
-        raise ValueError(f"{label} path is outside the manifest evidence root")
-    path = _bounded_private_path(
-        artifact_root / relative,
-        evidence_root,
-        label,
-    )
-    _validate_manifest_snapshot_parent_chain(path, evidence_root, label)
-    raw = _read_private_bytes(path, label)
-    observed_hash = _sha256_bytes(raw)
-    expected_hash = _require_sha256(record.get("sha256"), f"{label} SHA-256")
-    if observed_hash != expected_hash:
-        raise ValueError(
-            f"{label} digest mismatch: expected={expected_hash} observed={observed_hash}"
-        )
-    return _parse_yaml_mapping(raw, label), raw, observed_hash
-
-
-def _manifest_engine_records(
-    payload: Mapping[str, Any], label: str
-) -> tuple[Mapping[str, Any], dict[str, Mapping[str, Any]]]:
-    target = payload.get("target")
-    artifacts = payload.get("artifacts")
-    if not isinstance(target, Mapping) or not isinstance(artifacts, list):
-        raise ValueError(f"{label} lacks target/artifact authority")
-    seen: set[str] = set()
-    engines: dict[str, Mapping[str, Any]] = {}
-    for row in artifacts:
-        if not isinstance(row, Mapping):
-            raise ValueError(f"{label} contains a malformed artifact record")
-        artifact_id = str(row.get("id") or "").strip()
-        if not artifact_id or artifact_id in seen:
-            raise ValueError(f"{label} contains a missing or duplicate artifact ID")
-        seen.add(artifact_id)
-        if row.get("kind") == "tensorrt_engine":
-            engines[artifact_id] = row
-    if not set(ENGINE_NAME_BY_ARTIFACT_ID) <= set(engines):
-        raise ValueError(f"{label} lacks a reviewed TensorRT engine artifact")
-    return target, engines
-
-
-def _manifest_artifact_records(
-    payload: Mapping[str, Any], label: str
-) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
-    artifacts = payload.get("artifacts")
-    if not isinstance(artifacts, list):
-        raise ValueError(f"{label} artifacts must be a list")
-    all_rows: dict[str, Mapping[str, Any]] = {}
-    engines: dict[str, Mapping[str, Any]] = {}
-    for row in artifacts:
-        if not isinstance(row, Mapping):
-            raise ValueError(f"{label} contains a malformed artifact record")
-        artifact_id = str(row.get("id") or "").strip()
-        if not artifact_id or artifact_id in all_rows:
-            raise ValueError(f"{label} contains a missing or duplicate artifact ID")
-        all_rows[artifact_id] = row
-        if row.get("kind") == "tensorrt_engine":
-            engines[artifact_id] = row
-    if not set(ENGINE_NAME_BY_ARTIFACT_ID) <= set(engines):
-        raise ValueError(f"{label} lacks a reviewed TensorRT engine artifact")
-    return all_rows, engines
-
-
-def _append_manifest_diff(
-    paths: list[str], path: tuple[str, ...], left: object, right: object
-) -> None:
-    if len(paths) >= MANIFEST_REBASE_MAX_DIFF_PATHS:
-        raise ValueError("manifest semantic diff exceeds the accepted bound")
-    if isinstance(left, Mapping) and isinstance(right, Mapping):
-        for key in sorted(set(left) | set(right), key=str):
-            if key not in left or key not in right:
-                paths.append(".".join((*path, str(key))))
-            else:
-                _append_manifest_diff(paths, (*path, str(key)), left[key], right[key])
-        return
-    if isinstance(left, list) and isinstance(right, list):
-        if len(left) != len(right):
-            paths.append(".".join((*path, "length")))
-        for index, (left_item, right_item) in enumerate(zip(left, right)):
-            _append_manifest_diff(paths, (*path, str(index)), left_item, right_item)
-        return
-    if left != right:
-        paths.append(".".join(path))
-
-
-def _manifest_diff_summary(
-    old: Mapping[str, Any],
-    new: Mapping[str, Any],
-    old_rows: Mapping[str, Mapping[str, Any]],
-    new_rows: Mapping[str, Mapping[str, Any]],
-    engine_ids: set[str],
-) -> dict[str, Any]:
-    paths: list[str] = []
-    for key in sorted((set(old) | set(new)) - {"artifacts"}, key=str):
-        if key not in old or key not in new:
-            paths.append(str(key))
-        else:
-            _append_manifest_diff(paths, (str(key),), old[key], new[key])
-    for artifact_id in sorted(set(old_rows) | set(new_rows)):
-        if artifact_id not in old_rows or artifact_id not in new_rows:
-            paths.append(f"artifacts.{artifact_id}")
-        else:
-            _append_manifest_diff(
-                paths,
-                ("artifacts", artifact_id),
-                old_rows[artifact_id],
-                new_rows[artifact_id],
-            )
-    changed_ids = sorted(
-        artifact_id
-        for artifact_id in set(old_rows) | set(new_rows)
-        if old_rows.get(artifact_id) != new_rows.get(artifact_id)
-    )
-    return {
-        "changed_path_count": len(paths),
-        "changed_paths": paths,
-        "changed_artifact_ids": changed_ids,
-        "changed_non_engine_artifact_ids": [
-            artifact_id for artifact_id in changed_ids if artifact_id not in engine_ids
-        ],
-    }
-
-
-def _manifest_runtime_image_transition(
-    old: Mapping[str, Any], new: Mapping[str, Any]
-) -> dict[str, Any]:
-    old_runtime = old.get("runtime")
-    new_runtime = new.get("runtime")
-    if not isinstance(old_runtime, Mapping) or not isinstance(new_runtime, Mapping):
-        raise ValueError("manifest runtime authority must be a mapping")
-    old_without_image = dict(old_runtime)
-    new_without_image = dict(new_runtime)
-    old_image = old_without_image.pop("image", None)
-    new_image = new_without_image.pop("image", None)
-    if old_without_image != new_without_image:
-        raise ValueError("manifest rebase changed runtime authority outside image")
-    changed = old_image != new_image
-    if (new_image is not None or changed) and (
-        not isinstance(new_image, Mapping) or dict(new_image) != RUNTIME_IMAGE_AUTHORITY
-    ):
-        raise ValueError("manifest rebase runtime image is not reviewed authority")
-    if old_image is not None and not isinstance(old_image, Mapping):
-        raise ValueError("old manifest runtime image authority is malformed")
-    return {
-        "changed": changed,
-        "before": copy.deepcopy(dict(old_image))
-        if isinstance(old_image, Mapping)
-        else None,
-        "after": copy.deepcopy(dict(new_image))
-        if isinstance(new_image, Mapping)
-        else None,
-    }
-
-
-def _recompute_manifest_rebase_semantics(
-    old: Mapping[str, Any], new: Mapping[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if old.get("target") != new.get("target"):
-        raise ValueError("manifest rebase changed DS9 target authority")
-    runtime_transition = _manifest_runtime_image_transition(old, new)
-    ignored_top_level = {"artifacts", "runtime", "updated_at"}
-    old_top_level = set(old) - ignored_top_level
-    new_top_level = set(new) - ignored_top_level
-    if old_top_level != new_top_level:
-        raise ValueError("manifest rebase changed unsupported top-level keys")
-    for key in old_top_level:
-        if old[key] != new[key]:
-            raise ValueError(
-                f"manifest rebase changed unsupported top-level authority: {key}"
-            )
-    old_rows, old_engines = _manifest_artifact_records(old, "old manifest")
-    new_rows, new_engines = _manifest_artifact_records(new, "new manifest")
-    if old_engines != new_engines:
-        raise ValueError("manifest rebase changed TensorRT engine authority")
-    return (
-        _manifest_diff_summary(old, new, old_rows, new_rows, set(old_engines)),
-        runtime_transition,
-    )
-
-
-def _transition_canonical_json(payload: Mapping[str, Any]) -> bytes:
-    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
-
-def _parse_transition_json(raw: bytes, label: str) -> Mapping[str, Any]:
-    try:
-        payload = strict_json_loads(raw, label=label)
-    except StrictJSONError as exc:
-        raise ValueError(f"{label} is not valid unique-key UTF-8 JSON") from exc
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{label} document root must be a mapping")
-    return payload
-
-
-def _load_transition_snapshot(
-    transaction_dir: Path, filename: str, label: str
-) -> bytes:
-    if filename not in _MAPANYTHING_TRANSITION_SNAPSHOT_FILENAMES:
-        raise ValueError(f"{label} has an unreviewed snapshot filename")
-    path = _bounded_private_path(
-        transaction_dir / filename,
-        transaction_dir,
-        label,
-    )
-    return _read_private_bytes(path, label)
-
-
-def _mapanything_transition_manifest_semantics(
-    old: Mapping[str, Any], new: Mapping[str, Any]
-) -> dict[str, Any]:
-    old_top = dict(old)
-    new_top = dict(new)
-    old_top.pop("artifacts", None)
-    new_top.pop("artifacts", None)
-    if old_top != new_top:
-        raise ValueError(
-            "MapAnything transition manifest changed outside artifact inventory"
-        )
-    old_rows, _old_engines = _manifest_artifact_records(
-        old, "old MapAnything transition manifest"
-    )
-    new_rows, _new_engines = _manifest_artifact_records(
-        new, "new MapAnything transition manifest"
-    )
-    if set(old_rows) != set(new_rows) or MAPANYTHING_ARTIFACT_ID not in old_rows:
-        raise ValueError("MapAnything transition manifest membership drifted")
-    for artifact_id in set(old_rows) - {MAPANYTHING_ARTIFACT_ID}:
-        if old_rows[artifact_id] != new_rows[artifact_id]:
-            raise ValueError(
-                "MapAnything transition changed another manifest artifact: "
-                f"{artifact_id}"
-            )
-    old_map = old_rows[MAPANYTHING_ARTIFACT_ID]
-    new_map = new_rows[MAPANYTHING_ARTIFACT_ID]
-    changed_paths: list[str] = []
-    _append_manifest_diff(changed_paths, (), old_map, new_map)
-    if changed_paths != ["compatibility.precision", "output"]:
-        raise ValueError("MapAnything transition manifest diff is not exact")
-    old_compatibility = old_map.get("compatibility")
-    new_compatibility = new_map.get("compatibility")
-    if (
-        old_map.get("kind") != "tensorrt_engine"
-        or old_map.get("output") != MAPANYTHING_OLD_OUTPUT
-        or new_map.get("output") != MAPANYTHING_NEW_OUTPUT
-        or not isinstance(old_compatibility, Mapping)
-        or not isinstance(new_compatibility, Mapping)
-        or old_compatibility.get("precision") != "fp16"
-        or new_compatibility.get("precision") != "fp32"
-    ):
-        raise ValueError("MapAnything transition manifest endpoints drifted")
-    return {
-        "artifact_id": MAPANYTHING_ARTIFACT_ID,
-        "changed_paths": changed_paths,
-        "old_record_sha256": _sha256_bytes(_transition_canonical_json(old_map)),
-        "new_record_sha256": _sha256_bytes(_transition_canonical_json(new_map)),
-        "old_output": MAPANYTHING_OLD_OUTPUT,
-        "new_output": MAPANYTHING_NEW_OUTPUT,
-    }
-
-
-def _mapanything_transition_source_semantics(
-    old: Mapping[str, Any], new: Mapping[str, Any]
-) -> dict[str, Any]:
-    old_contracts = _validate_source_contract_document(
-        old, "old MapAnything transition source contracts"
-    )
-    new_contracts = _validate_source_contract_document(
-        new, "new MapAnything transition source contracts"
-    )
-    changed = sorted(
-        name for name in old_contracts if old_contracts[name] != new_contracts[name]
-    )
-    if changed != [MAPANYTHING_CONTRACT_NAME]:
-        raise ValueError("MapAnything transition source-contract diff is not exact")
-    old_map = old_contracts[MAPANYTHING_CONTRACT_NAME]
-    new_map = new_contracts[MAPANYTHING_CONTRACT_NAME]
-    old_build = old_map.get("maintenance_build")
-    new_build = new_map.get("maintenance_build")
-    if (
-        not isinstance(old_build, Mapping)
-        or old_build.get("precision_arg") != "--fp16"
-        or not isinstance(new_build, Mapping)
-        or new_build.get("precision") != "fp32"
-        or "precision_arg" in new_build
-        or not isinstance(new_map.get("quality_gate"), Mapping)
-    ):
-        raise ValueError("MapAnything transition source-contract endpoints drifted")
-    return {
-        "changed_contracts": [MAPANYTHING_CONTRACT_NAME],
-        "old_contract_sha256": _sha256_bytes(_transition_canonical_json(old_map)),
-        "new_contract_sha256": _sha256_bytes(_transition_canonical_json(new_map)),
-    }
-
-
-def _verify_mapanything_historic_output(artifact_root: Path) -> None:
-    relative = _relative_path(MAPANYTHING_OLD_OUTPUT)
-    path = _bounded_private_path(
-        _physical_path(relative, artifact_root),
-        artifact_root,
-        "historic MapAnything FP16 output",
-    )
-    try:
-        lexical = path.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError("historic MapAnything FP16 output is missing") from exc
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ValueError("historic MapAnything FP16 output is unsafe") from exc
-    try:
-        before = os.fstat(descriptor)
-        if (
-            stat.S_ISLNK(lexical.st_mode)
-            or not stat.S_ISREG(before.st_mode)
-            or (before.st_dev, before.st_ino) != (lexical.st_dev, lexical.st_ino)
-            or before.st_uid != os.getuid()
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) & 0o022
-            or before.st_size != MAPANYTHING_OLD_OUTPUT_SIZE_BYTES
-        ):
-            raise ValueError(
-                "historic MapAnything FP16 output ownership/link/size drifted"
-            )
-        digest = hashlib.sha256()
-        remaining = before.st_size
-        while remaining:
-            block = os.read(descriptor, min(8 * 1024 * 1024, remaining))
-            if not block:
-                break
-            digest.update(block)
-            remaining -= len(block)
-        after = os.fstat(descriptor)
-        if remaining or (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ):
-            raise ValueError("historic MapAnything FP16 output changed while read")
-        if digest.hexdigest() != MAPANYTHING_OLD_OUTPUT_SHA256:
-            raise ValueError("historic MapAnything FP16 output hash drifted")
-    finally:
-        os.close(descriptor)
-
-
-def _mapanything_transition_plan(
-    *,
-    old_realization_hash: str,
-    new_realization_hash: str,
-    updated_before: str,
-    updated_after: str,
-    inventory_before: list[str],
-    inventory_after: list[str],
-    retired_artifact: Mapping[str, Any],
-    manifest_diff: Mapping[str, Any],
-    source_contract_diff: Mapping[str, Any],
-) -> dict[str, Any]:
-    return {
-        "contract": MAPANYTHING_TRANSITION_PLAN_CONTRACT,
-        "authorities": {
-            "manifest": {
-                "old_sha256": MAPANYTHING_OLD_MANIFEST_SHA256,
-                "new_sha256": MAPANYTHING_NEW_MANIFEST_SHA256,
-            },
-            "source_contracts": {
-                "old_sha256": MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256,
-                "new_sha256": MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256,
-            },
-        },
-        "realization": {
-            "old_sha256": old_realization_hash,
-            "new_sha256": new_realization_hash,
-            "updated_at_utc_before": updated_before,
-            "updated_at_utc_after": updated_after,
-            "realized_artifact_ids_before": inventory_before,
-            "realized_artifact_ids_after": inventory_after,
-        },
-        "retired_artifact": copy.deepcopy(dict(retired_artifact)),
-        "manifest_diff": copy.deepcopy(dict(manifest_diff)),
-        "source_contract_diff": copy.deepcopy(dict(source_contract_diff)),
-        "mutation_paths": [
-            "artifacts.engine.mapanything",
-            "base_manifest.sha256",
-            "source_contracts.sha256",
-            "updated_at_utc",
-        ],
-    }
-
-
-def _mapanything_transition_committed_edge(
-    *, artifact_root: Path, transaction_dir: Path
-) -> dict[str, Any] | None:
-    _require_private_directory(
-        transaction_dir, "MapAnything authority-transition transaction"
-    )
-    inventory = list(transaction_dir.iterdir())
-    if (
-        len(inventory) != len(_MAPANYTHING_TRANSITION_INVENTORY)
-        or {path.name for path in inventory} != _MAPANYTHING_TRANSITION_INVENTORY
-        or any(path.is_symlink() or not path.is_file() for path in inventory)
-    ):
-        raise ValueError("MapAnything authority-transition inventory drifted")
-    evidence_path = transaction_dir / MAPANYTHING_TRANSITION_EVIDENCE_FILENAME
-    evidence, evidence_raw = _load_private_json_with_bytes(
-        evidence_path, "MapAnything authority-transition evidence"
-    )
-    if _transition_canonical_json(evidence) != evidence_raw:
-        raise ValueError("MapAnything authority-transition evidence is not canonical")
-    if (
-        evidence.get("schema_version") != 1
-        or evidence.get("contract") != MAPANYTHING_TRANSITION_CONTRACT
-    ):
-        raise ValueError("MapAnything authority-transition evidence contract drifted")
-    transaction_id = str(evidence.get("transaction_id") or "")
-    if (
-        transaction_id != transaction_dir.name
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,127}", transaction_id) is None
-    ):
-        raise ValueError("MapAnything authority-transition transaction ID is invalid")
-    state = str(evidence.get("state") or "")
-    if state in _MAPANYTHING_TRANSITION_TERMINAL_ABORT_STATES:
-        return None
-    if state != "committed":
-        raise ValueError("unresolved MapAnything authority-transition evidence")
-    required_keys = {
-        "schema_version",
-        "contract",
-        "transaction_id",
-        "state",
-        "prepared_at_utc",
-        "committed_at_utc",
-        "aborted_at_utc",
-        "rolled_back_at_utc",
-        "recovery",
-        "realization_replace_recovery",
-        "plan_sha256",
-        "authorities",
-        "realization",
-        "retired_artifact",
-        "manifest_diff",
-        "source_contract_diff",
-        "mutation_paths",
-        "semantic_checks",
-        "verification_stages",
-    }
-    if set(evidence) != required_keys:
-        raise ValueError("MapAnything authority-transition evidence fields drifted")
-    prepared_at = _parse_explicit_utc(
-        evidence.get("prepared_at_utc"), "MapAnything transition prepared_at_utc"
-    )
-    committed_at = _parse_explicit_utc(
-        evidence.get("committed_at_utc"), "MapAnything transition committed_at_utc"
-    )
-    if committed_at < prepared_at:
-        raise ValueError("MapAnything transition commit predates preparation")
-    if (
-        evidence.get("aborted_at_utc") is not None
-        or evidence.get("rolled_back_at_utc") is not None
-    ):
-        raise ValueError("committed MapAnything transition contains abort metadata")
-    recovery = evidence.get("recovery")
-    if recovery is not None:
-        recovery = _require_exact_record(
-            recovery,
-            {"outcome", "recorded_at_utc"},
-            "MapAnything transition recovery",
-        )
-        if recovery.get("outcome") != "exact_after_realization_terminalized":
-            raise ValueError("committed MapAnything recovery outcome is invalid")
-        _parse_explicit_utc(
-            recovery.get("recorded_at_utc"), "MapAnything recovery timestamp"
-        )
-    replace_recovery = evidence.get("realization_replace_recovery")
-    if replace_recovery is not None:
-        _validate_replace_recovery(
-            replace_recovery, "MapAnything realization replace recovery"
-        )
-    stages = evidence.get("verification_stages")
-    if (
-        not isinstance(stages, list)
-        or len(stages) != len(set(stages))
-        or stages[:2] != ["initial", "snapshots_written"]
-    ):
-        raise ValueError("MapAnything transition verification stages drifted")
-    if recovery is None and stages != [
-        "initial",
-        "snapshots_written",
-        "pre_cas",
-        "post_cas",
-        "pre_evidence_commit",
-    ]:
-        raise ValueError("MapAnything transition continuous verification is incomplete")
-    if recovery is not None and stages[-1:] != ["recovery_final"]:
-        raise ValueError("MapAnything recovery lacks final verification")
-
-    authorities = _require_exact_record(
-        evidence.get("authorities"),
-        {"manifest", "source_contracts"},
-        "MapAnything transition authorities",
-    )
-    manifest_authority = _require_exact_record(
-        authorities.get("manifest"),
-        {"old_path", "old_sha256", "new_path", "new_authority_path", "new_sha256"},
-        "MapAnything transition manifest authority",
-    )
-    source_authority = _require_exact_record(
-        authorities.get("source_contracts"),
-        {"old_path", "old_sha256", "new_path", "new_authority_path", "new_sha256"},
-        "MapAnything transition source authority",
-    )
-    expected_manifest_authority = {
-        "old_path": "old_asset_manifest.yaml",
-        "old_sha256": MAPANYTHING_OLD_MANIFEST_SHA256,
-        "new_path": "new_asset_manifest.yaml",
-        "new_authority_path": BASE_MANIFEST_PATH,
-        "new_sha256": MAPANYTHING_NEW_MANIFEST_SHA256,
-    }
-    expected_source_authority = {
-        "old_path": "old_engine_source_contracts.json",
-        "old_sha256": MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256,
-        "new_path": "new_engine_source_contracts.json",
-        "new_authority_path": SOURCE_CONTRACT_PATH,
-        "new_sha256": MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256,
-    }
-    if (
-        dict(manifest_authority) != expected_manifest_authority
-        or dict(source_authority) != expected_source_authority
-    ):
-        raise ValueError("MapAnything transition authority endpoints drifted")
-
-    old_manifest_raw = _load_transition_snapshot(
-        transaction_dir, "old_asset_manifest.yaml", "old transition manifest"
-    )
-    new_manifest_raw = _load_transition_snapshot(
-        transaction_dir, "new_asset_manifest.yaml", "new transition manifest"
-    )
-    old_source_raw = _load_transition_snapshot(
-        transaction_dir,
-        "old_engine_source_contracts.json",
-        "old transition source contracts",
-    )
-    new_source_raw = _load_transition_snapshot(
-        transaction_dir,
-        "new_engine_source_contracts.json",
-        "new transition source contracts",
-    )
-    old_realization_raw = _load_transition_snapshot(
-        transaction_dir,
-        "asset_realization.before.json",
-        "old transition realization",
-    )
-    new_realization_raw = _load_transition_snapshot(
-        transaction_dir,
-        "asset_realization.after.json",
-        "new transition realization",
-    )
-    for observed, expected, label in (
-        (
-            _sha256_bytes(old_manifest_raw),
-            MAPANYTHING_OLD_MANIFEST_SHA256,
-            "old manifest",
-        ),
-        (
-            _sha256_bytes(new_manifest_raw),
-            MAPANYTHING_NEW_MANIFEST_SHA256,
-            "new manifest",
-        ),
-        (
-            _sha256_bytes(old_source_raw),
-            MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256,
-            "old source contracts",
-        ),
-        (
-            _sha256_bytes(new_source_raw),
-            MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256,
-            "new source contracts",
-        ),
-    ):
-        if observed != expected:
-            raise ValueError(f"MapAnything transition {label} snapshot hash drifted")
-    old_manifest = _parse_yaml_mapping(old_manifest_raw, "old transition manifest")
-    new_manifest = _parse_yaml_mapping(new_manifest_raw, "new transition manifest")
-    old_source = _parse_transition_json(
-        old_source_raw, "old transition source contracts"
-    )
-    new_source = _parse_transition_json(
-        new_source_raw, "new transition source contracts"
-    )
-    old_realization = _parse_transition_json(
-        old_realization_raw, "old transition realization"
-    )
-    new_realization = _parse_transition_json(
-        new_realization_raw, "new transition realization"
-    )
-    if (
-        _transition_canonical_json(old_realization) != old_realization_raw
-        or _transition_canonical_json(new_realization) != new_realization_raw
-    ):
-        raise ValueError(
-            "MapAnything transition realization snapshots are not canonical"
-        )
-    manifest_diff = _mapanything_transition_manifest_semantics(
-        old_manifest, new_manifest
-    )
-    source_diff = _mapanything_transition_source_semantics(old_source, new_source)
-    if evidence.get("manifest_diff") != manifest_diff:
-        raise ValueError("MapAnything transition manifest diff evidence drifted")
-    if evidence.get("source_contract_diff") != source_diff:
-        raise ValueError("MapAnything transition source diff evidence drifted")
-
-    realization_record = _require_exact_record(
-        evidence.get("realization"),
-        {
-            "path",
-            "old_snapshot",
-            "new_snapshot",
-            "old_sha256",
-            "new_sha256",
-            "updated_at_utc_before",
-            "updated_at_utc_after",
-            "realized_artifact_ids_before",
-            "realized_artifact_ids_after",
-        },
-        "MapAnything transition realization binding",
-    )
-    if (
-        realization_record.get("path") != REALIZATION_FILENAME
-        or realization_record.get("old_snapshot") != "asset_realization.before.json"
-        or realization_record.get("new_snapshot") != "asset_realization.after.json"
-    ):
-        raise ValueError("MapAnything transition realization path drifted")
-    old_realization_hash = _require_sha256(
-        realization_record.get("old_sha256"), "old transition realization hash"
-    )
-    new_realization_hash = _require_sha256(
-        realization_record.get("new_sha256"), "new transition realization hash"
-    )
-    if (
-        _sha256_bytes(old_realization_raw) != old_realization_hash
-        or _sha256_bytes(new_realization_raw) != new_realization_hash
-        or old_realization_hash == new_realization_hash
-    ):
-        raise ValueError("MapAnything transition realization snapshot hash drifted")
-    before_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_before"),
-        "MapAnything transition old realization timestamp",
-    )
-    after_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_after"),
-        "MapAnything transition new realization timestamp",
-    )
-    if after_time <= before_time:
-        raise ValueError("MapAnything transition realization timestamp did not advance")
-    if set(old_realization) != {
-        "schema_version",
-        "contract",
-        "base_manifest",
-        "source_contracts",
-        "created_at_utc",
-        "updated_at_utc",
-        "artifacts",
-    } or set(new_realization) != set(old_realization):
-        raise ValueError("MapAnything transition realization schema drifted")
-    if (
-        old_realization.get("contract") != REALIZATION_CONTRACT
-        or new_realization.get("contract") != REALIZATION_CONTRACT
-        or old_realization.get("schema_version") != 1
-        or new_realization.get("schema_version") != 1
-        or old_realization.get("base_manifest")
-        != {"path": BASE_MANIFEST_PATH, "sha256": MAPANYTHING_OLD_MANIFEST_SHA256}
-        or new_realization.get("base_manifest")
-        != {"path": BASE_MANIFEST_PATH, "sha256": MAPANYTHING_NEW_MANIFEST_SHA256}
-        or old_realization.get("source_contracts")
-        != {
-            "path": SOURCE_CONTRACT_PATH,
-            "sha256": MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256,
-        }
-        or new_realization.get("source_contracts")
-        != {
-            "path": SOURCE_CONTRACT_PATH,
-            "sha256": MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256,
-        }
-        or old_realization.get("created_at_utc")
-        != new_realization.get("created_at_utc")
-        or old_realization.get("updated_at_utc")
-        != realization_record.get("updated_at_utc_before")
-        or new_realization.get("updated_at_utc")
-        != realization_record.get("updated_at_utc_after")
-    ):
-        raise ValueError("MapAnything transition realization authority drifted")
-    old_artifacts = old_realization.get("artifacts")
-    new_artifacts = new_realization.get("artifacts")
-    if not isinstance(old_artifacts, Mapping) or not isinstance(new_artifacts, Mapping):
-        raise ValueError("MapAnything transition realized inventories are malformed")
-    before_ids = _require_sorted_unique_strings(
-        realization_record.get("realized_artifact_ids_before"),
-        "MapAnything transition before inventory",
-        allow_empty=False,
-    )
-    after_ids = _require_sorted_unique_strings(
-        realization_record.get("realized_artifact_ids_after"),
-        "MapAnything transition after inventory",
-        allow_empty=True,
-    )
-    if (
-        list(before_ids) != sorted(old_artifacts)
-        or list(after_ids) != sorted(new_artifacts)
-        or set(before_ids) - set(after_ids) != {MAPANYTHING_ARTIFACT_ID}
-        or set(after_ids) - set(before_ids)
-        or MAPANYTHING_ARTIFACT_ID in new_artifacts
-    ):
-        raise ValueError("MapAnything transition retirement inventory drifted")
-    for artifact_id in after_ids:
-        if old_artifacts.get(artifact_id) != new_artifacts.get(artifact_id):
-            raise ValueError(
-                "MapAnything transition changed a preserved realization record"
-            )
-    retired_record = old_artifacts.get(MAPANYTHING_ARTIFACT_ID)
-    if not isinstance(retired_record, Mapping):
-        raise ValueError("MapAnything transition old realization record is missing")
-    retired_record_hash = _sha256_bytes(_transition_canonical_json(retired_record))
-    if retired_record_hash != MAPANYTHING_OLD_REALIZED_RECORD_SHA256:
-        raise ValueError("MapAnything transition old realization record hash drifted")
-    retired_artifact = _require_exact_record(
-        evidence.get("retired_artifact"),
-        {"artifact_id", "realized_record_sha256", "output"},
-        "MapAnything retired artifact evidence",
-    )
-    retired_output = _require_exact_record(
-        retired_artifact.get("output"),
-        {"path", "sha256", "size_bytes"},
-        "MapAnything retired output evidence",
-    )
-    expected_retired = {
-        "artifact_id": MAPANYTHING_ARTIFACT_ID,
-        "realized_record_sha256": MAPANYTHING_OLD_REALIZED_RECORD_SHA256,
-        "output": {
-            "path": MAPANYTHING_OLD_OUTPUT,
-            "sha256": MAPANYTHING_OLD_OUTPUT_SHA256,
-            "size_bytes": MAPANYTHING_OLD_OUTPUT_SIZE_BYTES,
-        },
-    }
-    if (
-        dict(retired_artifact) != expected_retired
-        or dict(retired_output) != expected_retired["output"]
-    ):
-        raise ValueError("MapAnything retired output evidence drifted")
-    provenance = retired_record.get("provenance")
-    maintenance = (
-        provenance.get("maintenance") if isinstance(provenance, Mapping) else None
-    )
-    if (
-        not isinstance(provenance, Mapping)
-        or provenance.get("output_sha256") != MAPANYTHING_OLD_OUTPUT_SHA256
-        or not isinstance(maintenance, Mapping)
-        or maintenance.get("output_size_bytes") != MAPANYTHING_OLD_OUTPUT_SIZE_BYTES
-        or maintenance.get("precision") != "fp16"
-    ):
-        raise ValueError("MapAnything retired realization proof drifted")
-    _verify_mapanything_historic_output(artifact_root)
-
-    expected_mutations = [
-        "artifacts.engine.mapanything",
-        "base_manifest.sha256",
-        "source_contracts.sha256",
-        "updated_at_utc",
-    ]
-    if evidence.get("mutation_paths") != expected_mutations:
-        raise ValueError("MapAnything transition mutation paths drifted")
-    semantic_checks = evidence.get("semantic_checks")
-    expected_checks = {
-        "exact_reviewed_authority_hashes",
-        "manifest_change_is_mapanything_fp32_only",
-        "source_contract_change_is_mapanything_fp32_only",
-        "realization_authorities_advance_together",
-        "only_mapanything_realization_is_retired",
-        "other_realized_records_are_unchanged",
-        "old_fp16_bytes_are_preserved_and_verified",
-    }
-    if (
-        not isinstance(semantic_checks, Mapping)
-        or set(semantic_checks) != expected_checks
-        or any(value is not True for value in semantic_checks.values())
-    ):
-        raise ValueError("MapAnything transition semantic checks drifted")
-    plan = _mapanything_transition_plan(
-        old_realization_hash=old_realization_hash,
-        new_realization_hash=new_realization_hash,
-        updated_before=str(realization_record["updated_at_utc_before"]),
-        updated_after=str(realization_record["updated_at_utc_after"]),
-        inventory_before=list(before_ids),
-        inventory_after=list(after_ids),
-        retired_artifact=retired_artifact,
-        manifest_diff=manifest_diff,
-        source_contract_diff=source_diff,
-    )
-    if _sha256_bytes(_transition_canonical_json(plan)) != _require_sha256(
-        evidence.get("plan_sha256"), "MapAnything transition plan hash"
-    ):
-        raise ValueError("MapAnything transition plan hash drifted")
-    return {
-        "edge_kind": "mapanything_authority_transition",
-        "edge_uid": f"mapanything:{transaction_id}",
-        "transaction_id": transaction_id,
-        "evidence_sha256": _sha256_bytes(evidence_raw),
-        "manifest_old_hash": MAPANYTHING_OLD_MANIFEST_SHA256,
-        "manifest_new_hash": MAPANYTHING_NEW_MANIFEST_SHA256,
-        "source_old_hash": MAPANYTHING_OLD_SOURCE_CONTRACTS_SHA256,
-        "source_new_hash": MAPANYTHING_NEW_SOURCE_CONTRACTS_SHA256,
-        "old_manifest_document": old_manifest,
-        "new_manifest_document": new_manifest,
-        "old_source_document": old_source,
-        "new_source_document": new_source,
-        "realized_ids_before": frozenset(before_ids),
-        "realized_ids_after": frozenset(after_ids),
-        "retired_ids": frozenset({MAPANYTHING_ARTIFACT_ID}),
-        "old_realization_hash": old_realization_hash,
-        "new_realization_hash": new_realization_hash,
-        "updated_at_before": before_time,
-        "updated_at_after": after_time,
-        "prepared_at": prepared_at,
-        "committed_at": committed_at,
-        "changed_contracts": frozenset({MAPANYTHING_CONTRACT_NAME}),
-        "mapped_artifacts": frozenset({MAPANYTHING_ARTIFACT_ID}),
-    }
-
-
-def _load_mapanything_transition_edges(
-    artifact_root: Path,
-) -> tuple[dict[str, Any], ...]:
-    evidence_root = artifact_root / MAPANYTHING_TRANSITION_ROOT
-    if not evidence_root.exists() and not evidence_root.is_symlink():
-        return ()
-    _require_private_directory(evidence_root, "MapAnything transition evidence root")
-    entries = list(evidence_root.iterdir())
-    if len(entries) > MAPANYTHING_TRANSITION_MAX_TRANSACTIONS:
-        raise ValueError("MapAnything transition evidence exceeds safety bound")
-    edges: list[dict[str, Any]] = []
-    for entry in sorted(entries, key=lambda value: value.name):
-        if entry.is_symlink() or not entry.is_dir():
-            raise ValueError("MapAnything transition evidence inventory is unsafe")
-        edge = _mapanything_transition_committed_edge(
-            artifact_root=artifact_root,
-            transaction_dir=entry,
-        )
-        if edge is not None:
-            edges.append(edge)
-    return tuple(edges)
-
-
-def _edge_realized_ids_before(edge: Mapping[str, Any]) -> frozenset[str]:
-    value = edge.get("realized_ids_before", edge.get("realized_ids", frozenset()))
-    return frozenset(str(item) for item in value)
-
-
-def _edge_realized_ids_after(edge: Mapping[str, Any]) -> frozenset[str]:
-    value = edge.get("realized_ids_after", edge.get("realized_ids", frozenset()))
-    return frozenset(str(item) for item in value)
-
-
-def _manifest_rebase_committed_edge(
-    *,
-    artifact_root: Path,
-    evidence_root: Path,
-    transaction_dir: Path,
-    known_source_contract_hashes: set[str],
-    current_realized_ids: set[str],
-) -> dict[str, Any] | None:
-    _require_private_directory(transaction_dir, "manifest-rebase transaction")
-    inventory = list(transaction_dir.iterdir())
-    if len(inventory) != 1 or inventory[0].name != MANIFEST_REBASE_EVIDENCE_FILENAME:
-        raise ValueError(
-            f"manifest-rebase transaction inventory is ambiguous: {transaction_dir}"
-        )
-    evidence, evidence_raw = _load_private_json_with_bytes(
-        inventory[0], "manifest-rebase evidence"
-    )
-    if (
-        evidence.get("schema_version") != 1
-        or evidence.get("contract") != MANIFEST_REBASE_CONTRACT
-    ):
-        raise ValueError("manifest-rebase evidence contract is invalid")
-    transaction_id = str(evidence.get("transaction_id") or "")
-    if (
-        transaction_id != transaction_dir.name
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,127}", transaction_id) is None
-    ):
-        raise ValueError("manifest-rebase transaction ID is invalid")
-    state = str(evidence.get("state") or "")
-    if state in {"aborted_before_commit", "rolled_back_after_evidence_failure"}:
-        return None
-    if state != "committed":
-        raise ValueError("unresolved manifest-rebase evidence requires recovery")
-    allowed_keys = (
-        _MANIFEST_REBASE_REQUIRED_EVIDENCE_KEYS
-        | _MANIFEST_REBASE_OPTIONAL_EVIDENCE_KEYS
-    )
-    if (
-        not _MANIFEST_REBASE_REQUIRED_EVIDENCE_KEYS.issubset(evidence)
-        or set(evidence) - allowed_keys
-    ):
-        raise ValueError("committed manifest-rebase evidence fields drifted")
-    prepared_at = _parse_explicit_utc(
-        evidence.get("prepared_at_utc"), "manifest-rebase prepared_at_utc"
-    )
-    committed_at = _parse_explicit_utc(
-        evidence.get("committed_at_utc"), "manifest-rebase committed_at_utc"
-    )
-    if committed_at < prepared_at:
-        raise ValueError("manifest-rebase commit predates preparation")
-    if "realization_replace_recovery" in evidence:
-        _validate_replace_recovery(
-            evidence["realization_replace_recovery"],
-            "manifest-rebase replace recovery",
-        )
-
-    old_record = _require_exact_record(
-        evidence.get("old_manifest"),
-        {"path", "sha256"},
-        "old manifest evidence",
-    )
-    new_record = _require_exact_record(
-        evidence.get("new_manifest"),
-        {"path", "sha256"},
-        "new manifest evidence",
-    )
-    if new_record.get("path") != BASE_MANIFEST_PATH:
-        raise ValueError("new manifest evidence path drifted")
-    old_hash = _require_sha256(old_record.get("sha256"), "old manifest hash")
-    new_hash = _require_sha256(new_record.get("sha256"), "new manifest hash")
-    if old_hash == new_hash:
-        raise ValueError("manifest-rebase edge does not advance its authority")
-    old_document, _old_raw, observed_old_hash = _load_manifest_snapshot(
-        artifact_root,
-        evidence_root,
-        old_record,
-        label="old manifest snapshot",
-    )
-    if observed_old_hash != old_hash:
-        raise ValueError("old manifest snapshot hash drifted")
-
-    source_record = _require_exact_record(
-        evidence.get("source_contracts"),
-        {"path", "sha256"},
-        "manifest-rebase source-contract binding",
-    )
-    source_hash = _require_sha256(
-        source_record.get("sha256"), "manifest-rebase source-contract hash"
-    )
-    if (
-        source_record.get("path") != SOURCE_CONTRACT_PATH
-        or source_hash not in known_source_contract_hashes
-    ):
-        raise ValueError("manifest-rebase source-contract binding is not authoritative")
-
-    realization_record = _require_exact_record(
-        evidence.get("realization"),
-        {
-            "path",
-            "old_sha256",
-            "new_sha256",
-            "updated_at_utc_before",
-            "updated_at_utc_after",
-        },
-        "manifest-rebase realization binding",
-    )
-    if realization_record.get("path") != REALIZATION_FILENAME:
-        raise ValueError("manifest-rebase realization path drifted")
-    old_realization_hash = _require_sha256(
-        realization_record.get("old_sha256"), "manifest-rebase old realization hash"
-    )
-    new_realization_hash = _require_sha256(
-        realization_record.get("new_sha256"), "manifest-rebase new realization hash"
-    )
-    if old_realization_hash == new_realization_hash:
-        raise ValueError("manifest-rebase realization CAS did not advance")
-    before_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_before"),
-        "manifest-rebase prior realization timestamp",
-    )
-    after_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_after"),
-        "manifest-rebase proposed realization timestamp",
-    )
-    if after_time <= before_time:
-        raise ValueError("manifest-rebase realization timestamp did not advance")
-
-    realized = _require_sorted_unique_strings(
-        evidence.get("realized_engine_ids"),
-        "manifest-rebase realized engines",
-        allow_empty=True,
-    )
-    if not set(realized) <= current_realized_ids:
-        raise ValueError("manifest-rebase names unknown current realized engines")
-    if evidence.get("mutation_paths") != [
-        "base_manifest.sha256",
-        "updated_at_utc",
-    ]:
-        raise ValueError("manifest-rebase mutation paths drifted")
-    semantic_checks = evidence.get("semantic_checks")
-    allowed_semantic_key_sets = {
-        frozenset(_MANIFEST_REBASE_REQUIRED_SEMANTIC_CHECK_KEYS),
-        frozenset(
-            _MANIFEST_REBASE_REQUIRED_SEMANTIC_CHECK_KEYS
-            | {
-                "runtime_fields_outside_image_unchanged",
-                "runtime_image_change_is_exact_reviewed_authority",
-            }
-        ),
-    }
-    if (
-        not isinstance(semantic_checks, Mapping)
-        or frozenset(semantic_checks) not in allowed_semantic_key_sets
-        or any(value is not True for value in semantic_checks.values())
-    ):
-        raise ValueError("manifest-rebase semantic checks are incomplete")
-    manifest_diff = _require_exact_record(
-        evidence.get("manifest_diff"),
-        {
-            "changed_artifact_ids",
-            "changed_non_engine_artifact_ids",
-            "changed_path_count",
-            "changed_paths",
-        },
-        "manifest-rebase diff summary",
-    )
-    changed_ids = _require_sorted_unique_strings(
-        manifest_diff.get("changed_artifact_ids"),
-        "manifest-rebase changed artifact IDs",
-        allow_empty=True,
-    )
-    changed_non_engine_ids = _require_sorted_unique_strings(
-        manifest_diff.get("changed_non_engine_artifact_ids"),
-        "manifest-rebase changed non-engine artifact IDs",
-        allow_empty=True,
-    )
-    changed_paths = _require_sorted_unique_strings(
-        manifest_diff.get("changed_paths"),
-        "manifest-rebase changed paths",
-        allow_empty=True,
-    )
-    if (
-        not set(changed_non_engine_ids) <= set(changed_ids)
-        or manifest_diff.get("changed_path_count") != len(changed_paths)
-        or set(changed_ids) & set(ENGINE_NAME_BY_ARTIFACT_ID)
-    ):
-        raise ValueError("manifest-rebase diff summary is inconsistent")
-    runtime_image_authority = evidence.get("runtime_image_authority")
-    if runtime_image_authority is not None and not isinstance(
-        runtime_image_authority, Mapping
-    ):
-        raise ValueError("manifest-rebase runtime-image evidence is malformed")
-
-    return {
-        "edge_kind": "manifest_rebase",
-        "edge_uid": f"manifest:{transaction_id}",
-        "transaction_id": transaction_id,
-        "evidence_sha256": _sha256_bytes(evidence_raw),
-        "old_hash": old_hash,
-        "new_hash": new_hash,
-        "old_document": old_document,
-        "source_contracts_hash": source_hash,
-        "realized_ids": frozenset(realized),
-        "realized_ids_before": frozenset(realized),
-        "realized_ids_after": frozenset(realized),
-        "retired_ids": frozenset(),
-        "old_realization_hash": old_realization_hash,
-        "new_realization_hash": new_realization_hash,
-        "updated_at_before": before_time,
-        "updated_at_after": after_time,
-        "prepared_at": prepared_at,
-        "committed_at": committed_at,
-        "semantic_checks": dict(semantic_checks),
-        "manifest_diff": dict(manifest_diff),
-        "runtime_image_authority": (
-            dict(runtime_image_authority)
-            if isinstance(runtime_image_authority, Mapping)
-            else None
-        ),
-    }
-
-
-def _validate_manifest_rebase_chain(
-    *,
-    artifact_root: Path,
-    current_manifest_path: Path,
-    current_manifest_sha256: str,
-    current_manifest_document: Mapping[str, Any] | None = None,
-    current_realized_ids: set[str],
-    known_source_contract_hashes: set[str],
-    required_manifest_hashes: set[str],
-    combined_transition_edges: Sequence[Mapping[str, Any]] | None = None,
-) -> dict[str, Any]:
-    current_hash = _require_sha256(
-        current_manifest_sha256, "current base-manifest authority hash"
-    )
-    if current_manifest_document is None:
-        current_raw = _read_regular_owned_bytes(
-            current_manifest_path, "current base-manifest authority"
-        )
-        if _sha256_bytes(current_raw) != current_hash:
-            raise ValueError(
-                "current base-manifest authority changed during validation"
-            )
-        current_document = _parse_yaml_mapping(
-            current_raw, "current base-manifest authority"
-        )
-    else:
-        current_document = current_manifest_document
-    _manifest_engine_records(current_document, "current base-manifest authority")
-
-    combined = tuple(
-        combined_transition_edges
-        if combined_transition_edges is not None
-        else _load_mapanything_transition_edges(artifact_root)
-    )
-    known_realized_ids = set(current_realized_ids)
-    for transition_edge in combined:
-        known_realized_ids.update(_edge_realized_ids_before(transition_edge))
-        known_realized_ids.update(_edge_realized_ids_after(transition_edge))
-    edges: list[dict[str, Any]] = []
-    evidence_root = artifact_root / MANIFEST_REBASE_ROOT
-    if not evidence_root.exists() and not evidence_root.is_symlink():
-        raise ValueError("manifest-rebase evidence root is missing")
-    if evidence_root.exists() or evidence_root.is_symlink():
-        _require_owned_nonwritable_directory(
-            evidence_root, "manifest-rebase evidence root"
-        )
-        entries = list(evidence_root.iterdir())
-        if len(entries) > MANIFEST_REBASE_MAX_TRANSACTIONS:
-            raise ValueError("manifest-rebase evidence inventory exceeds safety bound")
-        for entry in sorted(entries, key=lambda value: value.name):
-            if entry.is_symlink():
-                raise ValueError("manifest-rebase inventory contains a symlink")
-            if not entry.is_dir():
-                raise ValueError(
-                    "manifest-rebase inventory contains an unexpected file"
-                )
-            evidence_path = entry / MANIFEST_REBASE_EVIDENCE_FILENAME
-            if not evidence_path.exists() and not evidence_path.is_symlink():
-                _require_owned_nonwritable_directory(
-                    entry, "manifest-rebase input container"
-                )
-                continue
-            edge = _manifest_rebase_committed_edge(
-                artifact_root=artifact_root,
-                evidence_root=evidence_root,
-                transaction_dir=entry,
-                known_source_contract_hashes=known_source_contract_hashes,
-                current_realized_ids=known_realized_ids,
-            )
-            if edge is not None:
-                edges.append(edge)
-    for transition_edge in combined:
-        edge = dict(transition_edge)
-        edge.update(
-            {
-                "old_hash": transition_edge["manifest_old_hash"],
-                "new_hash": transition_edge["manifest_new_hash"],
-                "old_document": transition_edge["old_manifest_document"],
-                "new_document": transition_edge["new_manifest_document"],
-            }
-        )
-        edges.append(edge)
-    if not edges:
-        raise ValueError("no committed manifest-rebase chain is available")
-
-    by_old: dict[str, dict[str, Any]] = {}
-    by_new: dict[str, dict[str, Any]] = {}
-    for edge in edges:
-        old_hash = str(edge["old_hash"])
-        new_hash = str(edge["new_hash"])
-        if old_hash in by_old:
-            raise ValueError("manifest-rebase chain branches from one old hash")
-        if new_hash in by_new:
-            raise ValueError("manifest-rebase chain has ambiguous predecessors")
-        by_old[old_hash] = edge
-        by_new[new_hash] = edge
-    roots = [edge for edge in edges if edge["old_hash"] not in by_new]
-    if len(roots) != 1:
-        raise ValueError("manifest-rebase chain is cyclic or has ambiguous roots")
-    ordered: list[dict[str, Any]] = []
-    edge = roots[0]
-    visited: set[str] = set()
-    while True:
-        edge_uid = str(edge.get("edge_uid") or edge["transaction_id"])
-        if edge_uid in visited:
-            raise ValueError("manifest-rebase chain contains a cycle")
-        visited.add(edge_uid)
-        ordered.append(edge)
-        next_edge = by_old.get(str(edge["new_hash"]))
-        if next_edge is None:
-            break
-        edge = next_edge
-    if len(ordered) != len(edges):
-        raise ValueError("manifest-rebase chain is disconnected or ambiguous")
-    if ordered[-1]["new_hash"] != current_hash:
-        raise ValueError("manifest-rebase chain does not reach current authority")
-
-    positions = {str(edge["old_hash"]): index for index, edge in enumerate(ordered)}
-    positions[current_hash] = len(ordered)
-    if not required_manifest_hashes <= set(positions):
-        raise ValueError(
-            "required historic manifest binding is absent from the committed chain"
-        )
-    selected_start = min(positions[value] for value in required_manifest_hashes)
-    selected = ordered[selected_start:]
-
-    previous: dict[str, Any] | None = None
-    for index, edge in enumerate(ordered):
-        next_document = (
-            ordered[index + 1]["old_document"]
-            if index + 1 < len(ordered)
-            else current_document
-        )
-        if edge.get("edge_kind") == "mapanything_authority_transition":
-            if dict(next_document) != dict(edge["new_document"]):
-                raise ValueError(
-                    "MapAnything transition manifest successor is disconnected"
-                )
-            _mapanything_transition_manifest_semantics(
-                edge["old_document"], next_document
-            )
-        else:
-            old_target, old_engines = _manifest_engine_records(
-                edge["old_document"], "old manifest transition authority"
-            )
-            next_target, next_engines = _manifest_engine_records(
-                next_document, "next manifest transition authority"
-            )
-            if old_target != next_target or old_engines != next_engines:
-                raise ValueError(
-                    "manifest-rebase transition changed target or TensorRT engine authority"
-                )
-            expected_diff, expected_runtime_transition = (
-                _recompute_manifest_rebase_semantics(
-                    edge["old_document"], next_document
-                )
-            )
-            if edge["manifest_diff"] != expected_diff:
-                raise ValueError(
-                    "manifest-rebase diff evidence differs from exact YAML semantics"
-                )
-            runtime_checks_present = {
-                "runtime_fields_outside_image_unchanged",
-                "runtime_image_change_is_exact_reviewed_authority",
-            } <= set(edge["semantic_checks"])
-            if runtime_checks_present:
-                if edge["runtime_image_authority"] != expected_runtime_transition:
-                    raise ValueError(
-                        "manifest-rebase runtime-image evidence differs from exact YAML semantics"
-                    )
-            elif (
-                edge["runtime_image_authority"] is not None
-                or expected_runtime_transition["changed"]
-            ):
-                raise ValueError(
-                    "legacy manifest-rebase evidence cannot authorize runtime-image drift"
-                )
-        if previous is not None:
-            if previous["committed_at"] > edge["prepared_at"]:
-                raise ValueError("manifest-rebase chronology is not monotonic")
-            if not set(_edge_realized_ids_after(previous)) <= set(
-                _edge_realized_ids_before(edge)
-            ):
-                raise ValueError(
-                    "manifest-rebase realized-engine binding is not monotonic"
-                )
-        previous = edge
-    return {
-        "accepted_manifest_hashes": frozenset(
-            {current_hash, *(str(edge["old_hash"]) for edge in selected)}
-        ),
-        "edges": tuple(selected),
-    }
-
-
-def _source_rebase_committed_edge(
-    *,
-    artifact_root: Path,
-    evidence_root: Path,
-    transaction_dir: Path,
-    current_realized_ids: set[str],
-) -> dict[str, Any] | None:
-    _require_private_directory(transaction_dir, "source-contract rebase transaction")
-    inventory = list(transaction_dir.iterdir())
-    if (
-        len(inventory) != 1
-        or inventory[0].name != SOURCE_CONTRACT_REBASE_EVIDENCE_FILENAME
-    ):
-        raise ValueError(
-            f"source-contract rebase transaction inventory is ambiguous: {transaction_dir}"
-        )
-    evidence_path = inventory[0]
-    evidence, evidence_raw = _load_private_json_with_bytes(
-        evidence_path,
-        "source-contract rebase evidence",
-    )
-    if (
-        evidence.get("schema_version") != 1
-        or evidence.get("contract") != SOURCE_CONTRACT_REBASE_CONTRACT
-    ):
-        raise ValueError("source-contract rebase evidence contract is invalid")
-    transaction_id = str(evidence.get("transaction_id") or "")
-    if (
-        transaction_id != transaction_dir.name
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,127}", transaction_id) is None
-    ):
-        raise ValueError("source-contract rebase transaction ID is invalid")
-    state = str(evidence.get("state") or "")
-    if state in {"aborted_before_commit", "rolled_back_after_evidence_failure"}:
-        return None
-    if state != "committed":
-        raise ValueError("unresolved source-contract rebase evidence requires recovery")
-    allowed_keys = (
-        _SOURCE_REBASE_REQUIRED_EVIDENCE_KEYS | _SOURCE_REBASE_OPTIONAL_EVIDENCE_KEYS
-    )
-    if (
-        not _SOURCE_REBASE_REQUIRED_EVIDENCE_KEYS.issubset(evidence)
-        or set(evidence) - allowed_keys
-    ):
-        raise ValueError("committed source-contract rebase evidence fields drifted")
-    prepared_at = _parse_explicit_utc(
-        evidence.get("prepared_at_utc"),
-        "source-contract rebase prepared_at_utc",
-    )
-    committed_at = _parse_explicit_utc(
-        evidence.get("committed_at_utc"),
-        "source-contract rebase committed_at_utc",
-    )
-    if committed_at < prepared_at:
-        raise ValueError("source-contract rebase commit predates preparation")
-    if "realization_replace_recovery" in evidence:
-        _validate_replace_recovery(
-            evidence["realization_replace_recovery"],
-            "source-contract rebase replace recovery",
-        )
-
-    old_record = _require_exact_record(
-        evidence.get("old_source_contracts"),
-        {"path", "sha256"},
-        "old source-contract evidence",
-    )
-    new_record = _require_exact_record(
-        evidence.get("new_source_contracts"),
-        {"path", "sha256"},
-        "new source-contract evidence",
-    )
-    if new_record.get("path") != SOURCE_CONTRACT_PATH:
-        raise ValueError("new source-contract evidence path drifted")
-    old_hash = _require_sha256(
-        old_record.get("sha256"), "old source-contract evidence hash"
-    )
-    new_hash = _require_sha256(
-        new_record.get("sha256"), "new source-contract evidence hash"
-    )
-    if old_hash == new_hash:
-        raise ValueError("source-contract rebase edge does not advance its authority")
-    old_document, _old_raw, observed_old_hash = _load_source_contract_snapshot(
-        artifact_root,
-        evidence_root,
-        old_record,
-        label="old source-contract snapshot",
-    )
-    if observed_old_hash != old_hash:
-        raise ValueError("old source-contract snapshot hash drifted")
-
-    base_record = _require_exact_record(
-        evidence.get("base_manifest"),
-        {"path", "sha256"},
-        "source-contract rebase base manifest",
-    )
-    if base_record.get("path") != BASE_MANIFEST_PATH:
-        raise ValueError("source-contract rebase base-manifest path drifted")
-    base_hash = _require_sha256(
-        base_record.get("sha256"), "source-contract rebase base-manifest hash"
-    )
-    realization_record = _require_exact_record(
-        evidence.get("realization"),
-        {
-            "path",
-            "old_sha256",
-            "new_sha256",
-            "updated_at_utc_before",
-            "updated_at_utc_after",
-        },
-        "source-contract rebase realization binding",
-    )
-    if realization_record.get("path") != REALIZATION_FILENAME:
-        raise ValueError("source-contract rebase realization path drifted")
-    old_realization_hash = _require_sha256(
-        realization_record.get("old_sha256"),
-        "source-contract rebase old realization hash",
-    )
-    new_realization_hash = _require_sha256(
-        realization_record.get("new_sha256"),
-        "source-contract rebase new realization hash",
-    )
-    if old_realization_hash == new_realization_hash:
-        raise ValueError("source-contract rebase realization CAS did not advance")
-    before_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_before"),
-        "source-contract rebase prior realization timestamp",
-    )
-    after_time = _parse_explicit_utc(
-        realization_record.get("updated_at_utc_after"),
-        "source-contract rebase proposed realization timestamp",
-    )
-    if after_time <= before_time:
-        raise ValueError("source-contract rebase realization timestamp did not advance")
-
-    changed = _require_sorted_unique_strings(
-        evidence.get("changed_contracts"),
-        "source-contract rebase changed contracts",
-        allow_empty=False,
-    )
-    mapped = _require_sorted_unique_strings(
-        evidence.get("mapped_unrealized_artifact_ids"),
-        "source-contract rebase mapped artifacts",
-        allow_empty=False,
-    )
-    realized = _require_sorted_unique_strings(
-        evidence.get("realized_engine_ids"),
-        "source-contract rebase realized engines",
-        allow_empty=True,
-    )
-    expected_contract_names = set(ENGINE_NAME_BY_ARTIFACT_ID.values())
-    if not set(changed) <= expected_contract_names:
-        raise ValueError("source-contract rebase names an unregistered contract")
-    artifact_by_engine = {
-        engine_name: artifact_id
-        for artifact_id, engine_name in ENGINE_NAME_BY_ARTIFACT_ID.items()
-    }
-    expected_mapped = {artifact_by_engine[name] for name in changed}
-    if set(mapped) != expected_mapped:
-        raise ValueError("source-contract rebase mapped artifact evidence drifted")
-    if set(realized) & expected_mapped:
-        raise ValueError("source-contract rebase changed a realized engine contract")
-    if not set(realized) <= current_realized_ids:
-        raise ValueError(
-            "source-contract rebase realization binding names unknown current engines"
-        )
-    if evidence.get("mutation_paths") != [
-        "source_contracts.sha256",
-        "updated_at_utc",
-    ]:
-        raise ValueError("source-contract rebase mutation paths drifted")
-    semantic_checks = evidence.get("semantic_checks")
-    if (
-        not isinstance(semantic_checks, Mapping)
-        or set(semantic_checks) != _SOURCE_REBASE_SEMANTIC_CHECK_KEYS
-        or any(
-            semantic_checks[key] is not True
-            for key in _SOURCE_REBASE_SEMANTIC_CHECK_KEYS
-        )
-    ):
-        raise ValueError("source-contract rebase semantic checks are incomplete")
-
-    return {
-        "edge_kind": "source_contract_rebase",
-        "edge_uid": f"source:{transaction_id}",
-        "transaction_id": transaction_id,
-        "evidence_sha256": _sha256_bytes(evidence_raw),
-        "old_hash": old_hash,
-        "new_hash": new_hash,
-        "old_document": old_document,
-        "base_manifest_hash": base_hash,
-        "changed_contracts": frozenset(str(value) for value in changed),
-        "mapped_artifacts": frozenset(str(value) for value in mapped),
-        "realized_ids": frozenset(str(value) for value in realized),
-        "realized_ids_before": frozenset(str(value) for value in realized),
-        "realized_ids_after": frozenset(str(value) for value in realized),
-        "retired_ids": frozenset(),
-        "old_realization_hash": old_realization_hash,
-        "new_realization_hash": new_realization_hash,
-        "updated_at_before": before_time,
-        "updated_at_after": after_time,
-        "prepared_at": prepared_at,
-        "committed_at": committed_at,
-    }
-
-
-def _validate_source_contract_rebase_chain(
-    *,
-    artifact_root: Path,
-    current_source_contracts_path: Path,
-    current_source_contracts_sha256: str,
-    current_source_contracts_document: Mapping[str, Any] | None = None,
-    current_manifest_path: Path,
-    current_manifest_sha256: str,
-    current_manifest_document: Mapping[str, Any] | None = None,
-    current_realization: Mapping[str, Any],
-    current_realization_sha256: str,
-) -> dict[str, frozenset[str]]:
-    """Return historic source hashes equivalent for each realized engine."""
-
-    current_hash = _require_sha256(
-        current_source_contracts_sha256,
-        "current source-contract authority hash",
-    )
-    if current_source_contracts_document is None:
-        current_document, current_raw = _load_regular_json_with_bytes(
-            current_source_contracts_path,
-            "current source-contract authority",
-        )
-        if _sha256_bytes(current_raw) != current_hash:
-            raise ValueError(
-                "current source-contract authority changed during validation"
-            )
-    else:
-        current_document = current_source_contracts_document
-    current_contracts = _validate_source_contract_document(
-        current_document,
-        "current source-contract authority",
-    )
-    current_base = _require_exact_record(
-        current_realization.get("base_manifest"),
-        {"path", "sha256"},
-        "current realization base manifest",
-    )
-    if current_base.get("path") != BASE_MANIFEST_PATH:
-        raise ValueError("current realization base-manifest path drifted")
-    current_base_hash = _require_sha256(
-        current_base.get("sha256"), "current realization base-manifest hash"
-    )
-    if current_base_hash != _require_sha256(
-        current_manifest_sha256, "current base-manifest authority hash"
-    ):
-        raise ValueError("current realization base-manifest binding is wrong")
-    current_source_record = _require_exact_record(
-        current_realization.get("source_contracts"),
-        {"path", "sha256"},
-        "current realization source-contract binding",
-    )
-    if current_source_record != {
-        "path": SOURCE_CONTRACT_PATH,
-        "sha256": current_hash,
-    }:
-        raise ValueError("current realization source-contract binding is wrong")
-    current_realization_hash = _require_sha256(
-        current_realization_sha256, "current realization hash"
-    )
-    current_realization_updated_at = _parse_explicit_utc(
-        current_realization.get("updated_at_utc"),
-        "current realization updated_at_utc",
-    )
-    current_realized_raw = current_realization.get("artifacts")
-    if not isinstance(current_realized_raw, Mapping):
-        raise ValueError("current realization artifacts must be a mapping")
-    current_realized_ids = {str(value) for value in current_realized_raw}
-
-    combined_transition_edges = _load_mapanything_transition_edges(artifact_root)
-    known_realized_ids = set(current_realized_ids)
-    for transition_edge in combined_transition_edges:
-        known_realized_ids.update(_edge_realized_ids_before(transition_edge))
-        known_realized_ids.update(_edge_realized_ids_after(transition_edge))
-    edges: list[dict[str, Any]] = []
-    evidence_root = artifact_root / SOURCE_CONTRACT_REBASE_ROOT
-    if not evidence_root.exists() and not evidence_root.is_symlink():
-        raise ValueError("source-contract rebase evidence root is missing")
-    if evidence_root.exists() or evidence_root.is_symlink():
-        _require_private_directory(
-            evidence_root, "source-contract rebase evidence root"
-        )
-        entries = list(evidence_root.iterdir())
-        if len(entries) > SOURCE_CONTRACT_REBASE_MAX_TRANSACTIONS + 1:
-            raise ValueError(
-                "source-contract rebase evidence inventory exceeds safety bound"
-            )
-        for entry in sorted(entries, key=lambda value: value.name):
-            if entry.is_symlink():
-                raise ValueError("source-contract rebase inventory contains a symlink")
-            if entry.name == SOURCE_CONTRACT_REBASE_INPUT_ROOT:
-                _require_private_directory(entry, "source-contract rebase input root")
-                continue
-            if not entry.is_dir():
-                raise ValueError(
-                    "source-contract rebase inventory contains an unexpected file"
-                )
-            edge = _source_rebase_committed_edge(
-                artifact_root=artifact_root,
-                evidence_root=evidence_root,
-                transaction_dir=entry,
-                current_realized_ids=known_realized_ids,
-            )
-            if edge is not None:
-                edges.append(edge)
-    for transition_edge in combined_transition_edges:
-        edge = dict(transition_edge)
-        edge.update(
-            {
-                "old_hash": transition_edge["source_old_hash"],
-                "new_hash": transition_edge["source_new_hash"],
-                "old_document": transition_edge["old_source_document"],
-                "new_document": transition_edge["new_source_document"],
-                "base_manifest_hash": transition_edge["manifest_old_hash"],
-            }
-        )
-        edges.append(edge)
-    if not edges:
-        raise ValueError("no committed source-contract rebase chain is available")
-
-    by_old: dict[str, dict[str, Any]] = {}
-    by_new: dict[str, dict[str, Any]] = {}
-    for edge in edges:
-        old_hash = str(edge["old_hash"])
-        new_hash = str(edge["new_hash"])
-        if old_hash in by_old:
-            raise ValueError("source-contract rebase chain branches from one old hash")
-        if new_hash in by_new:
-            raise ValueError("source-contract rebase chain has ambiguous predecessors")
-        by_old[old_hash] = edge
-        by_new[new_hash] = edge
-    roots = [edge for edge in edges if edge["old_hash"] not in by_new]
-    if len(roots) != 1:
-        raise ValueError(
-            "source-contract rebase chain is cyclic or has ambiguous roots"
-        )
-    ordered: list[dict[str, Any]] = []
-    edge = roots[0]
-    visited: set[str] = set()
-    while True:
-        edge_uid = str(edge.get("edge_uid") or edge["transaction_id"])
-        if edge_uid in visited:
-            raise ValueError("source-contract rebase chain contains a cycle")
-        visited.add(edge_uid)
-        ordered.append(edge)
-        next_edge = by_old.get(str(edge["new_hash"]))
-        if next_edge is None:
-            break
-        edge = next_edge
-    if len(ordered) != len(edges):
-        raise ValueError("source-contract rebase chain is disconnected or ambiguous")
-    if ordered[-1]["new_hash"] != current_hash:
-        raise ValueError(
-            "source-contract rebase chain does not reach current authority"
-        )
-
-    known_source_hashes = {
-        current_hash,
-        *(str(edge["old_hash"]) for edge in ordered),
-        *(str(edge["new_hash"]) for edge in ordered),
-    }
-    source_base_hashes = {str(edge["base_manifest_hash"]) for edge in ordered}
-    manifest_chain: dict[str, Any] | None = None
-    if source_base_hashes == {current_base_hash}:
-        accepted_manifest_hashes = frozenset({current_base_hash})
-        manifest_edges: tuple[dict[str, Any], ...] = ()
-    else:
-        manifest_chain = _validate_manifest_rebase_chain(
-            artifact_root=artifact_root,
-            current_manifest_path=current_manifest_path,
-            current_manifest_sha256=current_base_hash,
-            current_manifest_document=current_manifest_document,
-            current_realized_ids=current_realized_ids,
-            known_source_contract_hashes=known_source_hashes,
-            required_manifest_hashes=source_base_hashes,
-            combined_transition_edges=combined_transition_edges,
-        )
-        accepted_manifest_hashes = manifest_chain["accepted_manifest_hashes"]
-        manifest_edges = manifest_chain["edges"]
-    if not source_base_hashes <= set(accepted_manifest_hashes):
-        raise ValueError(
-            "source-contract rebase base-manifest binding is not in the proven manifest chain"
-        )
-
-    previous: dict[str, Any] | None = None
-    for index, edge in enumerate(ordered):
-        next_document = (
-            ordered[index + 1]["old_document"]
-            if index + 1 < len(ordered)
-            else current_document
-        )
-        next_contracts = _validate_source_contract_document(
-            next_document,
-            "next source-contract transition authority",
-        )
-        if edge.get("edge_kind") == "mapanything_authority_transition" and dict(
-            next_document
-        ) != dict(edge["new_document"]):
-            raise ValueError(
-                "MapAnything transition source-contract successor is disconnected"
-            )
-        observed_changes = {
-            key
-            for key in current_contracts
-            if edge["old_document"]["contracts"][key] != next_contracts[key]
-        }
-        if observed_changes != set(edge["changed_contracts"]):
-            raise ValueError(
-                "source-contract rebase allowlist differs from semantic contract changes"
-            )
-        if previous is not None:
-            if previous["committed_at"] > edge["prepared_at"]:
-                raise ValueError("source-contract rebase chronology is not monotonic")
-            if not set(_edge_realized_ids_after(previous)) <= set(
-                _edge_realized_ids_before(edge)
-            ):
-                raise ValueError(
-                    "source-contract rebase realized-engine binding is not monotonic"
-                )
-        previous = edge
-    realization_transitions: dict[str, str] = {}
-    realization_predecessors: dict[str, str] = {}
-    transition_edges: dict[str, dict[str, Any]] = {}
-    unique_provenance_edges: dict[str, dict[str, Any]] = {}
-    for provenance_edge in [*ordered, *manifest_edges]:
-        edge_uid = str(
-            provenance_edge.get("edge_uid")
-            or f"legacy:{provenance_edge['transaction_id']}"
-        )
-        prior = unique_provenance_edges.get(edge_uid)
-        if prior is not None:
-            if (
-                provenance_edge.get("edge_kind") != "mapanything_authority_transition"
-                or prior.get("evidence_sha256")
-                != provenance_edge.get("evidence_sha256")
-                or prior.get("old_realization_hash")
-                != provenance_edge.get("old_realization_hash")
-                or prior.get("new_realization_hash")
-                != provenance_edge.get("new_realization_hash")
-            ):
-                raise ValueError(
-                    "realization provenance edge is duplicated ambiguously"
-                )
-            continue
-        unique_provenance_edges[edge_uid] = provenance_edge
-    for provenance_edge in unique_provenance_edges.values():
-        old_realization_hash = str(provenance_edge["old_realization_hash"])
-        new_realization_hash = str(provenance_edge["new_realization_hash"])
-        if old_realization_hash in realization_transitions:
-            raise ValueError("realization provenance graph branches ambiguously")
-        if new_realization_hash in realization_predecessors:
-            raise ValueError("realization provenance graph has ambiguous predecessors")
-        realization_transitions[old_realization_hash] = new_realization_hash
-        realization_predecessors[new_realization_hash] = old_realization_hash
-        transition_edges[old_realization_hash] = provenance_edge
-
-    realization_roots = set(realization_transitions) - set(realization_predecessors)
-    if not realization_roots:
-        raise ValueError("realization provenance graph is cyclic or has no root")
-
-    # Engine maintenance may legitimately add or replace independently
-    # validated engine records between two source/manifest rebase transactions.
-    # Such a maintenance step has no rebase edge because it changes neither
-    # authority document. Preserve the same fail-closed rule already used for a
-    # newer current realization: each disconnected rebase component must be
-    # chronologically ordered and its realized-engine inventory must be a
-    # monotonic superset of the preceding component's terminal inventory.
-    components: list[list[dict[str, Any]]] = []
-    visited_realization_edges: set[str] = set()
-    for root_hash in realization_roots:
-        component: list[dict[str, Any]] = []
-        edge = transition_edges[root_hash]
-        while True:
-            old_realization_hash = str(edge["old_realization_hash"])
-            if old_realization_hash in visited_realization_edges:
-                raise ValueError("realization provenance graph contains a cycle")
-            visited_realization_edges.add(old_realization_hash)
-            component.append(edge)
-            following = transition_edges.get(str(edge["new_realization_hash"]))
-            if following is None:
-                break
-            edge = following
-        components.append(component)
-    if len(visited_realization_edges) != len(transition_edges):
-        raise ValueError("realization provenance graph contains a cycle")
-
-    components.sort(key=lambda value: value[0]["updated_at_before"])
-    for previous_component, next_component in zip(components, components[1:]):
-        previous_terminal = previous_component[-1]
-        next_root = next_component[0]
-        if previous_terminal["updated_at_after"] >= next_root["updated_at_before"]:
-            raise ValueError(
-                "realization maintenance gap timestamps are not strictly monotonic"
-            )
-        if previous_terminal["committed_at"] > next_root["prepared_at"]:
-            raise ValueError(
-                "realization maintenance gap evidence chronology is not monotonic"
-            )
-        if not set(_edge_realized_ids_after(previous_terminal)) <= set(
-            _edge_realized_ids_before(next_root)
-        ):
-            raise ValueError(
-                "realization maintenance gap drops previously realized engines"
-            )
-
-    for component in components:
-        for provenance_edge, following_edge in zip(component, component[1:]):
-            if (
-                _edge_realized_ids_after(provenance_edge)
-                != _edge_realized_ids_before(following_edge)
-                or provenance_edge["updated_at_after"]
-                != following_edge["updated_at_before"]
-            ):
-                raise ValueError(
-                    "realization rebase boundary has inconsistent state or timestamp binding"
-                )
-
-    terminal_edge = components[-1][-1]
-    terminal_realization_hash = str(terminal_edge["new_realization_hash"])
-    terminal_realized_ids = set(_edge_realized_ids_after(terminal_edge))
-    terminal_updated_at = terminal_edge["updated_at_after"]
-    if terminal_realization_hash == current_realization_hash:
-        if (
-            terminal_realized_ids != current_realized_ids
-            or terminal_updated_at != current_realization_updated_at
-        ):
-            raise ValueError(
-                "current realization state is not exactly bound to rebase evidence"
-            )
-    elif (
-        not terminal_realized_ids <= current_realized_ids
-        or terminal_updated_at >= current_realization_updated_at
-    ):
-        raise ValueError(
-            "current realization does not monotonically succeed rebase evidence"
-        )
-
-    accepted: dict[str, set[str]] = {
-        artifact_id: {current_hash} for artifact_id in current_realized_ids
-    }
-    equivalent_suffix = {artifact_id: True for artifact_id in current_realized_ids}
-    for index in range(len(ordered) - 1, -1, -1):
-        edge = ordered[index]
-        next_document = (
-            ordered[index + 1]["old_document"]
-            if index + 1 < len(ordered)
-            else current_document
-        )
-        old_contracts = edge["old_document"]["contracts"]
-        next_contracts = next_document["contracts"]
-        for artifact_id in current_realized_ids:
-            engine_name = ENGINE_NAME_BY_ARTIFACT_ID.get(artifact_id)
-            if engine_name is None:
-                continue
-            unchanged = (
-                engine_name not in edge["changed_contracts"]
-                and artifact_id not in edge["mapped_artifacts"]
-                and old_contracts[engine_name] == next_contracts[engine_name]
-            )
-            equivalent_suffix[artifact_id] = (
-                equivalent_suffix[artifact_id] and unchanged
-            )
-            if equivalent_suffix[artifact_id]:
-                accepted[artifact_id].add(str(edge["old_hash"]))
-    return {artifact_id: frozenset(hashes) for artifact_id, hashes in accepted.items()}
 
 
 def _validate_wholebody_snapshot_copy(
@@ -3702,7 +1572,7 @@ def _validate_gpu_memory_guard_proof(
         raise ValueError("GPU-memory guard lacks a reviewed GPU UUID")
     root = artifact_root.resolve(strict=True)
     artifact_root_id = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
-    expected_guard_mib = gpu_sampler.reviewed_guard_mib(expected_engine)
+    expected_guard_mib = legacy_gpu_guard.reviewed_guard_mib(expected_engine)
     container_id = str(guard_record.get("container_id") or "")
     wrapper_pid = guard_record.get("wrapper_pid")
     wrapper_start = guard_record.get("wrapper_start_time_ticks")
@@ -3719,7 +1589,7 @@ def _validate_gpu_memory_guard_proof(
     ):
         raise ValueError("realized GPU-memory guard identity is invalid")
     exact_fields = {
-        "contract": gpu_sampler.CONTRACT,
+        "contract": legacy_gpu_guard.CONTRACT,
         "engine": expected_engine,
         "transaction_id": transaction_id,
         "prepared_transaction_sha256": prepared_sha256,
@@ -3727,8 +1597,8 @@ def _validate_gpu_memory_guard_proof(
         "device_index": 0,
         "gpu_uuid": expected_uuid,
         "guard_mib": expected_guard_mib,
-        "sample_interval_ms": gpu_sampler.REVIEWED_SAMPLE_INTERVAL_MS,
-        "maximum_gap_limit_ms": gpu_sampler.REVIEWED_MAX_GAP_MS,
+        "sample_interval_ms": legacy_gpu_guard.REVIEWED_SAMPLE_INTERVAL_MS,
+        "maximum_gap_limit_ms": legacy_gpu_guard.REVIEWED_MAX_GAP_MS,
     }
     for key, expected in exact_fields.items():
         if guard_record.get(key) != expected:
@@ -3760,14 +1630,14 @@ def _validate_gpu_memory_guard_proof(
         artifact_root_id=artifact_root_id,
         container_id=container_id,
         guard_mib=expected_guard_mib,
-        interval_ms=gpu_sampler.REVIEWED_SAMPLE_INTERVAL_MS,
-        max_gap_ms=gpu_sampler.REVIEWED_MAX_GAP_MS,
+        interval_ms=legacy_gpu_guard.REVIEWED_SAMPLE_INTERVAL_MS,
+        max_gap_ms=legacy_gpu_guard.REVIEWED_MAX_GAP_MS,
         parent_pid=wrapper_pid,
         parent_start_time_ticks=wrapper_start,
         allow_active=False,
     )
     try:
-        reconstructed = gpu_sampler.summarize(summary_args)
+        reconstructed = legacy_gpu_guard.summarize(summary_args)
     except Exception as exc:
         raise ValueError(f"NVML GPU-memory guard proof is invalid: {exc}") from exc
     declared_summary = guard_record.get("summary")
@@ -3797,7 +1667,6 @@ def _validate_engine_maintenance_proof(
     source_contracts_path: Path = SOURCE_CONTRACTS,
     source_contract_document: Mapping[str, Any] | None = None,
     current_source_contracts_sha256: str | None = None,
-    accepted_source_contract_hashes: frozenset[str] | None = None,
     artifact_root: Path,
     maintenance_manifest_path: Path,
     maintenance_manifest_sha256: str,
@@ -3855,15 +1724,9 @@ def _validate_engine_maintenance_proof(
         current_source_contracts_sha256 or _file_sha256(source_contracts_path),
         "current source-contract authority digest",
     )
-    accepted_hashes = accepted_source_contract_hashes or frozenset(
-        {authoritative_source_contracts_sha256}
-    )
-    if (
-        authoritative_source_contracts_sha256 not in accepted_hashes
-        or maintenance_source_contracts_sha256 not in accepted_hashes
-    ):
+    if maintenance_source_contracts_sha256 != authoritative_source_contracts_sha256:
         raise ValueError(
-            "maintenance source-contract input digest is not authoritative"
+            "maintenance source-contract input digest differs from current authority"
         )
 
     if source_contract_document is None:
@@ -3915,20 +1778,19 @@ def _validate_engine_maintenance_proof(
     platform = metadata.get("platform")
     if not isinstance(platform, Mapping):
         raise ValueError("maintenance platform must be a mapping")
-    build_image = target.get("build_image")
-    if not isinstance(build_image, Mapping):
-        raise ValueError("target build-image authority is missing")
-    exact_platform = {
-        "image": build_image.get("reference"),
-        "image_id": build_image.get("image_id"),
-        "base_digest": build_image.get("base_digest"),
-        "tensorrt_version": build_image.get("tensorrt_version"),
-        "cuda_version": build_image.get("cuda_version"),
-    }
+    native_host = target.get("native_host")
+    if not isinstance(native_host, Mapping) or dict(native_host) != NATIVE_HOST_AUTHORITY:
+        raise ValueError("target native-host authority is missing")
+    native_receipt = platform.get("image") == "native_host"
+    exact_platform = (
+        NATIVE_ENGINE_RECEIPT_PLATFORM
+        if native_receipt
+        else LEGACY_ENGINE_RECEIPT_PLATFORM
+    )
     for key, expected in exact_platform.items():
         if platform.get(key) != expected:
             raise ValueError(
-                f"maintenance platform {key} differs from build-image authority"
+                f"maintenance platform {key} differs from reviewed receipt authority"
             )
     for key in (
         "driver_version",
@@ -3989,12 +1851,76 @@ def _validate_engine_maintenance_proof(
             or row.get("status") != "passed"
             or row.get("returncode") != 0
             or row.get("timed_out") is not False
+            or (native_receipt and row.get("output_exceeded") is not False)
             or row.get("proof") != proof
             or not isinstance(row.get("command"), list)
             or not row.get("command")
         ):
             raise ValueError(
                 f"maintenance command did not pass its proof gate: {label}"
+            )
+
+    if native_receipt:
+        if "host_transaction" in metadata:
+            raise ValueError(
+                "native-host maintenance must not carry a retired host transaction"
+            )
+        native_build = metadata.get("native_host")
+        if (
+            not isinstance(native_build, Mapping)
+            or set(native_build) != NATIVE_HOST_BUILD_AUTHORITY_KEYS
+        ):
+            raise ValueError("native-host build authority fields drifted")
+        source_input_label = (
+            "staged_tracker_reid_source"
+            if expected_engine == "v3dt_tracker_reid"
+            else "staged_onnx"
+        )
+        source_input = inputs.get(source_input_label)
+        if not isinstance(source_input, Mapping):
+            raise ValueError(
+                f"native-host maintenance lacks {source_input_label} input evidence"
+            )
+        expected_source_sha256 = _require_sha256(
+            source_input.get("sha256"), "native-host source input digest"
+        )
+        build_command = by_label[build_label].get("command")
+        assert isinstance(build_command, list)
+        exact_native_build = {
+            "backend": "native_host",
+            "deepstream": native_host["sdk_root"],
+            "cuda": native_host["cuda_root"],
+            "tensorrt": "TensorRT v101600",
+            "python_abi": "cp312",
+            "source_sha256": expected_source_sha256,
+            "output_sha256": output_sha256,
+            "command": " ".join(str(value) for value in build_command),
+        }
+        for key, expected in exact_native_build.items():
+            if native_build.get(key) != expected:
+                raise ValueError(
+                    f"native-host build authority differs from evidence: {key}"
+                )
+        compiler = str(native_build.get("compiler") or "")
+        if not compiler or len(compiler.encode("utf-8")) > 4096:
+            raise ValueError("native-host compiler identity is missing or unbounded")
+        if len(str(native_build.get("command") or "").encode("utf-8")) > 65536:
+            raise ValueError("native-host build command evidence is unbounded")
+
+        candidate = maintenance_payload.get("candidate")
+        install_transaction = maintenance_payload.get("install_transaction")
+        if (
+            not isinstance(candidate, Mapping)
+            or candidate.get("sha256") != output_sha256
+            or candidate.get("size_bytes") != output_size_bytes
+            or not isinstance(install_transaction, Mapping)
+            or install_transaction.get("status") != "installed_verified"
+            or install_transaction.get("target") != maintenance_payload.get("target")
+            or install_transaction.get("candidate") != candidate
+            or installed.get("path") != maintenance_payload.get("target")
+        ):
+            raise ValueError(
+                "native-host maintenance lacks a verified atomic install transaction"
             )
 
     _validate_wholebody_builder_maintenance(
@@ -4016,7 +1942,16 @@ def _validate_engine_maintenance_proof(
         raise ValueError("artifact compatibility/maintenance provenance is missing")
     guard_present = "gpu_memory_guard" in declared_maintenance
     guard = declared_maintenance.get("gpu_memory_guard")
-    if not guard_present:
+    if native_receipt:
+        if guard_present:
+            raise ValueError(
+                "native-host receipt must not carry the retired container GPU guard"
+            )
+        if declared_maintenance.get("manifest_sha256") != bound_maintenance_sha256:
+            raise ValueError(
+                "native-host realized maintenance digest differs from private evidence"
+            )
+    elif not guard_present:
         if artifact_id in UNCONDITIONALLY_GUARD_REQUIRED_ARTIFACT_IDS:
             raise ValueError(
                 "Wholebody49 realized provenance requires a sealed GPU-memory guard"
@@ -4113,7 +2048,6 @@ def validate_asset_realization(
             base_payload = copy.deepcopy(
                 dict(_parse_yaml_mapping(base_raw, "base-manifest authority"))
             )
-        base_authority_document = copy.deepcopy(base_payload)
         base_sha256 = _sha256_bytes(base_raw)
         source_contract_document, source_contract_raw = _load_regular_json_with_bytes(
             SOURCE_CONTRACTS, "engine source-contract authority"
@@ -4190,9 +2124,6 @@ def validate_asset_realization(
                 "asset realization contains unknown/non-engine artifact IDs: "
                 + ", ".join(sorted(unknown))
             )
-        accepted_source_contract_hashes_by_artifact: (
-            dict[str, frozenset[str]] | None
-        ) = None
         for artifact_id, realized in realized_artifacts.items():
             if not isinstance(realized, Mapping) or set(realized) != {
                 "state",
@@ -4254,24 +2185,10 @@ def validate_asset_realization(
                 if (
                     maintenance_source_contracts_sha256
                     != current_source_contracts_sha256
-                    and accepted_source_contract_hashes_by_artifact is None
                 ):
-                    accepted_source_contract_hashes_by_artifact = (
-                        _validate_source_contract_rebase_chain(
-                            artifact_root=root,
-                            current_source_contracts_path=SOURCE_CONTRACTS,
-                            current_source_contracts_sha256=(
-                                current_source_contracts_sha256
-                            ),
-                            current_source_contracts_document=(
-                                source_contract_document
-                            ),
-                            current_manifest_path=base_path,
-                            current_manifest_sha256=expected_base["sha256"],
-                            current_manifest_document=base_authority_document,
-                            current_realization=realization,
-                            current_realization_sha256=realization_sha256,
-                        )
+                    raise ValueError(
+                        "maintenance source-contract input digest differs from "
+                        f"current authority: {artifact_id}"
                     )
                 output = _physical_path(
                     _relative_path(by_id[artifact_id]["output"]), root
@@ -4294,11 +2211,6 @@ def validate_asset_realization(
                     target=base_payload.get("target") or {},
                     source_contract_document=source_contract_document,
                     current_source_contracts_sha256=(current_source_contracts_sha256),
-                    accepted_source_contract_hashes=(
-                        accepted_source_contract_hashes_by_artifact.get(artifact_id)
-                        if accepted_source_contract_hashes_by_artifact is not None
-                        else None
-                    ),
                     artifact_root=root,
                     maintenance_manifest_path=maintenance_path,
                     maintenance_manifest_sha256=_sha256_bytes(maintenance_raw),

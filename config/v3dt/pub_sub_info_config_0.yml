@@ -1,8 +1,0 @@
-pubBrokerTopicStr:
-- 'localhost:1883;ds3d/cam0'  # living-room (source 0)
-- 'localhost:1883;ds3d/cam1'  # kitchen (source 1)
-- 'localhost:1883;ds3d/cam2'  # family-room (source 2)
-subPeerBrokerTopicStrs:
-- []  # living-room has no neighbors
-- - 'localhost:1883;ds3d/cam2'  # kitchen subscribes to family-room
-- - 'localhost:1883;ds3d/cam1'  # family-room subscribes to kitchen

@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 
 from geometry.depth_source import DepthSummary, MapAnythingDepthSource
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 
 
 def test_depth_summary_valid_ratio(tmp_path: Path):

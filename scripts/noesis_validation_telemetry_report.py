@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate saved or live DS8 WebSocket telemetry through the shared toolbox."""
+"""Validate saved or live DS9.1 WebSocket telemetry through the shared toolbox."""
 
 from __future__ import annotations
 
@@ -73,13 +73,13 @@ def _load_messages(args: argparse.Namespace) -> list[Mapping[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate DS8 tracking/BEV telemetry from NDJSON or live WebSocket.")
+    parser = argparse.ArgumentParser(description="Validate DS9.1 tracking/BEV telemetry from NDJSON or live WebSocket.")
     parser.add_argument("--input", action="append", default=[], help="NDJSON file with one WebSocket JSON message per line.")
     parser.add_argument("--ws", default="", help="Live WebSocket URL to capture.")
     parser.add_argument("--duration", type=float, default=20.0, help="Live WebSocket capture duration seconds.")
     parser.add_argument("--output-dir", default="diagnostics/validation", help="Output directory for reports.")
     parser.add_argument("--run-id", default="", help="Override report run id.")
-    parser.add_argument("--pipeline-config", default="config/infer.yaml")
+    parser.add_argument("--pipeline-config", default="DS9/config/infer.yaml")
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
     parser.add_argument("--expected-world-frame", default="backend_world_m")
     parser.add_argument("--expected-bev-frame-mode", default="world")

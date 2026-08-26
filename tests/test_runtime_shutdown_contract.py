@@ -14,19 +14,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIMES = (
-    ROOT / "noesis" / "ds8_runtime.py",
-    ROOT / "noesis" / "ds8_runtime_v3dt_reimpl.py",
-    ROOT / "DS9" / "noesis" / "ds9_runtime_core.py",
-)
+RUNTIMES = (ROOT / "DS9" / "noesis" / "ds9_runtime_core.py",)
 
 
 @pytest.mark.parametrize(
     "module_name",
-    (
-        "noesis.ds8_runtime",
-        "noesis.ds8_runtime_v3dt_reimpl",
-    ),
+    ("noesis.ds9_runtime_core",),
 )
 def test_runtime_rejects_unknown_tracking_mode(module_name: str) -> None:
     runtime = importlib.import_module(module_name)
@@ -159,7 +152,7 @@ def test_runtime_never_treats_wait_failure_as_pipeline_quiescence(
 
 
 def test_wait_loop_exception_sets_explicit_failure_state() -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     class _FailingPipeline:
         @staticmethod
@@ -168,7 +161,7 @@ def test_wait_loop_exception_sets_explicit_failure_state() -> None:
 
     state: dict[str, object] = {}
     shutdown_event = threading.Event()
-    thread = ds8_runtime._start_pyservicemaker_wait_loop(
+    thread = runtime._start_pyservicemaker_wait_loop(
         _FailingPipeline(),
         shutdown_event,
         logging.getLogger("test.runtime-shutdown"),
@@ -184,8 +177,8 @@ def test_wait_loop_exception_sets_explicit_failure_state() -> None:
 
 
 def test_websocket_startup_timeout_cancels_and_joins_owner_thread() -> None:
-    from noesis import ds8_runtime
-    from websocket_server import WebSocketStartupError
+    from noesis import ds9_runtime_core as runtime
+    from noesis.server.websocket import WebSocketStartupError
 
     class _BlockedStartupServer:
         def __init__(self) -> None:
@@ -209,7 +202,7 @@ def test_websocket_startup_timeout_cancels_and_joins_owner_thread() -> None:
 
     server = _BlockedStartupServer()
     with pytest.raises(WebSocketStartupError) as raised:
-        ds8_runtime._start_websocket_server(server, timeout_s=0.05)
+        runtime._start_websocket_server(server, timeout_s=0.05)
 
     receipt = raised.value.receipt
     assert server.start_entered.is_set()
@@ -222,7 +215,7 @@ def test_websocket_startup_timeout_cancels_and_joins_owner_thread() -> None:
     assert receipt.event_loop_closed is True
     assert receipt.quiesced is True
     assert not any(
-        thread.name == "DS8-WebSocket" and thread.is_alive()
+        thread.name == "DS9-WebSocket" and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -280,7 +273,7 @@ def test_post_bind_startup_failures_follow_startup_ownership_transaction(
     assert 'return _abort_startup("shutdown_requested_before_activation")' in startup
 
     attempted = startup.index("startup_transaction.mark_activation_attempted()")
-    activation = startup.index("ds8_pipeline.activate()")
+    activation = startup.index("deepstream_pipeline.activate()")
     activation_failure = startup.index("pipeline activation failed")
     activation_abort = startup.index(
         '_abort_ambiguous_and_wait("pipeline_activation_failed")',
@@ -301,7 +294,7 @@ class _FakeRestServer:
 
 
 def test_rest_shutdown_receipt_proves_server_and_analytics_quiescence() -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     server = _FakeRestServer()
     analytics_lock = threading.Lock()
@@ -312,7 +305,7 @@ def test_rest_shutdown_receipt_proves_server_and_analytics_quiescence() -> None:
 
     thread = threading.Thread(target=_serve_until_stopped, name="test-rest-server")
     thread.start()
-    receipt = ds8_runtime._stop_rest_server(
+    receipt = runtime._stop_rest_server(
         server,
         thread,
         analytics_lock,
@@ -330,7 +323,7 @@ def test_rest_shutdown_receipt_proves_server_and_analytics_quiescence() -> None:
 
 
 def test_rest_shutdown_receipt_rejects_blocked_server_thread() -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     server = _FakeRestServer()
     release_server = threading.Event()
@@ -341,7 +334,7 @@ def test_rest_shutdown_receipt_rejects_blocked_server_thread() -> None:
     thread.start()
     analytics_lock = threading.Lock()
     try:
-        receipt = ds8_runtime._stop_rest_server(
+        receipt = runtime._stop_rest_server(
             server,
             thread,
             analytics_lock,
@@ -359,7 +352,7 @@ def test_rest_shutdown_receipt_rejects_blocked_server_thread() -> None:
 
 
 def test_rest_shutdown_receipt_rejects_blocked_roi_reload_transaction() -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     analytics_lock = threading.Lock()
     transaction_entered = threading.Event()
@@ -377,7 +370,7 @@ def test_rest_shutdown_receipt_rejects_blocked_roi_reload_transaction() -> None:
     worker.start()
     assert transaction_entered.wait(timeout=1.0)
     try:
-        receipt = ds8_runtime._stop_rest_server(
+        receipt = runtime._stop_rest_server(
             None,
             None,
             analytics_lock,
@@ -395,7 +388,7 @@ def test_rest_shutdown_receipt_rejects_blocked_roi_reload_transaction() -> None:
 
 def test_real_rest_server_does_not_abandon_blocked_sync_handler() -> None:
     from fastapi import FastAPI
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     app = FastAPI()
     app.state.noesis_internal_auth = {"mode": "disabled"}
@@ -412,7 +405,7 @@ def test_real_rest_server_does_not_abandon_blocked_sync_handler() -> None:
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
 
-    server, server_thread = ds8_runtime._start_rest_server(
+    server, server_thread = runtime._start_rest_server(
         app,
         "127.0.0.1",
         port,
@@ -434,7 +427,7 @@ def test_real_rest_server_does_not_abandon_blocked_sync_handler() -> None:
         request_thread.start()
         assert handler_entered.wait(timeout=1.0)
 
-        receipt = ds8_runtime._stop_rest_server(
+        receipt = runtime._stop_rest_server(
             server,
             server_thread,
             threading.Lock(),
@@ -457,10 +450,7 @@ def test_real_rest_server_does_not_abandon_blocked_sync_handler() -> None:
 
 @pytest.mark.parametrize(
     "module_name",
-    (
-        "noesis.ds8_runtime",
-        "noesis.ds8_runtime_v3dt_reimpl",
-    ),
+    ("noesis.ds9_runtime_core",),
 )
 def test_rest_startup_timeout_retains_cleanly_stopped_owner(
     module_name: str,
@@ -504,10 +494,7 @@ def test_rest_startup_timeout_retains_cleanly_stopped_owner(
 
 @pytest.mark.parametrize(
     "module_name",
-    (
-        "noesis.ds8_runtime",
-        "noesis.ds8_runtime_v3dt_reimpl",
-    ),
+    ("noesis.ds9_runtime_core",),
 )
 def test_rest_startup_timeout_retains_unresolved_live_owner(
     module_name: str,
@@ -565,7 +552,7 @@ def test_rest_startup_early_exit_retains_owned_thread_and_proves_cleanup(
 ) -> None:
     import uvicorn
 
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     class _Server:
         started = False
@@ -576,15 +563,15 @@ def test_rest_startup_early_exit_retains_owned_thread_and_proves_cleanup(
             return None
 
     server = _Server()
-    monkeypatch.setattr(ds8_runtime, "_port_bindable", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_port_bindable", lambda *_args: True)
     monkeypatch.setattr(uvicorn, "Config", lambda **_kwargs: object())
     monkeypatch.setattr(uvicorn, "Server", lambda **_kwargs: server)
 
-    with pytest.raises(ds8_runtime.RestStartupError) as raised:
-        ds8_runtime._start_rest_server(_rest_test_app(), "127.0.0.1", 18080)
+    with pytest.raises(runtime.RestStartupError) as raised:
+        runtime._start_rest_server(_rest_test_app(), "127.0.0.1", 18080)
 
     assert raised.value.server is server
-    assert raised.value.thread.name == "DS8-REST"
+    assert raised.value.thread.name == "DS9-REST"
     assert raised.value.cleanup_proven is True
     assert not raised.value.thread.is_alive()
 
@@ -594,7 +581,7 @@ def test_rest_startup_timeout_cancels_and_joins_owned_thread(
 ) -> None:
     import uvicorn
 
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     class _Server:
         started = False
@@ -606,13 +593,13 @@ def test_rest_startup_timeout_cancels_and_joins_owned_thread(
 
     ticks = iter((0.0, 11.0))
     server = _Server()
-    monkeypatch.setattr(ds8_runtime, "_port_bindable", lambda *_args: True)
-    monkeypatch.setattr(ds8_runtime.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(runtime, "_port_bindable", lambda *_args: True)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(uvicorn, "Config", lambda **_kwargs: object())
     monkeypatch.setattr(uvicorn, "Server", lambda **_kwargs: server)
 
-    with pytest.raises(ds8_runtime.RestStartupError) as raised:
-        ds8_runtime._start_rest_server(_rest_test_app(), "127.0.0.1", 18080)
+    with pytest.raises(runtime.RestStartupError) as raised:
+        runtime._start_rest_server(_rest_test_app(), "127.0.0.1", 18080)
 
     assert server.should_exit is True
     assert raised.value.cleanup_proven is True
@@ -624,7 +611,7 @@ def test_rest_startup_timeout_never_loses_unjoined_thread_owner(
 ) -> None:
     import uvicorn
 
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     release = threading.Event()
 
@@ -638,13 +625,13 @@ def test_rest_startup_timeout_never_loses_unjoined_thread_owner(
 
     ticks = iter((0.0, 11.0))
     server = _Server()
-    monkeypatch.setattr(ds8_runtime, "_port_bindable", lambda *_args: True)
-    monkeypatch.setattr(ds8_runtime.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(runtime, "_port_bindable", lambda *_args: True)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(uvicorn, "Config", lambda **_kwargs: object())
     monkeypatch.setattr(uvicorn, "Server", lambda **_kwargs: server)
     try:
-        with pytest.raises(ds8_runtime.RestStartupError) as raised:
-            ds8_runtime._start_rest_server(
+        with pytest.raises(runtime.RestStartupError) as raised:
+            runtime._start_rest_server(
                 _rest_test_app(),
                 "127.0.0.1",
                 18080,
@@ -679,10 +666,10 @@ def test_runtime_rest_partial_startup_is_watchdog_fatal(runtime_path: Path) -> N
 
 
 def test_websocket_shutdown_rejects_missing_event_loop() -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     with pytest.raises(RuntimeError, match="event loop was unavailable"):
-        ds8_runtime._stop_websocket_server(  # type: ignore[attr-defined]
+        runtime._stop_websocket_server(  # type: ignore[attr-defined]
             object(),
             threading.current_thread(),
             None,
@@ -693,7 +680,7 @@ def test_websocket_shutdown_rejects_missing_event_loop() -> None:
 def test_websocket_shutdown_rejects_live_worker_after_listener_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from noesis import ds8_runtime
+    from noesis import ds9_runtime_core as runtime
 
     class _Future:
         @staticmethod
@@ -733,11 +720,11 @@ def test_websocket_shutdown_rejects_live_worker_after_listener_stop(
         coroutine.close()
         return _Future()
 
-    monkeypatch.setattr(ds8_runtime.asyncio, "run_coroutine_threadsafe", _schedule)
+    monkeypatch.setattr(runtime.asyncio, "run_coroutine_threadsafe", _schedule)
     loop = _Loop()
     thread = _Thread()
     with pytest.raises(RuntimeError, match="thread remained alive"):
-        ds8_runtime._stop_websocket_server(  # type: ignore[attr-defined]
+        runtime._stop_websocket_server(  # type: ignore[attr-defined]
             _Server(),
             thread,
             loop,
@@ -766,11 +753,9 @@ def test_runtime_providers_cooperate_with_shutdown_before_depth_enable(
     runtime_path: Path,
 ) -> None:
     source = runtime_path.read_text(encoding="utf-8")
-    provider_region = source[
-        source.index("    def _ds8_auto_calibrate_handler") : source.index(
-            "    pipeline = ds8_pipeline.build_pipeline"
-        )
-    ]
+    provider_start = "    def _auto_calibrate_handler"
+    provider_end = "    pipeline = deepstream_pipeline.build_pipeline"
+    provider_region = source[source.index(provider_start) : source.index(provider_end)]
 
     assert provider_region.count("if shutdown_event.is_set():") >= 2
     assert '"error": "shutting_down"' in provider_region
@@ -784,8 +769,10 @@ def test_ma_depth_cache_only_contract_never_opens_inference_gate(
     runtime_path: Path,
 ) -> None:
     source = runtime_path.read_text(encoding="utf-8")
-    start = source.index("    def _ds8_ma_depth_provider(")
-    end = source.index("    def _ds8_floorplan_provider(", start)
+    provider_start = "    def _ma_depth_provider("
+    provider_end = "    def _floorplan_provider("
+    start = source.index(provider_start)
+    end = source.index(provider_end, start)
     provider = source[start:end]
 
     assert "cache_only: bool = False" in provider
@@ -842,7 +829,7 @@ def test_runtime_map_worker_shutdown_is_after_probe_quiescence_before_storage(
     ) < shutdown.index("storage_shutdown_receipt = close_depth_storage(")
 
 
-def test_ds8_v3dt_and_ds9_share_the_same_rest_shutdown_gate() -> None:
+def test_ds9_tracking_modes_share_the_same_rest_shutdown_gate() -> None:
     gates: list[str] = []
     for runtime_path in RUNTIMES:
         source = runtime_path.read_text(encoding="utf-8")

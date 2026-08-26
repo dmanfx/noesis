@@ -249,7 +249,7 @@ def _spawn_runtime(
     ws_port = ws_url.port or 6040
     cmd = [
         sys.executable,
-        "noesis/ds8_runtime.py",
+        "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
         str(args.pipeline_config),
         "--cameras-config",
@@ -980,7 +980,9 @@ def main() -> int:
         description="Exact-frame camera-local BEV/tracking geometry gate."
     )
     parser.add_argument("--ws", default="ws://127.0.0.1:6040", help="WebSocket URL")
-    parser.add_argument("--pipeline-config", type=Path, default=Path("config/infer.yaml"))
+    parser.add_argument(
+        "--pipeline-config", type=Path, default=Path("DS9/config/infer.yaml")
+    )
     parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
     parser.add_argument(
         "--calibration-config",
@@ -1002,7 +1004,7 @@ def main() -> int:
         help="Maximum camera-local p95 geometry error in meters",
     )
     parser.add_argument(
-        "--no-spawn", action="store_true", help="Do not spawn ds8_runtime"
+        "--no-spawn", action="store_true", help="Do not spawn the DS9 runtime"
     )
     parser.add_argument("--floorplan-authority", type=Path, required=True)
     parser.add_argument("--floorplan-source", type=Path, required=True)

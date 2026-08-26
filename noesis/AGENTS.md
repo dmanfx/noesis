@@ -18,9 +18,9 @@ canonical DS9.1 runtime. It is not an independently runnable DS8 stack.
 - `metadata/`: public metadata schemas and adapters.
 - identity, calibration, world, scene, and persistence modules shared by DS9.1.
 
-The executable adapter lives under `DS9/noesis/`. Some shared modules and
-mirrored DS9 files retain DS8-era names for compatibility; do not infer runtime
-authority from those names or launch `noesis/ds8_runtime.py`.
+The executable adapter lives under `DS9/noesis/`. Immutable model-artifact and
+persisted replay identifiers may retain DS8-era names for read compatibility;
+those labels do not confer runtime authority.
 
 ## Rules
 

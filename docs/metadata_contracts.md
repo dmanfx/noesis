@@ -176,7 +176,7 @@ Pixels with invalid or near-zero normals are rendered transparent (typically bec
 
 ## 3. Analytics Object & Frame Meta
 
-**Producers/Consumers:** `noesis/pipelines/hooks._AnalyticsTelemetryProcessor` and exclusion/BEV helpers.
+**Producers/Consumers:** `DS9/noesis/pipelines/hooks._AnalyticsTelemetryProcessor` and exclusion/BEV helpers.
 
 ### Object-Level Analytics Meta
 
@@ -578,11 +578,11 @@ static void pose_meta_release(gpointer data, gpointer) {
 }
 ```
 
-**DS9.1 note:** Service Maker Python wrappers do not expose `obj_user_meta_list` or `append` for arbitrary user meta. Use a **native bridge** (e.g., `native/noesis_pose_meta_ext.cpp`) to unwrap `ObjectMetadata` → `NvDsObjectMeta*` and call `nvds_add_user_meta_to_obj`.
+**DS9.1 note:** Service Maker Python wrappers do not expose `obj_user_meta_list` or `append` for arbitrary user meta. Use a **native bridge** (e.g., `DS9/native/noesis_pose_meta_ext.cpp`) to unwrap `ObjectMetadata` → `NvDsObjectMeta*` and call `nvds_add_user_meta_to_obj`.
 
 ## 6. Pose Feature User Meta (Object-Level)
 
-**Producer:** `noesis/pipelines/hooks.PoseFeatureProcessor` (YOLO26 pose SGIE).
+**Producer:** `DS9/noesis/pipelines/hooks.PoseFeatureProcessor` (YOLO26 pose SGIE).
 
 **Meta type:** `NOESIS.POSE_FEATURES` (user meta attached to each `NvDsObjectMeta`).
 
@@ -752,7 +752,7 @@ This visualization does **not** add new user meta; it is purely an OSD overlay.
 
 ## 9. Calibration & Geometry
 
-**Consumers:** `noesis/telemetry/bev.py`, calibration RPCs in `websocket_server.py`, geometry helpers.
+**Consumers:** `noesis/telemetry/bev.py`, calibration RPCs in `noesis/server/websocket.py`, geometry helpers.
 
 - Calibration data (intrinsics + extrinsics + floor plane) must be consistent across:
   - `config/cameras.yaml` / calibration outputs.

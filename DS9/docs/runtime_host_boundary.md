@@ -94,5 +94,5 @@ in private files and are never passed to the browser or written into docs.
 - appliance releases, selectors, bundle manifests, and state-clone mechanics
 - DS8/DS9.0 Python, native libraries, parsers, plugins, or TensorRT engines
 
-Those files may remain temporarily for history/removal work, but the native
-runtime must not read or invoke them.
+Those executable surfaces have been removed from the active repository. The
+native runtime must not recreate, read, or invoke them.

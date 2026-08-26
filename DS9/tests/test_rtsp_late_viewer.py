@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class MosaicLateViewerTests(unittest.TestCase):
     def test_ds9_uses_shm_au_transport_and_allocates_webrtc_slots_on_demand(self) -> None:
         pipeline_source = (
-            ROOT / "DS9" / "noesis" / "pipelines" / "ds8_pipeline.py"
+            ROOT / "DS9" / "noesis" / "pipelines" / "deepstream_pipeline.py"
         ).read_text(encoding="utf-8")
         runtime_source = (
             ROOT / "DS9" / "noesis" / "ds9_runtime_core.py"

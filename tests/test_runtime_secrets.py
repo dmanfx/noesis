@@ -10,7 +10,7 @@ from urllib.parse import urlunsplit
 import pytest
 import yaml
 
-from mapanything_config import ServiceConfig, load_service_config
+from noesis.config.mapanything import ServiceConfig, load_service_config
 from noesis_core.runtime_secrets import (
     RuntimeSecretError,
     load_camera_uri_registry,
@@ -229,14 +229,13 @@ def test_public_pipeline_and_provenance_never_serialize_camera_uri() -> None:
     assert "rtsp://<redacted>" in rendered_error
 
 
-def test_ds8_and_ds9_pipeline_components_do_not_receive_uri_secret(
+def test_canonical_pipeline_components_do_not_receive_uri_secret(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from noesis.pipelines import ds8_pipeline as ds8
-    from DS9.noesis.pipelines import ds8_pipeline as ds9
+    from noesis.pipelines import deepstream_pipeline as pipeline
 
-    monkeypatch.setenv("NOESIS_DS8_STUB_PIPELINE", "1")
+    monkeypatch.setenv("NOESIS_DS9_STUB_PIPELINE", "1")
     monkeypatch.setenv("NOESIS_BUILD_DIR", str(tmp_path / "build"))
     ds9_engine = tmp_path / "ds9.engine"
     ds9_engine.write_bytes(b"engine")
@@ -271,18 +270,17 @@ def test_ds8_and_ds9_pipeline_components_do_not_receive_uri_secret(
         ),
         encoding="utf-8",
     )
-    for module, path in (
-        (ds8, Path("config/infer.yaml")),
-        (ds9, ds9_config),
-    ):
-        module._PIPELINE_SINGLETON = None
-        graph = module.build_pipeline(path)
-        source_components = [
-            component
-            for component in graph.components.values()
-            if component.element == "nvurisrcbin"
-        ]
-        assert source_components
-        assert all("uri_secret" not in component.config for component in source_components)
-        assert all(str(component.config.get("uri") or "").startswith("rtsp") for component in source_components)
-        module._PIPELINE_SINGLETON = None
+    pipeline._PIPELINE_SINGLETON = None
+    graph = pipeline.build_pipeline(ds9_config)
+    source_components = [
+        component
+        for component in graph.components.values()
+        if component.element == "nvurisrcbin"
+    ]
+    assert source_components
+    assert all("uri_secret" not in component.config for component in source_components)
+    assert all(
+        str(component.config.get("uri") or "").startswith("rtsp")
+        for component in source_components
+    )
+    pipeline._PIPELINE_SINGLETON = None

@@ -12,7 +12,6 @@ from .base import ContractModel
 
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,63}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
-_IMAGE_ID_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _GIT_OID_RE = re.compile(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
 _TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
@@ -24,7 +23,6 @@ _MAX_SAFE_INTEGER = (1 << 53) - 1
 Identifier = Annotated[str, Field(pattern=_IDENTIFIER_RE.pattern)]
 Sha256 = Annotated[str, Field(pattern=_SHA256_RE.pattern)]
 GitOid = Annotated[str, Field(pattern=_GIT_OID_RE.pattern)]
-ImageId = Annotated[str, Field(pattern=_IMAGE_ID_RE.pattern)]
 SchemaVersion = Annotated[int, Field(strict=True, ge=1, le=1_000_000)]
 BaselineBytes = Annotated[int, Field(strict=True, ge=0, le=128 * 1024 * 1024)]
 BaselineFileCount = Annotated[int, Field(strict=True, ge=1, le=10_000_000)]
@@ -111,56 +109,18 @@ class ApplianceReadinessVersions(ContractModel):
     websocket_health_contract_version: Literal[2]
 
 
-class DS8RuntimeSelector(ContractModel):
-    family: Literal["ds8"]
-    pgie_profile: Literal[
-        "yolo11",
-        "yolo11_seg",
-        "yolo26",
-        "yolo26_seg",
-        "rfdetr",
-        "rfdetr_seg",
-        "wholebody49",
-    ]
-    model_size: Literal["n", "s", "m", "l", "x"]
-    tracking_mode: Literal["baseline", "v3dt"]
-
-    @model_validator(mode="after")
-    def _profile_size_is_approved(self) -> "DS8RuntimeSelector":
-        sizes = {
-            "yolo11": frozenset(("s", "m", "l")),
-            "yolo11_seg": frozenset(("s", "m", "l")),
-            "yolo26": frozenset(("n", "s", "m", "l", "x")),
-            "yolo26_seg": frozenset(("n", "s", "m")),
-            "rfdetr": frozenset(("n", "s", "m")),
-            "rfdetr_seg": frozenset(("n", "s", "m")),
-            "wholebody49": frozenset(("s", "x")),
-        }
-        if self.model_size not in sizes[self.pgie_profile]:
-            raise ValueError("PGIE profile/model size is not an approved DS8 pair")
-        return self
-
-    @property
-    def variant(self) -> str:
-        return (
-            f"ds8:{self.pgie_profile}:{self.model_size}:{self.tracking_mode}"
-        )
-
-
 class DS9RuntimeSelector(ContractModel):
     family: Literal["ds9"]
     lane: Literal["baseline", "v3dt", "wholebody49-s", "wholebody49-x"]
     supervisor_path: str
-    runtime_image_id: ImageId
-    build_image_id: ImageId
-    docker_root: str
+    native_root: str
     artifact_root: str
     runtime_root: str
     asset_realization_sha256: Sha256
     ownership_matrix_sha256: Sha256
 
     @field_validator(
-        "supervisor_path", "docker_root", "artifact_root", "runtime_root"
+        "supervisor_path", "native_root", "artifact_root", "runtime_root"
     )
     @classmethod
     def _paths_are_absolute(cls, value: str) -> str:
@@ -168,13 +128,13 @@ class DS9RuntimeSelector(ContractModel):
 
     @model_validator(mode="after")
     def _roots_are_disjoint(self) -> "DS9RuntimeSelector":
-        roots = (self.docker_root, self.artifact_root, self.runtime_root)
+        roots = (self.native_root, self.artifact_root, self.runtime_root)
         if any(
             _paths_overlap(left, right)
             for index, left in enumerate(roots)
             for right in roots[index + 1 :]
         ):
-            raise ValueError("DS9 Docker, artifact, and runtime roots must be disjoint")
+            raise ValueError("DS9 native, artifact, and runtime roots must be disjoint")
         return self
 
     @property
@@ -182,10 +142,7 @@ class DS9RuntimeSelector(ContractModel):
         return f"ds9:{self.lane}"
 
 
-RuntimeSelector = Annotated[
-    DS8RuntimeSelector | DS9RuntimeSelector,
-    Field(discriminator="family"),
-]
+RuntimeSelector = DS9RuntimeSelector
 
 
 class DeploymentSelector(ContractModel):
@@ -214,15 +171,14 @@ class DeploymentSelector(ContractModel):
             raise ValueError("Noesis checkout must use noesis-runtime-v1")
         if _paths_overlap(self.menon_checkout.root, self.noesis_checkout.root):
             raise ValueError("Menon and Noesis checkout roots must be disjoint")
-        if isinstance(self.runtime, DS9RuntimeSelector):
-            expected_supervisor = os.path.join(
-                self.noesis_checkout.root,
-                "DS9",
-                "scripts",
-                "run_canonical_runtime_container.py",
-            )
-            if self.runtime.supervisor_path != expected_supervisor:
-                raise ValueError("DS9 supervisor path is not the canonical runtime supervisor")
+        expected_supervisor = os.path.join(
+            self.noesis_checkout.root,
+            "DS9",
+            "scripts",
+            "run_canonical_runtime_host.py",
+        )
+        if self.runtime.supervisor_path != expected_supervisor:
+            raise ValueError("DS9 supervisor path is not the canonical native host supervisor")
         return self
 
 
@@ -270,7 +226,7 @@ class StateBaseline(ContractModel):
 
 
 class StateMigration(ContractModel):
-    mode: Literal["fresh", "clone", "migrate", "import_ds8"]
+    mode: Literal["fresh", "clone", "migrate"]
     tool_sha256: Sha256
     report_sha256: Sha256
 
@@ -336,7 +292,7 @@ class DeploymentHealth(ContractModel):
     deployment_id: Identifier
     selector_sha256: Sha256
     state_release_id: Identifier
-    runtime_family: Literal["ds8", "ds9"]
+    runtime_family: Literal["ds9"]
     runtime_variant: str = Field(min_length=1, max_length=128)
     instance_id: str = Field(min_length=1, max_length=160)
     run_id: str = Field(min_length=1, max_length=160)
@@ -365,7 +321,7 @@ class RuntimeDeploymentContext(ContractModel):
     deployment_id: Identifier
     selector_sha256: Sha256
     state_release_id: Identifier
-    runtime_family: Literal["ds8", "ds9"]
+    runtime_family: Literal["ds9"]
     runtime_variant: str = Field(min_length=1, max_length=128)
     boot_id: Identifier
     software_revision: GitOid
@@ -389,7 +345,7 @@ class WebSocketDeploymentHealth(ContractModel):
     deployment_id: Identifier
     selector_sha256: Sha256
     state_release_id: Identifier
-    runtime_family: Literal["ds8", "ds9"]
+    runtime_family: Literal["ds9"]
     runtime_variant: str = Field(min_length=1, max_length=128)
     instance_id: str = Field(min_length=1, max_length=160)
     run_id: str = Field(min_length=1, max_length=160)
@@ -416,7 +372,6 @@ __all__ = [
     "CheckoutBinding",
     "DeploymentHealth",
     "DeploymentSelector",
-    "DS8RuntimeSelector",
     "DS9RuntimeSelector",
     "StateBaseline",
     "StateBaselineBinding",

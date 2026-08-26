@@ -394,10 +394,11 @@ The DS8 generation introduced the Service Maker pipeline, GPU-first memory
 contract, MapAnything/DAv2 depth roles, StableID, canonical telemetry, BEV,
 WebRTC mosaic, and many shared services still used by DS9.1. DS8 itself is no
 longer executable authority. Its plans and decisions are retained under
-`docs/history/ds8/` and `plans/archive/ds8/` to explain the origin of those
+`docs/history/runtime/ds8/` and `plans/archive/ds8/` to explain the origin of those
 contracts.
 
 ## Earlier — DS7 and pre-Service-Maker application
 
-GI/GStreamer pad-probe and older runtime material is retained only under
-`docs/history/ds7/` and `plans/archive/legacy_prototypes/`.
+GI/GStreamer pad-probe and older local-only prototype material is retained in
+the checksummed supplemental archive indexed by
+`archive/manifests/supplemental_history_20260826.json`.

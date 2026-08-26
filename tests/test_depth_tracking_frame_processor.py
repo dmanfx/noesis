@@ -213,7 +213,7 @@ def _aligned_frame(
     )
 
 
-def test_aligned_depth_store_waits_for_exact_sibling_frame_before_lagged_fallback() -> None:
+def test_aligned_depth_store_bypasses_wait_before_lagged_fallback() -> None:
     hooks.reset_core_path_instrumentation()
     store = hooks._AlignedDepthFrameStore()  # type: ignore[attr-defined]
     lagged = _aligned_frame(source_id=0, frame_id=10, pts_us=100_000)
@@ -243,16 +243,15 @@ def test_aligned_depth_store_waits_for_exact_sibling_frame_before_lagged_fallbac
     thread.join(timeout=1.0)
 
     assert not thread.is_alive()
-    assert resolved == [(exact, 0, 0.0)]
+    assert resolved == [(lagged, 1, 33.333)]
     counters = hooks.get_core_path_instrumentation_snapshot()["counters"]
     assert counters["depth_bridge_put_total"] == 2
-    assert counters["depth_bridge_wait_total"] == 1
-    assert counters["depth_bridge_exact_resolve_total"] == 1
-    assert counters.get("depth_bridge_wait_timeout_total", 0) == 0
-    assert counters.get("depth_bridge_lagged_resolve_total", 0) == 0
+    assert counters["depth_bridge_wait_bypassed_total"] == 1
+    assert counters.get("depth_bridge_exact_resolve_total", 0) == 0
+    assert counters["depth_bridge_lagged_resolve_total"] == 1
 
 
-def test_aligned_depth_store_times_out_then_uses_bounded_prior_frame() -> None:
+def test_aligned_depth_store_bypasses_wait_then_uses_bounded_prior_frame() -> None:
     hooks.reset_core_path_instrumentation()
     store = hooks._AlignedDepthFrameStore()  # type: ignore[attr-defined]
     lagged = _aligned_frame(source_id=0, frame_id=10, pts_us=100_000)
@@ -270,8 +269,9 @@ def test_aligned_depth_store_times_out_then_uses_bounded_prior_frame() -> None:
     assert age_frames == 1
     assert age_ms == 33.333
     counters = hooks.get_core_path_instrumentation_snapshot()["counters"]
-    assert counters["depth_bridge_wait_total"] == 1
-    assert counters["depth_bridge_wait_timeout_total"] == 1
+    assert counters["depth_bridge_wait_bypassed_total"] == 1
+    assert counters.get("depth_bridge_wait_total", 0) == 0
+    assert counters.get("depth_bridge_wait_timeout_total", 0) == 0
     assert counters["depth_bridge_lagged_resolve_total"] == 1
     assert counters["depth_bridge_lagged_age_frames_total"] == 1
     assert counters["depth_bridge_lagged_age_us_total"] == 33_333
@@ -300,11 +300,11 @@ def test_aligned_depth_store_rejects_wrong_source_pts_and_age() -> None:
     assert counters.get("depth_bridge_lagged_resolve_total", 0) == 0
 
 
-def test_object_depth_rendezvous_wait_is_finite_and_hard_bounded(monkeypatch) -> None:
+def test_object_depth_rendezvous_wait_defaults_to_nonblocking_and_is_bounded(monkeypatch) -> None:
     processor = _fusion_processor(hooks._AlignedDepthFrameStore())  # type: ignore[attr-defined]
 
     monkeypatch.setenv("NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS", "inf")
-    assert processor._exact_frame_wait_ms() == 20.0  # type: ignore[attr-defined]
+    assert processor._exact_frame_wait_ms() == 0.0  # type: ignore[attr-defined]
     monkeypatch.setenv("NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS", "999999")
     assert processor._exact_frame_wait_ms() == 250.0  # type: ignore[attr-defined]
     monkeypatch.setenv("NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS", "-5")
@@ -328,7 +328,7 @@ def test_depth_tracking_captures_device_aligned_frame(monkeypatch) -> None:
 
     monkeypatch.setattr(hooks, "noesis_depth_tracking_tensor_ext", _NativeExt)
 
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(frame_meta)  # type: ignore[attr-defined]
 
     stored, age_frames, age_ms = processor.depth_store.resolve(  # type: ignore[attr-defined]
         source_id=0,
@@ -362,7 +362,7 @@ def test_depth_tracking_returns_none_when_native_ext_has_no_tensor(monkeypatch) 
 
     monkeypatch.setattr(hooks, "noesis_depth_tracking_tensor_ext", _NativeExt)
 
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(frame_meta)  # type: ignore[attr-defined]
 
     stored, _, _ = processor.depth_store.resolve(  # type: ignore[attr-defined]
         source_id=0,
@@ -398,7 +398,12 @@ def test_object_depth_fusion_copies_only_object_roi_from_device_frame(monkeypatc
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -412,7 +417,7 @@ def test_object_depth_fusion_copies_only_object_roi_from_device_frame(monkeypatc
     monkeypatch.setattr(hooks, "noesis_depth_meta_ext", native_ext)
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
     assert device_frame.roi_calls == [(10, 20, 30, 40)]
     assert len(attached) == 1
@@ -423,7 +428,7 @@ def test_object_depth_fusion_copies_only_object_roi_from_device_frame(monkeypatc
     assert payload["depth_median"] == 4.25
 
 
-def test_object_depth_fusion_skips_host_roi_copy_by_default(monkeypatch) -> None:
+def test_object_depth_fusion_uses_bounded_host_roi_when_native_stats_are_unavailable(monkeypatch) -> None:
     store = hooks._AlignedDepthFrameStore()  # type: ignore[attr-defined]
     device_frame = _DeviceDepthFrame(value=4.25, frame_w=1920, frame_h=1080)
     store.put(
@@ -447,7 +452,12 @@ def test_object_depth_fusion_skips_host_roi_copy_by_default(monkeypatch) -> None
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -462,14 +472,14 @@ def test_object_depth_fusion_skips_host_roi_copy_by_default(monkeypatch) -> None
     hooks.reset_core_path_instrumentation()
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
-    assert device_frame.roi_calls == []
+    assert device_frame.roi_calls == [(10, 20, 30, 40)]
     payload = json.loads(attached[0])
-    assert payload["status"] == "native_stats_unavailable"
+    assert payload["status"] == "ok"
     assert payload["sampling_mode"] == "instance_mask"
     counters = hooks.get_core_path_instrumentation_snapshot().get("counters", {})
-    assert int(counters.get("detection_wake.object_depth_host_roi_copy_skipped", 0)) == 1
+    assert int(counters.get("object_depth_gpu_roi_copies_total", 0)) == 1
 
 
 def test_object_depth_fusion_uses_native_mask_stats_when_available(monkeypatch) -> None:
@@ -496,7 +506,12 @@ def test_object_depth_fusion_uses_native_mask_stats_when_available(monkeypatch) 
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -511,12 +526,12 @@ def test_object_depth_fusion_uses_native_mask_stats_when_available(monkeypatch) 
     hooks.reset_core_path_instrumentation()
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
     assert device_frame.roi_calls == []
     assert device_frame.mask_stats_calls[0] == (10, 20, 30, 40, 4096)
     assert device_frame.mask_dtypes
-    assert all(dtype == np.dtype("uint8") for dtype in device_frame.mask_dtypes)
+    assert all(dtype == np.dtype("float32") for dtype in device_frame.mask_dtypes)
     assert len(attached) == 1
     payload = json.loads(attached[0])
     assert payload["status"] == "ok"
@@ -543,6 +558,7 @@ def test_object_depth_attach_false_is_observable(monkeypatch, caplog) -> None:
 
     with caplog.at_level("WARNING"):
         attached = processor._attach_object_depth_payload(  # type: ignore[attr-defined]
+            object(),
             _ObjMeta(),
             {"status": "ok"},
         )
@@ -578,14 +594,14 @@ def test_object_depth_fusion_prefers_combined_native_person_mask_stats(monkeypat
         )
     )
     processor = _fusion_processor(store)
-    monkeypatch.setattr(
-        processor,
-        "_mask_foot_uv",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("native foot_uv should be used")),
-    )
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -599,16 +615,16 @@ def test_object_depth_fusion_prefers_combined_native_person_mask_stats(monkeypat
     monkeypatch.setattr(hooks, "noesis_depth_meta_ext", native_ext)
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
     assert device_frame.roi_calls == []
     assert device_frame.mask_stats_calls == []
     assert device_frame.person_stats_calls == [(10, 20, 30, 40, 4096)]
-    assert device_frame.person_mask_dtypes == [np.dtype("uint8")]
+    assert device_frame.person_mask_dtypes == [np.dtype("float32")]
     payload = json.loads(attached[0])
     assert payload["status"] == "ok"
     assert payload["sampling_mode"] == "instance_mask"
-    assert payload["anchor_uv"] == [25.0, 59.0]
+    assert payload["anchor_uv"] == [24.0, 59.0]
     assert payload["anchor_source"] == "lower_body_band"
     assert payload["anchor_depth_m"] == 4.25
 
@@ -639,7 +655,12 @@ def test_object_depth_fusion_reuses_recent_cached_payload(monkeypatch) -> None:
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -654,8 +675,9 @@ def test_object_depth_fusion_reuses_recent_cached_payload(monkeypatch) -> None:
     hooks.reset_core_path_instrumentation()
 
     obj = _ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))
-    processor.handle_frame_ds8(_FrameMeta(object_items=[obj]))  # type: ignore[attr-defined]
-    processor.handle_frame_ds8(
+    processor.handle_servicemaker_frame(object(), _FrameMeta(object_items=[obj]))  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(
+        object(),
         _FrameMeta(
             frame_number=12,
             buf_pts=123556789000,
@@ -666,7 +688,7 @@ def test_object_depth_fusion_reuses_recent_cached_payload(monkeypatch) -> None:
     assert device_frame.roi_calls == []
     assert device_frame.person_stats_calls == [(10, 20, 30, 40, 4096)]
     cache_entry = processor._result_cache[(0, 7)]  # type: ignore[attr-defined]
-    assert isinstance(cache_entry.get("_payload_json"), str)
+    assert cache_entry.get("_payload_json") is None
     assert len(attached) == 2
     first = json.loads(attached[0])
     second = json.loads(attached[1])
@@ -705,7 +727,12 @@ def test_object_depth_fusion_uses_bbox_band_when_person_mask_is_missing(monkeypa
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -716,18 +743,19 @@ def test_object_depth_fusion_uses_bbox_band_when_person_mask_is_missing(monkeypa
     monkeypatch.setattr(hooks, "noesis_depth_meta_ext", native_ext)
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
-    assert device_frame.roi_calls == [(10, 40, 30, 20)]
+    assert device_frame.roi_calls == [(20, 50, 10, 10)]
     assert len(attached) == 1
     payload = json.loads(attached[0])
-    assert payload["status"] == "ok"
-    assert payload["sampling_mode"] == "bbox_band"
-    assert payload["sample_count"] == 600
+    assert payload["status"] == "no_ground_contact"
+    assert payload["sampling_mode"] == "bbox_core"
+    assert payload["sample_count"] == 100
     assert payload["depth_center"] == 5.5
     assert payload["depth_median"] == 5.5
-    assert payload["anchor_source"] == "lower_body_band"
-    assert payload["anchor_depth_m"] == 5.5
+    assert "anchor_source" not in payload
+    assert "anchor_depth_m" not in payload
+    assert payload["evidence_reason"] == "bbox_only_without_person_contact_support"
 
 
 def test_object_depth_fusion_uses_native_bbox_band_stats_when_available(monkeypatch) -> None:
@@ -754,7 +782,12 @@ def test_object_depth_fusion_uses_native_bbox_band_stats_when_available(monkeypa
     processor = _fusion_processor(store)
     attached: list[str] = []
 
-    def _attach(_obj_meta: Any, payload_json: str, _replace_existing: bool = True) -> bool:
+    def _attach(
+        _batch_meta: Any,
+        _obj_meta: Any,
+        payload_json: str,
+        _replace_existing: bool = True,
+    ) -> bool:
         attached.append(payload_json)
         return True
 
@@ -766,16 +799,17 @@ def test_object_depth_fusion_uses_native_bbox_band_stats_when_available(monkeypa
     hooks.reset_core_path_instrumentation()
 
     frame_meta = _FrameMeta(object_items=[_ObjMeta(rect_params=_Rect(left=10.0, top=20.0, width=30.0, height=40.0))])
-    processor.handle_frame_ds8(frame_meta)  # type: ignore[attr-defined]
+    processor.handle_servicemaker_frame(object(), frame_meta)  # type: ignore[attr-defined]
 
     assert device_frame.roi_calls == []
-    assert device_frame.stats_calls == [(10, 40, 30, 20, 4096)]
+    assert device_frame.stats_calls == [(20, 50, 10, 10, 4096)]
     assert len(attached) == 1
     payload = json.loads(attached[0])
-    assert payload["status"] == "ok"
-    assert payload["sampling_mode"] == "bbox_band_native"
-    assert payload["sample_count"] == 600
+    assert payload["status"] == "no_ground_contact"
+    assert payload["sampling_mode"] == "bbox_core_native"
+    assert payload["sample_count"] == 100
     assert payload["depth_median"] == 5.5
-    assert payload["anchor_source"] == "lower_body_band"
+    assert "anchor_source" not in payload
+    assert payload["evidence_reason"] == "bbox_only_without_person_contact_support"
     counters = hooks.get_core_path_instrumentation_snapshot().get("counters", {})
     assert int(counters.get("detection_wake.object_depth_native_stats", 0)) == 1

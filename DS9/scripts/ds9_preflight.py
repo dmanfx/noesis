@@ -282,7 +282,8 @@ def _python_modules_ok() -> bool:
         mod = importlib.import_module("pyds")
     except Exception as exc:
         _warn(
-            f"pyds unavailable in DS9 container ({exc}); DS9 path must rely on Service Maker/native extensions"
+            f"pyds unavailable in the native DS9.1 environment ({exc}); "
+            "the runtime must rely on Service Maker/native extensions"
         )
     else:
         _ok(f"pyds: {getattr(mod, '__file__', '<builtin>')}")

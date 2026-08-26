@@ -17,8 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _prepare_zeroplane_paths(zeroplane_repo: Path) -> None:
     repo = Path(zeroplane_repo).resolve()
     # ZeroPlane's DUSt3R dependency imports a top-level `models` namespace from
-    # croco. The Noesis repo also has models.py, so remove repo-root entries
-    # before adding ZeroPlane third-party paths.
+    # croco. Isolate its third-party namespace before adding ZeroPlane paths.
     sys.path[:] = [p for p in sys.path if p not in ("", str(REPO_ROOT))]
     sys.path[:0] = [
         str(repo / "third_party" / "dust3r" / "croco"),

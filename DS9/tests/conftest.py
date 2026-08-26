@@ -27,7 +27,7 @@ _MISSING = object()
 
 @pytest.fixture(autouse=True)
 def _isolate_native_extension_module_cache():  # type: ignore[no-untyped-def]
-    """Prevent one DS8/DS9 test from choosing another test's native origin."""
+    """Prevent native-extension cache state from leaking between test modules."""
 
     before = {
         name: sys.modules.get(name, _MISSING)

@@ -12,11 +12,11 @@ from typing import Any, Dict
 import numpy as np
 import pytest
 
-from noesis import ds8_runtime
+from noesis import ds9_runtime_core as runtime
 from noesis.pipelines import hooks
 from noesis.server import boundary_metrics
 from noesis.telemetry import publishers
-from websocket_server import WebSocketServer, _serialize_boundary_json
+from noesis.server.websocket import WebSocketServer, _serialize_boundary_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,14 +35,20 @@ def _import_runtime_env(extra_env: dict[str, str] | None = None) -> dict[str, st
     for name in THREAD_ENV_VARS + ("NOESIS_CPU_MATH_THREADS",):
         env.pop(name, None)
     env.update(extra_env or {})
-    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(REPO_ROOT / "DS9" / "native_extensions"),
+            str(REPO_ROOT / "DS9"),
+            str(REPO_ROOT),
+        )
+    )
 
     code = """
 import json
 import os
-from noesis import ds8_runtime
+from noesis import ds9_runtime as runtime
 
-print("CPU_CAPS_JSON=" + json.dumps({name: os.environ.get(name) for name in ds8_runtime._CPU_MATH_THREAD_ENV_VARS}, sort_keys=True))
+print("CPU_CAPS_JSON=" + json.dumps({name: os.environ.get(name) for name in runtime._CPU_MATH_THREAD_ENV_VARS}, sort_keys=True))
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -97,7 +103,7 @@ def test_zero_copy_stats_fields_present() -> None:
         include_budget=True,
     )
 
-    callback = ds8_runtime._build_stats_callback(  # type: ignore[attr-defined]
+    callback = runtime._build_stats_callback(  # type: ignore[attr-defined]
         _DummyPipeline(),
         {0: "cam0"},
         ws_metrics_getter=ws.get_boundary_serialization_metrics,
@@ -131,9 +137,9 @@ def test_ws_port_selection_fails_when_required_port_is_busy(monkeypatch) -> None
     def _fake_bindable(_host: str, port: int) -> bool:
         return bool(availability.get(int(port), False))
 
-    monkeypatch.setattr(ds8_runtime, "_port_bindable", _fake_bindable)
+    monkeypatch.setattr(runtime, "_port_bindable", _fake_bindable)
     with pytest.raises(RuntimeError, match="required WebSocket endpoint"):
-        ds8_runtime._select_ws_port(  # type: ignore[attr-defined]
+        runtime._select_ws_port(  # type: ignore[attr-defined]
             "127.0.0.1",
             6008,
             8,
@@ -142,35 +148,35 @@ def test_ws_port_selection_fails_when_required_port_is_busy(monkeypatch) -> None
 
 
 def test_rest_server_refuses_an_occupied_required_endpoint(monkeypatch) -> None:
-    monkeypatch.setattr(ds8_runtime, "_port_bindable", lambda _host, _port: False)
+    monkeypatch.setattr(runtime, "_port_bindable", lambda _host, _port: False)
     app = SimpleNamespace(
         state=SimpleNamespace(noesis_internal_auth={"mode": "required"})
     )
     with pytest.raises(RuntimeError, match="required REST endpoint"):
-        ds8_runtime._start_rest_server(app, "127.0.0.1", 8080)  # type: ignore[attr-defined]
+        runtime._start_rest_server(app, "127.0.0.1", 8080)  # type: ignore[attr-defined]
 
 
 def test_internal_control_defaults_are_loopback() -> None:
-    source = Path(ds8_runtime.__file__).read_text(encoding="utf-8")
+    source = Path(runtime.__file__).read_text(encoding="utf-8")
     assert 'os.environ.get("NOESIS_WS_HOST", "127.0.0.1")' in source
     assert 'os.environ.get("NOESIS_REST_HOST", "127.0.0.1")' in source
 
 
 def test_sigterm_uses_cleanup_path_with_bounded_watchdog() -> None:
-    source = Path(ds8_runtime.__file__).read_text(encoding="utf-8")
+    source = Path(runtime.__file__).read_text(encoding="utf-8")
     assert "signal.signal(signal.SIGTERM, _signal_handler)" in source
     assert "NOESIS_SHUTDOWN_GRACE_SECONDS" in source
     assert "signal.alarm(0)" in source
     assert "sigterm hard exit" not in source
 
 
-def test_ds8_runtime_caps_cpu_math_threads_before_numpy_import() -> None:
+def test_ds9_runtime_caps_cpu_math_threads_before_numpy_import() -> None:
     values = _import_runtime_env()
 
     assert values == {name: "1" for name in THREAD_ENV_VARS}
 
 
-def test_ds8_runtime_cpu_math_threads_override_preserves_explicit_pool_values() -> None:
+def test_ds9_runtime_cpu_math_threads_override_preserves_explicit_pool_values() -> None:
     values = _import_runtime_env(
         {
             "NOESIS_CPU_MATH_THREADS": "3",

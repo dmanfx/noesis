@@ -142,7 +142,7 @@ models:
     attach_tensor_meta: true
 
 tracker:
-  config-file: config/nvtracker.yaml
+  config-file: DS9/config/nvtracker.yaml
   ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
 
 analytics:

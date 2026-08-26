@@ -4,7 +4,6 @@ import copy
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from scripts import menon_bev_track_parity_smoke_test as gate
 
@@ -372,10 +371,8 @@ def test_registered_depth_oracle_rejects_invalid_status_and_used_mismatch() -> N
         assert summary["comparisons"] == 0
 
 
-def test_all_reviewed_runtime_configs_and_ownership_lock_camera_local_frame() -> None:
+def test_all_reviewed_runtime_configs_lock_camera_local_frame() -> None:
     for relative in (
-        "config/infer.yaml",
-        "config/infer_v3dt_baseline.yaml",
         "DS9/config/infer.yaml",
         "DS9/config/infer_v3dt.yaml",
     ):
@@ -385,16 +382,3 @@ def test_all_reviewed_runtime_configs_and_ownership_lock_camera_local_frame() ->
             frame_mode="camera_local",
             units="meters",
         )
-
-    ownership = yaml.safe_load(
-        (REPO_ROOT / "DS9/docs/runtime_ownership.yaml").read_text(encoding="utf-8")
-    )
-    capability = next(
-        row
-        for row in ownership["capabilities"]
-        if row["id"] == "config.local_bev_frame"
-    )
-    bindings = capability["evidence"]["repository_source"]
-    assert {
-        row["yaml_equals"]["bev.frame"] for row in bindings.values()
-    } == {"camera_local_ground_m"}

@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 import geometry.depth_publisher as depth_publisher
-from config import AppConfig
 from geometry.depth_publisher import (
     DepthDiagnosticsPublisher,
     DiagnosticsConfig,
     DiagnosticsConfigurationError,
+    DiagnosticsSettings,
     load_private_secret,
 )
 
@@ -42,21 +42,22 @@ def _config(**overrides: object) -> DiagnosticsConfig:
     return replace(base, **overrides)
 
 
-def test_source_config_contains_paths_not_plaintext_credentials() -> None:
-    settings = AppConfig().integrations
-    assert settings.ENABLE_OCCUPANCY_PUBLISH is False
-    assert settings.ENABLE_DEPTH_DIAGNOSTICS_MQTT is False
-    assert settings.ENABLE_DEPTH_DIAGNOSTICS_INFLUX is False
-    assert settings.MQTT_PASSWORD_FILE is None
-    assert settings.INFLUX_TOKEN_FILE is None
-    assert not hasattr(settings, "MQTT_PASSWORD")
-    assert not hasattr(settings, "INFLUX_TOKEN")
+def test_diagnostics_settings_are_disabled_and_contain_only_secret_paths() -> None:
+    settings = DiagnosticsSettings()
+    assert settings.mqtt_enabled is False
+    assert settings.influx_enabled is False
+    assert settings.mqtt_password_file is None
+    assert settings.influx_token_file is None
+    assert not hasattr(settings, "mqtt_password")
+    assert not hasattr(settings, "influx_token")
 
 
 def test_disabled_settings_do_not_open_configured_secret_paths(tmp_path: Path) -> None:
-    settings = AppConfig().integrations
-    settings.MQTT_PASSWORD_FILE = str(tmp_path / "does-not-exist")
-    settings.INFLUX_TOKEN_FILE = str(tmp_path / "also-does-not-exist")
+    settings = replace(
+        DiagnosticsSettings(),
+        mqtt_password_file=tmp_path / "does-not-exist",
+        influx_token_file=tmp_path / "also-does-not-exist",
+    )
     assert DepthDiagnosticsPublisher.from_settings(settings, environ={}) is None
 
 
@@ -152,9 +153,11 @@ def test_private_secret_rejects_ambiguous_content(
 def test_file_path_environment_overrides_are_explicit_but_plaintext_env_is_rejected(
     tmp_path: Path,
 ) -> None:
-    settings = AppConfig().integrations
-    settings.MQTT_PASSWORD_FILE = str(tmp_path / "settings-password")
-    settings.INFLUX_TOKEN_FILE = str(tmp_path / "settings-token")
+    settings = replace(
+        DiagnosticsSettings(),
+        mqtt_password_file=tmp_path / "settings-password",
+        influx_token_file=tmp_path / "settings-token",
+    )
     config = DiagnosticsConfig.from_settings(
         settings,
         environ={

@@ -141,6 +141,25 @@ def _secret_path(value: object) -> Path | None:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticsSettings:
+    """Public, disabled-by-default settings for optional diagnostic sinks."""
+
+    mqtt_enabled: bool = False
+    influx_enabled: bool = False
+    base_topic: str = "noesis/occupancy"
+    mqtt_host: str = "127.0.0.1"
+    mqtt_port: int = 1883
+    mqtt_username: str = "noesis"
+    mqtt_password_file: Path | None = None
+    mqtt_qos: int = 1
+    mqtt_retain: bool = True
+    influx_url: str = "http://127.0.0.1:8086"
+    influx_org: str = "Lambda"
+    influx_token_file: Path | None = None
+    influx_bucket: str = "noesis_raw"
+
+
+@dataclass(frozen=True, slots=True)
 class DiagnosticsConfig:
     mqtt_enabled: bool
     influx_enabled: bool
@@ -163,10 +182,11 @@ class DiagnosticsConfig:
     @classmethod
     def from_settings(
         cls,
-        settings: object,
+        settings: DiagnosticsSettings | None = None,
         *,
         environ: Mapping[str, str] | None = None,
     ) -> "DiagnosticsConfig":
+        configured = settings or DiagnosticsSettings()
         values = os.environ if environ is None else environ
         if "NOESIS_MQTT_PASSWORD" in values or "NOESIS_INFLUX_TOKEN" in values:
             raise DiagnosticsConfigurationError(
@@ -174,41 +194,41 @@ class DiagnosticsConfig:
             )
         mqtt_password_file = _secret_path(
             values.get("NOESIS_MQTT_PASSWORD_FILE")
-            or getattr(settings, "MQTT_PASSWORD_FILE", None)
+            or configured.mqtt_password_file
         )
         influx_token_file = _secret_path(
             values.get("NOESIS_INFLUX_TOKEN_FILE")
-            or getattr(settings, "INFLUX_TOKEN_FILE", None)
+            or configured.influx_token_file
         )
         return cls(
             mqtt_enabled=_setting_bool(
-                getattr(settings, "ENABLE_DEPTH_DIAGNOSTICS_MQTT", False),
-                name="ENABLE_DEPTH_DIAGNOSTICS_MQTT",
+                configured.mqtt_enabled,
+                name="mqtt_enabled",
             ),
             influx_enabled=_setting_bool(
-                getattr(settings, "ENABLE_DEPTH_DIAGNOSTICS_INFLUX", False),
-                name="ENABLE_DEPTH_DIAGNOSTICS_INFLUX",
+                configured.influx_enabled,
+                name="influx_enabled",
             ),
-            base_topic=str(getattr(settings, "BASE_TOPIC", "") or "").strip(),
-            mqtt_host=str(getattr(settings, "MQTT_HOST", "") or "").strip(),
+            base_topic=str(configured.base_topic or "").strip(),
+            mqtt_host=str(configured.mqtt_host or "").strip(),
             mqtt_port=_setting_int(
-                getattr(settings, "MQTT_PORT", 0) or 0,
-                name="MQTT_PORT",
+                configured.mqtt_port or 0,
+                name="mqtt_port",
             ),
-            mqtt_username=str(getattr(settings, "MQTT_USERNAME", "") or "").strip(),
+            mqtt_username=str(configured.mqtt_username or "").strip(),
             mqtt_password_file=mqtt_password_file,
             mqtt_qos=_setting_int(
-                getattr(settings, "MQTT_QOS", 0) or 0,
-                name="MQTT_QOS",
+                configured.mqtt_qos,
+                name="mqtt_qos",
             ),
             mqtt_retain=_setting_bool(
-                getattr(settings, "MQTT_RETAIN", False),
-                name="MQTT_RETAIN",
+                configured.mqtt_retain,
+                name="mqtt_retain",
             ),
-            influx_url=str(getattr(settings, "INFLUX_URL", "") or "").strip(),
-            influx_org=str(getattr(settings, "INFLUX_ORG", "") or "").strip(),
+            influx_url=str(configured.influx_url or "").strip(),
+            influx_org=str(configured.influx_org or "").strip(),
             influx_token_file=influx_token_file,
-            influx_bucket=str(getattr(settings, "INFLUX_BUCKET_RAW", "") or "").strip(),
+            influx_bucket=str(configured.influx_bucket or "").strip(),
         )
 
 
@@ -242,7 +262,7 @@ class DepthDiagnosticsPublisher:
     @classmethod
     def from_settings(
         cls,
-        settings: object,
+        settings: DiagnosticsSettings | None = None,
         *,
         environ: Mapping[str, str] | None = None,
         logger: Optional[logging.Logger] = None,
@@ -408,5 +428,6 @@ __all__ = [
     "DepthDiagnosticsPublisher",
     "DiagnosticsConfig",
     "DiagnosticsConfigurationError",
+    "DiagnosticsSettings",
     "load_private_secret",
 ]

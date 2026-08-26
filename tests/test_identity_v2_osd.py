@@ -93,7 +93,7 @@ def test_post_resolution_osd_uses_exact_decision_and_preserves_depth_fragment() 
             ("camera-a", 7, "12"): visitor,
         }
     )
-    processor.handle_frame_ds8(frame)
+    processor.handle_servicemaker_frame(frame)
     assert rows.iterations == 1
     assert rows.rows[0].text_params.display_text == "#1 Alice depth=2.37m 0.91"
     assert rows.rows[1].text_params.display_text == "#1000 0.82"
@@ -120,7 +120,7 @@ def test_post_resolution_osd_is_neutral_on_camera_frame_or_tracker_mismatch(
     )
     obj = _object(tracker_id, label="#999 z=1.20m 0.91")
     processor = _processor({("camera-a", 7, "11"): decision})
-    processor.handle_frame_ds8(
+    processor.handle_servicemaker_frame(
         SimpleNamespace(
             source_id=source_id,
             frame_number=frame_id,
@@ -170,15 +170,10 @@ def test_authoritative_attach_uses_verified_explicit_tiler_sink_api(
     assert kwargs == {"tips": "sink"}
 
 
-def test_ds8_v3dt_ds9_post_resolution_osd_parity_is_declared() -> None:
-    paths = (
-        ROOT / "noesis" / "pipelines" / "hooks.py",
-        ROOT / "noesis" / "pipelines" / "hooks_v3dt_reimpl.py",
-        ROOT / "DS9" / "noesis" / "pipelines" / "hooks.py",
-    )
-    for path in paths:
-        source = path.read_text(encoding="utf-8")
-        assert "attach_identity_v2_post_resolution_osd_hook(" in source
-        assert 'tips="sink"' in source
-        assert "IdentityV2PostResolutionOsdProcessor" in source
-        assert "_IdentityV2PostResolutionOsdOperator" in source
+def test_ds9_post_resolution_osd_attachment_is_declared() -> None:
+    path = ROOT / "DS9" / "noesis" / "pipelines" / "hooks.py"
+    source = path.read_text(encoding="utf-8")
+    assert "attach_identity_v2_post_resolution_osd_hook(" in source
+    assert 'tips="sink"' in source
+    assert "IdentityV2PostResolutionOsdProcessor" in source
+    assert "_IdentityV2PostResolutionOsdOperator" in source

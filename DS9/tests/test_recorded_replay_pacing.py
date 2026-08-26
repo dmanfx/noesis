@@ -18,7 +18,7 @@ def _load_pipeline_module():
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
-    path = ROOT / "DS9" / "noesis" / "pipelines" / "ds8_pipeline.py"
+    path = ROOT / "DS9" / "noesis" / "pipelines" / "deepstream_pipeline.py"
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

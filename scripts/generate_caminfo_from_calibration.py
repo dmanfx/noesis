@@ -16,7 +16,6 @@ from pathlib import Path
 # Paths relative to repo root
 REPO_ROOT = Path(__file__).parent.parent
 CAMERAS_YAML = REPO_ROOT / "config" / "cameras.yaml"
-INTRINSICS_JSON = REPO_ROOT / "intrinsics.json"
 CALIBRATION_JSON = REPO_ROOT / "config" / "camera_calibration.json"
 OUTPUT_DIR = REPO_ROOT / "config" / "camInfo"
 
@@ -27,9 +26,13 @@ def load_cameras():
     return data["cameras"]
 
 
-def load_intrinsics():
-    with open(INTRINSICS_JSON) as f:
-        return json.load(f)
+def load_intrinsics_models():
+    with open(CAMERAS_YAML) as f:
+        data = yaml.safe_load(f) or {}
+    models = data.get("intrinsics_models") or {}
+    if not isinstance(models, dict):
+        raise TypeError(f"{CAMERAS_YAML} intrinsics_models must be a mapping")
+    return models
 
 
 def load_calibration():
@@ -38,19 +41,31 @@ def load_calibration():
 
 
 def get_k_matrix(intrinsics_data: dict, model_name: str) -> np.ndarray:
-    """Get 3x3 K matrix for a camera model."""
-    # Handle naming variations between cameras.yaml and intrinsics.json
-    # cameras.yaml uses: unifi_g3_instant, unifi_g4_instant
-    # intrinsics.json uses: unifi_protect_g3_instant, unifi_protect_g4_instant
-    candidates = [
-        model_name,
-        f"unifi_protect_{model_name}",
-        model_name.replace("unifi_", "unifi_protect_"),
-    ]
-    for key in candidates:
-        if key in intrinsics_data:
-            return np.array(intrinsics_data[key]["intrinsics"]["K_matrix"], dtype=np.float64)
-    raise KeyError(f"Intrinsics model '{model_name}' not found. Available: {list(intrinsics_data.keys())}")
+    """Get a 3x3 K matrix from a canonical cameras.yaml model."""
+    entry = intrinsics_data.get(model_name)
+    if not isinstance(entry, dict):
+        raise KeyError(
+            f"Intrinsics model '{model_name}' not found. Available: {list(intrinsics_data.keys())}"
+        )
+    intrinsics = entry.get("intrinsics") or {}
+    if not isinstance(intrinsics, dict):
+        raise TypeError(f"Intrinsics model '{model_name}' has no intrinsics mapping")
+    matrix = intrinsics.get("K3x3") or entry.get("K3x3")
+    if isinstance(matrix, list):
+        values = np.asarray(matrix, dtype=np.float64)
+        if values.size == 9:
+            return values.reshape((3, 3))
+    try:
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Intrinsics model '{model_name}' has no valid K parameters") from exc
+    return np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
 
 
 def compute_projection_matrix(K: np.ndarray, E_col_major: list) -> np.ndarray:
@@ -93,7 +108,7 @@ def write_caminfo(camera_name: str, P: np.ndarray, output_dir: Path):
 
 def main():
     cameras = load_cameras()
-    intrinsics = load_intrinsics()
+    intrinsics = load_intrinsics_models()
     calibration = load_calibration()
     
     for cam_id, cam_info in cameras.items():
@@ -120,4 +135,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

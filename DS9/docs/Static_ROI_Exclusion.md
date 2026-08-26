@@ -15,11 +15,10 @@ removal and there is no legacy fallback.
 
 - Source: `DS9/csrc/nvdsroiexclude/`.
 - Runtime plugin: native DS9.1 artifact selected by the supervisor.
-- Pipeline wiring: `DS9/noesis/pipelines/ds8_pipeline.py` (legacy filename,
-  DS9-owned copy).
+- Pipeline wiring: `DS9/noesis/pipelines/deepstream_pipeline.py`.
 - Public config: `DS9/config/infer.yaml` `analytics.exclude`.
 - Runtime state/config: path selected by `NOESIS_ANALYTICS_EXCLUDE_CONFIG`.
-- REST persistence/reload: `DS9/noesis/server/analytics_api.py`.
+- REST persistence/reload: `noesis/server/analytics_api.py`.
 
 ## Polygon and removal semantics
 
@@ -50,4 +49,4 @@ After source/plugin changes:
 4. Use one short ROI reload smoke and confirm detections inside the edited
    polygon disappear before tracker counts.
 
-Do not install or load the archived root DS8 plugin.
+Do not install or load any plugin copy outside `DS9/gst-plugins/`.

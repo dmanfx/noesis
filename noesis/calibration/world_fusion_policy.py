@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 
 
 CONTRACT = "noesis.world_measurement_fusion_policy"
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 MAX_POLICY_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -91,7 +91,6 @@ class CameraWorldFusionProfile:
 @dataclass(frozen=True, slots=True)
 class WorldFusionPolicy:
     policy_id: str
-    runtime_lane: str
     evidence: Mapping[str, Any]
     cameras: Mapping[str, CameraWorldFusionProfile]
 
@@ -107,13 +106,9 @@ class WorldFusionPolicy:
 def load_world_fusion_policy(
     path: str | Path,
     *,
-    runtime_lane: str,
     active_camera_ids: Sequence[str],
     depth_registration: Any,
 ) -> WorldFusionPolicy:
-    lane = str(runtime_lane).strip().lower()
-    if lane not in {"ds8", "ds9"}:
-        raise WorldFusionPolicyError("runtime_lane must be ds8 or ds9")
     target = Path(path)
     try:
         size = target.stat().st_size
@@ -185,7 +180,7 @@ def load_world_fusion_policy(
             raw,
             {
                 "calibration_fingerprint_sha256",
-                "registration_ids",
+                "registration_id",
                 "floor_weight_scale",
                 "depth_weight_scale",
                 "floor_only_allowed",
@@ -194,13 +189,11 @@ def load_world_fusion_policy(
             },
             label=f"camera profile {camera_id}",
         )
-        registration_ids = raw.get("registration_ids")
-        if not isinstance(registration_ids, Mapping):
-            raise WorldFusionPolicyError(f"camera profile {camera_id} registration_ids must be an object")
-        _require_keys(registration_ids, {"ds8", "ds9"}, label=f"camera profile {camera_id} registration_ids")
-        registration_id = str(registration_ids.get(lane) or "").strip()
+        registration_id = str(raw.get("registration_id") or "").strip()
         if not registration_id.startswith(f"{camera_id}:"):
-            raise WorldFusionPolicyError(f"camera profile {camera_id} has invalid {lane} registration id")
+            raise WorldFusionPolicyError(
+                f"camera profile {camera_id} has an invalid DS9 registration id"
+            )
         calibration_sha = _require_sha256(
             raw.get("calibration_fingerprint_sha256"),
             label=f"camera profile {camera_id} calibration fingerprint",
@@ -264,7 +257,6 @@ def load_world_fusion_policy(
 
     return WorldFusionPolicy(
         policy_id=hashlib.sha256(_canonical_json(payload)).hexdigest(),
-        runtime_lane=lane,
         evidence=dict(evidence),
         cameras=profiles,
     )

@@ -1,6 +1,6 @@
 # Noesis documentation
 
-Status: current for the native DeepStream 9.1 application, 2026-08-15.
+Status: current for the native DeepStream 9.1 application, 2026-08-26.
 
 This directory separates current specifications from historical implementation
 records. If an archived document conflicts with a current document, the current
@@ -23,6 +23,7 @@ document and live source/config win.
 | WebSocket contract | [`api_contracts_ws.md`](api_contracts_ws.md) |
 | REST contract | [`api_contracts_rest.md`](api_contracts_rest.md) |
 | Metadata contracts | [`metadata_contracts.md`](metadata_contracts.md) |
+| Pose-assisted StableID behavior | [`pose_stable_id_integration.md`](pose_stable_id_integration.md) |
 | Architecture decisions | [`architecture_decisions.md`](architecture_decisions.md) |
 | Upgrade/change history | [`upgrade_history.md`](upgrade_history.md) |
 | Agent skill routing | [`../DS9/docs/deepstream_9_1_agent_skills.md`](../DS9/docs/deepstream_9_1_agent_skills.md) |
@@ -62,6 +63,19 @@ document and live source/config win.
 - [`Occupancy_Publishing.md`](Occupancy_Publishing.md) and
   [`Integrations_Playbook.md`](Integrations_Playbook.md): integrations.
 
+## Diagrams and operations
+
+- [`flow_diagram_high_level.md`](flow_diagram_high_level.md) and
+  [`flow_diagram_low_level.md`](flow_diagram_low_level.md): current application
+  and publication flows.
+- [`WebSocket_API.md`](WebSocket_API.md): concise operator-facing transport
+  reference; field-level authority remains
+  [`api_contracts_ws.md`](api_contracts_ws.md).
+- [`Cache_Clearing.md`](Cache_Clearing.md): targeted GStreamer registry and
+  TensorRT realization repair.
+- [`CONVENTIONS.md`](CONVENTIONS.md): repository commit, pull-request, and
+  release-note conventions.
+
 ## Runtime-specific DS9.1 docs
 
 Use [`../DS9/docs/README.md`](../DS9/docs/README.md) for model, native bridge,
@@ -80,12 +94,15 @@ canonical-world, BEV/capture, maintenance, and operator references.
 
 DeepStream 7/8, DeepStream 9.0, container-era DS9.1, completed upgrade plans,
 bridge audits, and experiment reports live under [`history/`](history/README.md),
-[`../DS9/docs/history/`](../DS9/docs/history/README.md), and
 [`../plans/archive/`](../plans/archive/README.md). They explain prior decisions
 but are not instructions for the current app.
 
 ## Documentation change log
 
+- **2026-08-26:** Consolidated runtime history under one root archive, moved
+  completed DS9 native-port work orders into the plans archive, retired active
+  DS8 visuals and nested archive policy files, and aligned current MV3DT status
+  with the accepted Kitchen/Family Room explicit opt-in.
 - **2026-08-25:** Replaced the active room-specific baseline localization
   policy with one universal, uncertainty-aware world measurement resolver;
   documented typed hypotheses, real compatible-source fusion, conservative

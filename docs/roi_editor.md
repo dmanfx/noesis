@@ -55,7 +55,6 @@ Run the UI-independent contract gates first:
 ```bash
 python3 -m pytest -q \
   tests/test_analytics_api.py \
-  tests/test_pipeline_build.py \
   tests/test_roi_reload_smoke_test.py \
   DS9/tests/test_nvdsroiexclude_plugin.py
 ```

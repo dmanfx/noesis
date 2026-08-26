@@ -31,9 +31,8 @@ When runtime identity behavior changes:
 5. inspect only the relevant identity counters and one resource snapshot.
 
 Use `DS9/scripts/ds9_identity_shadow_live_gate.py` directly when its required
-session/run identifiers are available. Do not route it through
-`ds9_live_validation_runner.py`; that broad runner still contains retired RTSP
-assumptions and is not the native baseline gate.
+session/run identifiers are available. It is the focused native identity gate;
+there is no broad release-validation wrapper in the active repository.
 
 Cross-camera and open-set flags are meaningful only when the observed scene
 actually contains those events. A liveness run without truth labels cannot

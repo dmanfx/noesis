@@ -272,7 +272,7 @@ def _spawn_runtime(
 ) -> subprocess.Popen[str]:
     cmd = [
         sys.executable,
-        "noesis/ds8_runtime.py",
+        "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
         str(pipeline_config),
         "--cameras-config",
@@ -288,7 +288,7 @@ def _spawn_runtime(
     synthetic_state_dir: Optional[Path] = None
     if stub:
         synthetic_state_dir = _configure_synthetic_runtime_environment(env)
-        env["NOESIS_DS8_STUB_PIPELINE"] = "1"
+        env["NOESIS_DS9_STUB_PIPELINE"] = "1"
         env["NOESIS_MOSAIC_RTSP_ENABLED"] = "0"
         env["NOESIS_MOSAIC_WEBRTC_ENABLED"] = "0"
         cmd.extend(["--storage-base", str(synthetic_state_dir / "depth")])
@@ -441,7 +441,9 @@ def _parse_args() -> argparse.Namespace:
         description="Zero-copy stats smoke test (WS contract + thresholds)"
     )
     p.add_argument(
-        "--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml"
+        "--pipeline-config",
+        type=Path,
+        default=REPO_ROOT / "DS9" / "config" / "infer.yaml",
     )
     p.add_argument(
         "--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml"

@@ -3,7 +3,7 @@ name: CPU contracts
 on:
   pull_request:
   push:
-    branches: [Devel, main]
+    branches: [DS9]
 
 permissions:
   contents: read

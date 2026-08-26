@@ -477,7 +477,7 @@ def test_rfdetr_matched_rows_bypass_yolo_pose_budget_and_attach_fail_closed(
         frame_number=1,
         buf_pts=1_000_000,
     )
-    processor.handle_frame_ds8(object(), frame)
+    processor.handle_servicemaker_frame(object(), frame)
     assert [row[1].object_id for row in attached] == [41, 42]
 
     monkeypatch.setattr(
@@ -486,7 +486,7 @@ def test_rfdetr_matched_rows_bypass_yolo_pose_budget_and_attach_fail_closed(
         SimpleNamespace(attach_pose_features=lambda *args: False),
     )
     with pytest.raises(RuntimeError, match="native metadata attach returned false"):
-        processor.handle_frame_ds8(object(), frame)
+        processor.handle_servicemaker_frame(object(), frame)
 
 
 def test_native_source_uses_frame_tensor_meta_and_strict_mutual_match() -> None:

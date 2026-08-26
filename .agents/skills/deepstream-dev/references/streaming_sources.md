@@ -91,7 +91,7 @@ h264parse -> qtmux -> filesink      output.mp4
 
 ## Local Files
 
-**When to use**: Video files already available inside the container or on a mounted host path.
+**When to use**: Video files already available on the native host.
 No HTTP server is required.
 
 Convert plain filesystem paths to `file://` URIs before passing them to `nvurisrcbin`:
@@ -104,7 +104,6 @@ p.add("nvurisrcbin", "src", {"uri": uri, "gpu-id": 0})
 ```
 
 **Notes**:
-- Containerized apps must mount the host directory containing the video file.
 - For MP4/MOV/MKV files, `nvurisrcbin` handles demuxing internally.
 - If the user explicitly needs parser-level control for raw elementary streams such as `.h264`
   or `.h265`, use the manual parser patterns in [use_cases_pipelines.md](use_cases_pipelines.md).
@@ -164,8 +163,8 @@ p.add("nvurisrcbin", "src", {"uri": "http://host:8080/stream.m3u8", "gpu-id": 0}
 GStreamer's `hlsdemux` (from `gstreamer1.0-plugins-bad`) is selected automatically from the
 URI. Output remains `video/x-raw(memory:NVMM)`; everything downstream is unchanged.
 
-**Container package requirement**: `gstreamer1.0-plugins-bad` must be installed. See
-[docker_containers.md](docker_containers.md).
+**Native package requirement**: `gstreamer1.0-plugins-bad` must be installed. See
+[native_host_setup.md](native_host_setup.md).
 
 **Known limitations**:
 
@@ -313,7 +312,7 @@ variants:
 When a platform or CDN offers multiple encodings, prefer H.264 or H.265 for the widest DeepStream
 compatibility. Avoid adding decoder plugin-rank overrides in source examples; keep decoder
 selection and troubleshooting guidance in [gstreamer_plugins.md](gstreamer_plugins.md) and
-[docker_containers.md](docker_containers.md).
+[native_host_setup.md](native_host_setup.md).
 
 ---
 
@@ -450,19 +449,19 @@ ffmpeg -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" \
 
 ---
 
-## Docker and Container Notes
+## Native-host setup notes
 
-For Docker image selection, pyservicemaker installation, GPU runtime flags, codec package
-installation, environment variables, and common container failures, use
-[docker_containers.md](docker_containers.md).
+For pyservicemaker installation, runtime environment variables, and codec
+packages, use [native_host_setup.md](native_host_setup.md).
 
-Source-specific container notes:
+Source-specific host notes:
 
 - HLS requires `gstreamer1.0-plugins-bad` for `hlsdemux`.
 - DASH requires the GStreamer DASH demuxer; install `gstreamer1.0-plugins-bad` if it is missing.
-- HTTP MP4 inputs may require the codec packages covered in `docker_containers.md` if the
-  source includes audio or codecs stripped from the base image.
-- Install pyservicemaker with the wildcard wheel path documented in `docker_containers.md`:
+- HTTP MP4 inputs may require the codec packages covered in
+  `native_host_setup.md` if the source includes audio or an optional codec.
+- Install pyservicemaker with the wildcard wheel path documented in
+  `native_host_setup.md`:
   `/opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl`.
 
 ---

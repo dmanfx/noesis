@@ -66,7 +66,7 @@ def test_closed_gate_drops_late_depth_and_analytics_callbacks() -> None:
         sensor_id_map={},
         publication_gate=gate,
     )
-    processor.handle_frame_ds8(_PoisonFrame())
+    processor.handle_servicemaker_frame(_PoisonFrame())
 
     receipt = gate.snapshot()
     assert receipt.admitted == receipt.completed == 0

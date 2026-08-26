@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "strategy": "external-manifest",
+  "captured_utc": "2026-08-26T05:27:05Z",
+  "parent_repository_head": "e83851634e087ea74424bc7f4b418aacc04539c8",
+  "archive_root_env": "NOESIS_WORKSPACE_PRESERVATION_ROOT",
+  "dependencies": [
+    {
+      "path": "external/DeepStream-Yolo-Seg",
+      "origin": "https://github.com/marcoslucianops/DeepStream-Yolo-Seg",
+      "commit": "a8ec7eccd1e57829c95f9ed1283176787df7f09f",
+      "branch": "master",
+      "upstream": "origin/master",
+      "parent_registration": "external checkout; not a submodule or tracked tree",
+      "working_tree": {
+        "state": "dirty source plus generated native build outputs",
+        "tracked_modified": [
+          "utils/export_rfdetr_seg.py"
+        ],
+        "untracked_source_preserved": [
+          "nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo11.cpp",
+          "utils/labels.txt"
+        ],
+        "generated_build_outputs_excluded": [
+          "nvdsinfer_custom_impl_Yolo_seg/libnvdsinfer_custom_impl_Yolo_seg.so",
+          "nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.o",
+          "nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo11.o",
+          "nvdsinfer_custom_impl_Yolo_seg/trt_plugins/common.o",
+          "nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSInference.o",
+          "nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSPlugin.o",
+          "nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignKernel.o",
+          "nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignPlugin.o"
+        ]
+      },
+      "preservation": {
+        "archive_relative_path": "2026-08-26/third_party/deepstream_yolo_seg_local_source_a8ec7eccd1e5_20260826.tar.gz",
+        "archive_sha256": "c7eafbbd678b4ada0abbd5021579ebce0ba2f50a0633811b85e3e5e43f3a5856",
+        "archive_size_bytes": 10858,
+        "patch_relative_path": "2026-08-26/third_party/deepstream_yolo_seg_export_rfdetr_seg_a8ec7eccd1e5_20260826.patch",
+        "patch_sha256": "133854bbcf26382e605e381c17d9caa8043c0102f92785953fe5e39d6a703a1a",
+        "patch_size_bytes": 8518,
+        "validation": "The patch applied to the base commit and reproduced the captured working-tree file byte-for-byte; the archive was extracted and every included member digest was verified."
+      }
+    },
+    {
+      "path": "external/Depth-Anything-3",
+      "origin": "https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+      "commit": "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4",
+      "branch": null,
+      "upstream": null,
+      "parent_registration": "external checkout; not a submodule or tracked tree",
+      "working_tree": {
+        "state": "clean detached HEAD"
+      }
+    },
+    {
+      "path": "external/map-anything",
+      "origin": "https://github.com/facebookresearch/map-anything",
+      "commit": "d445200988e5079a0251f21cb78239fb85804947",
+      "branch": "main",
+      "upstream": "origin/main",
+      "parent_registration": "external checkout; not a submodule or tracked tree",
+      "working_tree": {
+        "state": "tracked source clean; generated metadata untracked",
+        "generated_outputs_excluded": [
+          "mapanything.egg-info/"
+        ]
+      }
+    },
+    {
+      "path": "src/mapanything",
+      "origin": "https://github.com/facebookresearch/map-anything.git",
+      "commit": "fde8425513178bb4f89fba9828193e6be3ece248",
+      "branch": "main",
+      "upstream": "origin/main",
+      "parent_registration": "external checkout; not a submodule or tracked tree",
+      "working_tree": {
+        "state": "clean"
+      }
+    }
+  ]
+}

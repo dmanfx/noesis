@@ -44,8 +44,8 @@ rotation so both sides use the same value.
   references where the application controls serialization.
 - The browser never receives the internal token. Menon exchanges authenticated
   browser sessions/tickets for loopback Noesis access.
-- Legacy `config.py` inline values have no authority and must not be copied into
-  DS9.1 config.
+- The retired root `config.py` has been removed. Do not reintroduce a parallel
+  settings authority or copy historical inline values into DS9.1 config.
 
 Use focused secret and native-supervisor tests after changing this boundary; do
 not stage a release merely to validate a private-file parser.

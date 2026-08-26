@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis.calibration.manager import (
     CalibrationManager,
     create_calibration_manager,
@@ -60,11 +60,7 @@ def _default_mapanything_refresh_url() -> str:
     host = os.environ.get("NOESIS_DEPTH_REST_HOST", "127.0.0.1").strip() or "127.0.0.1"
     if host in {"0.0.0.0", "::"}:
         host = "127.0.0.1"
-    port = (
-        os.environ.get("NOESIS_DEPTH_REST_PORT")
-        or os.environ.get("NOESIS_DS8_REST_PORT")
-        or "8082"
-    )
+    port = os.environ.get("NOESIS_DEPTH_REST_PORT") or "8082"
     return f"http://{host}:{port}/api/v1/depth/refresh"
 
 
@@ -237,7 +233,7 @@ def _apply_dewarper_transform(frame_bgr: np.ndarray, transform: DewarperFrameTra
     source_k = np.asarray(transform.source_intrinsics, dtype=np.float64).copy()
     # The checked-in dewarper configs are authored for the camera stream
     # resolution. If OpenCV gives us a different source size, scale only the
-    # source camera matrix; the DS8 dewarper output size/intrinsics stay fixed.
+    # source camera matrix; the authored dewarper output size/intrinsics stay fixed.
     authored_w, authored_h = int(transform.output_size[0]), int(transform.output_size[1])
     if image_w > 0 and image_h > 0 and (image_w, image_h) != (authored_w, authored_h):
         sx = float(image_w) / float(authored_w)
@@ -362,14 +358,14 @@ def _trigger_mapanything_refresh(refresh_url: str, *, seconds: int, timeout_s: f
             body = response.read().decode("utf-8")
     except Exception as exc:
         raise VirtualTwinBuildError(
-            f"failed to trigger DS8 MapAnything refresh at {request_url}: {exc}"
+            f"failed to trigger MapAnything refresh at {request_url}: {exc}"
         ) from exc
     if status < 200 or status >= 300:
-        raise VirtualTwinBuildError(f"DS8 MapAnything refresh returned HTTP {status}: {body[:240]}")
+        raise VirtualTwinBuildError(f"MapAnything refresh returned HTTP {status}: {body[:240]}")
     try:
         payload = json.loads(body) if body.strip() else {}
     except json.JSONDecodeError as exc:
-        raise VirtualTwinBuildError(f"DS8 MapAnything refresh returned non-JSON payload: {body[:240]}") from exc
+        raise VirtualTwinBuildError(f"MapAnything refresh returned non-JSON payload: {body[:240]}") from exc
     return payload if isinstance(payload, dict) else {"payload": payload}
 
 
@@ -398,7 +394,7 @@ def _wait_for_mapanything_snapshot(
         time.sleep(0.25)
     detail = f" last load error: {last_error}" if last_error else ""
     raise VirtualTwinBuildError(
-        f"timed out waiting for fresh DS8 MapAnything snapshot for {camera_id} "
+        f"timed out waiting for a fresh MapAnything snapshot for {camera_id} "
         f"under {depth_base} newer than {min_ts_us}.{detail}"
     )
 
@@ -653,7 +649,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 f"--no-mapanything-refresh requested, but no usable persisted MapAnything snapshot exists "
                 f"for {args.camera} under {depth_base}"
             )
-        LOGGER.info("using existing DS8 MapAnything snapshot %s", baseline_snapshot.path)
+        LOGGER.info("using existing MapAnything snapshot %s", baseline_snapshot.path)
 
     if args.zeroplane_precomputed_dir:
         zeroplane = PrecomputedZeroPlaneAdapter(Path(args.zeroplane_precomputed_dir))
@@ -699,7 +695,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
             refresh_payloads.append(refresh_payload)
             LOGGER.info(
-                "triggered DS8 MapAnything refresh for keyframe %s (%ss via %s)",
+                "triggered MapAnything refresh for keyframe %s (%ss via %s)",
                 frame_id,
                 int(args.mapanything_refresh_seconds),
                 args.mapanything_refresh_url,
@@ -745,7 +741,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
         LOGGER.info(
-            "captured keyframe %s with %d ZeroPlane plane candidates and DS8 MapAnything coverage %.3f from %s",
+            "captured keyframe %s with %d ZeroPlane plane candidates and MapAnything coverage %.3f from %s",
             frame_id,
             len(zp_frame.planes),
             coverage,
@@ -762,7 +758,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         revision_id=revision_id,
         camera_label=args.camera,
         mapanything_refs={
-            "source": "ds8_pipeline_depth_snapshots",
+            "source": "canonical_pipeline_depth_snapshots",
             "depth_base": str(depth_base),
             "refresh_url": None if args.no_mapanything_refresh else str(args.mapanything_refresh_url),
             "refresh_seconds": None if args.no_mapanything_refresh else int(args.mapanything_refresh_seconds),
@@ -802,7 +798,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build an offline MapAnything+ZeroPlane virtual-twin reconstruction")
     parser.add_argument("--camera", default="living-room")
-    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml")
+    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "DS9" / "config" / "infer.yaml")
     parser.add_argument("--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml")
     parser.add_argument("--alignment-config", type=Path, default=REPO_ROOT / "config" / "ply_alignment.json")
     parser.add_argument(
@@ -830,7 +826,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-mapanything-refresh",
         action="store_true",
-        help="Use the latest existing DS8 MapAnything Zarr snapshot instead of triggering /api/v1/depth/refresh.",
+        help="Use the latest existing MapAnything Zarr snapshot instead of triggering /api/v1/depth/refresh.",
     )
     parser.add_argument("--zeroplane-repo", type=Path, default=REPO_ROOT / "external" / "ZeroPlane")
     parser.add_argument("--zeroplane-config", type=Path, default=REPO_ROOT / "external" / "ZeroPlane" / "configs" / "ZeroPlaneNYUV2" / "dust3r_large_dpt_bs16_50ep.yaml")

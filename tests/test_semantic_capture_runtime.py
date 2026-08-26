@@ -6,10 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from semantic_capture_runtime.manager import SemanticCaptureManager
+from noesis.semantic_capture.manager import SemanticCaptureManager
 
 
 def _fake_runner(command: list[str], **_kwargs: object) -> SimpleNamespace:
+    assert command[command.index("-m") + 1] == "noesis.semantic_capture.main"
     output = Path(command[command.index("--output-dir") + 1])
     rows: list[dict[str, object]] = []
     for source_id, (room, stem) in enumerate(

@@ -2,7 +2,7 @@
 """Run fixture-based Noesis/Menon validation checks.
 
 This is the offline/fixture entrypoint for the shared validation toolbox. It is
-intentionally lightweight and GPU-free; DS8 runtime and Menon live validators can
+intentionally lightweight and GPU-free; DS9.1 runtime and Menon live validators can
 feed the same JSON report schema as they are added.
 """
 

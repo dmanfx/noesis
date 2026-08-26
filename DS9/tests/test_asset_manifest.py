@@ -39,33 +39,42 @@ class AssetManifestTests(unittest.TestCase):
             sum(result["state_counts"].values()), result["artifact_count"]
         )
 
-    def test_runtime_image_authority_is_separate_and_layered_on_build_image(self) -> None:
-        build_image = self.manifest["target"]["build_image"]
-        runtime_image = self.manifest["runtime"]["image"]
+    def test_native_host_and_runtime_authorities_are_exact(self) -> None:
+        self.assertEqual(
+            self.manifest["target"]["native_host"],
+            validator.NATIVE_HOST_AUTHORITY,
+        )
+        for key, value in validator.NATIVE_RUNTIME_AUTHORITY.items():
+            self.assertEqual(self.manifest["runtime"][key], value)
 
-        self.assertEqual(runtime_image, validator.RUNTIME_IMAGE_AUTHORITY)
-        self.assertEqual(runtime_image["parent_reference"], build_image["reference"])
-        self.assertEqual(runtime_image["parent_image_id"], build_image["image_id"])
-        self.assertNotEqual(runtime_image["reference"], build_image["reference"])
-        self.assertNotEqual(runtime_image["image_id"], build_image["image_id"])
-        dockerfile = REPO_ROOT / runtime_image["dockerfile"]
-        self.assertEqual(validator._hash_file(dockerfile), runtime_image["dockerfile_sha256"])
-
-    def test_runtime_image_authority_drift_is_rejected(self) -> None:
+    def test_native_host_authority_drift_is_rejected(self) -> None:
         for key, value in (
-            ("image_id", "sha256:" + "0" * 64),
-            ("parent_image_id", "sha256:" + "1" * 64),
-            ("dockerfile_sha256", "2" * 64),
+            ("driver_minimum", "0.0.0"),
+            ("gstreamer", "0.0"),
+            ("native_root_env", "UNREVIEWED_ROOT"),
         ):
             with self.subTest(key=key):
                 manifest = copy.deepcopy(self.manifest)
-                manifest["runtime"]["image"][key] = value
+                manifest["target"]["native_host"][key] = value
                 result = validator.validate_manifest(manifest)
                 self.assertFalse(result["ok"])
                 self.assertTrue(
-                    any("runtime.image" in error for error in result["errors"]),
+                    any("target.native_host" in error for error in result["errors"]),
                     result["errors"],
                 )
+
+    def test_validator_has_no_retired_transition_chain(self) -> None:
+        source = (
+            REPO_ROOT / "DS9/scripts/validate_asset_manifest.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("LEGACY_ENGINE_RECEIPT_PLATFORM", source)
+        for retired in (
+            "_validate_manifest_rebase_chain",
+            "_validate_source_contract_rebase_chain",
+            "_mapanything_transition_committed_edge",
+            "runtime_image_authority",
+        ):
+            self.assertNotIn(retired, source)
 
     def test_canonical_file_gate_reports_missing_artifacts(self) -> None:
         result = validator.validate_manifest(self.manifest, check_files=True, profile="canonical")

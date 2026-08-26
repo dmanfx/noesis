@@ -19,9 +19,11 @@
 # Local:  sop-inference-bp/docker/Docker.build
 ################################################################################
 
-# Stage 1: Extract DeepStream headers from any deepstream 8.0+ image
+# Stage 1: Extract DeepStream headers from an explicitly reviewed DS9.1 image.
+# The caller must pass --build-arg DEEPSTREAM_DEV_IMAGE=<immutable reference>.
 ARG BASE_IMAGE="nvcr.io/nvidia/blueprint/vss-engine:2.4.1"
-FROM nvcr.io/nvidia/deepstream:9.0-triton-multiarch AS ds_dev
+ARG DEEPSTREAM_DEV_IMAGE
+FROM ${DEEPSTREAM_DEV_IMAGE} AS ds_dev
 
 # Stage 2: Build on VSS engine base (includes vLLM, PyTorch, DeepStream Python SDK)
 ARG BASE_IMAGE

@@ -17,10 +17,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DS8_PLUGIN_ROOT = ROOT / "gst-plugins"
-DS9_PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
-DS8_SOURCE = DS8_PLUGIN_ROOT / "noesiseos" / "gstnoesiseos.cpp"
-DS9_SOURCE = DS9_PLUGIN_ROOT / "noesiseos" / "gstnoesiseos.cpp"
+PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
+SOURCE = PLUGIN_ROOT / "noesiseos" / "gstnoesiseos.cpp"
 RTSP_RE = re.compile(r"rtsps?://[^\s'\"<>]+", re.IGNORECASE)
 
 
@@ -33,7 +31,7 @@ def _load_ds9_pipeline_builder():
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
-    path = ROOT / "DS9" / "noesis" / "pipelines" / "ds8_pipeline.py"
+    path = ROOT / "DS9" / "noesis" / "pipelines" / "deepstream_pipeline.py"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load DS9 pipeline builder: {path}")
@@ -45,7 +43,7 @@ def _load_ds9_pipeline_builder():
 
 class EosPluginSourceTests(unittest.TestCase):
     def test_source_is_zero_copy_and_uses_standard_downstream_eos(self) -> None:
-        source = DS8_SOURCE.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("gst_event_new_eos()", source)
         self.assertIn(
@@ -74,23 +72,14 @@ class EosPluginSourceTests(unittest.TestCase):
         self.assertNotIn("gst_buffer_map", source)
         self.assertNotIn("gst_buffer_make_writable", source)
 
-    def test_ds8_and_ds9_sources_are_owned_mirrors(self) -> None:
-        self.assertFalse(DS8_SOURCE.is_symlink())
-        self.assertFalse(DS9_SOURCE.is_symlink())
-        self.assertEqual(DS8_SOURCE.read_bytes(), DS9_SOURCE.read_bytes())
-
-        ds8_cmake = (DS8_SOURCE.parent / "CMakeLists.txt").read_text(encoding="utf-8")
-        ds9_cmake = (DS9_SOURCE.parent / "CMakeLists.txt").read_text(encoding="utf-8")
-        self.assertIn('NOESIS_DEEPSTREAM_MAJOR="8"', ds8_cmake)
-        self.assertNotIn('NOESIS_DEEPSTREAM_MAJOR="9"', ds8_cmake)
+    def test_source_and_build_are_owned_by_ds91(self) -> None:
+        self.assertFalse(SOURCE.is_symlink())
+        ds9_cmake = (SOURCE.parent / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn('NOESIS_DEEPSTREAM_MAJOR="9"', ds9_cmake)
         self.assertNotIn('NOESIS_DEEPSTREAM_MAJOR="8"', ds9_cmake)
 
     def test_every_declared_runtime_valve_forwards_sticky_eos(self) -> None:
-        for relative in (
-            Path("noesis/pipelines/ds8_pipeline.py"),
-            Path("DS9/noesis/pipelines/ds8_pipeline.py"),
-        ):
+        for relative in (Path("DS9/noesis/pipelines/deepstream_pipeline.py"),):
             with self.subTest(path=relative):
                 tree = ast.parse(
                     (ROOT / relative).read_text(encoding="utf-8"),
@@ -192,7 +181,7 @@ class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "NOESIS_DS8_STUB_PIPELINE": "1",
+                "NOESIS_DS9_STUB_PIPELINE": "1",
                 "NOESIS_BUILD_DIR": str(root / "build"),
                 "NOESIS_MOSAIC_RTSP_ENABLED": "0",
                 "NOESIS_MOSAIC_WEBRTC_ENABLED": "0",
@@ -261,7 +250,7 @@ class EosPluginRuntimeTests(unittest.TestCase):
         program: str,
         *,
         timeout: float,
-        plugin_root: Path = DS8_PLUGIN_ROOT,
+        plugin_root: Path = PLUGIN_ROOT,
     ) -> tuple[int, str, bool]:
         self._plugin_binary(plugin_root)
         with tempfile.TemporaryDirectory(prefix="noesis-eos-process-") as raw:
@@ -308,31 +297,29 @@ class EosPluginRuntimeTests(unittest.TestCase):
             if line.startswith("{") and line.endswith("}")
         ]
 
-    def test_ds8_and_ds9_binaries_register_owned_uint_contracts(self) -> None:
-        for major, plugin_root in ((8, DS8_PLUGIN_ROOT), (9, DS9_PLUGIN_ROOT)):
-            binary = self._plugin_binary(plugin_root)
-            with self.subTest(major=major):
-                with tempfile.TemporaryDirectory(prefix="noesis-eos-inspect-") as raw:
-                    result = subprocess.run(
-                        ["gst-inspect-1.0", "noesiseos"],
-                        cwd=ROOT,
-                        env=self._env(plugin_root, Path(raw)),
-                        text=True,
-                        capture_output=True,
-                        timeout=30,
-                        check=False,
-                    )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    _safe_output(result.stdout + result.stderr),
-                )
-                self.assertIn(str(binary), result.stdout)
-                self.assertIn(f"orderly EOS control bridge (DS{major})", result.stdout)
-                self.assertIn("request-sequence", result.stdout)
-                self.assertIn("accepted-sequence", result.stdout)
-                self.assertIn("last-request-ok", result.stdout)
-                self.assertIn("Unsigned Integer. Range: 0 - 4294967295", result.stdout)
+    def test_binary_registers_owned_uint_contracts(self) -> None:
+        binary = self._plugin_binary(PLUGIN_ROOT)
+        with tempfile.TemporaryDirectory(prefix="noesis-eos-inspect-") as raw:
+            result = subprocess.run(
+                ["gst-inspect-1.0", "noesiseos"],
+                cwd=ROOT,
+                env=self._env(PLUGIN_ROOT, Path(raw)),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            result.returncode,
+            0,
+            _safe_output(result.stdout + result.stderr),
+        )
+        self.assertIn(str(binary), result.stdout)
+        self.assertIn("orderly EOS control bridge (DS9)", result.stdout)
+        self.assertIn("request-sequence", result.stdout)
+        self.assertIn("accepted-sequence", result.stdout)
+        self.assertIn("last-request-ok", result.stdout)
+        self.assertIn("Unsigned Integer. Range: 0 - 4294967295", result.stdout)
 
     def test_monotonic_request_emits_exactly_one_eos_and_acknowledges_it(self) -> None:
         program = textwrap.dedent(

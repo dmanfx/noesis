@@ -103,7 +103,7 @@ def validate_reid_swin_nvinfer_properties(props: Mapping[str, Any]) -> None:
 
 
 def validate_reid_swin_model_config(model_cfg: Mapping[str, Any]) -> None:
-    """Validate the SDK-neutral YAML contract consumed by DS8 and DS9."""
+    """Validate the SDK-neutral YAML contract consumed by DS9.1."""
 
     label = "models.reid TAO Swin-Tiny profile"
     expected: Mapping[str, Any] = {

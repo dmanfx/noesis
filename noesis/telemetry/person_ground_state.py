@@ -339,7 +339,7 @@ class PersonGroundState:
     idle_jitter_m: float = 0.0
 
     # Physical-admission diagnostics.  These describe the current measurement,
-    # not the filtered output, and are intentionally shared by DS8 and DS9.
+    # not the filtered output, and are shared across DS9.1 tracking modes.
     measurement_accepted: bool = True
     measurement_rejection_reason: Optional[str] = None
     measurement_innovation_m: float = 0.0

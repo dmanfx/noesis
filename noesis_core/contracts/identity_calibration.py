@@ -1009,7 +1009,7 @@ class IdentityAuthorityCutoverArtifact(ContractModel):
     contract_version: Literal[1]
     approved_at_us: TimestampUs
     approved_by: str = Field(min_length=1, max_length=200)
-    runtime: Literal["ds8", "ds9"]
+    runtime: Literal["ds9"]
     model_sha256: Sha256
     model_layer: str = Field(min_length=1, max_length=200)
     embedding_dim: int = Field(ge=1)

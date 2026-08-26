@@ -14,7 +14,7 @@ from noesis.server.boundary_metrics import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Noesis DS8 ReID API")
+app = FastAPI(title="Noesis DS9 ReID API")
 app.router.route_class = BoundaryMetricsRoute
 
 _MANAGER_GETTER: Optional[Callable[[], Any]] = None

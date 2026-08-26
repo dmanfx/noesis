@@ -67,7 +67,7 @@ for field in (
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_v3dt_canonical_bbox3d_world_is_preserved_and_baseline_mode_is_unchanged() -> None:
+def test_v3dt_and_baseline_preseeded_world_fail_closed_without_calibration() -> None:
     code = r'''
 import sys
 from pathlib import Path
@@ -93,9 +93,12 @@ v3dt = {
     "world_source": "bbox3d",
 }
 processor._augment_track_with_world(0, "living-room", v3dt)
-assert v3dt["world"] == [1.0, 2.0, 3.0]
-assert v3dt["world_source"] == "bbox3d"
-assert v3dt["world_frame"] == "backend_world_m"
+assert "world" not in v3dt
+assert "world_source" not in v3dt
+assert "world_frame" not in v3dt
+assert v3dt["world_valid"] is False
+assert v3dt["world_quality"] == "invalid"
+assert v3dt["world_quality_reason"] == "calibration_unavailable"
 
 processor._tracking_mode = "baseline"
 baseline = {
@@ -105,8 +108,12 @@ baseline = {
     "world_source": "pose_floor_only",
 }
 processor._augment_track_with_world(0, "living-room", baseline)
-assert baseline["world"] == [4.0, 5.0, 6.0]
-assert baseline["world_source"] == "pose_floor_only"
+assert "world" not in baseline
+assert "world_source" not in baseline
+assert "world_frame" not in baseline
+assert baseline["world_valid"] is False
+assert baseline["world_quality"] == "invalid"
+assert baseline["world_quality_reason"] == "calibration_unavailable"
 '''
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(

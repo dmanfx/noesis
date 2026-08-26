@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from calibration_bundle import load_alignment, load_extrinsics, pose_to_E_col_major
+from noesis.calibration.bundle import load_alignment, load_extrinsics, pose_to_E_col_major
 
 
 def _camera_names_from_yaml(path: Path) -> List[str]:

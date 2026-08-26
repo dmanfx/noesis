@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Noesis
 // SPDX-License-Identifier: MIT
 //
-// DeepStream 8 custom parser for YOLO26-Seg (fused output0 only).
+// DeepStream 9.1 custom parser for YOLO26-Seg (fused output0 only).
 //
 // Expected output tensor layout per detection row:
 //   [x1, y1, x2, y2, score, class_id, mask_flattened...]

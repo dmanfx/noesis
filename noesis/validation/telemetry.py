@@ -106,7 +106,7 @@ def _timestamp_seconds(payload: Mapping[str, Any], fallback_s: float, *, ts_defa
         value = _safe_float(payload.get("timestamp"))
     if value is None:
         return float(fallback_s)
-    # DS8 BEV contracts use microseconds for `ts`; epoch milliseconds and
+    # Canonical BEV contracts use microseconds for `ts`; epoch milliseconds and
     # nanoseconds also show up in diagnostics. Prefer magnitude over guessing.
     if value > 1e17:
         return float(value / 1e9)
@@ -252,7 +252,7 @@ def validate_tracking_contract(
             failure_type=None if tracking_messages else FailureType.INFRASTRUCTURE,
             metric={"tracking_message_count": len(tracking_messages), "raw_message_count": samples.raw_message_count},
             detail="Tracking messages were observed." if tracking_messages else "No tracking messages were observed.",
-            suggested_next_diagnostic=None if tracking_messages else "Capture DS8 WebSocket telemetry while the runtime is active.",
+            suggested_next_diagnostic=None if tracking_messages else "Capture DS9.1 WebSocket telemetry while the runtime is active.",
         )
     )
     world_valid_tracks = 0

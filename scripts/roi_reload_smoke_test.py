@@ -711,7 +711,7 @@ def _spawn_runtime(
 ) -> subprocess.Popen[bytes]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "noesis" / "ds8_runtime.py"),
+        str(REPO_ROOT / "DS9" / "noesis" / "ds9_runtime.py"),
         "--pipeline-config",
         str(args.pipeline_config),
         "--cameras-config",
@@ -1017,7 +1017,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rest", default="http://127.0.0.1:8080", help="REST base URL"
     )
-    parser.add_argument("--pipeline-config", type=Path, default=Path("config/infer.yaml"))
+    parser.add_argument(
+        "--pipeline-config", type=Path, default=Path("DS9/config/infer.yaml")
+    )
     parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
     parser.add_argument("--no-spawn", action="store_true", help="Attach to an existing runtime")
     parser.add_argument(

@@ -306,14 +306,14 @@ def _authority_cutover_env(
         "contract_version": 1,
         "approved_at_us": 3,
         "approved_by": "test-owner",
-        "runtime": "ds8",
+        "runtime": "ds9",
         "model_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
         "model_layer": config["models"]["reid"]["layer"],
         "embedding_dim": config["models"]["reid"]["embedding_dim"],
         "model_semantic_profile_sha256": semantic_profile_sha256,
         "scoring_artifact_sha256": scoring_artifact_sha256,
         "authority_runtime_profile_sha256": (
-            identity_authority_runtime_profile_sha256(runtime="ds8")
+            identity_authority_runtime_profile_sha256(runtime="ds9")
         ),
         "camera_topology_sha256": hashlib.sha256(topology.read_bytes()).hexdigest(),
         "camera_ids": ["camera-a", "camera-b"],
@@ -351,7 +351,7 @@ def _authority_cutover_env(
 def test_authority_cutover_rejects_duplicate_selector_keys(tmp_path) -> None:
     artifact = tmp_path / "authority-cutover.json"
     artifact.write_text(
-        '{"runtime":"ds9","runtime":"ds8"}',
+        '{"runtime":"ds9","runtime":"ds9"}',
         encoding="utf-8",
     )
     artifact.chmod(0o600)
@@ -370,7 +370,7 @@ def test_authority_cutover_rejects_duplicate_selector_keys(tmp_path) -> None:
                 ),
             },
             repo_root=tmp_path,
-            runtime="ds8",
+            runtime="ds9",
             model_fingerprint="a" * 64,
             model_layer="features",
             embedding_dim=4,
@@ -839,7 +839,7 @@ def test_authoritative_requires_loaded_transform_and_separate_cutover_evidence(
 
     gate_path = tmp_path / "authority-cutover.json"
     gate_payload = json.loads(gate_path.read_text(encoding="utf-8"))
-    gate_payload["runtime"] = "ds9"
+    gate_payload["runtime"] = "ds8"
     gate_path.write_text(json.dumps(gate_payload), encoding="utf-8")
     runtime_mismatch_env = {
         **calibrated,
@@ -848,7 +848,7 @@ def test_authoritative_requires_loaded_transform_and_separate_cutover_evidence(
             gate_path.read_bytes()
         ).hexdigest(),
     }
-    with pytest.raises(IdentityV2ConfigurationError, match="runtime does not match"):
+    with pytest.raises(IdentityV2ConfigurationError, match="contract is invalid"):
         create_identity_v2_service(
             pipeline_config=config,
             pipeline_yaml_path=pipeline_yaml,
@@ -1253,6 +1253,8 @@ def test_authoritative_evidence_rejection_remains_unknown_through_world_adapter(
                 "world": [1.0, 0.0, 2.0],
                 "world_valid": True,
                 "world_frame": "backend_world_m",
+                "world_frame_revision": "identity-v2-test-v1",
+                "world_transform_sha256": "d" * 64,
                 "world_quality": "good",
                 "world_source": "identity-v2-test",
             }
@@ -1277,7 +1279,7 @@ def test_authoritative_evidence_rejection_remains_unknown_through_world_adapter(
         assert primitive.diagnostic_track["display_name"] is None
         assert primitive.diagnostic_track["identity_v2"]["state"] == "unknown"
         producer = ProducerRef(
-            runtime="ds8",
+            runtime="ds9",
             instance_id="identity-v2-test",
             run_id=service.run_id,
             software_revision="test",

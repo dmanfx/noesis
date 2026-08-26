@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://noesis.local/schemas/ds9-asset-manifest-v2.json",
-  "title": "Noesis DS9 artifact manifest",
+  "$id": "https://noesis.local/schemas/ds9-native-asset-manifest-v3.json",
+  "title": "Noesis native DS9.1 artifact manifest",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,13 +17,14 @@
     "packaging_boundary"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "manifest_id": {"type": "string", "minLength": 1},
     "schema": {"const": "DS9/docs/asset_manifest.schema.json"},
     "updated_at": {"type": "string", "format": "date"},
     "target": {
       "type": "object",
-      "required": ["platform", "python", "deepstream", "cuda", "tensorrt", "build_image"],
+      "additionalProperties": false,
+      "required": ["platform", "python", "deepstream", "cuda", "tensorrt", "native_host"],
       "properties": {
         "platform": {"type": "string"},
         "python": {"const": "3.12"},
@@ -38,20 +39,18 @@
         },
         "cuda": {"const": "13.2"},
         "tensorrt": {"const": "10.16.0.72"},
-        "build_image": {
+        "native_host": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["reference", "image_id", "base_digest", "tensorrt_version", "cuda_version", "dockerfile", "dockerfile_sha256", "requirements", "requirements_sha256"],
+          "required": ["operating_system", "architecture", "driver_minimum", "gstreamer", "sdk_root", "cuda_root", "native_root_env"],
           "properties": {
-            "reference": {"const": "noesis-ds9-dev:9.1-20260812"},
-            "image_id": {"const": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"},
-            "base_digest": {"const": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"},
-            "tensorrt_version": {"const": "10.16.0.72"},
-            "cuda_version": {"const": "13.2.0.046"},
-            "dockerfile": {"const": "DS9/docker/Dockerfile"},
-            "dockerfile_sha256": {"const": "9f5f63a18c41256e06cab5514dcb6c5b47d290b8ea06a172490026776c56f01a"},
-            "requirements": {"const": "DS9/docker/requirements.lock.txt"},
-            "requirements_sha256": {"const": "de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48"}
+            "operating_system": {"const": "ubuntu-24.04"},
+            "architecture": {"const": "x86_64"},
+            "driver_minimum": {"const": "595.58.03"},
+            "gstreamer": {"const": "1.24.2"},
+            "sdk_root": {"const": "/opt/nvidia/deepstream/deepstream-9.1"},
+            "cuda_root": {"const": "/usr/local/cuda-13.2"},
+            "native_root_env": {"const": "NOESIS_DS91_NATIVE_ROOT"}
           }
         }
       }
@@ -60,7 +59,10 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "image",
+        "backend",
+        "supervisor",
+        "artifact_root_env",
+        "runtime_root_env",
         "entrypoint",
         "implementation",
         "pipeline_config",
@@ -73,32 +75,10 @@
         "scene_release_api"
       ],
       "properties": {
-        "image": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "reference",
-            "image_id",
-            "parent_reference",
-            "parent_image_id",
-            "base_digest",
-            "tensorrt_version",
-            "cuda_version",
-            "dockerfile",
-            "dockerfile_sha256"
-          ],
-          "properties": {
-            "reference": {"const": "noesis-ds9-runtime:9.1-20260812"},
-            "image_id": {"const": "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e"},
-            "parent_reference": {"const": "noesis-ds9-dev:9.1-20260812"},
-            "parent_image_id": {"const": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"},
-            "base_digest": {"const": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"},
-            "tensorrt_version": {"const": "10.16.0.72"},
-            "cuda_version": {"const": "13.2.0.046"},
-            "dockerfile": {"const": "DS9/docker/Dockerfile.runtime"},
-            "dockerfile_sha256": {"const": "4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133"}
-          }
-        },
+        "backend": {"const": "native_host"},
+        "supervisor": {"const": "DS9/scripts/run_canonical_runtime_host.py"},
+        "artifact_root_env": {"const": "NOESIS_DS9_ARTIFACT_ROOT"},
+        "runtime_root_env": {"const": "NOESIS_DS9_RUNTIME_ROOT"},
         "entrypoint": {"const": "DS9/noesis/ds9_runtime.py"},
         "implementation": {"const": "DS9/noesis/ds9_runtime_core.py"},
         "pipeline_config": {"const": "DS9/config/infer.yaml"},

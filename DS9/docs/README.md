@@ -1,6 +1,6 @@
 # DS9.1 documentation index
 
-Status: native-host baseline, 2026-08-15.
+Status: native-host baseline, updated 2026-08-26.
 
 ## Current operational docs
 
@@ -41,7 +41,7 @@ AMC remains deferred.
 
 ## History
 
-[`history/README.md`](history/README.md) indexes the DS8 migration copies,
-DS9.0/container deployment material, completed 9.1 upgrade plans, bridge audits,
-and model experiments. Those files are evidence only and must not be used as
-current run/build instructions.
+[`../../docs/history/README.md`](../../docs/history/README.md) is the single
+documentation-history index. Completed migration work orders are indexed by
+[`../../plans/archive/README.md`](../../plans/archive/README.md). Those files
+are evidence only and must not be used as current run/build instructions.

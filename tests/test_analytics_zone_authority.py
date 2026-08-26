@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from noesis.pipelines import hooks, hooks_v3dt_reimpl
+from noesis.pipelines import hooks
 from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
 from noesis_core.contracts.base import Matrix3, Vector3
 from noesis_core.contracts.identity import IdentityKind, SubjectRef
@@ -81,10 +81,10 @@ def _rect() -> SimpleNamespace:
     return SimpleNamespace(left=10.0, top=20.0, width=30.0, height=40.0)
 
 
-@pytest.mark.parametrize("module", [hooks, hooks_v3dt_reimpl])
 def test_servicemaker_adapter_uses_oc_membership_before_roi_compatibility(
-    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(hooks, "noesis_analytics_meta_ext", None)
     analytics = SimpleNamespace(
         dirStatus="",
         lcStatus=[],
@@ -100,7 +100,7 @@ def test_servicemaker_adapter_uses_oc_membership_before_roi_compatibility(
         nvdsanalytics_obj_items=[analytics],
     )
 
-    track = _processor(module)._build_track_dict_ds8(obj, "kitchen")
+    track = _processor(hooks)._build_track_dict_servicemaker(obj, "kitchen")
 
     assert track is not None
     assert track["zone"] == "Kitchen"
@@ -108,10 +108,7 @@ def test_servicemaker_adapter_uses_oc_membership_before_roi_compatibility(
     assert track["zone_authoritative"] is True
 
 
-@pytest.mark.parametrize("module", [hooks, hooks_v3dt_reimpl])
-def test_pyds_adapter_rejects_ambiguous_oc_membership_without_roi_fallback(
-    module: Any,
-) -> None:
+def test_pyds_adapter_rejects_ambiguous_oc_membership_without_roi_fallback() -> None:
     analytics = SimpleNamespace(
         dirStatus="",
         lcStatus=[],
@@ -133,7 +130,7 @@ def test_pyds_adapter_rejects_ambiguous_oc_membership_without_roi_fallback(
         obj_user_meta_list=[user_meta],
     )
 
-    track = _processor(module)._build_track_dict(obj, "kitchen")
+    track = _processor(hooks)._build_track_dict(obj, "kitchen")
 
     assert track is not None
     assert "zone" not in track
@@ -166,7 +163,7 @@ obj = SimpleNamespace(
     rect_params=SimpleNamespace(left=10.0, top=20.0, width=30.0, height=40.0),
     nvdsanalytics_obj_items=[analytics],
 )
-track = processor._build_track_dict_ds8(obj, "family-room")
+track = processor._build_track_dict_servicemaker(obj, "family-room")
 assert track["zone"] == "FamilyRoom"
 assert track["zone_source"] == "nvdsanalytics_roi"
 assert track["zone_authoritative"] is True

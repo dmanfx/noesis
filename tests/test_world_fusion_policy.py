@@ -18,25 +18,16 @@ POLICY_PATH = REPO_ROOT / "config" / "world_measurement_fusion_policy.json"
 CAMERAS = ("living-room", "kitchen", "family-room")
 
 
-@pytest.mark.parametrize(
-    ("lane", "registration_path"),
-    (
-        ("ds8", REPO_ROOT / "config" / "depth_registration.json"),
-        ("ds9", REPO_ROOT / "DS9" / "config" / "depth_registration.json"),
-    ),
-)
-def test_canonical_world_fusion_policy_binds_each_runtime_lane(
-    lane: str,
-    registration_path: Path,
-) -> None:
+def test_diagnostic_world_fusion_policy_binds_ds9_registration() -> None:
     policy = load_world_fusion_policy(
         POLICY_PATH,
-        runtime_lane=lane,
         active_camera_ids=CAMERAS,
-        depth_registration=DepthRegistrationManager.load(registration_path),
+        depth_registration=DepthRegistrationManager.load(
+            REPO_ROOT / "DS9" / "config" / "depth_registration.json"
+        ),
     )
     assert len(policy.policy_id) == 64
-    assert CONTRACT_VERSION == 2
+    assert CONTRACT_VERSION == 3
     assert policy.evidence["range_capture_id"] == "alignment-walk-20260719T1733Z-recovered"
     assert {profile.floor_ray_max_range_m for profile in policy.cameras.values()} == {22.0}
     assert policy.profile("family-room").floor_weight_scale == 1.0
@@ -61,24 +52,22 @@ def test_world_fusion_policy_rejects_camera_set_drift(tmp_path: Path) -> None:
     with pytest.raises(WorldFusionPolicyError, match="camera set"):
         load_world_fusion_policy(
             _write_policy(tmp_path, payload),
-            runtime_lane="ds8",
             active_camera_ids=CAMERAS,
             depth_registration=DepthRegistrationManager.load(
-                REPO_ROOT / "config" / "depth_registration.json"
+                REPO_ROOT / "DS9" / "config" / "depth_registration.json"
             ),
         )
 
 
 def test_world_fusion_policy_rejects_registration_binding_drift(tmp_path: Path) -> None:
     payload = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
-    payload["cameras"]["family-room"]["registration_ids"]["ds8"] = "family-room:wrong"
+    payload["cameras"]["family-room"]["registration_id"] = "family-room:wrong"
     with pytest.raises(WorldFusionPolicyError, match="registration binding mismatch"):
         load_world_fusion_policy(
             _write_policy(tmp_path, payload),
-            runtime_lane="ds8",
             active_camera_ids=CAMERAS,
             depth_registration=DepthRegistrationManager.load(
-                REPO_ROOT / "config" / "depth_registration.json"
+                REPO_ROOT / "DS9" / "config" / "depth_registration.json"
             ),
         )
 
@@ -101,10 +90,9 @@ def test_world_fusion_policy_rejects_invalid_scales(
     with pytest.raises(WorldFusionPolicyError, match=message):
         load_world_fusion_policy(
             _write_policy(tmp_path, payload),
-            runtime_lane="ds8",
             active_camera_ids=CAMERAS,
             depth_registration=DepthRegistrationManager.load(
-                REPO_ROOT / "config" / "depth_registration.json"
+                REPO_ROOT / "DS9" / "config" / "depth_registration.json"
             ),
         )
 
@@ -129,17 +117,17 @@ def test_world_fusion_policy_rejects_invalid_floor_ray_range(
     with pytest.raises(WorldFusionPolicyError, match=message):
         load_world_fusion_policy(
             _write_policy(tmp_path, payload),
-            runtime_lane="ds8",
             active_camera_ids=CAMERAS,
             depth_registration=DepthRegistrationManager.load(
-                REPO_ROOT / "config" / "depth_registration.json"
+                REPO_ROOT / "DS9" / "config" / "depth_registration.json"
             ),
         )
 
 
-def test_ds8_ds9_policy_parsers_remain_byte_identical() -> None:
+def test_world_fusion_policy_has_one_shared_owner() -> None:
     assert (
         REPO_ROOT / "noesis" / "calibration" / "world_fusion_policy.py"
-    ).read_bytes() == (
+    ).is_file()
+    assert not (
         REPO_ROOT / "DS9" / "noesis" / "calibration" / "world_fusion_policy.py"
-    ).read_bytes()
+    ).exists()

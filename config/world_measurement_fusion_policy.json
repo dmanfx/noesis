@@ -1,6 +1,6 @@
 {
   "contract": "noesis.world_measurement_fusion_policy",
-  "contract_version": 2,
+  "contract_version": 3,
   "evidence": {
     "capture_id": "alignment-walk-20260718T210307Z",
     "telemetry_sha256": "ba7e32a0a227cc1377c7bd73d98805331c2f410e9d5694fe321ea29e112e7a1a",
@@ -11,10 +11,7 @@
   "cameras": {
     "family-room": {
       "calibration_fingerprint_sha256": "ee22aa6b6367aabf31944d53e0a8edc13e8dfe2a06f589b23bc8e522f71d0bc6",
-      "registration_ids": {
-        "ds8": "family-room:68e5e712bd81",
-        "ds9": "family-room:00b4146829372956cb11a0506c214c5b76364a5ba9c3128c901b28116ccf9843"
-      },
+      "registration_id": "family-room:0b3a6cbc77e1214670ddf3f07205f8173047570d9a3121f6bd8c7e6104429bbb",
       "floor_weight_scale": 1.0,
       "depth_weight_scale": 0.0,
       "floor_only_allowed": true,
@@ -29,10 +26,7 @@
     },
     "kitchen": {
       "calibration_fingerprint_sha256": "16654dd3b282a3a574bdf9a7299f5671804c4dab97276934627252a86182850e",
-      "registration_ids": {
-        "ds8": "kitchen:b9ae7732a485",
-        "ds9": "kitchen:824a05b74372b5b9e181f0f64595266a2ecd1eb50898e8c192dfb977f2debfd7"
-      },
+      "registration_id": "kitchen:29271c108ae19727b2735688a377f5eb53fbd660a84b335204b87e5ae60bc0da",
       "floor_weight_scale": 0.0,
       "depth_weight_scale": 1.0,
       "floor_only_allowed": false,
@@ -47,10 +41,7 @@
     },
     "living-room": {
       "calibration_fingerprint_sha256": "2e6253444412b292a6c41061be530e4db218d2128b6093c1ccbf9bf2886d102c",
-      "registration_ids": {
-        "ds8": "living-room:47fd1c0efd10",
-        "ds9": "living-room:a5e6c1244e357c27407c5852752ba9775898017c408ffa8db6579e36e2e3b530"
-      },
+      "registration_id": "living-room:f5278810a82a50e75962c2aa8902ed6790c3f2ca00d1d6384246801c33d9a55c",
       "floor_weight_scale": 1.0,
       "depth_weight_scale": 1.0,
       "floor_only_allowed": false,

@@ -10,15 +10,13 @@ import stat
 import subprocess
 from threading import RLock
 import time
-from typing import Any, Callable, Mapping, TypeVar
+from typing import Any, Callable, Literal, Mapping, TypeVar
 
 from pydantic import ValidationError
 
 from noesis_core.contracts.appliance import (
     DeploymentHealth,
     DeploymentSelector,
-    DS8RuntimeSelector,
-    DS9RuntimeSelector,
     RuntimeDeploymentContext,
     StateBaseline,
     StateRelease,
@@ -39,11 +37,6 @@ _T = TypeVar("_T")
 
 NOESIS_RUNTIME_DIRECTORY_ROOTS = (
     "config",
-    "pipelines",
-    "gst-plugins",
-    "native_extensions",
-    "artifacts/native",
-    "plugins",
     "external/ds_preprocess_shim",
     "data/scene_priors",
     "data/scene_fusions",
@@ -808,11 +801,13 @@ class DeploymentHealthBinding:
         deployment_id: str,
         selector_sha256: str,
         state_release_id: str,
-        runtime_family: str,
+        runtime_family: Literal["ds9"],
         runtime_variant: str,
         software_revision: str,
         boot_id: str,
     ) -> None:
+        if runtime_family != "ds9":
+            _fail("appliance health runtime family must be ds9")
         self.deployment_id = deployment_id
         self.selector_sha256 = selector_sha256
         self.state_release_id = state_release_id
@@ -866,7 +861,7 @@ class DeploymentHealthBinding:
             deployment_id=self.deployment_id,
             selector_sha256=self.selector_sha256,
             state_release_id=self.state_release_id,
-            runtime_family=self.runtime_family,  # type: ignore[arg-type]
+            runtime_family=self.runtime_family,
             runtime_variant=self.runtime_variant,
             instance_id=producer[0],
             run_id=producer[1],
@@ -886,7 +881,7 @@ class DeploymentHealthBinding:
 
 
 class ApplianceBinding(DeploymentHealthBinding):
-    """Exact selected deployment identity shared by DS8 and DS9 adapters.
+    """Exact selected DS9 native-host deployment identity.
 
     The Menon adapter owns the single full-lifetime shared state-release lease.
     This object deliberately has no lock path and acquires no nested lease; it
@@ -1126,6 +1121,9 @@ def _require_environment_binding(
         "NOESIS_STATE_RELEASE_MANIFEST": os.fspath(state.manifest_path),
         "NOESIS_STATE_RELEASE_ROOT": state.release.root,
         "NOESIS_RUNTIME_FAMILY": selector.runtime.family,
+        "NOESIS_DS91_NATIVE_ROOT": selector.runtime.native_root,
+        "NOESIS_DS9_ARTIFACT_ROOT": selector.runtime.artifact_root,
+        "NOESIS_DS9_RUNTIME_ROOT": selector.runtime.runtime_root,
         "NOESIS_ANALYTICS_CONFIG": os.fspath(state.runtime_files["analytics_config"]),
         "NOESIS_ANALYTICS_EXCLUDE_CONFIG": os.fspath(
             state.runtime_files["analytics_exclude"]
@@ -1146,10 +1144,7 @@ def load_appliance_binding(
     selector_sha256: str,
     repo_root: str | Path,
     env: Mapping[str, str],
-    expected_family: str,
-    expected_profile: str | None = None,
-    expected_size: str | None = None,
-    expected_tracking_mode: str | None = None,
+    expected_family: Literal["ds9"],
     expected_lane: str | None = None,
     verify_checkout: bool = True,
 ) -> ApplianceBinding:
@@ -1165,7 +1160,7 @@ def load_appliance_binding(
         _fail("deployment selector digest does not match --selector-sha256")
     if selector_path.name != f"{selector_sha256}.json":
         _fail("deployment selector path is not content-addressed by its digest")
-    if selector.runtime.family != expected_family:
+    if expected_family != "ds9" or selector.runtime.family != expected_family:
         _fail(
             f"selected runtime family is {selector.runtime.family}, not {expected_family}"
         )
@@ -1183,24 +1178,8 @@ def load_appliance_binding(
             != selector.noesis_checkout.snapshot_sha256
         ):
             _fail("running Noesis checkout identity does not match the selector")
-    if isinstance(selector.runtime, DS8RuntimeSelector):
-        expected = (
-            expected_profile,
-            expected_size,
-            expected_tracking_mode,
-        )
-        observed = (
-            selector.runtime.pgie_profile,
-            selector.runtime.model_size,
-            selector.runtime.tracking_mode,
-        )
-        if expected != observed:
-            _fail(
-                "DS8 runtime arguments do not match the selected profile/size/tracking tuple"
-            )
-    elif isinstance(selector.runtime, DS9RuntimeSelector):
-        if expected_lane is not None and expected_lane != selector.runtime.lane:
-            _fail("DS9 supervisor lane does not match the deployment selector")
+    if expected_lane is not None and expected_lane != selector.runtime.lane:
+        _fail("DS9 supervisor lane does not match the deployment selector")
     state = _validate_state_release(selector)
     _require_environment_binding(
         env=env,
@@ -1248,7 +1227,7 @@ def runtime_deployment_context(binding: DeploymentHealthBinding) -> RuntimeDeplo
         deployment_id=binding.deployment_id,
         selector_sha256=binding.selector_sha256,
         state_release_id=binding.state_release_id,
-        runtime_family=binding.runtime_family,  # type: ignore[arg-type]
+        runtime_family=binding.runtime_family,
         runtime_variant=binding.runtime_variant,
         boot_id=binding.boot_id,
         software_revision=binding.software_revision,

@@ -11,15 +11,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DS8_PLUGIN_ROOT = ROOT / "gst-plugins"
-DS9_PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
-DS8_SOURCE = DS8_PLUGIN_ROOT / "noesisforceidr" / "gstnoesisforceidr.cpp"
-DS9_SOURCE = DS9_PLUGIN_ROOT / "noesisforceidr" / "gstnoesisforceidr.cpp"
+PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
+SOURCE = PLUGIN_ROOT / "noesisforceidr" / "gstnoesisforceidr.cpp"
 
 
 class ForceIdrPluginSourceTests(unittest.TestCase):
     def test_source_uses_official_downstream_event_without_mapping_buffers(self) -> None:
-        source = DS8_SOURCE.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("gst_nvevent_enc_force_idr", source)
         self.assertIn("gst_pad_push_event(GST_BASE_TRANSFORM_SRC_PAD(self), event)", source)
@@ -34,19 +32,11 @@ class ForceIdrPluginSourceTests(unittest.TestCase):
         self.assertNotIn("gst_buffer_map", source)
         self.assertNotIn("gst_buffer_make_writable", source)
 
-    def test_ds8_and_ds9_sources_are_owned_mirrors(self) -> None:
-        self.assertFalse(DS8_SOURCE.is_symlink())
-        self.assertFalse(DS9_SOURCE.is_symlink())
-        self.assertEqual(DS8_SOURCE.read_bytes(), DS9_SOURCE.read_bytes())
-
-        ds8_cmake = (DS8_SOURCE.parent / "CMakeLists.txt").read_text(
+    def test_source_and_build_are_owned_by_ds91(self) -> None:
+        self.assertFalse(SOURCE.is_symlink())
+        ds9_cmake = (SOURCE.parent / "CMakeLists.txt").read_text(
             encoding="utf-8"
         )
-        ds9_cmake = (DS9_SOURCE.parent / "CMakeLists.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("deepstream-8.0", ds8_cmake)
-        self.assertNotIn("deepstream-9.1", ds8_cmake)
         self.assertIn("deepstream-9.1", ds9_cmake)
         self.assertNotIn("deepstream-8.0", ds9_cmake)
         self.assertIn("NVDS_VERSION_MINOR", ds9_cmake)
@@ -74,19 +64,17 @@ class ForceIdrPluginRegistrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def test_ds8_and_ds9_binaries_register_the_strict_property_contract(self) -> None:
-        for plugin_root in (DS8_PLUGIN_ROOT, DS9_PLUGIN_ROOT):
-            with self.subTest(plugin_root=plugin_root):
-                output = self._inspect(plugin_root)
-                self.assertIn(str(plugin_root / "libgstnoesisforceidr.so"), output)
-                self.assertIn("request-sequence", output)
-                self.assertIn("accepted-sequence", output)
-                self.assertIn("last-request-ok", output)
-                self.assertIn("stream-id", output)
-                self.assertIn("Capabilities:\n      ANY", output)
+    def test_binary_registers_the_strict_property_contract(self) -> None:
+        output = self._inspect(PLUGIN_ROOT)
+        self.assertIn(str(PLUGIN_ROOT / "libgstnoesisforceidr.so"), output)
+        self.assertIn("request-sequence", output)
+        self.assertIn("accepted-sequence", output)
+        self.assertIn("last-request-ok", output)
+        self.assertIn("stream-id", output)
+        self.assertIn("Capabilities:\n      ANY", output)
 
     def test_monotonic_request_acknowledges_exactly_one_official_event(self) -> None:
-        binary = DS8_PLUGIN_ROOT / "libgstnoesisforceidr.so"
+        binary = PLUGIN_ROOT / "libgstnoesisforceidr.so"
         if not binary.is_file():
             self.skipTest(f"plugin has not been built: {binary}")
 
@@ -142,7 +130,7 @@ class ForceIdrPluginRegistrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="noesis-force-idr-event-") as raw:
             env = os.environ.copy()
-            env["GST_PLUGIN_PATH"] = str(DS8_PLUGIN_ROOT)
+            env["GST_PLUGIN_PATH"] = str(PLUGIN_ROOT)
             env["GST_REGISTRY"] = str(Path(raw) / "registry.bin")
             result = subprocess.run(
                 [sys.executable, "-c", program],
@@ -167,7 +155,7 @@ class ForceIdrPluginRegistrationTests(unittest.TestCase):
         )
 
     def test_servicemaker_node_round_trips_uint_sequence_and_ack(self) -> None:
-        binary = DS8_PLUGIN_ROOT / "libgstnoesisforceidr.so"
+        binary = PLUGIN_ROOT / "libgstnoesisforceidr.so"
         if not binary.is_file():
             self.skipTest(f"plugin has not been built: {binary}")
         try:
@@ -208,7 +196,7 @@ class ForceIdrPluginRegistrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="noesis-force-idr-node-") as raw:
             env = os.environ.copy()
-            env["GST_PLUGIN_PATH"] = str(DS8_PLUGIN_ROOT)
+            env["GST_PLUGIN_PATH"] = str(PLUGIN_ROOT)
             env["GST_REGISTRY"] = str(Path(raw) / "registry.bin")
             result = subprocess.run(
                 [sys.executable, "-c", program],

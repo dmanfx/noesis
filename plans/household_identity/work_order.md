@@ -42,7 +42,9 @@ preserved under
   appearance evidence and fails closed otherwise.
 - Living Room ↔ Family Room do not overlap.
 - Kitchen ↔ Living Room are adjacency only.
-- This identity topology does not enable MV3DT or AMC. Both remain deferred.
+- This identity topology does not itself enable MV3DT or AMC. The accepted
+  Kitchen/Family Room MV3DT lane remains a separate explicit runtime opt-in;
+  AMC remains deferred.
 
 ## Optional work
 

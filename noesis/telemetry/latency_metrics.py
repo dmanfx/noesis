@@ -18,13 +18,13 @@ try:  # DS metadata bindings (optional for unit tests / non-DS hosts)
 except Exception:  # pragma: no cover - import-safe fallback when DS libs absent
     pyds = None  # type: ignore
 
-# Optional DS8 Service Maker latency shim
+# Optional Service Maker latency shim
 try:  # pragma: no cover - runtime optional
     import noesis_latency_ext  # type: ignore
 except Exception:  # pragma: no cover
     noesis_latency_ext = None  # type: ignore
 
-# Optional DS8 Service Maker latency shim
+# Optional Service Maker latency shim
 try:  # pragma: no cover - runtime optional
     import noesis_latency_ext  # type: ignore
 except Exception:  # pragma: no cover
@@ -308,7 +308,7 @@ class LatencyCollector:
                     # Defensive: never let a single bad sample break telemetry.
                     continue
 
-    # -------------------- DS8 Service Maker path --------------------
+    # -------------------- Service Maker path --------------------
 
     def record_from_sm_buffer(self, buffer: object) -> None:
         """Extract latency samples from a Service Maker Buffer via native shim."""

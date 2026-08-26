@@ -49,8 +49,8 @@ class V3DTAxisMap:
     ``scripts/generate_v3dt_caminfo.py`` right-multiplies the canonical
     world-to-camera extrinsics by the same matrix. Consequently a point emitted
     by the tracker must be multiplied by this matrix before it is published in
-    ``backend_world_m``. Keeping the transform here prevents DS8, DS9, and live
-    evidence tooling from independently interpreting a compact axis string.
+    ``backend_world_m``. Keeping the transform here prevents DS9.1 adapters and
+    live evidence tooling from independently interpreting a compact axis string.
     """
 
     spec: str

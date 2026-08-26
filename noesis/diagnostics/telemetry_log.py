@@ -23,7 +23,7 @@ from noesis_core.runtime_secrets import public_pipeline_config
 logger = logging.getLogger(__name__)
 
 try:
-    from models import convert_numpy_types
+    from noesis.models import convert_numpy_types
 except Exception:  # pragma: no cover - fallback when frontend utilities absent
     def convert_numpy_types(payload: Any) -> Any:  # type: ignore[override]
         return payload

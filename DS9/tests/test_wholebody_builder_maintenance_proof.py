@@ -264,11 +264,7 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
                 ),
             },
             "platform": {
-                "image": "noesis-ds9-dev:test",
-                "image_id": "sha256:image",
-                "base_digest": "sha256:base",
-                "tensorrt_version": "10.16.0.72",
-                "cuda_version": "13.2.0.046",
+                **validator.LEGACY_ENGINE_RECEIPT_PLATFORM,
                 "driver_version": "595.71.05",
                 "gpu_name": "fixture-gpu",
                 "gpu_uuid": "GPU-fixture",
@@ -312,26 +308,14 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
     manifest_relative = (
         Path("DS9/models/engine_maintenance") / run_directory.name / "manifest.json"
     ).as_posix()
-    target = {
-        "build_image": {
-            "reference": "noesis-ds9-dev:test",
-            "image_id": "sha256:image",
-            "base_digest": "sha256:base",
-            "tensorrt_version": "10.16.0.72",
-            "cuda_version": "13.2.0.046",
-        }
-    }
+    target = {"native_host": copy.deepcopy(validator.NATIVE_HOST_AUTHORITY)}
     artifact = {"compatibility": {"precision": "fp16", "batch": 3}}
     provenance = {
         "maintenance": {
             "manifest": manifest_relative,
             "manifest_sha256": manifest_sha256,
             "output_size_bytes": output_size,
-            "image": "noesis-ds9-dev:test",
-            "image_id": "sha256:image",
-            "base_digest": "sha256:base",
-            "tensorrt_version": "10.16.0.72",
-            "cuda_version": "13.2.0.046",
+            **validator.LEGACY_ENGINE_RECEIPT_PLATFORM,
             "driver_version": "595.71.05",
             "gpu": {
                 "name": "fixture-gpu",
@@ -349,14 +333,14 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
     cohort.chmod(0o700)
     guard_path = cohort / "gpu-memory.jsonl"
     wrapper_pid = os.getpid()
-    wrapper_start = validator.gpu_sampler._proc_start_time_ticks(wrapper_pid)
-    guard_mib = validator.gpu_sampler.reviewed_guard_mib(engine)
+    wrapper_start = validator.legacy_gpu_guard._proc_start_time_ticks(wrapper_pid)
+    guard_mib = validator.legacy_gpu_guard.reviewed_guard_mib(engine)
     sampled_at = "2026-07-11T12:00:00.000001Z"
     guard_rows = [
         {
             "kind": "header",
             "schema_version": 1,
-            "contract": validator.gpu_sampler.CONTRACT,
+            "contract": validator.legacy_gpu_guard.CONTRACT,
             "device_index": 0,
             "expected_uuid": "GPU-fixture",
             "engine": engine,
@@ -367,9 +351,9 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
             ).hexdigest(),
             "container_id": "7" * 64,
             "guard_mib": guard_mib,
-            "guard_bytes": guard_mib * validator.gpu_sampler.MIB,
-            "interval_ms": validator.gpu_sampler.REVIEWED_SAMPLE_INTERVAL_MS,
-            "max_gap_ms": validator.gpu_sampler.REVIEWED_MAX_GAP_MS,
+            "guard_bytes": guard_mib * validator.legacy_gpu_guard.MIB,
+            "interval_ms": validator.legacy_gpu_guard.REVIEWED_SAMPLE_INTERVAL_MS,
+            "max_gap_ms": validator.legacy_gpu_guard.REVIEWED_MAX_GAP_MS,
             "parent_pid": wrapper_pid,
             "parent_start_time_ticks": wrapper_start,
             "sampler_pid": wrapper_pid,
@@ -382,11 +366,11 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
             "sampled_at_utc": sampled_at,
             "monotonic_ns": 1_000_000_000,
             "total_mib": 12288,
-            "total_bytes": 12288 * validator.gpu_sampler.MIB,
+            "total_bytes": 12288 * validator.legacy_gpu_guard.MIB,
             "reserved_mib": 0,
             "reserved_bytes": 0,
             "used_mib": 512,
-            "used_bytes": 512 * validator.gpu_sampler.MIB,
+            "used_bytes": 512 * validator.legacy_gpu_guard.MIB,
         },
         {
             "kind": "footer",
@@ -424,15 +408,15 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
             ).hexdigest(),
             "container_id": "7" * 64,
             "guard_mib": guard_mib,
-            "interval_ms": validator.gpu_sampler.REVIEWED_SAMPLE_INTERVAL_MS,
-            "max_gap_ms": validator.gpu_sampler.REVIEWED_MAX_GAP_MS,
+            "interval_ms": validator.legacy_gpu_guard.REVIEWED_SAMPLE_INTERVAL_MS,
+            "max_gap_ms": validator.legacy_gpu_guard.REVIEWED_MAX_GAP_MS,
             "parent_pid": wrapper_pid,
             "parent_start_time_ticks": wrapper_start,
             "allow_active": False,
         },
     )()
     provenance["maintenance"]["gpu_memory_guard"] = {
-        "contract": validator.gpu_sampler.CONTRACT,
+        "contract": validator.legacy_gpu_guard.CONTRACT,
         "path": guard_path.relative_to(root).as_posix(),
         "sha256": hashlib.sha256(guard_path.read_bytes()).hexdigest(),
         "engine": engine,
@@ -447,9 +431,9 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
         "device_index": 0,
         "gpu_uuid": "GPU-fixture",
         "guard_mib": guard_mib,
-        "sample_interval_ms": validator.gpu_sampler.REVIEWED_SAMPLE_INTERVAL_MS,
-        "maximum_gap_limit_ms": validator.gpu_sampler.REVIEWED_MAX_GAP_MS,
-        "summary": validator.gpu_sampler.summarize(summary_args),
+        "sample_interval_ms": validator.legacy_gpu_guard.REVIEWED_SAMPLE_INTERVAL_MS,
+        "maximum_gap_limit_ms": validator.legacy_gpu_guard.REVIEWED_MAX_GAP_MS,
+        "summary": validator.legacy_gpu_guard.summarize(summary_args),
     }
     return {
         "artifact_root": root,
@@ -499,7 +483,6 @@ def _validate(
         target=fixture["target"],
         source_contract_document=fixture["source_document"],
         current_source_contracts_sha256=SOURCE_CONTRACTS_SHA256,
-        accepted_source_contract_hashes=frozenset({SOURCE_CONTRACTS_SHA256}),
         artifact_root=fixture["artifact_root"],
         maintenance_manifest_path=(fixture["manifest_path"] if bind_manifest else None),
         maintenance_manifest_sha256=bound_sha256,
@@ -508,11 +491,62 @@ def _validate(
     )
 
 
+def _convert_to_native_receipt(fixture: dict[str, object]) -> None:
+    maintenance = fixture["maintenance"]
+    provenance = fixture["provenance"]["maintenance"]
+    platform = {
+        **validator.NATIVE_ENGINE_RECEIPT_PLATFORM,
+        "driver_version": "595.71.05",
+        "gpu_name": "fixture-gpu",
+        "gpu_uuid": "GPU-fixture",
+        "gpu_compute_capability": "12.0",
+        "gpu_memory_mib": "12288",
+        "expected_trtexec_banner": "TensorRT v101600",
+    }
+    maintenance["metadata"]["platform"] = platform
+    maintenance["metadata"].pop("host_transaction")
+    build_command = next(
+        row["command"] for row in maintenance["commands"] if row["label"] == "build"
+    )
+    maintenance["metadata"]["native_host"] = {
+        "backend": "native_host",
+        "deepstream": validator.NATIVE_HOST_AUTHORITY["sdk_root"],
+        "cuda": validator.NATIVE_HOST_AUTHORITY["cuda_root"],
+        "tensorrt": "TensorRT v101600",
+        "compiler": "fixture nvcc",
+        "python_abi": "cp312",
+        "source_sha256": ONNX_SHA256,
+        "output_sha256": OUTPUT_SHA256,
+        "command": " ".join(build_command),
+    }
+    for row in maintenance["commands"]:
+        row["output_exceeded"] = False
+    target_path = "/workspace/final.engine"
+    maintenance["target"] = target_path
+    maintenance["installed"]["path"] = target_path
+    maintenance["install_transaction"] = {
+        "status": "installed_verified",
+        "target": target_path,
+        "candidate": copy.deepcopy(maintenance["candidate"]),
+    }
+    provenance.update(platform)
+    provenance.pop("expected_trtexec_banner", None)
+    provenance.pop("gpu_memory_guard")
+
+
 @pytest.mark.parametrize("engine", tuple(VARIANT_FIXTURES))
 def test_wholebody_builder_private_maintenance_proof_passes(
     tmp_path: Path, engine: str
 ) -> None:
     _validate(_fixture(tmp_path, engine))
+
+
+def test_wholebody_builder_native_host_receipt_passes_without_legacy_guard(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _convert_to_native_receipt(fixture)
+    _validate(fixture)
 
 
 def test_wholebody_builder_proof_rejects_missing_caller_manifest_binding(

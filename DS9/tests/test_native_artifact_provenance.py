@@ -67,7 +67,7 @@ def _fixture(
     }
     supplemental = module_name in provenance._SUPPLEMENTAL_NATIVE_MODULES
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_id": "noesis-ds9-artifacts",
         "schema": "DS9/docs/asset_manifest.schema.json",
         "target": {
@@ -270,7 +270,7 @@ def test_incompatible_manifest_authority_or_incomplete_provenance_fails(
     manifest_path = ds9_root / "asset_manifest.yaml"
 
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    manifest["schema_version"] = 3
+    manifest["schema_version"] = 2
     manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
     with pytest.raises(
         provenance.DS9NativeArtifactProvenanceError,

@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.virtual_twin.artifacts import write_json, write_points_glb, write_points_npz, write_textured_mesh_glb
 from noesis.virtual_twin.builder import calibration_fingerprint, revision_id_from_clock
@@ -1888,7 +1888,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     depth_base = _resolve_repo_path(args.mapanything_depth_base, service_config.storage.depth_base)
     floorplan_cache_base = _resolve_repo_path(args.floorplan_cache_base, depth_base / "floorplans")
     cameras_config = _resolve_repo_path(args.cameras_config, REPO_ROOT / "config" / "cameras.yaml")
-    pipeline_config = _resolve_repo_path(args.pipeline_config, REPO_ROOT / "config" / "infer.yaml")
+    pipeline_config = _resolve_repo_path(
+        args.pipeline_config, REPO_ROOT / "DS9" / "config" / "infer.yaml"
+    )
     alignment_config = _resolve_repo_path(args.alignment_config, REPO_ROOT / "config" / "ply_alignment.json")
     pipeline = _read_yaml(pipeline_config)
     camera_labels = load_camera_labels(cameras_config)
@@ -2040,7 +2042,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build Menon room reconstruction artifacts directly from latest MapAnything depth snapshots.")
     parser.add_argument("--camera", action="append", choices=(*DEFAULT_CAMERAS, "all"), default=None)
-    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml")
+    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "DS9" / "config" / "infer.yaml")
     parser.add_argument("--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml")
     parser.add_argument("--alignment-config", type=Path, default=REPO_ROOT / "config" / "ply_alignment.json")
     parser.add_argument("--mapanything-depth-base", type=Path, default=None)

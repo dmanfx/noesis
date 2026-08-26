@@ -59,7 +59,7 @@ def _build_probe_app() -> FastAPI:
         )
         return payload
 
-    # Production mounts these API routers into the DS8/DS9 runtime app. This
+    # Production mounts these API routers into the DS9.1 runtime app. This
     # exercises that exact include-router response path.
     parent = FastAPI()
     parent.include_router(child.router)

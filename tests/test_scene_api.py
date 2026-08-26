@@ -341,13 +341,9 @@ def test_current_payload_rejects_any_mutated_cohort_member(
     assert response.status_code == 409
 
 
-def test_ds8_v3dt_and_ds9_mount_the_same_scene_router() -> None:
+def test_ds9_mounts_the_shared_scene_router() -> None:
     root = Path(__file__).resolve().parents[1]
-    for relative in (
-        "noesis/ds8_runtime.py",
-        "noesis/ds8_runtime_v3dt_reimpl.py",
-        "DS9/noesis/ds9_runtime_core.py",
-    ):
+    for relative in ("DS9/noesis/ds9_runtime_core.py",):
         source = (root / relative).read_text(encoding="utf-8")
         assert "scene_api" in source
         assert "app.include_router(scene_api.router)" in source

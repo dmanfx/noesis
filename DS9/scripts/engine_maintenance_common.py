@@ -68,18 +68,15 @@ _MAPANYTHING_PLATFORM_KEYS = {
     "gpu_memory_mib",
     "expected_trtexec_banner",
 }
-_PROVENANCE_ENV = {
-    "NOESIS_DS9_MAINT_IMAGE": "image",
-    "NOESIS_DS9_MAINT_IMAGE_ID": "image_id",
-    "NOESIS_DS9_MAINT_BASE_DIGEST": "base_digest",
-    "NOESIS_DS9_MAINT_TRT_VERSION": "tensorrt_version",
-    "NOESIS_DS9_MAINT_CUDA_VERSION": "cuda_version",
-    "NOESIS_DS9_MAINT_DRIVER_VERSION": "driver_version",
-    "NOESIS_DS9_MAINT_GPU_NAME": "gpu_name",
-    "NOESIS_DS9_MAINT_GPU_UUID": "gpu_uuid",
-    "NOESIS_DS9_MAINT_GPU_COMPUTE_CAPABILITY": "gpu_compute_capability",
-    "NOESIS_DS9_MAINT_GPU_MEMORY_MIB": "gpu_memory_mib",
+NATIVE_HOST_PLATFORM = {
+    "image": "native_host",
+    "image_id": "native_host",
+    "base_digest": "native_host",
+    "tensorrt_version": "10.16.0.72",
+    "cuda_version": "13.2",
 }
+MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024
+MAX_PLATFORM_PROBE_BYTES = 16 * 1024
 
 _NEGATIVE_TRTEXEC_PATTERNS = (
     re.compile(r"\[E\]", re.IGNORECASE),
@@ -1142,78 +1139,6 @@ def validate_maintenance_build_contract(
     return expected
 
 
-def validate_prepared_transaction_authority(
-    *,
-    transaction_manifest: Path,
-    expected_sha256: str,
-    engine_name: str,
-    engine_target: Path,
-) -> dict[str, Any]:
-    """Authorize a real container build from the host's prepared transaction."""
-
-    if transaction_manifest.is_symlink() or not transaction_manifest.is_file():
-        raise EngineMaintenanceError(
-            f"prepared transaction must be a regular non-symlink file: {transaction_manifest}"
-        )
-    info = transaction_manifest.stat()
-    if (
-        info.st_uid != os.getuid()
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or info.st_size <= 0
-        or info.st_size > 2 * 1024 * 1024
-    ):
-        raise EngineMaintenanceError(
-            "prepared transaction must be owner-private, single-link, and bounded"
-        )
-    raw = transaction_manifest.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != expected_sha256:
-        raise EngineMaintenanceError("prepared transaction digest changed")
-
-    try:
-        payload = strict_json_loads(
-            raw,
-            label="prepared engine transaction",
-        )
-    except StrictJSONError as exc:
-        raise EngineMaintenanceError(
-            "prepared transaction is not valid strict JSON"
-        ) from exc
-    if not isinstance(payload, dict) or (
-        payload.get("schema_version") != 1
-        or payload.get("contract") != "noesis.ds9.engine_finalize_transaction"
-        or payload.get("state") != "prepared"
-        or not re.fullmatch(
-            r"[0-9A-Za-z_.-]+", str(payload.get("transaction_id") or "")
-        )
-        or payload.get("engine") != engine_name
-        or payload.get("container_engine_output")
-        != str(engine_target.expanduser().absolute())
-    ):
-        raise EngineMaintenanceError(
-            "prepared transaction does not authorize this engine target"
-        )
-    prior = payload.get("prior_engine")
-    if not isinstance(prior, Mapping):
-        raise EngineMaintenanceError("prepared transaction lacks prior-engine authority")
-    target = engine_target.expanduser().absolute()
-    if bool(prior.get("exists")):
-        required_regular_file(target, "engine target at prepared-authority gate")
-        if (
-            target.stat().st_size != prior.get("size_bytes")
-            or sha256_file(target) != prior.get("sha256")
-            or f"{stat.S_IMODE(target.stat().st_mode):04o}" != prior.get("mode")
-        ):
-            raise EngineMaintenanceError(
-                "engine target differs from the prepared host snapshot"
-            )
-    elif target.exists() or target.is_symlink():
-        raise EngineMaintenanceError(
-            "engine target appeared after the prepared host snapshot"
-        )
-    return payload
-
-
 def required_regular_file(path: Path, label: str) -> None:
     if path.is_symlink():
         raise EngineMaintenanceError(f"{label} must not be a symlink: {path}")
@@ -1651,13 +1576,68 @@ def validate_wholebody_builder_transcript(
         )
 
 
-def maintenance_provenance_from_environment() -> dict[str, str]:
-    provenance = {"expected_trtexec_banner": DS9_TRTEXEC_BANNER}
-    for environment_name, manifest_name in _PROVENANCE_ENV.items():
-        value = str(os.environ.get(environment_name, "") or "").strip()
-        if value:
-            provenance[manifest_name] = value
-    return provenance
+def native_host_maintenance_platform() -> dict[str, str]:
+    """Read the bounded GPU/driver identity for the sole build backend."""
+
+    backend = str(os.environ.get("NOESIS_DS9_MAINT_BACKEND") or "").strip()
+    if backend != "native_host":
+        raise EngineMaintenanceError(
+            "DS9 engine maintenance requires NOESIS_DS9_MAINT_BACKEND=native_host"
+        )
+    command = [
+        "nvidia-smi",
+        "--query-gpu=driver_version,name,uuid,compute_cap,memory.total",
+        "--format=csv,noheader,nounits",
+        "--id=0",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise EngineMaintenanceError(
+            "native-host GPU identity probe failed"
+        ) from exc
+    output = result.stdout or ""
+    if (
+        result.returncode != 0
+        or len(output.encode("utf-8", errors="replace")) > MAX_PLATFORM_PROBE_BYTES
+    ):
+        raise EngineMaintenanceError(
+            "native-host GPU identity probe failed or exceeded its output bound"
+        )
+    rows = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise EngineMaintenanceError(
+            "native-host maintenance requires exactly one selected GPU"
+        )
+    fields = [value.strip() for value in rows[0].split(",")]
+    if len(fields) != 5:
+        raise EngineMaintenanceError("native-host GPU identity probe is malformed")
+    driver, gpu_name, gpu_uuid, compute_capability, memory_mib = fields
+    if (
+        re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", driver) is None
+        or not gpu_name
+        or not gpu_uuid.startswith("GPU-")
+        or re.fullmatch(r"[0-9]+\.[0-9]+", compute_capability) is None
+        or not memory_mib.isdigit()
+        or int(memory_mib) <= 0
+    ):
+        raise EngineMaintenanceError("native-host GPU identity values are invalid")
+    return {
+        **NATIVE_HOST_PLATFORM,
+        "driver_version": driver,
+        "gpu_name": gpu_name,
+        "gpu_uuid": gpu_uuid,
+        "gpu_compute_capability": compute_capability,
+        "gpu_memory_mib": memory_mib,
+        "expected_trtexec_banner": DS9_TRTEXEC_BANNER,
+    }
 
 
 def native_host_build_authority(
@@ -1680,10 +1660,17 @@ def native_host_build_authority(
             "native_host provenance requires NOESIS_DS9_MAINT_COMPILER and "
             "NOESIS_DS9_MAINT_PYTHON_ABI"
         )
-    if output_sha256 and (
-        len(output_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in output_sha256)
+    for label, value in (
+        ("source_sha256", source_sha256),
+        ("output_sha256", output_sha256),
     ):
-        raise EngineMaintenanceError("native_host output_sha256 must be a SHA-256 hex digest")
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise EngineMaintenanceError(
+                f"native_host {label} must be a SHA-256 hex digest"
+            )
+    rendered_command = [str(part) for part in command]
+    if not rendered_command or any(not part for part in rendered_command):
+        raise EngineMaintenanceError("native_host build command must be non-empty")
     return {
         "backend": "native_host",
         "deepstream": deepstream,
@@ -1693,7 +1680,7 @@ def native_host_build_authority(
         "python_abi": python_abi,
         "source_sha256": source_sha256,
         "output_sha256": output_sha256,
-        "command": " ".join(str(part) for part in command),
+        "command": " ".join(rendered_command),
     }
 
 
@@ -1810,6 +1797,33 @@ class EngineMaintenanceRun:
         evidence[key] = dict(value)
         self.persist()
 
+    def record_native_host_build(
+        self, authority: Mapping[str, object]
+    ) -> None:
+        """Bind one verified candidate to the native-host build command."""
+
+        metadata = self.payload.get("metadata")
+        if not isinstance(metadata, dict):
+            raise EngineMaintenanceError("maintenance metadata is malformed")
+        if "native_host" in metadata:
+            raise EngineMaintenanceError(
+                "native-host build authority is already recorded"
+            )
+        candidate = self.payload.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise EngineMaintenanceError(
+                "native-host build authority requires a recorded candidate"
+            )
+        if (
+            authority.get("backend") != "native_host"
+            or authority.get("output_sha256") != candidate.get("sha256")
+        ):
+            raise EngineMaintenanceError(
+                "native-host build authority differs from the candidate"
+            )
+        metadata["native_host"] = dict(authority)
+        self.persist()
+
     def record_mapanything_functional_quality(
         self,
         *,
@@ -1845,7 +1859,7 @@ class EngineMaintenanceRun:
         *,
         workspace_root: Path,
     ) -> dict[str, object]:
-        """Copy one SDK-derived plan into the host-authorized candidate path."""
+        """Copy one SDK-derived plan into this run's private candidate path."""
 
         workspace_raw = workspace_root.expanduser().absolute()
         reject_symlink_ancestors(workspace_raw, "derived-plan workspace")
@@ -1886,7 +1900,7 @@ class EngineMaintenanceRun:
         )
         if candidate_path != expected_candidate:
             raise EngineMaintenanceError(
-                "derived-plan candidate must be the exact host-authorized path: "
+                "derived-plan candidate must be the exact run-owned path: "
                 f"expected={expected_candidate} observed={candidate_path}"
             )
         require_absent_candidate_path(candidate_path)
@@ -1897,7 +1911,7 @@ class EngineMaintenanceRun:
             "workspace_root": str(workspace),
             "derived": _stat_record(derived_path, derived_info),
             "candidate": str(candidate_path),
-            "failure_cleanup_authority": "host_engine_finalize_transaction",
+            "failure_cleanup_authority": "native_host_manual_recovery",
         }
         self.payload["candidate_adoption"] = adoption
         self.persist()
@@ -1968,7 +1982,7 @@ class EngineMaintenanceRun:
         proof: str,
         timeout_seconds: int | None = None,
         env: Mapping[str, str] | None = None,
-        max_output_bytes: int | None = None,
+        max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
     ) -> dict[str, object]:
         rendered = [str(value) for value in command]
         print("[RUN]", " ".join(rendered))
@@ -1994,19 +2008,21 @@ class EngineMaintenanceRun:
             returncode = -1
         duration = time.monotonic() - started
         output_exceeded = False
-        if max_output_bytes is not None:
-            if (
-                isinstance(max_output_bytes, bool)
-                or not isinstance(max_output_bytes, int)
-                or max_output_bytes <= 0
-            ):
-                raise EngineMaintenanceError("command output bound must be positive")
-            encoded = output.encode("utf-8", errors="replace")
-            if len(encoded) > max_output_bytes:
-                output_exceeded = True
-                output = encoded[:max_output_bytes].decode(
-                    "utf-8", errors="replace"
-                ) + "\n[NOESIS] transcript truncated at mandatory bound\n"
+        if (
+            isinstance(max_output_bytes, bool)
+            or not isinstance(max_output_bytes, int)
+            or max_output_bytes <= 0
+            or max_output_bytes > MAX_COMMAND_OUTPUT_BYTES
+        ):
+            raise EngineMaintenanceError(
+                f"command output bound must be within 1..{MAX_COMMAND_OUTPUT_BYTES} bytes"
+            )
+        encoded = output.encode("utf-8", errors="replace")
+        if len(encoded) > max_output_bytes:
+            output_exceeded = True
+            output = encoded[:max_output_bytes].decode(
+                "utf-8", errors="replace"
+            ) + "\n[NOESIS] transcript truncated at mandatory bound\n"
         if output:
             print(output, end="" if output.endswith("\n") else "\n")
         log_path = self.run_dir / "logs" / f"{label}.log"

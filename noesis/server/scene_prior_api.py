@@ -27,7 +27,7 @@ def _runtime_components(request: Request) -> tuple[ScenePriorSet, Any, Mapping[i
         priors, calibration, camera_labels = supplied
     else:
         try:
-            from noesis.pipelines.ds8_pipeline import get_pipeline
+            from noesis.pipelines.deepstream_pipeline import get_pipeline
 
             pipeline = get_pipeline()
         except Exception as exc:

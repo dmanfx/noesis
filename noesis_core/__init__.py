@@ -1,8 +1,8 @@
 """Runtime-neutral Noesis product core.
 
 This package must remain importable without DeepStream, Service Maker, CUDA,
-GStreamer, or browser dependencies. DS8 and DS9 adapters consume the same
-contracts and domain services from here.
+GStreamer, or browser dependencies. The DS9.1 adapter consumes the contracts
+and domain services from here.
 """
 
 from .contracts import CONTRACT_MODELS

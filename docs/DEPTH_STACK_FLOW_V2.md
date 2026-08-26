@@ -64,7 +64,7 @@ flowchart LR
   Camera/room names do not select different algorithms. See
   [`universal_world_localization.md`](universal_world_localization.md).
 - **MapAnything gating:** `mapanything_valve.drop` toggles through
-  `DS8Pipeline.mark_depth_enabled()`; REST `/api/v1/depth/refresh` and
+  `DeepStreamPipeline.mark_depth_enabled()`; REST `/api/v1/depth/refresh` and
   `get_ma_depth` open the gate for a bounded window.
 - **MapAnything postprocess:** `MapAnythingProcessor` aligns depth/conf/mask,
   records `DepthResult`, and stores snapshots through `DepthStorageManager`.

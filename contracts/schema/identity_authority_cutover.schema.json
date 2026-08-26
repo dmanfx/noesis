@@ -135,10 +135,7 @@
       "$ref": "#/$defs/IdentityAuthorityGateEvidence"
     },
     "runtime": {
-      "enum": [
-        "ds8",
-        "ds9"
-      ],
+      "const": "ds9",
       "title": "Runtime",
       "type": "string"
     },

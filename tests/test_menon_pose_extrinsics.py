@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from calibration_bundle import pose_to_E_col_major
+from noesis.calibration.bundle import pose_to_E_col_major
 from noesis.calibration.geometry import pixel_to_world
 from noesis.calibration.pose_v1 import E_col_major_to_pose_v1
 

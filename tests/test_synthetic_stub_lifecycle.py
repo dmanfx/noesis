@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from noesis.pipelines import ds8_pipeline
+from noesis.pipelines import deepstream_pipeline as pipeline_builder
 from noesis_core.servicemaker_shutdown import (
     OrderlyEosError,
     SyntheticStubEosMessage,
@@ -25,19 +25,6 @@ from noesis_core.servicemaker_shutdown import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_ds9_pipeline_builder() -> Any:
-    module_name = "ds9_synthetic_stub_lifecycle"
-    sys.modules.pop(module_name, None)
-    path = ROOT / "DS9" / "noesis" / "pipelines" / "ds8_pipeline.py"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"unable to load DS9 pipeline builder: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -55,15 +42,8 @@ def _load_module(name: str, path: Path) -> Any:
     return module
 
 
-@pytest.mark.parametrize(
-    "module",
-    [
-        ds8_pipeline,
-        pytest.param(_load_ds9_pipeline_builder(), id="ds9"),
-    ],
-    ids=["ds8", "ds9"],
-)
-def test_synthetic_stub_orderly_eos_is_monotonic_and_unblocks_wait(module: Any) -> None:
+def test_synthetic_stub_orderly_eos_is_monotonic_and_unblocks_wait() -> None:
+    module = pipeline_builder
     backend = module._NoopDSPipeline("lifecycle-test")
     backend.add("noesiseos", "orderly_eos_control")
     callbacks: list[SyntheticStubEosMessage] = []
@@ -119,15 +99,8 @@ def test_synthetic_stub_orderly_eos_is_monotonic_and_unblocks_wait(module: Any) 
     assert [message.request_sequence for message in callbacks] == [1, 2]
 
 
-@pytest.mark.parametrize(
-    "module",
-    [
-        ds8_pipeline,
-        pytest.param(_load_ds9_pipeline_builder(), id="ds9"),
-    ],
-    ids=["ds8", "ds9"],
-)
-def test_synthetic_stub_eos_callback_failure_is_not_acknowledged(module: Any) -> None:
+def test_synthetic_stub_eos_callback_failure_is_not_acknowledged() -> None:
+    module = pipeline_builder
     backend = module._NoopDSPipeline("lifecycle-test")
     backend.add("noesiseos", "orderly_eos_control")
 
@@ -151,15 +124,8 @@ def test_synthetic_stub_eos_callback_failure_is_not_acknowledged(module: Any) ->
     assert node.get("last-request-ok") is False
 
 
-@pytest.mark.parametrize(
-    "module",
-    [
-        ds8_pipeline,
-        pytest.param(_load_ds9_pipeline_builder(), id="ds9"),
-    ],
-    ids=["ds8", "ds9"],
-)
-def test_synthetic_stub_node_get_and_analytics_receipt(module: Any, tmp_path: Path) -> None:
+def test_synthetic_stub_node_get_and_analytics_receipt(tmp_path: Path) -> None:
+    module = pipeline_builder
     config_path = tmp_path / "exclude.ini"
     config_path.write_text("[property]\nenable=1\n", encoding="utf-8")
     backend = module._NoopDSPipeline("analytics-test")
@@ -223,27 +189,19 @@ def test_synthetic_marker_requires_exact_non_promotable_pipeline_evidence() -> N
 
 def test_ds9_builder_uses_only_the_ds9_stub_selector() -> None:
     source = (
-        ROOT / "DS9" / "noesis" / "pipelines" / "ds8_pipeline.py"
+        ROOT / "DS9" / "noesis" / "pipelines" / "deepstream_pipeline.py"
     ).read_text(encoding="utf-8")
-    selector_block = source[source.index("under_pytest ="):source.index("pipeline = DS8Pipeline(")]
+    selector_block = source[
+        source.index("under_pytest =") : source.index("pipeline = DeepStreamPipeline(")
+    ]
     assert 'use_stub = _env_truthy("NOESIS_DS9_STUB_PIPELINE"' in selector_block
     assert "NOESIS_DS9_FORCE_NATIVE_TEST_PIPELINE" in selector_block
     assert "NOESIS_DS8_STUB_PIPELINE" not in selector_block
     assert "NOESIS_DS8_FORCE_NATIVE_TEST_PIPELINE" not in selector_block
 
 
-@pytest.mark.parametrize(
-    "runtime_path",
-    [
-        ROOT / "noesis" / "ds8_runtime.py",
-        ROOT / "noesis" / "ds8_runtime_v3dt_reimpl.py",
-        ROOT / "DS9" / "noesis" / "ds9_runtime_core.py",
-    ],
-    ids=["ds8", "v3dt", "ds9"],
-)
-def test_runtime_handles_only_the_typed_validated_stub_eos_before_native_guard(
-    runtime_path: Path,
-) -> None:
+def test_runtime_handles_only_the_typed_validated_stub_eos_before_native_guard() -> None:
+    runtime_path = ROOT / "DS9" / "noesis" / "ds9_runtime_core.py"
     source = runtime_path.read_text(encoding="utf-8")
     start = source.index("def _on_pyservicemaker_message(")
     end = source.index("\ndef _start_pyservicemaker_wait_loop(", start)

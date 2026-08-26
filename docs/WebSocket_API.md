@@ -26,7 +26,7 @@ BEV JPEG output are disabled.
 
 Implementation anchors:
 
-- server: `websocket_server.py`;
+- server: `noesis/server/websocket.py`;
 - runtime wiring: `DS9/noesis/ds9_runtime_core.py`;
 - publishers: `DS9/noesis/telemetry/` and shared `noesis/telemetry/`;
 - browser consumer: `oai2-fe/` through Menon.

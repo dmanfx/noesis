@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(DS9_ROOT))
 
 from geometry.depth_source import MapAnythingDepthSource
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis.calibration.depth_registration import (
     calibration_fingerprint_from_snapshot,
     write_depth_registration_bundle,

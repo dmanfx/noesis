@@ -118,11 +118,12 @@ must remain explicit and fail closed.
 
 ## ADR-010 — Useful history is archived, not normative
 
-**Accepted:** 2026-08-15
+**Accepted:** 2026-08-15; archive layout consolidated 2026-08-26
 
 Superseded DS7/DS8, DS9.0, container, migration, experiment, and validation
-diaries are retained under `docs/history/`, `DS9/docs/history/`, and
-`plans/archive/`. Active indexes never route implementation work through them.
+diaries are retained under the single `docs/history/` documentation archive and
+`plans/archive/` work-record archive. Active indexes never route implementation
+work through them.
 
 ## ADR-011 — SV3DT metadata and cuboid presentation are separate
 
@@ -570,8 +571,10 @@ independent `floor_ray`, `registered_depth`, optional `pose_scale`, and
 algorithm. Camera-specific calibration and registration residuals enter as
 measurement evidence and covariance; camera, room, site, and home identity
 never select estimator behavior. The historical
-`world_measurement_fusion_policy.json` remains non-authoritative comparison
-material. The native baseline validates and loads it into a separate
+`world_measurement_fusion_policy.json` remains non-authoritative, DS9-only
+comparison material. It contains one canonical depth-registration binding per
+camera rather than runtime-lane alternatives. The native baseline validates
+and loads it into a separate
 diagnostic-only field, then consults it only while a dashboard requests
 `Localization details`. It reconstructs the retired current-frame selection
 from the resolver's already-built compact candidates; it cannot feed

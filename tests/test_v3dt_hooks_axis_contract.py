@@ -15,11 +15,10 @@ DS9_ROOT = REPO_ROOT / "DS9"
 @pytest.mark.parametrize(
     ("adapter", "tracker_config"),
     (
-        (REPO_ROOT, "config/v3dt/nvtracker_v3dt_baseline.yml"),
         (DS9_ROOT, "DS9/config/v3dt/nvtracker_v3dt.yaml"),
     ),
 )
-def test_ds8_and_ds9_hooks_share_fail_closed_v3dt_axis_contract(
+def test_ds9_hooks_enforce_fail_closed_v3dt_axis_contract(
     adapter: Path,
     tracker_config: str,
 ) -> None:

@@ -22,7 +22,7 @@ from noesis_core.health import CapabilityMonitor, CapabilityPolicy
 from noesis_core.journal import AsyncContractJournal, ContractJournal
 from noesis_core.world import GlobalWorldFusion, WorldFusionConfig
 from noesis_core.world_service import CanonicalWorldService, WorldArtifacts
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 def _producer() -> ProducerRef:

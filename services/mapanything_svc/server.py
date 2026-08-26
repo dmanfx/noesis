@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from utils.rate_limited_logger import RateLimitedLogger
-from mapanything_config import ServiceConfig, load_service_config
+from noesis.config.mapanything import ServiceConfig, load_service_config
 
 try:
     from mapanything.models import MapAnything  # type: ignore

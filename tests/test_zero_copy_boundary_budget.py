@@ -7,7 +7,7 @@ from scripts.zero_copy_boundary_diagnostics import (
     BoundaryGateTracker,
     extract_boundary_diagnostics,
 )
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 def _expected_p99(values: list[float]) -> float:

@@ -1394,5 +1394,5 @@ def validate_menon_latency_alignment(
         },
         evidence=sorted(evidence),
         detail=detail,
-        suggested_next_diagnostic=None if status == CheckStatus.PASS else "Check DS8 telemetry timestamps, WebSocket buffering, Menon update scheduling, render queue lag, and browser display timing.",
+        suggested_next_diagnostic=None if status == CheckStatus.PASS else "Check DS9.1 telemetry timestamps, WebSocket buffering, Menon update scheduling, render queue lag, and browser display timing.",
     )

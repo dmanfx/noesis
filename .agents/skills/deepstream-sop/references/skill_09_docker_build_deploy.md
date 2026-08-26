@@ -19,8 +19,11 @@ docker images | grep vss-engine
 # Pull if missing (requires NGC credentials for nvcr.io)
 docker pull nvcr.io/nvidia/blueprint/vss-engine:2.4.1
 
-# Also needed: DeepStream image for header extraction (Stage 1 of Dockerfile)
-docker pull nvcr.io/nvidia/deepstream:8.0-triton-multiarch
+# Also needed: an explicitly reviewed DS9.1 image for header extraction
+# (Stage 1 of Dockerfile). Pin the exact immutable reference for the task.
+export DEEPSTREAM_DEV_IMAGE='<reviewed-ds9.1-image-reference>'
+test -n "$DEEPSTREAM_DEV_IMAGE"
+docker pull "$DEEPSTREAM_DEV_IMAGE"
 ```
 
 ---
@@ -182,7 +185,9 @@ https://github.com/basler/gst-plugin-pylon if not present in `binaries/gst-plugi
 # 1. Verify all pre-build steps above are complete, then:
 docker compose -f deploy/compose.yaml build
 # OR
-docker build . -f docker/Docker.build -t nvds-sop:latest
+docker build . -f docker/Docker.build \
+  --build-arg DEEPSTREAM_DEV_IMAGE="$DEEPSTREAM_DEV_IMAGE" \
+  -t nvds-sop:latest
 
 # 2. For a clean rebuild:
 docker compose -f deploy/compose.yaml build --no-cache

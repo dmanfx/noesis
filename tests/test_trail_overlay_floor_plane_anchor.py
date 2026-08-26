@@ -32,6 +32,7 @@ class _ObjMeta:
 class _FrameMeta:
     object_items: List[Any]
     source_id: int = 0
+    frame_number: int = 0
     compositor_rect: _Rect = field(default_factory=lambda: _Rect(0.0, 0.0, 1280.0, 720.0))
     source_frame_width: int = 1280
     source_frame_height: int = 720
@@ -48,17 +49,35 @@ class _CalibrationProvider:
     def snapshot(self, source_id: int, camera_id: str) -> CalibrationSnapshot:
         return self._snapshot
 
+    def world_snapshot(self, source_id: int, camera_id: str) -> CalibrationSnapshot:
+        return self._snapshot
+
 
 class _AnalyticsStub:
     def __init__(self) -> None:
         self.tracks_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = {}
 
-    def set_tracks(self, sensor_id: int, tracks: Dict[int, Dict[str, Any]]) -> None:
-        self.tracks_by_sensor[int(sensor_id)] = dict(tracks)
+    def set_tracks(
+        self,
+        sensor_id: int,
+        tracks: Dict[int, Dict[str, Any]],
+        *,
+        frame_id: int,
+    ) -> None:
+        self.tracks_by_sensor[int(sensor_id)] = {
+            int(track_id): {**dict(track), "frame_id": int(frame_id)}
+            for track_id, track in tracks.items()
+        }
 
-    def get_active_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
+    def get_active_track_map(
+        self, sensor_id: int, frame_id: int | None = None
+    ) -> Dict[int, Dict[str, Any]]:
         tracks = self.tracks_by_sensor.get(int(sensor_id), {})
-        return {int(k): dict(v) for k, v in tracks.items()}
+        return {
+            int(key): dict(value)
+            for key, value in tracks.items()
+            if frame_id is None or int(value["frame_id"]) == int(frame_id)
+        }
 
 
 class _DisplayMeta:
@@ -119,6 +138,9 @@ def _build_snapshot() -> CalibrationSnapshot:
         floor_y=0.0,
         image_size=(1280, 720),
         unit_scale=1.0,
+        world_frame_id="backend_world_m",
+        world_frame_revision="test-world-revision",
+        frame_transform_sha256="a" * 64,
     )
 
 
@@ -146,6 +168,22 @@ def _person_bbox(
     bbox = [float(u_foot - (width_px * 0.5)), float(v_top), float(width_px), float(v_foot - v_top)]
     assert bbox[3] > 0.0
     return bbox, (float(u_foot), float(v_foot))
+
+
+def _canonical_track(
+    *, frame_id: int, bbox: List[float], world: List[float]
+) -> Dict[str, Any]:
+    return {
+        "tracker_id": 7,
+        "frame_id": int(frame_id),
+        "bbox": list(bbox),
+        "world": list(world),
+        "world_valid": True,
+        "world_frame": "backend_world_m",
+        "world_frame_revision": "test-world-revision",
+        "world_transform_sha256": "a" * 64,
+        "image_size": [1280, 720],
+    }
 
 
 def _build_processor(
@@ -185,19 +223,32 @@ def _build_processor(
 def test_gravity_drop_anchor_stays_floor_locked_under_partial_occlusion() -> None:
     processor, calib, analytics = _build_processor()
     bbox_full, foot_uv = _person_bbox(calib, foot_world=[0.0, 0.0, 6.0])
-    analytics.set_tracks(0, {7: {"tracker_id": 7, "bbox": bbox_full}})
-    frame_1 = _FrameMeta(object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_full))])
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=1, bbox=bbox_full, world=[0.0, 0.0, 6.0])},
+        frame_id=1,
+    )
+    frame_1 = _FrameMeta(
+        object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_full))],
+        frame_number=1,
+    )
 
     processor._handle_frame(frame_1, SimpleNamespace(), now=10.0)  # type: ignore[attr-defined]
 
     state = processor._tracks[0][7]  # type: ignore[attr-defined]
-    assert state.height_ref_scene is not None
     first_point = state.points[-1]
     assert first_point.predicted is False
 
     bbox_partial = [bbox_full[0], bbox_full[1], bbox_full[2], bbox_full[3] * 0.25]
-    analytics.set_tracks(0, {7: {"tracker_id": 7, "bbox": bbox_partial}})
-    frame_2 = _FrameMeta(object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_partial))])
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=2, bbox=bbox_partial, world=[0.0, 0.0, 6.0])},
+        frame_id=2,
+    )
+    frame_2 = _FrameMeta(
+        object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_partial))],
+        frame_number=2,
+    )
 
     processor._handle_frame(frame_2, SimpleNamespace(), now=10.1)  # type: ignore[attr-defined]
 
@@ -214,16 +265,30 @@ def test_gap_prediction_only_extends_after_track_loss_until_ttl() -> None:
     bbox_1, _ = _person_bbox(calib, foot_world=[0.0, 0.0, 6.0])
     bbox_2, _ = _person_bbox(calib, foot_world=[0.4, 0.0, 6.0])
 
-    analytics.set_tracks(0, {7: {"tracker_id": 7, "bbox": bbox_1}})
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=1, bbox=bbox_1, world=[0.0, 0.0, 6.0])},
+        frame_id=1,
+    )
     processor._handle_frame(
-        _FrameMeta(object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_1))]),
+        _FrameMeta(
+            object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_1))],
+            frame_number=1,
+        ),
         SimpleNamespace(),
         now=10.0,
     )  # type: ignore[attr-defined]
 
-    analytics.set_tracks(0, {7: {"tracker_id": 7, "bbox": bbox_2}})
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=2, bbox=bbox_2, world=[0.4, 0.0, 6.0])},
+        frame_id=2,
+    )
     processor._handle_frame(
-        _FrameMeta(object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_2))]),
+        _FrameMeta(
+            object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox_2))],
+            frame_number=2,
+        ),
         SimpleNamespace(),
         now=10.2,
     )  # type: ignore[attr-defined]
@@ -231,22 +296,43 @@ def test_gap_prediction_only_extends_after_track_loss_until_ttl() -> None:
     state = processor._tracks[0][7]  # type: ignore[attr-defined]
     measured_len = len(state.points)
 
-    analytics.set_tracks(0, {})
-    processor._handle_frame(_FrameMeta(object_items=[]), SimpleNamespace(), now=10.6)  # type: ignore[attr-defined]
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=3, bbox=bbox_2, world=[0.4, 0.0, 6.0])},
+        frame_id=3,
+    )
+    processor._handle_frame(
+        _FrameMeta(object_items=[], frame_number=3),
+        SimpleNamespace(),
+        now=10.6,
+    )  # type: ignore[attr-defined]
 
     assert len(state.points) == measured_len + 1
     assert state.points[-1].predicted is True
     assert float(state.points[-1].x) > float(state.points[-2].x)
 
     after_gap_len = len(state.points)
-    processor._handle_frame(_FrameMeta(object_items=[]), SimpleNamespace(), now=11.4)  # type: ignore[attr-defined]
+    analytics.set_tracks(
+        0,
+        {7: _canonical_track(frame_id=4, bbox=bbox_2, world=[0.4, 0.0, 6.0])},
+        frame_id=4,
+    )
+    processor._handle_frame(
+        _FrameMeta(object_items=[], frame_number=4),
+        SimpleNamespace(),
+        now=11.4,
+    )  # type: ignore[attr-defined]
     assert len(state.points) == after_gap_len
 
 
-def test_floor_plane_anchor_falls_back_to_bbox_bottom_without_analytics() -> None:
-    processor, _calib, _analytics = _build_processor()
-    processor.pipeline.analytics_telemetry_processor = None
-    frame = _FrameMeta(object_items=[_ObjMeta(object_id=9, rect_params=_Rect(100.0, 50.0, 80.0, 200.0))])
+def test_bbox_anchor_uses_bbox_bottom_with_exact_analytics_row() -> None:
+    processor, _calib, analytics = _build_processor(anchor_mode="bbox_bottom")
+    bbox = [100.0, 50.0, 80.0, 200.0]
+    analytics.set_tracks(0, {9: {"tracker_id": 9, "bbox": bbox}}, frame_id=1)
+    frame = _FrameMeta(
+        object_items=[_ObjMeta(object_id=9, rect_params=_Rect(*bbox))],
+        frame_number=1,
+    )
 
     processor._handle_frame(frame, SimpleNamespace(), now=0.0)  # type: ignore[attr-defined]
 
@@ -261,6 +347,7 @@ def test_source_to_mosaic_uses_configured_tiler_rect_when_compositor_missing() -
     processor.pipeline.components = {
         "tiler": SimpleNamespace(config={"width": 3840, "height": 720, "columns": 3, "rows": 1})
     }
+    processor._mosaic_size = processor._resolve_mosaic_size()  # type: ignore[attr-defined]
     processor.pipeline.camera_labels = {0: "living-room", 1: "kitchen", 2: "family-room"}
     frame = _FrameMeta(
         object_items=[],
@@ -281,6 +368,7 @@ def test_floor_plane_anchor_maps_analytics_uv_into_source_tile_without_composito
     processor.pipeline.components = {
         "tiler": SimpleNamespace(config={"width": 3840, "height": 720, "columns": 3, "rows": 1})
     }
+    processor._mosaic_size = processor._resolve_mosaic_size()  # type: ignore[attr-defined]
     processor.pipeline.camera_labels = {0: "living-room", 1: "kitchen", 2: "family-room"}
     bbox, foot_uv = _person_bbox(calib, foot_world=[0.0, 0.0, 6.0])
     analytics.set_tracks(
@@ -291,13 +379,19 @@ def test_floor_plane_anchor_maps_analytics_uv_into_source_tile_without_composito
                 "bbox": bbox,
                 "world": [0.0, 0.0, 6.0],
                 "world_valid": True,
+                "world_frame": "backend_world_m",
+                "world_frame_revision": "test-world-revision",
+                "world_transform_sha256": "a" * 64,
+                "image_size": [1280, 720],
                 "image_foot": [float(foot_uv[0]), float(foot_uv[1])],
             }
         },
+        frame_id=1,
     )
     frame = _FrameMeta(
         object_items=[_ObjMeta(object_id=7, rect_params=_Rect(*bbox))],
         source_id=1,
+        frame_number=1,
         compositor_rect=None,  # type: ignore[arg-type]
         source_frame_width=1280,
         source_frame_height=720,
@@ -311,7 +405,7 @@ def test_floor_plane_anchor_maps_analytics_uv_into_source_tile_without_composito
 
 
 def test_predicted_segments_render_with_reduced_alpha(monkeypatch: pytest.MonkeyPatch) -> None:
-    processor, _calib, _analytics = _build_processor(anchor_mode="bbox_bottom", predicted_alpha_scale=0.5)
+    processor, _calib, analytics = _build_processor(anchor_mode="bbox_bottom", predicted_alpha_scale=0.5)
     processor._tracks[0] = {
         7: hooks._TrailTrackState(  # type: ignore[attr-defined]
             points=deque(
@@ -357,7 +451,8 @@ def test_predicted_segments_render_with_reduced_alpha(monkeypatch: pytest.Monkey
     fake_osd = SimpleNamespace(Line=_Line, Text=_Text, FontFamily=SimpleNamespace(Serif="Serif"))
     monkeypatch.setattr(hooks, "ds_osd", fake_osd)
 
-    frame = _FrameMeta(object_items=[])
+    analytics.set_tracks(0, {7: {"tracker_id": 7}}, frame_id=1)
+    frame = _FrameMeta(object_items=[], frame_number=1)
     batch = _BatchMeta()
     processor._handle_frame(frame, batch, now=1.0)  # type: ignore[attr-defined]
 

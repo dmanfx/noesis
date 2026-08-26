@@ -1,7 +1,7 @@
-"""Geometry helpers for DS8 calibration.
+"""Geometry helpers for canonical Noesis calibration.
 
 Single implementation of pixel_to_world with correct semantics:
-- DS8 does NOT apply align.matrix to outputs
+- The canonical runtime does NOT apply align.matrix to outputs
 - floor_y and unit_scale are applied consistently
 """
 

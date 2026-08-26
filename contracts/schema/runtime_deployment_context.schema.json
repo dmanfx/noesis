@@ -23,10 +23,7 @@
       "type": "string"
     },
     "runtime_family": {
-      "enum": [
-        "ds8",
-        "ds9"
-      ],
+      "const": "ds9",
       "title": "Runtime Family",
       "type": "string"
     },

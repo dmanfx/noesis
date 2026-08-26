@@ -19,10 +19,11 @@ license: CC-BY-4.0 AND Apache-2.0
 
 When the active workspace is the Noesis repository, read the root and
 `DS9/AGENTS.md` first and stop before the container workflow below. Noesis runs
-only native DS9.1, Docker is prohibited, and MV3DT/AMC remain disabled until
-the Kitchen geometry and Kitchen/Family Room overlap evidence are accepted.
-Use the material below only as an upstream reference outside the Noesis
-application; it is not an executable fallback for Noesis.
+only native DS9.1 and Docker is prohibited. Baseline tracking remains canonical;
+MV3DT is an explicit opt-in limited to the accepted Kitchen/Family Room peer
+edge, and AMC remains deferred. Use the material below only as an upstream
+reference outside the Noesis application; it is not an executable fallback for
+Noesis.
 
 ## When to Use This Skill
 

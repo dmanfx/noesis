@@ -1,25 +1,10 @@
 from __future__ import annotations
 
-import ast
 import logging
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
-from noesis.ds8_runtime import _build_mosaic_keyframe_requester
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def _function_ast(path: Path, name: str) -> str:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    node = next(
-        item
-        for item in tree.body
-        if isinstance(item, ast.FunctionDef) and item.name == name
-    )
-    return ast.dump(node, include_attributes=False)
+from noesis.ds9_runtime_core import _build_mosaic_keyframe_requester
 
 
 class _Trigger:
@@ -64,13 +49,6 @@ def _pipeline(trigger: _Trigger):
 
 
 class ForceIdrRuntimeTests(unittest.TestCase):
-    def test_ds9_keyframe_requester_is_exact_ds8_parity(self) -> None:
-        name = "_build_mosaic_keyframe_requester"
-        self.assertEqual(
-            _function_ast(ROOT / "noesis" / "ds8_runtime.py", name),
-            _function_ast(ROOT / "DS9" / "noesis" / "ds9_runtime_core.py", name),
-        )
-
     def test_monotonic_native_requests_are_acknowledged(self) -> None:
         trigger = _Trigger()
         requester = _build_mosaic_keyframe_requester(

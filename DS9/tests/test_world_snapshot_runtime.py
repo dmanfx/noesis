@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import ast
 import tempfile
 import time
 import unittest
@@ -17,8 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_publishers():
-    path = REPO_ROOT / "DS9" / "noesis" / "telemetry" / "publishers.py"
-    spec = importlib.util.spec_from_file_location("ds9_tracking_publishers", path)
+    path = REPO_ROOT / "noesis" / "telemetry" / "publishers.py"
+    spec = importlib.util.spec_from_file_location("shared_tracking_publishers", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load {path}")
     module = importlib.util.module_from_spec(spec)
@@ -76,7 +75,7 @@ class _WebSocketRecorder:
 
 
 class WorldSnapshotRuntimeTests(unittest.TestCase):
-    def test_ds9_publisher_emits_canonical_snapshot_and_health_progress(self) -> None:
+    def test_shared_publisher_emits_canonical_snapshot_and_health_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model_path = root / "detector.engine"
@@ -123,6 +122,11 @@ class WorldSnapshotRuntimeTests(unittest.TestCase):
                         "world": [1.0, 0.0, 2.0],
                         "world_valid": True,
                         "world_frame": "backend_world_m",
+                        "world_frame_revision": "world-rev",
+                        "world_transform_sha256": "d" * 64,
+                        "calibration_revision": "calibration-rev",
+                        "world_quality": "good",
+                        "world_source": "pose_depth_fused",
                     }
                 ],
             )
@@ -139,7 +143,6 @@ class WorldSnapshotRuntimeTests(unittest.TestCase):
             entity_id = tracking["world_snapshot"]["entities"][0]["entity_id"]
             self.assertEqual(entity_id, "visitor:ds9-test-run:1001:g3")
             self.assertEqual(websocket.messages[2]["payload"]["event_type"], "appeared")
-
             health = monitor.snapshot(generated_at_us=max(1, time.time_ns() // 1_000))
             self.assertEqual({row.status.value for row in health.capabilities}, {"healthy"})
 
@@ -154,24 +157,6 @@ class WorldSnapshotRuntimeTests(unittest.TestCase):
         self.assertIn("world_service=world_service", runtime)
         self.assertIn("health_monitor=capability_monitor", runtime)
 
-    def test_ds9_tracking_publisher_has_no_ds8_contract_drift(self) -> None:
-        def tracking_class(path: Path) -> str:
-            source = path.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-            node = next(
-                item
-                for item in tree.body
-                if isinstance(item, ast.ClassDef)
-                and item.name == "TrackingTelemetryPublisher"
-            )
-            return ast.get_source_segment(source, node) or ""
-
-        ds8 = tracking_class(REPO_ROOT / "noesis" / "telemetry" / "publishers.py")
-        ds9 = tracking_class(
-            REPO_ROOT / "DS9" / "noesis" / "telemetry" / "publishers.py"
-        )
-        self.assertEqual(ds9, ds8)
-
     def test_both_ds9_public_track_paths_apply_time_and_identity_contracts(self) -> None:
         hooks = (REPO_ROOT / "DS9" / "noesis" / "pipelines" / "hooks.py").read_text(encoding="utf-8")
         self.assertEqual(hooks.count("temporal_contract = _frame_temporal_contract"), 2)
@@ -179,12 +164,8 @@ class WorldSnapshotRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(hooks.count("**temporal_contract"), 2)
         self.assertGreaterEqual(hooks.count("**identity_contract"), 2)
 
-    def test_ds8_v3dt_and_ds9_emit_the_same_zone_authority_contract(self) -> None:
-        paths = (
-            REPO_ROOT / "noesis" / "pipelines" / "hooks.py",
-            REPO_ROOT / "noesis" / "pipelines" / "hooks_v3dt_reimpl.py",
-            REPO_ROOT / "DS9" / "noesis" / "pipelines" / "hooks.py",
-        )
+    def test_ds91_hooks_emit_the_authoritative_zone_contract(self) -> None:
+        paths = (REPO_ROOT / "DS9" / "noesis" / "pipelines" / "hooks.py",)
         for path in paths:
             hooks = path.read_text(encoding="utf-8")
             self.assertIn(

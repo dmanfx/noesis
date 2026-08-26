@@ -16,13 +16,14 @@ telemetry, and feeds the Menon/oai2-fe dashboard.
 - One GPU H.264 mosaic delivered through SHM/WebRTC. RTSP output is disabled.
 - REST is loopback-only on 8080 and WebSocket/WebRTC signaling is loopback-only
   on 6008; Menon owns browser-facing authentication and delivery.
-- Baseline tracking is canonical. MV3DT and AMC are disabled pending accepted
-  Kitchen geometry and Kitchen/Family Room overlap evidence.
+- Baseline tracking is canonical. MV3DT is an explicit opt-in limited to the
+  accepted Kitchen/Family Room peer edge; AMC remains deferred.
 
 DeepStream 8, DeepStream 9.0, and the former DS9.1 container deployment are
-historical. They are not supported runtime alternatives. Their remaining inert
-entrypoints/packages are tracked for destructive removal in
-[`plans/ds91_native_host_only_migration.md`](plans/ds91_native_host_only_migration.md).
+historical. They are not supported runtime alternatives, and their executable
+surfaces have been removed from the active tree. The retained non-normative
+record is indexed by [`docs/history/README.md`](docs/history/README.md) and
+[`plans/archive/README.md`](plans/archive/README.md).
 
 ## Architecture at a glance
 
@@ -55,6 +56,8 @@ The detailed graph and authority boundaries are in
 | `oai2-fe/` | Noesis diagnostics/dashboard frontend delivered through Menon |
 | `docs/` | Current architecture, contracts, operating guidance, and history index |
 | `plans/` | Active work orders; completed/superseded plans are under `plans/archive/` |
+| `archive/` | Checksummed external-archive locators; no executable legacy source |
+| `third_party/` | Provenance lock for external checkouts; no vendored runtime code |
 
 ## Operating the installed application
 

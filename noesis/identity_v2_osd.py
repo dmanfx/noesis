@@ -70,7 +70,7 @@ class IdentityV2PostResolutionOsdProcessor:
     sensor_id_map: Mapping[int, int] = field(default_factory=dict)
     decimals: int = 2
 
-    def handle_frame_ds8(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
         """Stamp one frame using a single traversal of fresh object wrappers."""
 
         source_id = _integer_attr(frame_meta, "source_id", "pad_index")
@@ -126,7 +126,7 @@ class IdentityV2PostResolutionOsdProcessor:
 
 
 class IdentityV2PostResolutionOsdOperator:
-    """Runtime-neutral operator body wrapped by adapter-local DS8 classes."""
+    """Runtime-neutral operator body wrapped by the DS9.1 adapter."""
 
     def __init__(self, processor: IdentityV2PostResolutionOsdProcessor) -> None:
         self.processor = processor
@@ -138,7 +138,7 @@ class IdentityV2PostResolutionOsdOperator:
         if frame_items is None:
             return
         for frame_meta in frame_items:
-            self.processor.handle_frame_ds8(frame_meta)
+            self.processor.handle_servicemaker_frame(frame_meta)
 
 
 __all__ = [

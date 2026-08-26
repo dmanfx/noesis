@@ -1,9 +1,9 @@
 # Kitchen optimized SV3DT profile
 
-Status: validated, opt-in per-camera SV3DT profile. MV3DT remains disabled in
-the canonical native DS9.1 application. This profile is isolated from the
-non-V3DT lane and does not replace its tracker, analytics, identity settings,
-or camera assets.
+Status: validated, opt-in per-camera SV3DT profile. This profile does not itself
+enable MV3DT; the accepted Kitchen/Family Room lane is a separate explicit
+opt-in. This profile is isolated from baseline and does not replace its tracker,
+analytics, identity settings, or camera assets.
 
 Bounded recorded-input reproduction command:
 
@@ -63,10 +63,10 @@ with its bottom-face center beneath the feet.
 ## MV3DT gate
 
 The synchronized July Kitchen and Family Room clips contain a real common-FOV
-doorway interval at approximately 47.0-49.5 seconds. That proves an overlap
-edge exists. It does not supply a trustworthy shared world frame: the latest
-three-room fusion remains `review_only`, with registration rejected for
+doorway interval at approximately 47.0-49.5 seconds. This candidate's recorded
+three-room fusion remained `review_only`, with registration rejected for
 training and held-out observation error, per-view deformation, and temporal
-holdout failure. Keep MV3DT disabled until a common Kitchen/Family transform
-passes those gates; per-room Scene Priors remain reconstruction evidence, not
-cross-camera tracking authority.
+holdout failure. That dated gate was later superseded by the separately
+accepted Kitchen/Family binding used by `DS9/config/infer_mv3dt.yaml`. Per-room
+Scene Priors remain reconstruction evidence and this SV3DT profile does not
+grant cross-camera tracking authority.

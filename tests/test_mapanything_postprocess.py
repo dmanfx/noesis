@@ -13,20 +13,31 @@ from geometry.depth_source import (
     DepthStorageManager,
     _binary_mask_component_evidence,
 )
-from noesis.pipelines import ds8_pipeline
+from noesis.pipelines import deepstream_pipeline as pipeline
 from noesis.pipelines import hooks
 
 
 @pytest.fixture(autouse=True)
-def _reset_pipeline_singleton():
-    ds8_pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
+def _reset_pipeline_singleton(monkeypatch: pytest.MonkeyPatch):
+    pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
+    monkeypatch.setenv("NOESIS_DS9_STUB_PIPELINE", "1")
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvinfer_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvtracker_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
     yield
-    ds8_pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
+    pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
 
 
-def _build_pipeline() -> ds8_pipeline.DS8Pipeline:
-    config_path = Path("config/infer.yaml")
-    return ds8_pipeline.build_pipeline(config_path)
+def _build_pipeline() -> pipeline.DeepStreamPipeline:
+    config_path = Path("DS9/config/infer.yaml")
+    return pipeline.build_pipeline(config_path)
 
 
 def test_mapanything_processor_emits_depth_result(tmp_path: Path):

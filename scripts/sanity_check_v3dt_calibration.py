@@ -418,7 +418,7 @@ def main() -> int:
             actions.append(
                 "camInfo appears to have been generated with INVERT_E=1 (treating E as if it must be inverted). "
                 "But your calibration JSON stores E as world->camera (col-major). For SV3DT, camInfo should use E directly. "
-                "Fix: set NOESIS_V3DT_CAMINFO_INVERT_E=0, regenerate camInfo, and prevent ds8_runtime autogen from reintroducing it."
+                "Fix: set NOESIS_V3DT_CAMINFO_INVERT_E=0, regenerate camInfo, and prevent runtime autogen from reintroducing it."
             )
 
         # World axes
@@ -466,7 +466,7 @@ def main() -> int:
             "  export NOESIS_V3DT_CAMINFO_Y_FLIP=1\n"
             "  export NOESIS_V3DT_CAMINFO_WORLD_SCALE=1\n"
             "  python3 scripts/generate_v3dt_caminfo.py --pipeline-config <...> --cameras-config <...> --calibration <...> --output-dir <...>\n"
-            "  export NOESIS_V3DT_AUTOGEN_CAMINFO=0   # stop ds8_runtime from overwriting\n"
+            "  export NOESIS_V3DT_AUTOGEN_CAMINFO=0   # stop runtime autogen from overwriting\n"
         )
         return 1
 

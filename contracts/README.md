@@ -18,7 +18,7 @@ contracts through `DS9/noesis/`. Older appliance selector and
 `noesis-runtime-v1` checkout-identity material remains implemented for
 historical compatibility but is not part of ordinary runtime activation or
 development. Its former documentation is archived under
-`docs/history/ds9_container/`.
+`docs/history/runtime/ds9_container/`.
 
 For current wire behavior, use `docs/api_contracts_ws.md`,
 `docs/api_contracts_rest.md`, and `docs/metadata_contracts.md`.

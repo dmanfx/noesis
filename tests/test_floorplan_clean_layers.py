@@ -202,7 +202,7 @@ def test_kitchen_clean_layers_obstacles_and_unknown_walkable() -> None:
 
 
 def test_kitchen_clean_layers_handles_inverted_height_axis() -> None:
-    # DS8 conventions require +Y up in the "camera_local_ground" frame. If a deployment
+    # Canonical conventions require +Y up in the "camera_local_ground" frame. If a deployment
     # violates this, floorplan layers may need additional sign/plane selection logic.
     # Keep this test as a placeholder for future regression coverage once a real
     # inverted-axis calibration is observed in the wild.

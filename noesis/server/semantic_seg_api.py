@@ -12,7 +12,7 @@ from noesis.server.boundary_metrics import (
     mark_rest_response_exempt,
     measure_rest_response_model,
 )
-from semantic_capture_runtime import (
+from noesis.semantic_capture import (
     SemanticCaptureBusy,
     SemanticCaptureError,
     SemanticCaptureManager,

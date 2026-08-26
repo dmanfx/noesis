@@ -1,4 +1,4 @@
-"""Shared DS8/DS9 identity-v2 runtime ownership and frame adapter.
+"""Shared identity-v2 service used by the canonical DS9 runtime.
 
 This module is deliberately independent of DeepStream metadata wrappers.  Each
 runtime extracts immutable primitive evidence while walking a source frame once,
@@ -536,23 +536,22 @@ def _load_open_set_policy(
 
 
 def _identity_runtime_name(environ: Mapping[str, str], pipeline_yaml_path: Path) -> str:
+    _ = pipeline_yaml_path
     configured = str(environ.get("NOESIS_DEEPSTREAM_MAJOR", "") or "").strip()
-    if configured:
-        if configured not in {"8", "9"}:
-            raise IdentityV2ConfigurationError(
-                "NOESIS_DEEPSTREAM_MAJOR must be 8 or 9 for identity authority"
-            )
-        return f"ds{configured}"
-    return "ds9" if "DS9" in pipeline_yaml_path.parts else "ds8"
+    if configured and configured != "9":
+        raise IdentityV2ConfigurationError(
+            "NOESIS_DEEPSTREAM_MAJOR must be 9 for identity authority"
+        )
+    return "ds9"
 
 
 def identity_authority_runtime_profile_sha256(*, runtime: str) -> str:
     """Hash the executable whole-frame identity surface for cutover evidence."""
 
     normalized_runtime = str(runtime or "").strip().lower()
-    if normalized_runtime not in {"ds8", "ds9"}:
+    if normalized_runtime != "ds9":
         raise IdentityV2ConfigurationError(
-            "identity authority runtime profile requires runtime=ds8|ds9"
+            "identity authority runtime profile requires runtime=ds9"
         )
     source_root = Path(__file__).resolve().parents[1]
     shared = {
@@ -564,19 +563,10 @@ def identity_authority_runtime_profile_sha256(*, runtime: str) -> str:
         "runtime": source_root / "reid" / "identity_v2" / "runtime.py",
         "scoring": source_root / "reid" / "identity_v2" / "scoring.py",
     }
-    if normalized_runtime == "ds9":
-        runtime_components = {
-            "runtime_entry": source_root / "DS9" / "noesis" / "ds9_runtime_core.py",
-            "analytics_hook": source_root / "DS9" / "noesis" / "pipelines" / "hooks.py",
-        }
-    else:
-        runtime_components = {
-            "runtime_entry": source_root / "noesis" / "ds8_runtime.py",
-            "analytics_hook": source_root / "noesis" / "pipelines" / "hooks.py",
-            "v3dt_analytics_hook": (
-                source_root / "noesis" / "pipelines" / "hooks_v3dt_reimpl.py"
-            ),
-        }
+    runtime_components = {
+        "runtime_entry": source_root / "DS9" / "noesis" / "ds9_runtime_core.py",
+        "analytics_hook": source_root / "DS9" / "noesis" / "pipelines" / "hooks.py",
+    }
     components = {**shared, **runtime_components}
     fingerprints = {}
     for role, path in sorted(components.items()):

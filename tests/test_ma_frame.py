@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import requests
 
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis_core.runtime_secrets import load_camera_uri_registry
 
 

@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from noesis.pipelines import ds8_pipeline  # noqa: E402
+from noesis.pipelines import deepstream_pipeline as pipeline  # noqa: E402
 from noesis.server import boundary_metrics  # noqa: E402
 
-PIPELINE_CONFIG_ENV = "NOESIS_DS8_PIPELINE_CONFIG"
+PIPELINE_CONFIG_ENV = "NOESIS_DS9_PIPELINE_CONFIG"
 FORCE_STUB_ENV = "NOESIS_DEPTH_API_FORCE_STUB"
 
 
@@ -37,14 +37,14 @@ def _load_depth_api(monkeypatch: pytest.MonkeyPatch, force_stub: bool) -> Any:
 def _reset_pipeline() -> None:
     """Clear the global pipeline singleton between tests."""
     try:
-        graph = ds8_pipeline.get_pipeline()
+        graph = pipeline.get_pipeline()
     except Exception:
         graph = None
 
     if graph is not None and getattr(graph, "_timer", None):
         graph._timer.cancel()
 
-    ds8_pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
+    pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
 
 
 @pytest.fixture(autouse=True)
@@ -52,23 +52,35 @@ def pipeline_guard(monkeypatch: pytest.MonkeyPatch):
     """Reset pipeline state before each test to keep globals isolated."""
     _reset_pipeline()
     boundary_metrics.reset_boundary_serialization_metrics()
+    monkeypatch.setenv("NOESIS_DS9_STUB_PIPELINE", "1")
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvinfer_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvtracker_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
     yield
     _reset_pipeline()
     boundary_metrics.reset_boundary_serialization_metrics()
     monkeypatch.delenv(PIPELINE_CONFIG_ENV, raising=False)
     monkeypatch.delenv(FORCE_STUB_ENV, raising=False)
+    monkeypatch.delenv("NOESIS_DS9_STUB_PIPELINE", raising=False)
 
 
 def test_depth_refresh_uses_controller_owned_provider(
     monkeypatch: pytest.MonkeyPatch,
 ):
     depth_api = _load_depth_api(monkeypatch, force_stub=False)
-    cfg_path = Path("config/infer.yaml")
+    cfg_path = Path("DS9/config/infer.yaml")
     assert cfg_path.exists()
     monkeypatch.setenv(PIPELINE_CONFIG_ENV, str(cfg_path))
     assert depth_api.ensure_pipeline_ready() is True
 
-    graph = ds8_pipeline.get_pipeline()
+    graph = pipeline.get_pipeline()
     assert graph.depth_enabled is False
 
     calls: list[int] = []
@@ -113,7 +125,7 @@ def test_depth_refresh_rejects_missing_or_busy_controller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     depth_api = _load_depth_api(monkeypatch, force_stub=False)
-    monkeypatch.setenv(PIPELINE_CONFIG_ENV, "config/infer.yaml")
+    monkeypatch.setenv(PIPELINE_CONFIG_ENV, "DS9/config/infer.yaml")
 
     with TestClient(depth_api.app) as client:
         missing = client.post(

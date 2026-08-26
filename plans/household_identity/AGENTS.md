@@ -45,9 +45,10 @@ for the canonical native DeepStream 9.1 application.
 - Pipeline selection: `DS9/config/infer.yaml`
 - Camera topology: `config/camera_topology.yaml`
 
-MV3DT remains disabled. Do not use an MV3DT remap as an identity solution or
-enable cross-camera overlap outside the geometry boundary recorded in
-`camera_topology.md`.
+MV3DT is not the baseline identity path. The accepted Kitchen/Family Room lane
+is a separate explicit runtime opt-in; do not use an MV3DT remap as an identity
+solution or enable cross-camera overlap outside the geometry boundary recorded
+in `camera_topology.md`.
 
 ## Work and validation
 

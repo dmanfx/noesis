@@ -48,7 +48,6 @@ def _processor(raw: SimpleNamespace, active: SimpleNamespace) -> hooks._Analytic
     )
     policy = WorldFusionPolicy(
         policy_id="world-boundary-test",
-        runtime_lane="ds9",
         evidence={},
         cameras={
             "cam0": CameraWorldFusionProfile(

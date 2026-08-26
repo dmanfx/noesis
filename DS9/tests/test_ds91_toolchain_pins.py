@@ -43,16 +43,13 @@ def _read(relative: str) -> str:
     return (DS9_ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_development_image_pins_ds91_and_installs_service_maker() -> None:
-    dockerfile = _read("docker/Dockerfile")
-    expected_base = (
-        "nvcr.io/nvidia/deepstream:9.1-triton-multiarch@"
-        "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
-    )
-    assert f"FROM {expected_base}" in dockerfile
-    assert "service-maker/python/pyservicemaker*.whl" in dockerfile
-    assert "import pyservicemaker" in dockerfile
-    assert "9.0-triton-multiarch" not in dockerfile
+def test_native_host_environment_pins_ds91_and_service_maker() -> None:
+    build_env = _read("scripts/ds9_build_env.sh")
+    host = _read("scripts/run_canonical_runtime_host.py")
+    assert DS_HOME in build_env
+    assert CUDA_HOME in build_env
+    assert "pyservicemaker" in host
+    assert "run_canonical_runtime_container" not in host
 
 
 def test_build_defaults_pin_ds91_and_cuda132() -> None:
@@ -91,7 +88,7 @@ def test_preflight_uses_exact_ds91_driver_floor() -> None:
     assert DS_HOME in preflight
 
 
-def test_active_authority_contracts_pin_the_built_ds91_images() -> None:
+def test_active_authority_contracts_pin_the_native_ds91_host() -> None:
     manifest = yaml.safe_load(_read("asset_manifest.yaml"))
     assert manifest["target"]["deepstream"] == {
         "major": 9,
@@ -100,11 +97,19 @@ def test_active_authority_contracts_pin_the_built_ds91_images() -> None:
     }
     assert manifest["target"]["cuda"] == "13.2"
     assert manifest["target"]["tensorrt"] == "10.16.0.72"
-    assert manifest["target"]["build_image"]["image_id"] == (
-        "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
-    )
-    assert manifest["runtime"]["image"]["image_id"] == (
-        "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e"
+    assert manifest["schema_version"] == 3
+    assert manifest["target"]["native_host"] == {
+        "operating_system": "ubuntu-24.04",
+        "architecture": "x86_64",
+        "driver_minimum": "595.58.03",
+        "gstreamer": "1.24.2",
+        "sdk_root": DS_HOME,
+        "cuda_root": CUDA_HOME,
+        "native_root_env": "NOESIS_DS91_NATIVE_ROOT",
+    }
+    assert manifest["runtime"]["backend"] == "native_host"
+    assert manifest["runtime"]["supervisor"] == (
+        "DS9/scripts/run_canonical_runtime_host.py"
     )
     assert all(
         item["compatibility"]["cuda"] == "13.2"
@@ -116,15 +121,11 @@ def test_active_authority_contracts_pin_the_built_ds91_images() -> None:
         if item["kind"] in {"nvinfer_parser", "tensorrt_plugin", "tensorrt_engine"}
     )
 
-    launcher = _read("scripts/run_canonical_runtime_container.py")
-    maintenance = _read("scripts/run_canonical_engine_maintenance.sh")
+    launcher = _read("scripts/run_canonical_runtime_host.py")
     host_maintenance = _read("scripts/run_canonical_engine_maintenance_host.sh")
-    for source in (launcher, maintenance, host_maintenance):
+    for source in (launcher, host_maintenance):
         assert "9.0-20260710" not in source
         assert "10.14.1.48" not in source
-    assert "TensorRT v101600" in maintenance
-    assert 'REQUIRED_DRIVER_VERSION="595.58.03"' in maintenance
-    assert 'NOESIS_DS9_ENGINE_BACKEND:-native_host' in maintenance
-    assert "run_canonical_engine_maintenance_host.sh" in maintenance
+    assert 'REQUIRED_DRIVER_VERSION="595.58.03"' in host_maintenance
     assert "native maintenance refuses NOESIS_DS9_DOCKER_ROOT" in host_maintenance
     assert "MV3DT/AMC remain disabled" in host_maintenance

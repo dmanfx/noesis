@@ -39,7 +39,7 @@ Mitigation: Review and scan skill before deployment. <br>
 - [Troubleshooting](references/troubleshooting.md) <br>
 - [REST API Dynamic Sources](references/rest_api_dynamic.md) <br>
 - [Metamux Config](references/metamux_config.md) <br>
-- [Docker Containers](references/docker_containers.md) <br>
+- [Native Host Setup](references/native_host_setup.md) <br>
 - [NVDS Message API Adapter](references/nvds_msgapi_adapter.md) <br>
 - [NVIDIA DeepStream SDK](https://developer.nvidia.com/deepstream-sdk) <br>
 

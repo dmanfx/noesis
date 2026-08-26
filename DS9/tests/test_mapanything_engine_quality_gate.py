@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import json
 import math
 import os
@@ -29,10 +28,6 @@ def _load(name: str, relative: str):
 common = _load(
     "ds9_mapanything_quality_common_test",
     "DS9/scripts/engine_maintenance_common.py",
-)
-finalizer = _load(
-    "ds9_mapanything_quality_finalizer_test",
-    "DS9/scripts/finalize_engine_realization.py",
 )
 
 
@@ -374,21 +369,6 @@ class MapAnythingEngineQualityGateTests(unittest.TestCase):
                 fixture_path=fixture,
             )
             self.assertEqual(validated["receipt_sha256"], receipt["receipt_sha256"])
-
-    def test_host_finalizer_validates_quality_before_realization(self) -> None:
-        source = inspect.getsource(finalizer.commit)
-        self.assertLess(
-            source.index("validate_mapanything_functional_quality_receipt("),
-            source.index("reconciler.reconcile("),
-        )
-        reconcile_source = inspect.getsource(finalizer.reconciler.reconcile)
-        self.assertLess(
-            reconcile_source.index(
-                "validate_mapanything_functional_quality_receipt("
-            ),
-            reconcile_source.index("os.replace(temporary, realization_path)"),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

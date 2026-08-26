@@ -108,7 +108,7 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         rest="http://127.0.0.1:8080",
         camera="kitchen",
         cameras_config=cameras,
-        pipeline_config=Path("config/infer.yaml"),
+        pipeline_config=Path("DS9/config/infer.yaml"),
         baseline_timeout=10.0,
         excluded_timeout=10.0,
         restore_timeout=10.0,

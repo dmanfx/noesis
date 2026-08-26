@@ -16,21 +16,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from noesis.server import analytics_api  # noqa: E402
-from noesis.pipelines import ds8_pipeline  # noqa: E402
+from noesis.pipelines import deepstream_pipeline as pipeline  # noqa: E402
 from noesis.pipelines import hooks  # noqa: E402
 
 
 def _reset_pipeline() -> None:
-    """Ensure the DS8 pipeline singleton is cleared between tests."""
+    """Ensure the canonical pipeline singleton is cleared between tests."""
     try:
-        graph = ds8_pipeline.get_pipeline()
+        graph = pipeline.get_pipeline()
     except Exception:
         graph = None
 
     if graph is not None and getattr(graph, "_timer", None):
         graph._timer.cancel()
 
-    ds8_pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
+    pipeline._PIPELINE_SINGLETON = None  # type: ignore[attr-defined]
 
 
 def _reset_analytics_state() -> None:
@@ -48,6 +48,18 @@ def analytics_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _reset_pipeline()
     _reset_analytics_state()
 
+    monkeypatch.setenv("NOESIS_DS9_STUB_PIPELINE", "1")
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvinfer_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "materialize_nvtracker_engine_only_config",
+        lambda **kwargs: Path(kwargs["source_config"]),
+    )
+
     cfg_src = Path("config/nvdsanalytics.yaml")
     cfg_dst = tmp_path / "nvdsanalytics.yaml"
     cfg_dst.write_text(cfg_src.read_text(encoding="utf-8"), encoding="utf-8")
@@ -60,6 +72,7 @@ def analytics_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _reset_analytics_state()
     monkeypatch.delenv(analytics_api.ANALYTICS_CONFIG_ENV, raising=False)
     monkeypatch.delenv("NOESIS_ANALYTICS_EXCLUDE_CONFIG", raising=False)
+    monkeypatch.delenv("NOESIS_DS9_STUB_PIPELINE", raising=False)
 
 
 @pytest.fixture()
@@ -111,7 +124,7 @@ def test_exclusion_path_lookup_has_no_default_when_pipeline_is_absent(
 
 
 def test_update_rolls_back_when_native_reload_cannot_be_acknowledged(client: TestClient):
-    graph = ds8_pipeline.build_pipeline(Path("config/infer.yaml"))
+    graph = pipeline.build_pipeline(Path("DS9/config/infer.yaml"))
     hooks.attach_analytics_reload_bridge(graph)
     node = graph.ds_pipeline["analytics_exclude"]
     real_set = node.set
@@ -227,7 +240,7 @@ def test_update_rejects_nonfinite_coordinates(client: TestClient):
 
 
 def test_update_returns_exact_native_reload_receipt(client: TestClient):
-    graph = ds8_pipeline.build_pipeline(Path("config/infer.yaml"))
+    graph = pipeline.build_pipeline(Path("DS9/config/infer.yaml"))
     config_path = Path(graph.components["analytics_exclude"].config["config-file"])
     analytics_cfg = analytics_api._load_config(force=True)
     stage_cfg = analytics_cfg["analytics"]["stages"]["exclude"]
@@ -294,7 +307,7 @@ def test_update_returns_exact_native_reload_receipt(client: TestClient):
 
 
 def test_receipt_read_failure_after_native_dispatch_poison_is_fatal(client: TestClient):
-    graph = ds8_pipeline.build_pipeline(Path("config/infer.yaml"))
+    graph = pipeline.build_pipeline(Path("DS9/config/infer.yaml"))
     config_path = Path(analytics_api._resolve_analytics_config())
     exclude_path = Path(analytics_api._resolve_exclude_config_path())
     config_before = config_path.read_bytes()
@@ -409,7 +422,7 @@ def test_post_commit_publication_failure_poison_is_fatal(
     monkeypatch: pytest.MonkeyPatch,
     publication_failure: str,
 ):
-    graph = ds8_pipeline.build_pipeline(Path("config/infer.yaml"))
+    graph = pipeline.build_pipeline(Path("DS9/config/infer.yaml"))
     config_path = Path(analytics_api._resolve_analytics_config())
     exclude_path = Path(analytics_api._resolve_exclude_config_path())
     config_before = config_path.read_bytes()

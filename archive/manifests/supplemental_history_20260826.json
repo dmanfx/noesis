@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "archive_id": "supplemental_history_20260826",
+  "purpose": "Preserve ignored historical source material before repository retirement and reorganization.",
+  "source_repository_head": "e83851634e087ea74424bc7f4b418aacc04539c8",
+  "source_branch": "DS9",
+  "capture_date_utc": "2026-08-26",
+  "archive_root_env": "NOESIS_WORKSPACE_PRESERVATION_ROOT",
+  "archive_relative_path": "2026-08-26/supplemental_history/noesis_supplemental_history_20260826.tar.gz",
+  "archive_sha256": "15897a46100225558b674cbac6d5460960cb4ff5b8e49896eb5546c45e6f0c81",
+  "archive_size_bytes": 341842,
+  "archive_format": "deterministic tar.gz",
+  "source_path_count": 107,
+  "unique_payload_count": 96,
+  "exact_duplicate_path_count": 11,
+  "source_bytes_including_duplicates": 1181317,
+  "stored_payload_bytes": 1095420,
+  "deduplication": "Exact SHA-256 content equality; one payload is stored for each unique digest.",
+  "contents": "The archive-internal MANIFEST.json maps every original repo-relative path to its stored member, current capture source path, SHA-256 digest, byte size, and duplicate representative.",
+  "exclusions": [
+    "models",
+    "build outputs",
+    "runtime artifacts",
+    "credentials",
+    "private environment files"
+  ],
+  "validation": {
+    "source_paths_resolved": 107,
+    "source_paths_missing": 0,
+    "fresh_extraction_verified": true,
+    "member_sizes_verified": true,
+    "member_sha256_verified": true
+  }
+}

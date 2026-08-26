@@ -1,7 +1,7 @@
 # DS9.1 WebSocket API contracts
 _Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-25._
 
-The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
+The WebSocket server (`noesis.server.websocket.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
 ## Authentication boundary
 
@@ -1344,7 +1344,7 @@ Validation diagnostics:
 
 ## 7. Control & RPC Message Types
 
-Handled in `websocket_server.py`:
+Handled in `noesis/server/websocket.py`:
 
 - `clear_stats` → clears latency samples and broadcasts updated stats.
 - `set_vis_toggle` → visualization toggle; server broadcasts `toggle_update`.

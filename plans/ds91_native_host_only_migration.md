@@ -1,7 +1,8 @@
-# Native DeepStream 9.1 migration — remaining cleanup
+# Native DeepStream 9.1 migration — cleanup status
 
-Status: application migration and performance acceptance are complete. Removal
-of the inert DS8/DS9.0 and Noesis-Docker surfaces remains pending.
+Status: application migration, performance acceptance, and repository
+consolidation are complete. Machine-level retirement of the isolated Noesis
+Docker service and its storage remains a separately controlled cleanup phase.
 
 The detailed migration diary, machine inventory, commands, and intermediate
 failures are preserved at
@@ -26,25 +27,39 @@ It is historical evidence, not an execution script.
 - [x] Current documentation describes only the native DS9.1 application;
   superseded implementation records are archived.
 
-## Remaining legacy removal
+## Repository retirement completed
 
-These steps are intentionally destructive. Resolve exact targets immediately
-before acting and preserve the existing legacy archive/checksums first.
+The 2026-08-26 consolidation completed these repository-scoped steps without
+changing the installed service or external dependency worktrees:
 
-- [ ] Verify the existing DS8/DS9.0 archive can still list and extract
-  representative source/config records.
-- [ ] Remove executable DS8 and DS9.0 runtime entrypoints, active configs,
-  services, build wrappers, and compatibility launch links outside the archive.
-- [ ] Remove installed DeepStream 8.0/9.0 SDK/package directories after proving
-  the native service and build tools resolve only 9.1 libraries.
-- [ ] Move or remove old DS9.0/container artifact roots without changing the
-  accepted DS9.1 realization.
-- [ ] Remove Noesis Dockerfiles, image-build/runtime scripts, isolated-daemon
-  configuration, images, networks, and data root after resolving their exact
-  ownership and confirming no open handles.
-- [ ] Stop and disable the isolated Noesis Docker daemon/socket.
-- [ ] Remove stale Noesis Docker/image variables from active environment and
-  service files.
+- [x] Preserve and independently verify supplemental history, orphaned
+  workspace material, and root evidence archives. Their checksums and
+  extraction checks are recorded under `archive/manifests/`.
+- [x] Remove executable DS8/DS9.0 entrypoints, duplicate configs, build
+  wrappers, compatibility launch paths, and root native artifacts from the
+  active repository.
+- [x] Remove repository Dockerfiles, image builders, container supervisors,
+  registry/promotion machinery, and container-only validation paths.
+- [x] Consolidate executable ownership under `DS9/`, shared application code
+  under `noesis/` and `noesis_core/`, and external dependency provenance under
+  `third_party/`.
+- [x] Confirm the canonical DeepStream installation path resolves to 9.1 and
+  the active Noesis process uses the native-host supervisor.
+
+## Remaining machine-level removal
+
+These steps are intentionally destructive and were not implied by the
+repository-only consolidation. Resolve exact targets and open handles again
+immediately before acting:
+
+- [ ] Stop and disable `noesis-ds9-secondary-docker.service`, which was still
+  active at the repository cleanup checkpoint.
+- [ ] Remove its isolated Docker images, networks, daemon configuration, and
+  `/mnt/noesis_storage/noesis-ds9-docker` data root after confirming ownership.
+- [ ] Inventory and remove any superseded DS9.0/container artifact roots while
+  preserving the accepted DS9.1 realization and external archives.
+- [ ] Remove stale Noesis Docker/image variables from machine-level environment
+  and service files, if any remain after the daemon is retired.
 
 Do not create DS8/DS9.0 stubs, aliases, or fallbacks. Archive material is for
 reading only and must not remain executable.
@@ -56,7 +71,7 @@ Do not stop or uninstall ordinary Docker until that workload has been moved or
 the user explicitly accepts its outage. Noesis can and must remain fully
 Docker-free regardless of that separate service.
 
-## Direct acceptance after cleanup
+## Direct acceptance after each cleanup phase
 
 Run only the checks invalidated by removal:
 

@@ -19,10 +19,9 @@ from noesis.calibration.depth_registration import (
 )
 from noesis.calibration.depth_registration_builder import build_registration_entry
 from noesis.calibration.manager import CalibrationSnapshot
-from noesis.ds8_runtime import _build_depth_registration_profile_fingerprints
-from noesis.ds8_runtime import _load_depth_registration_manager
-from noesis.ds8_runtime import _resolve_depth_registration_path
-from scripts.build_depth_registration import _first_depth_map
+from noesis.ds9_runtime_core import _build_depth_registration_profile_fingerprints
+from noesis.ds9_runtime_core import _load_depth_registration_manager
+from noesis.ds9_runtime_core import _resolve_depth_registration_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -215,7 +214,7 @@ print(json.dumps({
     assert payload["wrong_name_match"] is False
 
 
-def test_ds8_depth_registration_profiles_are_stable_for_generated_configs() -> None:
+def test_depth_registration_profiles_are_stable_for_generated_configs() -> None:
     repo_root = Path.cwd().resolve()
     pipeline_cfg = {
         "models": {
@@ -230,7 +229,7 @@ def test_ds8_depth_registration_profiles_are_stable_for_generated_configs() -> N
             "mapanything": {
                 "name": "mapanything_fullframe",
                 "engine": str(repo_root / "models/mapanything_depth/1/model.plan"),
-                "config-file-path": "pipelines/config_infer_secondary_mapanything.ini",
+                "config-file-path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
                 "batch_size": 3,
                 "gie_id": 2,
                 "attach_tensor_meta": True,
@@ -240,7 +239,7 @@ def test_ds8_depth_registration_profiles_are_stable_for_generated_configs() -> N
 
     active_profiles = _build_depth_registration_profile_fingerprints(
         pipeline_cfg,
-        pipeline_path=repo_root / "config/infer.yaml",
+        pipeline_path=repo_root / "DS9/config/infer.yaml",
     )
     generated_profiles = _build_depth_registration_profile_fingerprints(
         pipeline_cfg,
@@ -270,38 +269,11 @@ def test_ds8_depth_registration_profiles_are_stable_for_generated_configs() -> N
     }
     assert _build_depth_registration_profile_fingerprints(
         with_first_camera_secret,
-        pipeline_path=repo_root / "config/infer.yaml",
+        pipeline_path=repo_root / "DS9/config/infer.yaml",
     ) == _build_depth_registration_profile_fingerprints(
         with_rotated_camera_secret,
-        pipeline_path=repo_root / "config/infer.yaml",
+        pipeline_path=repo_root / "DS9/config/infer.yaml",
     )
-
-
-def test_depth_registration_builder_keeps_full_bhw_depth_map() -> None:
-    depth = np.arange(1 * 3 * 4, dtype=np.float32).reshape(1, 3, 4)
-
-    selected = _first_depth_map(depth)
-
-    assert selected.shape == (3, 4)
-    np.testing.assert_array_equal(selected, depth[0])
-
-
-def test_depth_registration_builder_accepts_bchw_single_channel_depth_map() -> None:
-    depth = np.arange(1 * 1 * 3 * 4, dtype=np.float32).reshape(1, 1, 3, 4)
-
-    selected = _first_depth_map(depth)
-
-    assert selected.shape == (3, 4)
-    np.testing.assert_array_equal(selected, depth[0, 0])
-
-
-def test_depth_registration_builder_accepts_2d_depth_map() -> None:
-    depth = np.arange(12, dtype=np.float32).reshape(3, 4)
-
-    selected = _first_depth_map(depth)
-
-    assert selected.shape == (3, 4)
-    np.testing.assert_array_equal(selected, depth)
 
 
 def test_depth_registration_bundle_round_trip_and_apply(tmp_path: Path) -> None:
@@ -459,7 +431,7 @@ def _mapanything_registration_fixture(
         {
             "enable": True,
             "name": "mapanything_fullframe",
-            "config-file-path": "pipelines/config_infer_secondary_mapanything.ini",
+            "config-file-path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
             "engine": "models/mapanything_depth/1/model.plan",
             "batch_size": 3,
             "gie_id": 2,
@@ -658,7 +630,7 @@ def test_depth_registration_apply_rejects_out_of_domain(tmp_path: Path) -> None:
     assert status == "out_of_domain_or_invalid"
 
 
-def test_depth_registration_runtime_loader_fails_for_active_camera_mismatch(tmp_path: Path) -> None:
+def test_depth_registration_runtime_loader_rejects_legacy_contract(tmp_path: Path) -> None:
     snapshot, _dav2_profile, _mapanything_profile, entry = _entry()
     bundle_path = write_depth_registration_bundle(path=tmp_path / "depth_registration.json", entries={"cam0": entry})
 
@@ -682,7 +654,10 @@ def test_depth_registration_runtime_loader_fails_for_active_camera_mismatch(tmp_
             "mapanything": {"name": "mapanything_fullframe", "engine": "models/mapanything_depth/1/model.plan"},
         },
     }
-    with pytest.raises(DepthRegistrationError, match="calibration_fingerprint_mismatch"):
+    with pytest.raises(
+        DepthRegistrationError,
+        match="depth_registration_contract_version_mismatch",
+    ):
         _load_depth_registration_manager(
             path=bundle_path,
             pipeline_path=Path.cwd() / "config" / "infer.yaml",
@@ -695,7 +670,10 @@ def test_depth_registration_runtime_loader_fails_for_active_camera_mismatch(tmp_
 
 def test_depth_registration_path_resolves_from_pipeline_config(tmp_path: Path) -> None:
     pipeline_path = tmp_path / "infer.yaml"
-    pipeline_path.write_text("depth_registration:\n  path: config/depth_registration.json\n", encoding="utf-8")
+    pipeline_path.write_text(
+        "depth_registration:\n  path: DS9/config/depth_registration.json\n",
+        encoding="utf-8",
+    )
     args = __import__("argparse").Namespace(depth_registration_config=None)
     resolved = _resolve_depth_registration_path(args, pipeline_path=pipeline_path)
-    assert resolved == (Path.cwd() / "config" / "depth_registration.json").resolve()
+    assert resolved == (Path.cwd() / "DS9" / "config" / "depth_registration.json").resolve()

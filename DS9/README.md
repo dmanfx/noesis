@@ -2,8 +2,8 @@
 
 `DS9/` is the canonical and only supported DeepStream stack for Noesis. It runs
 directly on the host; Docker, DeepStream 8, and DeepStream 9.0 are not supported
-runtime or build alternatives. Inert compatibility scripts remain only until
-the legacy-removal checklist is completed.
+runtime or build alternatives. Their executable compatibility surfaces have
+been removed from the active repository.
 
 The directory name and compatibility fields use `DS9`, while the required SDK
 version is exactly **9.1**.
@@ -97,9 +97,10 @@ Build only what changed:
 
 ## Capability status
 
-Baseline tracking is active. MV3DT and AMC are disabled until Kitchen geometry
-and synchronized Kitchen/Family Room overlap evidence are accepted. Presence of
-V3DT/MV3DT configs or engines does not enable them.
+Baseline tracking is active and remains the default. MV3DT is an explicit
+opt-in limited to the accepted Kitchen/Family Room peer edge; Living Room stays
+local-only. AMC remains deferred. Presence of additional V3DT/MV3DT configs or
+engines does not enable another peer edge.
 
 ## Documentation
 
@@ -112,5 +113,5 @@ V3DT/MV3DT configs or engines does not enable them.
   BEV and capture publication.
 - [`../docs/runtime_baseline.md`](../docs/runtime_baseline.md): accepted runtime
   and performance baseline.
-- [`docs/history/README.md`](docs/history/README.md): migration, container, and
-  experiment archive.
+- [`../docs/history/README.md`](../docs/history/README.md): migration,
+  container, audit, and experiment archive.

@@ -110,7 +110,7 @@ def _camera_extrinsics_col_major() -> list[float]:
 def test_validation_report_serializes_summary(tmp_path: Path) -> None:
     report = ValidationReport(
         run_id="unit",
-        source=SourceMetadata(pipeline_config="config/infer.yaml"),
+        source=SourceMetadata(pipeline_config="DS9/config/infer.yaml"),
         checks=[
             ValidationCheck(id="A", domain="core", name="a", status=CheckStatus.PASS, detail="ok"),
             ValidationCheck(id="B", domain="core", name="b", status=CheckStatus.WARNING, detail="warn"),

@@ -1,578 +1,110 @@
-schema_version: 2
-matrix_id: noesis-ds8-ds9-runtime-ownership
-updated_at: "2026-07-11"
-# Typed evidence contract: DS9/docs/runtime_ownership_evidence.md
+schema_version: 1
+matrix_id: noesis-ds9-native-runtime-ownership
+updated_at: "2026-08-26"
 
 policy:
-  canonical_runtime_now: ds8
-  intended_successor: ds9
-  ds8_entrypoint: noesis/ds8_runtime.py
-  ds9_entrypoint: DS9/noesis/ds9_runtime.py
+  canonical_runtime: ds9_native_host
+  entrypoint: DS9/noesis/ds9_runtime.py
+  implementation: DS9/noesis/ds9_runtime_core.py
+  supervisor: DS9/scripts/run_canonical_runtime_host.py
+  pipeline_config: DS9/config/infer.yaml
   allowed_module_classifications:
     - shared_single_source
-    - sdk_adapter
-    - duplicated_pending_convergence
-  allowed_capability_statuses:
-    - parity
-    - shared
-    - adapter_specific
-    - known_gap
-    - blocked
-  strict_blocking_statuses:
-    - known_gap
-    - blocked
-  forbidden_ds9_imports:
-    - id: ds8_runtime_module
-      module: noesis.ds8_runtime
-      regex: '(?m)^\s*(?:from|import)\s+noesis\.ds8_runtime\b'
-      reason: DS9 executable code must never delegate to the DS8 runtime.
-    - id: ds8_runtime_path
-      regex: 'noesis/ds8_runtime\.py'
-      reason: DS9 executable code must not spawn or shell out to the DS8 entrypoint.
-    - id: ds8_preflight_module
-      module: noesis.ds8_preflight
-      regex: '(?m)^\s*(?:from|import)\s+noesis\.ds8_preflight\b'
-      reason: DS9 configuration and launch policy must be owned by DS9 or a neutral shared module.
+    - ds9_adapter
   scan_roots:
     - DS9/noesis
     - DS9/scripts
-  scan_suffixes: [.py]
+    - noesis
+    - noesis_core
+    - scripts
+  scan_suffixes: [.py, .sh]
+  forbidden_active_references:
+    - id: ds8_runtime
+      regex: '(?:noesis[/.]ds8_runtime|ds8_runtime\.py)'
+      reason: The DS8 executable runtime is retired.
+      allow_paths:
+        - DS9/scripts/run_canonical_runtime_host.py
+        - DS9/scripts/run_static_prep_checks.sh
+        - scripts/check_agents_docs_consistency.py
+    - id: ds8_preflight
+      regex: '(?:noesis[/.]ds8_preflight|ds8_preflight\.py)'
+      reason: Native DS9.1 owns preflight and launch policy.
+      allow_paths:
+        - DS9/scripts/run_static_prep_checks.sh
+        - scripts/check_agents_docs_consistency.py
+    - id: container_launcher
+      regex: 'run_canonical_runtime_container\.py'
+      reason: The canonical runtime is native-host only.
+    - id: docker_runtime
+      regex: '(?:DS9/docker|secondary_docker\.sh|build_secondary_(?:dev|runtime)_image\.sh|validate_runtime_secrets_container\.sh)'
+      reason: Container build and execution paths are retired.
 
 modules:
-  # Product/domain modules intentionally consumed from one root implementation.
-  - id: shared.calibration_bundle
-    classification: shared_single_source
-    owner_path: calibration_bundle.py
-    rationale: Calibration bundle contracts are SDK-neutral product state.
-  - id: shared.depth_storage
-    classification: shared_single_source
-    owner_path: geometry/depth_source.py
-    rationale: Persisted depth and floorplan products must not diverge by SDK.
-  - id: shared.dewarper_validity
-    classification: shared_single_source
-    owner_path: geometry/dewarper_validity.py
-    rationale: Calibrated lens-FoV validity is shared geometry, while each SDK adapter supplies its dewarper config path.
+  - id: adapter.runtime_entrypoint
+    classification: ds9_adapter
+    owner_path: DS9/noesis/ds9_runtime.py
+  - id: adapter.runtime_core
+    classification: ds9_adapter
+    owner_path: DS9/noesis/ds9_runtime_core.py
+  - id: adapter.runtime_config
+    classification: ds9_adapter
+    owner_path: DS9/noesis/runtime_config.py
+  - id: adapter.pipeline
+    classification: ds9_adapter
+    owner_path: DS9/noesis/pipelines/deepstream_pipeline.py
+  - id: adapter.pipeline_hooks
+    classification: ds9_adapter
+    owner_path: DS9/noesis/pipelines/hooks.py
+  - id: adapter.native_sources
+    classification: ds9_adapter
+    owner_path: DS9/native
+  - id: adapter.parser_sources
+    classification: ds9_adapter
+    owner_path: DS9/pipelines
+  - id: adapter.gstreamer_sources
+    classification: ds9_adapter
+    owner_path: DS9/gst-plugins
   - id: shared.product_core
     classification: shared_single_source
     owner_path: noesis_core
-    rationale: Versioned product contracts, replay, world fusion, health, and scene releases must remain SDK-neutral.
-  - id: shared.internal_rest_auth
+  - id: shared.application_services
     classification: shared_single_source
-    owner_path: noesis/server/internal_auth.py
-    rationale: DS8 and DS9 expose one gateway-only internal REST boundary.
-  - id: shared.mapanything_config
+    owner_path: noesis
+  - id: shared.data_models
     classification: shared_single_source
-    owner_path: mapanything_config.py
-    rationale: MapAnything service policy is SDK-neutral.
-  - id: shared.pose_v1
+    owner_path: noesis/models.py
+  - id: shared.mapanything_adapter
     classification: shared_single_source
-    owner_path: noesis/calibration/pose_v1.py
-    rationale: World-pose normalization is a shared contract.
-  - id: shared.tracking_diagnostics
+    owner_path: noesis/adapters/mapanything.py
+  - id: shared.semantic_capture
     classification: shared_single_source
-    owner_path: noesis/diagnostics/telemetry_log.py
-    rationale: Diagnostics interpret the shared telemetry contract.
-  - id: shared.virtual_twin_api
-    classification: shared_single_source
-    owner_path: noesis/server/virtual_twin_api.py
-    rationale: Virtual-twin revisions and API semantics are product-owned.
-  - id: shared.person_ground_state
-    classification: shared_single_source
-    owner_path: noesis/telemetry/person_ground_state.py
-    rationale: Human support-point and posture state are world-model behavior.
-  - id: shared.canonical_bev_renderer
-    classification: shared_single_source
-    owner_path: noesis/telemetry/bev.py
-    rationale: DS8 and DS9 must resolve one BEV display, active-floorplan authority lifecycle, smoothing, trail, diagnostics, empty-frame activity, and failure-health implementation.
-  - id: shared.capture_event_fusion
-    classification: shared_single_source
-    owner_path: noesis_core/capture_event_fusion.py
-    rationale: Capture-event cohorts, raw-only admission, RGB association, and exact fusion evidence are SDK-neutral product behavior.
-  - id: shared.wholebody49_profile
-    classification: shared_single_source
-    owner_path: noesis/deimv2_wholebody49_assets.py
-    rationale: Wholebody49 variants, tensor/parser semantics, and config materialization are product contracts parameterized by runtime-owned artifact roots.
-  - id: shared.reid_swin_profile
-    classification: shared_single_source
-    owner_path: noesis/reid_swin_profile.py
-    rationale: The TAO Swin-Tiny source, preprocessing, tensor layer/dimension, and SGIE semantics are one product contract; each SDK owns its TensorRT engine.
-  - id: shared.canonical_world_service
-    classification: shared_single_source
-    owner_path: noesis_core/world_service.py
-    rationale: Observation normalization and global fusion must have one SDK-neutral owner.
-  - id: shared.runtime_world_factory
-    classification: shared_single_source
-    owner_path: noesis_core/runtime_world.py
-    rationale: Producer identity and calibration/model/config fingerprints must be built identically for DS8 and DS9.
-  - id: shared.capability_health_api
-    classification: shared_single_source
-    owner_path: noesis/server/health_api.py
-    rationale: Capability readiness is based on canonical producer progress, not an SDK-specific socket check.
-  - id: shared.scene_release_api
-    classification: shared_single_source
-    owner_path: noesis/server/scene_api.py
-    rationale: Atomic multi-camera scene releases and promotion history are product state shared by every runtime.
-  - id: shared.websocket_server
-    classification: shared_single_source
-    owner_path: websocket_server.py
-    rationale: WebSocket and WebRTC signaling contracts must be identical, including finite immutable sender admission, the global frozen-byte budget, zero-byte quiescence, and the bounded telemetry-client set with health bypass.
+    owner_path: noesis/semantic_capture
   - id: shared.identity_domain
     classification: shared_single_source
     owner_path: reid
-    rationale: Resident, visitor, gallery, and assignment state are product-owned.
-  - id: shared.validation
+  - id: shared.geometry_domain
     classification: shared_single_source
-    owner_path: noesis/validation
-    rationale: Both runtimes must be judged by the same validators.
-
-  # SDK-specific composition, compatibility, and native-access surfaces.
-  - id: adapter.ds8_runtime
-    classification: sdk_adapter
-    ds8_path: noesis/ds8_runtime.py
-    rationale: DeepStream 8 composition root.
-  - id: adapter.ds9_launcher
-    classification: sdk_adapter
-    ds9_path: DS9/noesis/ds9_runtime.py
-    rationale: DeepStream 9 environment and fail-fast composition root.
-  - id: adapter.ds9_runtime_core
-    classification: sdk_adapter
-    ds9_path: DS9/noesis/ds9_runtime_core.py
-    rationale: Temporary DS9 runtime adapter pending extraction of the shared application core.
-  - id: adapter.ds9_runtime_config
-    classification: sdk_adapter
-    ds9_path: DS9/noesis/runtime_config.py
-    rationale: DS9 path and PGIE/OSD materialization must not import DS8 preflight helpers.
-  - id: adapter.ds9_world_contract_fields
-    classification: sdk_adapter
-    ds9_path: DS9/noesis/telemetry/world_contract_adapter.py
-    rationale: DS9 Service Maker frame metadata is normalized into shared observation time and identity fields.
-  - id: adapter.ds9_capture_event_rgb_provider
-    classification: sdk_adapter
-    ds9_path: DS9/noesis/capture_event_rgb_provider.py
-    rationale: DS9 may offer only timestamped frames already owned by its active pipeline to the shared fusion coordinator; this adapter cannot open another source.
-  - id: adapter.ds9_preflight
-    classification: sdk_adapter
-    ds9_path: DS9/scripts/ds9_preflight.py
-    rationale: DS9 SDK, TensorRT, plugin, parser, and native ABI gate.
-
-  # Known copied modules. Every entry requires an explicit convergence target.
-  - id: duplicate.calibration.depth_registration
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/calibration/depth_registration.py
-    ds9_path: DS9/noesis/calibration/depth_registration.py
-    reason: DS9 currently carries path/compatibility differences.
-    convergence_target: Shared fingerprint semantics with SDK artifact paths supplied by adapters.
-  - id: duplicate.calibration.depth_registration_builder
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/calibration/depth_registration_builder.py
-    ds9_path: DS9/noesis/calibration/depth_registration_builder.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared module.
-  - id: duplicate.calibration.geometry
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/calibration/geometry.py
-    ds9_path: DS9/noesis/calibration/geometry.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared module.
-  - id: duplicate.calibration.manager
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/calibration/manager.py
-    ds9_path: DS9/noesis/calibration/manager.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared module.
-  - id: duplicate.calibration.scene_registration
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/calibration/scene_registration.py
-    ds9_path: DS9/noesis/calibration/scene_registration.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared module.
-  - id: duplicate.depth_tracking_materialization
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/depth_tracking_materialization.py
-    ds9_path: DS9/noesis/depth_tracking_materialization.py
-    reason: Engine/config output roots differ by SDK.
-    convergence_target: Shared materializer parameterized by an SDK artifact descriptor.
-  - id: duplicate.metadata.depth_result
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/metadata/depth_result.py
-    ds9_path: DS9/noesis/metadata/depth_result.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared contract.
-  - id: duplicate.metadata.intrinsics
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/metadata/intrinsics.py
-    ds9_path: DS9/noesis/metadata/intrinsics.py
-    reason: DS9 quarantines unsafe user-meta attachment behavior.
-    convergence_target: Shared intrinsics model plus SDK metadata attachment adapters.
-  - id: duplicate.metadata.object_depth
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/metadata/object_depth.py
-    ds9_path: DS9/noesis/metadata/object_depth.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared contract.
-  - id: duplicate.metadata.pose_features
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/metadata/pose_features.py
-    ds9_path: DS9/noesis/metadata/pose_features.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared contract.
-  - id: duplicate.pipeline.builder
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/pipelines/ds8_pipeline.py
-    ds9_path: DS9/noesis/pipelines/ds8_pipeline.py
-    reason: GStreamer elements and runtime lifecycle differ by SDK.
-    convergence_target: Shared graph specification with DS8 and DS9 element adapters.
-  - id: duplicate.pipeline.hooks
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/pipelines/hooks.py
-    ds9_path: DS9/noesis/pipelines/hooks.py
-    reason: DS9 requires owned native metadata adapters and compatibility quarantines.
-    convergence_target: Shared processors consuming normalized DS8/DS9 metadata adapters.
-  - id: duplicate.server.analytics_api
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/server/analytics_api.py
-    ds9_path: DS9/noesis/server/analytics_api.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared API.
-  - id: duplicate.server.boundary_metrics
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/server/boundary_metrics.py
-    ds9_path: DS9/noesis/server/boundary_metrics.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared metrics contract.
-  - id: duplicate.server.depth_api
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/server/depth_api.py
-    ds9_path: DS9/noesis/server/depth_api.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared API.
-  - id: duplicate.server.reid_api
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/server/reid_api.py
-    ds9_path: DS9/noesis/server/reid_api.py
-    reason: DS9 is missing the current household identity surface.
-    convergence_target: Root shared family-biased open-set identity API.
-  - id: duplicate.telemetry.init
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/telemetry/__init__.py
-    ds9_path: DS9/noesis/telemetry/__init__.py
-    reason: Namespace-package staging artifact.
-    convergence_target: Remove the DS9 copy when telemetry is explicitly shared.
-  - id: duplicate.telemetry.latency_metrics
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/telemetry/latency_metrics.py
-    ds9_path: DS9/noesis/telemetry/latency_metrics.py
-    reason: DS9 quarantines unsafe in-process latency access.
-    convergence_target: Shared metrics model plus SDK sampler adapters.
-  - id: duplicate.telemetry.motion_smoothing
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/telemetry/motion_smoothing.py
-    ds9_path: DS9/noesis/telemetry/motion_smoothing.py
-    reason: Staged during the original DS9 port.
-    convergence_target: Root shared module.
-  - id: duplicate.telemetry.publishers
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/telemetry/publishers.py
-    ds9_path: DS9/noesis/telemetry/publishers.py
-    reason: Payload evolution has drifted.
-    convergence_target: Shared versioned observation and world publishers.
-  - id: duplicate.yolo26_assets
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/yolo26_assets.py
-    ds9_path: DS9/noesis/yolo26_assets.py
-    reason: Engine and ONNX roots differ by SDK.
-    convergence_target: Shared semantic resolver parameterized by artifact manifest.
-  - id: duplicate.yolo26_seg_materialization
-    classification: duplicated_pending_convergence
-    ds8_path: noesis/yolo26_seg_materialization.py
-    ds9_path: DS9/noesis/yolo26_seg_materialization.py
-    reason: Engine and generated-config roots differ by SDK.
-    convergence_target: Shared semantic materializer parameterized by artifact manifest.
+    owner_path: geometry
+  - id: shared.websocket_boundary
+    classification: shared_single_source
+    owner_path: noesis/server/websocket.py
+  - id: shared.camera_config
+    classification: shared_single_source
+    owner_path: config/cameras.yaml
 
 capabilities:
-  - id: cli.core_runtime_options
-    surface: cli
-    status: parity
-    evidence:
-      repository_source:
-        ds8:
-          path: noesis/ds8_runtime.py
-          contains_all: [--pipeline-config, --pgie-profile, --size, --cameras-config, --tracking-mode, --enable-rest, --disable-rest]
-        ds9:
-          path: DS9/noesis/ds9_runtime_core.py
-          contains_all: [--pipeline-config, --pgie-profile, --size, --cameras-config, --tracking-mode, --enable-rest, --disable-rest]
-  - id: cli.pgie_profile_underscore_alias
-    surface: cli
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [--pgie_profile]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [--pgie_profile]}
-  - id: config.canonical_model_roles
-    surface: config
-    status: parity
-    evidence:
-      repository_source:
-        ds8:
-          path: config/infer.yaml
-          yaml_keys: [models.pgie, models.reid, models.pose, models.depth_tracking, models.mapanything]
-        ds9:
-          path: DS9/config/infer.yaml
-          yaml_keys: [models.pgie, models.reid, models.pose, models.depth_tracking, models.mapanything]
-  - id: config.local_bev_frame
-    surface: config
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: config/infer.yaml, yaml_equals: {bev.frame: camera_local_ground_m}}
-        ds8_v3dt: {path: config/infer_v3dt_baseline.yaml, yaml_equals: {bev.frame: camera_local_ground_m}}
-        ds9: {path: DS9/config/infer.yaml, yaml_equals: {bev.frame: camera_local_ground_m}}
-        ds9_v3dt: {path: DS9/config/infer_v3dt.yaml, yaml_equals: {bev.frame: camera_local_ground_m}}
-    notes: Inline BEV panels are locked to the active floorplan's camera-local ground frame in DS8, protected V3DT, and DS9. Before first authority, startup_pending emits no local BEV; post-ready loss is fatal. An exact empty frame is active success. The separate canonical world snapshot remains backend_world_m.
-  - id: depth.dewarper_validity_masks
-    surface: config
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: config/infer.yaml, yaml_keys: [dewarper_validity_masks.sources.0, dewarper_validity_masks.sources.1, dewarper_validity_masks.sources.2]}
-        ds9: {path: DS9/config/infer.yaml, yaml_keys: [dewarper_validity_masks.sources.0, dewarper_validity_masks.sources.1, dewarper_validity_masks.sources.2]}
-  - id: api.depth_refresh
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: noesis/server/depth_api.py, contains_all: ["@app.post", /api/v1/depth/refresh]}
-        ds9: {path: DS9/noesis/server/depth_api.py, contains_all: ["@app.post", /api/v1/depth/refresh]}
-  - id: api.internal_gateway_auth
-    surface: security
-    status: shared
-    evidence:
-      repository_source:
-        shared: {path: noesis/server/internal_auth.py, contains_all: [InternalBearerAuthMiddleware, NOESIS_INTERNAL_AUTH_MODE]}
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [configure_internal_rest_app(app), NOESIS_REST_CORS_ALLOW_ALL is forbidden]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [configure_internal_rest_app(app), NOESIS_REST_CORS_ALLOW_ALL is forbidden]}
-  - id: api.analytics_roi
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: noesis/server/analytics_api.py, contains_all: [/api/v1/analytics/rois]}
-        ds9: {path: DS9/noesis/server/analytics_api.py, contains_all: [/api/v1/analytics/rois]}
-  - id: api.reid_aliases
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: noesis/server/reid_api.py, contains_all: [/api/v1/reid/aliases/merge, /api/v1/reid/aliases/history]}
-        ds9: {path: DS9/noesis/server/reid_api.py, contains_all: [/api/v1/reid/aliases/merge, /api/v1/reid/aliases/history]}
-  - id: api.household_identity
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/server/reid_v2_api.py
-          contains_all: ['prefix="/api/v2/reid"', '@router.get("/residents"', identity_v2_health]
-        ds8:
-          path: noesis/ds8_runtime.py
-          contains_all: [app.include_router(reid_v2_api.router), create_identity_v2_service]
-        ds9:
-          path: DS9/noesis/ds9_runtime_core.py
-          contains_all: [app.include_router(reid_v2_api.router), create_identity_v2_service]
-    notes: DS8 and DS9 mount one shared family-biased open-set identity API and runtime. Authoritative startup remains scoring-calibration-gated by design; that is product state, not DS9 drift.
-  - id: identity.camera_topology_validation
-    surface: identity
-    status: parity
-    evidence:
-      repository_source:
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [camera_labels=camera_labels]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [camera_labels=camera_labels, 'extra_kwargs["camera_labels"]']}
-  - id: api.virtual_twin
-    surface: api
-    status: shared
-    evidence:
-      repository_source:
-        shared: {path: noesis/server/virtual_twin_api.py, contains_all: [/api/v1/virtual-twin/revisions]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [virtual_twin_api.app.router]}
-  - id: telemetry.core_message_types
-    surface: telemetry
-    status: parity
-    evidence:
-      repository_source:
-        ds8:
-          path: noesis/telemetry/publishers.py
-          contains_all: ['"type": "depth_result"', '"type": "tracking"']
-        ds9:
-          path: DS9/noesis/telemetry/publishers.py
-          contains_all: ['"type": "depth_result"', '"type": "tracking"']
-  - id: telemetry.canonical_world_snapshot
-    surface: telemetry
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis_core/runtime_world.py
-          contains_all: [create_runtime_world_service, tracking_model_manifest, camera_calibration]
-        ds8:
-          path: noesis/ds8_runtime.py
-          contains_all: [create_runtime_world_service, 'runtime="ds8"', world_service=world_service]
-        ds9:
-          path: DS9/noesis/ds9_runtime_core.py
-          contains_all: [create_runtime_world_service, 'runtime="ds9"', world_service=world_service]
-  - id: telemetry.public_frame_time_identity
-    surface: telemetry
-    status: parity
-    evidence:
-      repository_source:
-        ds8:
-          path: noesis/pipelines/hooks.py
-          contains_all: [observed_at_us, capture_time_status, media_pts_ns, visitor_generation]
-        ds9:
-          path: DS9/noesis/telemetry/world_contract_adapter.py
-          contains_all: [observed_at_us, capture_time_status, media_pts_ns, visitor_generation]
-  - id: health.canonical_capability_progress
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/server/health_api.py
-          contains_all: [/api/v1/health/capabilities, register_capability_monitor_getter]
-        ds8:
-          path: noesis/ds8_runtime.py
-          contains_all: [create_runtime_capability_monitor, health_monitor=capability_monitor, health_api.router]
-        ds9:
-          path: DS9/noesis/ds9_runtime_core.py
-          contains_all: [create_runtime_capability_monitor, health_monitor=capability_monitor, health_api.router]
-  - id: api.scene_releases
-    surface: api
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/server/scene_api.py
-          contains_all: [/api/v1/scenes, /releases, /current, /history, /promote, /rollback]
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [scene_api.router]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [scene_api.router]}
-  - id: telemetry.bev_contract
-    surface: telemetry
-    status: shared
-    evidence:
-      repository_source:
-        canonical:
-          path: noesis/telemetry/bev.py
-          python_import_origin:
-            module: noesis.telemetry.bev
-            expected_path: noesis/telemetry/bev.py
-            prepend_paths: [DS9, .]
-    notes: With BEV active, effective cadence is max of the selected tracking and BEV intervals. One immutable finite-only tracking/world/event batch receives typed bounded sender admission but remains behind a one-shot release gate until synchronous exact-count journal and private world commit; paired BEV then carries that exact source/frame/time/sequence/submission cohort and must receive a later admission ID. Pre-admission failure is retryable without sequence mutation; post-admission authority failure aborts with zero delivery and poisons publication. Count/lifecycle changes force the pair. Registered depth and calibration-image scaling are shared contract behavior, not DS9-local alternatives.
-  - id: telemetry.person_ground_state
-    surface: telemetry
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/telemetry/person_ground_state.py
-          contains_all: [HumanGroundConfig, PersonGroundState, update_human_cv_filter, commit_path_point]
-        ds8:
-          path: noesis/pipelines/hooks.py
-          contains_all: [from noesis.telemetry.person_ground_state import, update_human_cv_filter, apply_source_hysteresis]
-        ds9:
-          path: DS9/noesis/pipelines/hooks.py
-          contains_all: [from noesis.telemetry.person_ground_state import, update_human_cv_filter, apply_source_hysteresis]
-        shared_bev:
-          path: noesis/telemetry/bev.py
-          contains_all: [commit_path_point, trail_append_allowed, idle_jitter_m]
-  - id: model.wholebody49_profile
-    surface: cli
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/deimv2_wholebody49_assets.py
-          contains_all: [WHOLEBODY49_SIZES, validate_wholebody49_pgie_properties, NOESIS_ENGINE_DIR]
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [wholebody49, _shared_materialize_wholebody49_configs]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [wholebody49, _shared_materialize_wholebody49_configs, _validate_wholebody49_pgie_properties]}
-        ds9_parser:
-          path: DS9/pipelines/nvdsinfer_deimv2_wholebody49/nvdsinfer_deimv2_wholebody49.cpp
-          contains_all: [NvDsInferParseDeimv2Wholebody49, NvDsInferParseDeimv2Wholebody49Boxes]
-    acceptance:
-      owner: detector-profiles
-      reason: The DS9 TensorRT 10.14 S-mask and X-box engines are provenance-complete and the authoritative wholebody49 artifact profile passes. Fresh checksum-replayable occupied-scene v2, direct RTSP plus WebRTC decoded-media, and 300-second resource-soak evidence is still absent for both lanes.
-      exit_criteria: Promote fresh wholebody49-s and wholebody49-x sessions only when each exact container, checkout, realization, primary engine, and config cohort passes occupied mask-or-box semantics, all-source advancing frames at the provisional 2 fps and 2.5-second liveness floors, decoded media, zero CPU-copy violations, clean acknowledged shutdown, and the provisional fail-closed memory/resource ceilings. These bounds are policy floors and ceilings, not empirical model-performance claims.
-  - id: model.reid_profile
-    surface: config
-    status: parity
-    evidence:
-      repository_source:
-        shared:
-          path: noesis/reid_swin_profile.py
-          contains_all: [REID_SWIN_ONNX_SHA256, fc_pred, REID_SWIN_EMBEDDING_DIM]
-        ds8: {path: config/infer.yaml, contains_all: [config_infer_secondary_reid_swin.ini, fc_pred, 'embedding_dim: 256']}
-        ds9: {path: DS9/config/infer.yaml, contains_all: [config_infer_secondary_reid_swin.ini, fc_pred, 'embedding_dim: 256']}
-        ds9_runtime: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [_preflight_reid_profile, _validate_reid_swin_nvinfer_properties, _require_nonempty_runtime_engine]}
-    acceptance:
-      owner: identity
-      reason: The provenance-locked DS9 TensorRT 10.14 Swin-Tiny engine and shared fc_pred/256 preprocessing, SGIE, and native-extraction contract are realized. Fresh occupied-scene open-set runtime evidence is still absent.
-      exit_criteria: Promote a fresh baseline runtime session that passes the registered open-set non-force, embedding freshness, tracker continuity, lifecycle, throughput, and GPU-memory checks; semantic resident accuracy remains a separate calibrated product gate.
-  - id: model.mapanything_validated_fp32_builder
-    surface: artifacts
-    status: parity
-    evidence:
-      repository_source:
-        ds9_builder: {path: DS9/scripts/rebuild_engines.py, contains_all: [mapanything_images_294x518_b3_fp32.plan, MAPANYTHING_QUALITY_COMMAND_LABEL, --dumpOutput]}
-        ds9_quality_gate: {path: DS9/scripts/engine_maintenance_common.py, contains_all: [noesis.ds9.mapanything_functional_quality.v1, validate_mapanything_functional_quality_receipt]}
-        ds9_source_contract: {path: DS9/config/engine_source_contracts.json, contains_all: ['"precision": "fp32"', noesis.ds9.mapanything_functional_quality.v1]}
-    acceptance:
-      owner: ds9-build
-      reason: The guarded batch-3 FP32 MapAnything engine is realized through canonical maintenance with an independently revalidated real-inference functional receipt, candidate/final deserialization, and sealed NVML evidence. Fresh multi-camera depth/floorplan runtime evidence remains absent.
-      exit_criteria: Promote a fresh baseline runtime session with mapanything_depth_quality_v4 that validates non-empty finite depth, exact fresh/cache-only floorplans, N/N active authority, reconciled paired-BEV readiness, and no NaN, lifecycle, throughput, or GPU-memory regressions.
-  - id: media.websocket_webrtc_server
-    surface: media
-    status: shared
-    evidence:
-      repository_source:
-        shared: {path: websocket_server.py, contains_all: [webrtc_answer, webrtc_ice_candidate]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: ['from websocket_server import (', 'WebSocketServer,']}
-  - id: media.mosaic_webrtc_readiness
-    surface: media
-    status: parity
-    evidence:
-      repository_source:
-        shared_feeder: {path: noesis/mosaic_h264_bridge.py, contains_all: [MosaicH264ShmFeeder, _wait_for_socket, first_au_received=true, on_fatal_error]}
-        shared_gateway: {path: noesis/mosaic_webrtc_gateway.py, contains_all: [h264_appsrc, rtph264pay, APPSRC_MAX_AUS, shared_default_glib_context]}
-        ds8: {path: noesis/ds8_runtime.py, contains_all: [MosaicH264ShmFeeder, register_webrtc_gateway_factory, NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS]}
-        ds9: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [MosaicH264ShmFeeder, register_webrtc_gateway_factory, NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS]}
-    notes: Both adapters require the SHM socket, feeder PLAYING state, and first complete H.264 AU before readiness; they share one bounded AU fanout implementation, request IDRs for late/slow peers, and allocate bounded WebRTC gateway slots on demand. RTSP is optional tooling and is not browser ingress.
-  - id: metadata.ds9_pose_path
-    surface: metadata
-    status: adapter_specific
-    evidence:
-      repository_source:
-        ds9:
-          path: DS9/noesis/pipelines/hooks.py
-          contains_all: [NOESIS_DS9_ALLOW_PYDS_COMPAT, noesis_pose_meta_ext, extract_pose_keypoints, attach_pose_features, _record_quarantined_compat_path]
-  - id: tracking.v3dt
-    surface: tracking
-    status: parity
-    evidence:
-      repository_source:
-        ds9_config: {path: DS9/config/infer_v3dt.yaml, contains_all: ['profile: sv3dt', 'world_frame: backend_world_m', 'caminfo_world_axes: xzy', 'enable-padding: 0']}
-        ds9_assets: {path: DS9/noesis/v3dt_assets.py, contains_all: [validate_v3dt_assets, materialize_v3dt_tracker_config, NOESIS_DS9_ARTIFACT_ROOT]}
-        ds9_runtime: {path: DS9/noesis/ds9_runtime_core.py, contains_all: [_validate_v3dt_tracking_guardrails, _ensure_v3dt_meta_extension, nvtracker_v3dt_runtime.yaml]}
-        ds9_build: {path: DS9/scripts/run_canonical_engine_maintenance.sh, contains_all: [bodypose3dnet, v3dt_tracker_reid, require_capacity]}
-    acceptance:
-      owner: ds9-v3dt-adapter
-      reason: All three provenance-complete DS9 V3DT TensorRT engines and the authoritative V3DT artifact profile pass. The canonical adapter now restores the locked xzy tracker tuple into backend_world_m, but no fresh same-session v2 global-world, v3 semantic, open-set identity, resource-soak, and clean-shutdown cohort has been promoted.
-      exit_criteria: Promote a fresh V3DT runtime session that passes the registered v2 bbox3d/global-world axis, floor, native image-foot, v3 semantic publication/lifecycle/capture continuity, open-set identity, resource-soak, lifecycle, throughput, and GPU-memory gates. MV3DT overlap fusion and time synchronization remain separate acceptance work and are not claimed by the v2 SV3DT world gate.
-    notes: Protected V3DT and the DS9 V3DT adapter scale declared source image anchors, candidate points, and bboxes into the active calibration image size before BEV projection and use the shared registered-depth coherence and tracking-first paired-publication rules.
-  - id: artifacts.canonical_graph
-    surface: artifacts
-    status: parity
-    evidence:
-      repository_source:
-        ds9: {path: DS9/asset_manifest.yaml, yaml_keys: [artifacts]}
-    acceptance:
-      owner: ds9-build
-      reason: The external realization contains ten provenance-complete TensorRT engines, and authoritative canonical, V3DT, and Wholebody49 artifact validation all pass. Acceptance additionally requires an active external promotion that matches the exact current selector.
-      exit_criteria: Keep an exact current asset_realization selector active after the tracked matrix is frozen; the closed selector includes the validated runtime_image_id, and any runtime-image, manifest, source-contract, checkout, realization, or selected-output digest change requires fresh validation and superseding promotion.
+  - id: canonical_pipeline
+    status: enabled
+    owner_path: DS9/noesis/pipelines/deepstream_pipeline.py
+  - id: tracking_world_bev
+    status: enabled
+    owner_path: DS9/noesis/ds9_runtime_core.py
+  - id: websocket_webrtc
+    status: enabled
+    owner_path: noesis/server/websocket.py
+  - id: mv3dt_kitchen_family
+    status: opt_in
+    owner_path: DS9/config/infer_mv3dt.yaml
+  - id: automagic_calibration
+    status: deferred
+    owner_path: .agents/skills/amc-setup-calibration-stack/SKILL.md

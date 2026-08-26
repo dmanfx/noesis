@@ -11,7 +11,7 @@ import pytest
 
 import geometry.depth_source as depth_source
 from geometry.depth_source import DepthStorageManager, MapAnythingDepthSource
-from mapanything_config import (
+from noesis.config.mapanything import (
     InferenceSettings,
     PerformanceSettings,
     ServiceConfig,

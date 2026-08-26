@@ -127,7 +127,6 @@ expected_root = Path(__import__('os').environ['NOESIS_DS9_ARTIFACT_ROOT']).resol
 for cameras in (
     Path('DS9/config/cameras_v3dt.yaml'),
     Path('config/cameras.yaml'),
-    Path('config/cameras_v3dt_baseline.yaml'),
 ):
     bundle = validate_v3dt_assets(
         Path('DS9/config/infer_v3dt.yaml'),
@@ -796,11 +795,11 @@ extern "C" void NvMOT_DeInit(NvMOTContextHandle context) {
 
     def test_engine_maintenance_gates_the_installed_ds9_driver_floor(self) -> None:
         source = (
-            DS9_ROOT / "scripts" / "run_canonical_engine_maintenance.sh"
+            DS9_ROOT / "scripts" / "run_canonical_engine_maintenance_host.sh"
         ).read_text(encoding="utf-8")
         self.assertIn('REQUIRED_DRIVER_VERSION="595.58.03"', source)
-        self.assertIn('LOWEST_DRIVER_VERSION', source)
-        self.assertIn("upgrade the driver before any DS9 engine build", source)
+        self.assertIn('sort -V', source)
+        self.assertIn("host NVIDIA driver", source)
 
 
 if __name__ == "__main__":

@@ -51,7 +51,6 @@ REQUIRED_REFERENCES = (
     Path("scripts/webrtc_gateway_smoke_test.py"),
     Path("DS9/tests/test_world_snapshot_runtime.py"),
     Path("tests/test_active_floorplan_registry.py"),
-    Path("DS9/docs/history/README.md"),
     Path("plans/archive/README.md"),
     Path("plans/ds91_native_host_only_migration.md"),
 )
@@ -75,8 +74,6 @@ CURRENT_STANDALONE_DOCS = (
     Path("plans/ds91_native_host_only_migration.md"),
     Path("contracts/README.md"),
     Path("oai2-fe/README.md"),
-    Path("pipelines/README.md"),
-    Path("pipelines/mapanything_preprocess_fused/README.md"),
     Path("reid/README.md"),
     Path("testpipelines/roomform/README.md"),
     Path("tools/mapanything_phone_scan/README.md"),
@@ -90,18 +87,10 @@ CURRENT_STANDALONE_DOCS = (
     Path("DS9/config/v3dt/living_family_phone_optimized/README.md"),
     Path("DS9/config/v3dt/living_kitchen_tracking_candidate/README.md"),
     Path("DS9/config/v3dt/living_room_optimized/README.md"),
-    Path("testpipelines/Bidnetpipe/README.md"),
-    Path("testpipelines/deimv2-wholebody49/README.md"),
-    Path("testpipelines/room_layout_seg/README.md"),
-    Path("testpipelines/yolo26-pose/README.md"),
-    Path("testpipelines/yolo26-seg/README.md"),
-    Path("testpipelines/yolo26-seg-depth/README.md"),
-    Path("testpipelines/yolo26-sem-ade20k/README.md"),
 )
 
 ARCHIVE_PREFIXES = (
     "docs/history/",
-    "DS9/docs/history/",
     "plans/archive/",
 )
 

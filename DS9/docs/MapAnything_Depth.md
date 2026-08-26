@@ -138,8 +138,8 @@ Canonical pieces:
 
 - builder: `DS9/scripts/build_depth_registration.py`
 - artifact: `DS9/config/depth_registration.json`
-- schema/loader: `DS9/noesis/calibration/depth_registration.py`
-- fitter: `DS9/noesis/calibration/depth_registration_builder.py`
+- schema/loader: `noesis/calibration/depth_registration.py`
+- fitter: `noesis/calibration/depth_registration_builder.py`
 
 Operational rules:
 

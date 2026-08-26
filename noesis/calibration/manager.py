@@ -1,11 +1,11 @@
-"""CalibrationManager — single owner for DS8 calibration data.
+"""CalibrationManager — single owner for canonical Noesis calibration data.
 
 Consolidates loading, validation, and broadcasting of:
 - K (intrinsics) from config/cameras.yaml ONLY
 - E (extrinsics) from config/camera_calibration.json
 - align from config/ply_alignment.json
 
-See plans/DS8/ds8_calibration_workflow_unification_work_order.md for conventions.
+Current calibration contracts are documented under the repository's active docs.
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ class WorldCalibrationSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# File I/O helpers (reused from calibration_bundle.py patterns)
+# File I/O helpers (shared with noesis.calibration.bundle patterns)
 # ---------------------------------------------------------------------------
 
 
@@ -483,10 +483,10 @@ def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
 
 
 class CalibrationManager:
-    """Single owner for DS8 calibration loading, validation, and broadcasting.
+    """Single owner for calibration loading, validation, and broadcasting.
 
     Responsibilities:
-    - Load K from config/cameras.yaml ONLY (deprecate intrinsics.json, config.py)
+    - Load K only from canonical config/cameras.yaml
     - Apply streammux resolution scaling to K
     - Load E from config/camera_calibration.json
     - Load align from config/ply_alignment.json
@@ -904,7 +904,7 @@ class CalibrationManager:
     def _coerce_extrinsics_translation_to_meters(self, camera_id: str, E_col_major: List[float]) -> Tuple[List[float], Optional[str]]:
         """Best-effort normalize incoming extrinsics translation units to meters.
 
-        DS8 conventions require `config/camera_calibration.json` to store E (world→camera)
+        Noesis conventions require `config/camera_calibration.json` to store E (world→camera)
         in meters. Some upstream calibration tools/UI flows may emit translations in centimeters.
 
         Control via env:

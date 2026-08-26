@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from noesis import ds8_runtime
+from noesis import ds9_runtime_core as runtime
 from noesis.pipelines import hooks
 from noesis.server import boundary_metrics
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +50,7 @@ def test_ws_stats_contract_includes_zero_copy_fields() -> None:
     hooks._increment_core_counter("tensor_boundary_copy_bytes_total.pose_meta", 256)  # type: ignore[attr-defined]
     hooks._increment_core_counter("tensor_boundary_copy_bytes_total.depth_store", 512)  # type: ignore[attr-defined]
     hooks._CORE_PATH_INSTRUMENTATION.record_stage_timing(  # type: ignore[attr-defined]
-        metric="analytics.handle_frame_ds8",
+        metric="analytics.handle_servicemaker_frame",
         duration_ns=1234,
         item_count=2,
     )
@@ -69,7 +69,7 @@ def test_ws_stats_contract_includes_zero_copy_fields() -> None:
         include_budget=True,
     )
 
-    callback = ds8_runtime._build_stats_callback(  # type: ignore[attr-defined]
+    callback = runtime._build_stats_callback(  # type: ignore[attr-defined]
         _DummyPipeline(),
         {0: "cam0"},
         ws_metrics_getter=ws.get_boundary_serialization_metrics,
@@ -78,7 +78,7 @@ def test_ws_stats_contract_includes_zero_copy_fields() -> None:
     )
     payload = callback()
 
-    assert payload["stack"] == "ds8"
+    assert payload["stack"] == "ds9"
     assert isinstance(payload.get("timestamp"), (float, int))
 
     pipeline_payload = payload["pipeline"]
@@ -100,8 +100,8 @@ def test_ws_stats_contract_includes_zero_copy_fields() -> None:
     assert int(counters.get("tensor_boundary_copy_bytes_total.pose_meta", 0)) == 256
     assert int(counters.get("tensor_boundary_copy_bytes_total.depth_store", 0)) == 512
     stage_timings = zero_copy_core["stage_timings"]
-    assert int(stage_timings["analytics.handle_frame_ds8"]["count"]) == 1
-    assert int(stage_timings["analytics.handle_frame_ds8"]["last_items"]) == 2
+    assert int(stage_timings["analytics.handle_servicemaker_frame"]["count"]) == 1
+    assert int(stage_timings["analytics.handle_servicemaker_frame"]["last_items"]) == 2
 
     boundary_block = zero_copy_core["boundary_serialization_metrics"]
     assert isinstance(boundary_block.get("ws"), dict)

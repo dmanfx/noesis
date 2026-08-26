@@ -18,7 +18,7 @@ from noesis_core.appliance import (
     runtime_snapshot_digest,
 )
 from noesis_core.health import CapabilityMonitor, CapabilityPolicy
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 SHA = "a" * 64

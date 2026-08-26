@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,8 +15,13 @@ from geometry.floor import backproject_to_camera, camera_plane_to_world, fit_flo
 
 def _load_intrinsics(width: int, height: int) -> np.ndarray:
     root = Path(__file__).resolve().parents[1]
-    intr_data = json.loads((root / "intrinsics.json").read_text())
-    model = intr_data["unifi_protect_g3_instant"]
+    camera_config = yaml.safe_load((root / "config" / "cameras.yaml").read_text())
+    camera = next(
+        entry
+        for entry in camera_config["cameras"].values()
+        if entry.get("name") == "kitchen"
+    )
+    model = camera_config["intrinsics_models"][camera["model"]]
     fx = float(model["intrinsics"]["fx"])
     fy = float(model["intrinsics"]["fy"])
     cx = float(model["intrinsics"]["cx"])

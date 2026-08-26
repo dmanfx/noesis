@@ -5,7 +5,8 @@
 ## Policy precedence
 
 - Root `AGENTS.md` applies first; this file narrows DS9.1 work.
-- `DS9/docs/history/` is non-normative migration and experiment evidence.
+- Repository history under `../docs/history/` is non-normative migration and
+  experiment evidence.
 - Work in this subtree belongs on the repository `DS9` branch. Treat
   `feature_DS8` as read-only history, verify the current branch before a
   commit, and do not switch the shared checkout without explicit user
@@ -23,8 +24,8 @@
 - WebRTC/SHM mosaic enabled; RTSP disabled.
 
 Do not use Docker, a container supervisor, DS8/DS9.0 binaries, or
-`noesis/ds8_runtime.py`. Container scripts retained pending archival/removal are
-not valid implementation or validation paths.
+`noesis/ds8_runtime.py`. Those retired surfaces are not valid implementation
+or validation paths.
 
 ## Required workflow
 
@@ -76,8 +77,9 @@ native bridge, telemetry, persistence, or media change.
 - Parser/config sources: `pipelines/`; GStreamer plugins: `gst-plugins/`.
 - Fail closed on missing or incompatible artifacts. Never fall back to archived
   engines or native libraries.
-- AMC and MV3DT remain disabled under the geometry gate in root policy.
+- AMC remains deferred. MV3DT is an explicit opt-in limited to the accepted
+  Kitchen/Family Room peer edge; baseline tracking remains canonical.
 
 Record current DS9.1 decisions in `../docs/architecture_decisions.md` and dated
-milestones in `../docs/upgrade_history.md`; put migration diaries under
-`docs/history/`.
+milestones in `../docs/upgrade_history.md`; put migration diaries under the
+repository `docs/history/` or `plans/archive/` tree according to content type.

@@ -1,4 +1,4 @@
-"""Pose feature metadata payloads for DS8."""
+"""Pose feature metadata payloads for the canonical runtime."""
 
 from __future__ import annotations
 

@@ -68,7 +68,13 @@ class _PoseNativeStub:
             "keypoints_abs": abs_k,
         }
 
-    def attach_pose_features(self, obj_meta: Any, payload_json: str, replace_existing: bool = True) -> bool:
+    def attach_pose_features(
+        self,
+        _batch_meta: Any,
+        obj_meta: Any,
+        payload_json: str,
+        replace_existing: bool = True,
+    ) -> bool:
         obj_meta._pose_payload = str(payload_json)
         return True
 
@@ -113,7 +119,7 @@ def test_pose_overlay_reuses_attached_payload_without_second_tensor_extract(monk
     obj = _ObjMeta()
     frame = _FrameMeta(object_items=[obj])
 
-    feature_proc.handle_frame_ds8(frame)
+    feature_proc.handle_servicemaker_frame(object(), frame)
     payload = overlay_proc._extract_pose_payload(obj)
 
     assert payload is not None
@@ -129,7 +135,7 @@ def test_pose_overlay_reuses_attached_payload_without_second_tensor_extract(monk
     assert native.extract_calls == 1
 
 
-def test_pose_feature_processor_reuses_cached_track_pose_when_sgie_skips(monkeypatch) -> None:
+def test_pose_feature_processor_does_not_attach_when_sgie_skips(monkeypatch) -> None:
     class _SkippingPoseNativeStub(_PoseNativeStub):
         def extract_pose_keypoints(
             self,
@@ -159,15 +165,12 @@ def test_pose_feature_processor_reuses_cached_track_pose_when_sgie_skips(monkeyp
     obj_first = _ObjMeta()
     frame_first = _FrameMeta(object_items=[obj_first], frame_number=1)
 
-    proc.handle_frame_ds8(frame_first)
+    proc.handle_servicemaker_frame(object(), frame_first)
 
     obj_second = _ObjMeta(rect_params=_Rect(left=36.0, top=46.0, width=126.0, height=252.0))
     frame_second = _FrameMeta(object_items=[obj_second], frame_number=2)
-    proc.handle_frame_ds8(frame_second)
+    proc.handle_servicemaker_frame(object(), frame_second)
 
-    payload = __import__("json").loads(obj_second._pose_payload)
-    assert payload["pose_cache_reused"] is True
-    assert payload["pose_cache_age_frames"] == 1
-    assert payload["frame_id"] == 2
-    assert payload["bbox"] == [36.0, 46.0, 126.0, 252.0]
-    assert np.allclose(payload["keypoints_abs"][0][:2], [41.25, 53.35])
+    assert obj_first._pose_payload
+    assert obj_second._pose_payload == ""
+    assert native.extract_calls == 2

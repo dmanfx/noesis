@@ -576,7 +576,7 @@ def _canonical_browser_context(snapshot: Mapping[str, Any]) -> tuple[dict[str, A
     if (
         state.get("contract") != "noesis.world.snapshot"
         or state.get("contractVersion") != 1
-        or runtime not in {"ds8", "ds9"}
+        or runtime != "ds9"
         or not all(isinstance(producer.get(key), str) and producer.get(key).strip() == producer.get(key) and producer.get(key)
                    for key in ("instance_id", "run_id", "software_revision"))
         or state.get("runId") != run_id
@@ -1043,10 +1043,7 @@ def browser_snapshot_to_menon_trace(
     cameras = sorted({str(item.get("camera_id")) for item in placements if item.get("camera_id")})
     rooms = sorted({str(item.get("room")) for item in placements if item.get("room")})
     producer_runtime = str(canonical_context.get("runtime") if canonical_context else "").strip().lower()
-    pipeline_config = {
-        "ds8": "config/infer.yaml",
-        "ds9": "DS9/config/infer.yaml",
-    }.get(producer_runtime)
+    pipeline_config = "DS9/config/infer.yaml" if producer_runtime == "ds9" else None
     trace: dict[str, Any] = {
         "schema_version": 1,
         "run_id": str(run_id or snapshot.get("run_id") or "menon_browser_trace"),
@@ -1054,7 +1051,7 @@ def browser_snapshot_to_menon_trace(
             "repo": "Noesis_Devel",
             "runtime": producer_runtime or None,
             "pipeline_config": pipeline_config,
-            "cameras_config": "config/cameras.yaml" if producer_runtime == "ds8" else None,
+            "cameras_config": "config/cameras.yaml" if producer_runtime == "ds9" else None,
             "menon_available": True,
         },
         "scope": {"tiers": ["menon_trace", "menon_browser_capture"], "rooms": rooms, "cameras": cameras},

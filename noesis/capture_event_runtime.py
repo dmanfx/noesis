@@ -1,4 +1,4 @@
-"""Shared DS8/V3DT/DS9 RPC adapter for exact capture-event artifacts."""
+"""Shared DS9.1 RPC adapter for exact capture-event artifacts."""
 
 from __future__ import annotations
 

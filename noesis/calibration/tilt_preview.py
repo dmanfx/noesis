@@ -20,16 +20,13 @@ import numpy as np
 from noesis.calibration.pose_v1 import E_col_major_to_pose_v1
 import yaml
 
-from calibration_bundle import (
-    load_intrinsics,
-    _derive_k_from_intrinsics_model,  # type: ignore
-    _resolution_from_spec,  # type: ignore
-)
-from config import AppConfig
 from geometry.depth_source import MapAnythingDepthSource
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 
 DEFAULT_CAMERAS = ["living-room", "kitchen", "family-room"]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CAMERAS_CONFIG_PATH = REPO_ROOT / "config" / "cameras.yaml"
+CAMERA_CALIBRATION_PATH = REPO_ROOT / "config" / "camera_calibration.json"
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +42,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _load_camera_model_map(cameras_path: Optional[Path] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    cfg_path = Path(cameras_path) if cameras_path is not None else Path("config/cameras.yaml")
+    cfg_path = Path(cameras_path) if cameras_path is not None else CAMERAS_CONFIG_PATH
     if not cfg_path.exists():
         return {}, {}
     data = yaml.safe_load(cfg_path.read_text()) or {}
@@ -111,91 +108,21 @@ def _intrinsics_from_model(
     return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64), meta
 
 
-_FALLBACK_WARNED: set[str] = set()
-
-
 def _intrinsics_for_camera(
     cam_id: str,
     shape: Tuple[int, int],
     cameras_path: Optional[Path] = None,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-    if cameras_path is not None:
-        _, cam_to_model = _load_camera_model_map(cameras_path)
-        model_key = cam_to_model.get(cam_id, "")
-        K, meta = _intrinsics_from_model(model_key, shape, cameras_path)
-        if K is not None:
-            meta["source"] = "cameras_config"
-            return K, meta
-
-    intr_models, model_map, camera_specs = _load_intrinsics_bundle()
-    model_key = model_map.get(cam_id)
-    k_tuple = _derive_k_from_intrinsics_model(model_key, intr_models or {})
-    if k_tuple is not None:
-        fx, fy, cx, cy = k_tuple
-        meta: Dict[str, Any] = {
-            "source": "intrinsics_json",
-            "model": model_key or "",
-            "base_resolution": None,
-            "scale_x": 1.0,
-            "scale_y": 1.0,
-        }
-        base_res = None
-        spec = camera_specs.get(cam_id) if isinstance(camera_specs, dict) else None
-        if spec:
-            base_res = _resolution_from_spec(spec)  # type: ignore[arg-type]
-        if base_res is None and model_key and intr_models:
-            model_entry = intr_models.get(model_key)
-            if isinstance(model_entry, dict):
-                base_res = _resolution_from_spec(model_entry)  # type: ignore[arg-type]
-                if base_res is None:
-                    intr = model_entry.get("intrinsics")
-                    if isinstance(intr, dict):
-                        base_res = _resolution_from_spec(intr)  # type: ignore[arg-type]
-        width = float(shape[1])
-        height = float(shape[0])
-        if base_res:
-            base_w, base_h = base_res
-            if base_w > 0 and base_h > 0 and (base_w != width or base_h != height):
-                sx = width / float(base_w)
-                sy = height / float(base_h)
-                fx *= sx
-                cx *= sx
-                fy *= sy
-                cy *= sy
-                meta["scale_x"] = float(sx)
-                meta["scale_y"] = float(sy)
-            meta["base_resolution"] = [int(base_w), int(base_h)]
-        return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64), meta
-
-    if cameras_path is None:
-        models, cam_to_model = _load_camera_model_map(cameras_path)
-        fallback_model_key = cam_to_model.get(cam_id, "")
-        K, meta = _intrinsics_from_model(fallback_model_key, shape, cameras_path)
-    else:
-        K = None
-        meta = {}
-    if K is not None and cam_id not in _FALLBACK_WARNED:
-        logger.warning(
-            "Using fallback intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
-            cam_id,
-            fallback_model_key or "unknown",
-        )
-        _FALLBACK_WARNED.add(cam_id)
+    models, cam_to_model = _load_camera_model_map(cameras_path)
+    model_key = cam_to_model.get(cam_id, "")
+    if not model_key or model_key not in models:
+        logger.warning("No canonical intrinsics model is bound for camera '%s'", cam_id)
+        return None, {}
+    K, meta = _intrinsics_from_model(model_key, shape, cameras_path)
     if K is not None:
-        meta["source"] = "cameras_yaml_fallback"
+        meta["source"] = "cameras_config"
         return K, meta
     return None, {}
-
-
-def _load_intrinsics_bundle() -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, Any]]:
-    cfg = AppConfig()
-    intr_path = Path(cfg.calibration.INTRINSICS_PATH)
-    if not intr_path.is_absolute():
-        intr_path = Path(__file__).resolve().parents[2] / intr_path
-    intrinsics_models = load_intrinsics(str(intr_path))
-    model_map = dict(getattr(cfg.calibration, "CAMERA_INTRINSICS_MODEL_MAP", {}) or {})
-    camera_specs = dict(getattr(cfg.calibration, "CAMERA_SPECS", {}) or {})
-    return intrinsics_models, model_map, camera_specs
 
 
 def _decode_float32(b64: str, shape: Tuple[int, int]) -> np.ndarray:
@@ -498,7 +425,7 @@ def _resolve_camera_ids(
     cams = calib_data.get("cameras")
     if isinstance(cams, dict) and cams:
         return list(cams.keys())
-    cfg_path = Path(cameras_path) if cameras_path is not None else Path("config/cameras.yaml")
+    cfg_path = Path(cameras_path) if cameras_path is not None else CAMERAS_CONFIG_PATH
     if cfg_path.exists():
         data = yaml.safe_load(cfg_path.read_text()) or {}
         cam_entries = data.get("cameras") or {}
@@ -532,7 +459,7 @@ def tilt_preview_from_latest_depth(
     cfg = load_service_config()
     depth_source = MapAnythingDepthSource(cfg)
 
-    base_path = Path(input_path or "config/camera_calibration.json")
+    base_path = Path(input_path) if input_path is not None else CAMERA_CALIBRATION_PATH
     calib_data = _read_json(base_path)
     calib_data.setdefault("cameras", {})
     cam_list = _resolve_camera_ids(camera_ids, calib_data, cameras_path)
@@ -647,7 +574,11 @@ def tilt_preview_from_latest_depth(
         "updated": sorted(updates.keys()),
     }
     if persist and updates:
-        out_path = Path(output_path or "config/camera_calibration_preview.json")
+        out_path = (
+            Path(output_path)
+            if output_path is not None
+            else REPO_ROOT / "config" / "camera_calibration_preview.json"
+        )
         preview_data = apply_preview_updates(calib_data, updates)
         preview_data["preview_meta"] = {
             "method": "depth_tilt_preview",

@@ -68,11 +68,11 @@ def test_ds9_processor_publishes_rate_limited_advancing_empty_frames() -> None:
                 object_items=[],
             )
 
-        processor.handle_frame_ds8(empty_frame(20))
+        processor.handle_servicemaker_frame(empty_frame(20))
         now[0] = 100.1
-        processor.handle_frame_ds8(empty_frame(21))
+        processor.handle_servicemaker_frame(empty_frame(21))
         now[0] = 100.6
-        processor.handle_frame_ds8(empty_frame(22))
+        processor.handle_servicemaker_frame(empty_frame(22))
 
         assert [(source, tracks) for source, tracks, _meta in published] == [
             (0, []),
@@ -328,7 +328,7 @@ def test_ds9_processor_uses_pair_safe_tracking_bev_cadence_above_15fps() -> None
         for frame_id in range(13):
             now[0] = 100.0 + frame_id / 30.0
             frame_times[frame_id] = now[0]
-            processor.handle_frame_ds8(empty_frame(frame_id))
+            processor.handle_servicemaker_frame(empty_frame(frame_id))
 
         assert len(events) >= 8 and len(events) % 2 == 0
         assert all(
@@ -344,10 +344,10 @@ def test_ds9_processor_uses_pair_safe_tracking_bev_cadence_above_15fps() -> None
 
         os.environ.pop("NOESIS_REID_TEST_MODE")
         now[0] += 0.01
-        processor.handle_frame_ds8(empty_frame(100))
+        processor.handle_servicemaker_frame(empty_frame(100))
         os.environ["NOESIS_REID_TEST_MODE"] = "1"
         now[0] += 0.01
-        processor.handle_frame_ds8(empty_frame(101))
+        processor.handle_servicemaker_frame(empty_frame(101))
         assert events[-4:] == [
             ("tracking", 100),
             ("bev", 100),

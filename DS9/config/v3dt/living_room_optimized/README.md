@@ -1,8 +1,10 @@
 # Living-room optimized V3DT profile
 
-Status: archived experimental profile. MV3DT is disabled in the canonical
-native DS9.1 application. Keep this material only as prior tuning evidence; do
-not launch it unless the user explicitly reopens the MV3DT workstream.
+Status: archived experimental profile. This Living Room profile is not an
+accepted MV3DT lane; Living Room remains local-only. The separate
+Kitchen/Family Room lane is available only as an explicit opt-in. Keep this
+material as prior tuning evidence and do not launch this archived profile
+without explicit user direction.
 
 This directory is an isolated DS9 SV3DT tuning profile. It does not replace
 the locked V3DT assets in `caminfo_baseline/` and does not change the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for DS8 CalibrationManager.
+"""Unit tests for the canonical CalibrationManager.
 
 Tests:
 1. K-divergence: `calibration-bundle.cameras.K[cam]` matches `snapshot(cam).intrinsics`
@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-import importlib.util
 from pathlib import Path
-import sys
 
 import numpy as np
 import pytest
@@ -152,13 +150,10 @@ def test_calibration_authority_rejects_ambiguous_or_missing_inputs(
 def test_live_and_offline_paths_do_not_reintroduce_private_calibration_provider() -> None:
     root = Path(__file__).resolve().parents[1]
     paths = (
-        root / "noesis" / "ds8_runtime.py",
-        root / "noesis" / "ds8_runtime_v3dt_reimpl.py",
         root / "DS9" / "noesis" / "ds9_runtime_core.py",
         root / "scripts" / "build_virtual_twin_reconstruction.py",
         root / "scripts" / "build_rectified_virtual_twin_reconstruction.py",
         root / "scripts" / "build_stream_room_reconstruction.py",
-        root / "scripts" / "build_depth_registration.py",
         root / "DS9" / "scripts" / "build_depth_registration.py",
     )
     for path in paths:
@@ -642,36 +637,6 @@ def test_scene_similarity_persists_and_round_trips(manager: CalibrationManager, 
     rejected = manager.set_align({"scene_similarity": mismatched})
     assert rejected["ok"] is False
     assert "world_to_scene_sha256 does not match" in rejected["error"]
-
-
-def test_ds8_ds9_world_to_scene_digest_contract_is_identical() -> None:
-    ds9_path = (
-        Path(__file__).resolve().parents[1]
-        / "DS9"
-        / "noesis"
-        / "calibration"
-        / "manager.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "ds9_calibration_manager_digest_contract", ds9_path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(spec.name, None)
-    matrix = [
-        92.5, 0.0, 0.0, 0.0,
-        0.0, 92.5, 0.0, 0.0,
-        0.0, 0.0, 92.5, 0.0,
-        -4.6, 2.0, -0.1, 1.0,
-    ]
-    scene_to_m = 1.0 / 92.5
-    assert module._world_to_scene_sha256(  # type: ignore[attr-defined]
-        matrix, scene_to_m
-    ) == _world_to_scene_sha256(matrix, scene_to_m)
 
 
 def _family_active_frame_binding(repo_root: Path) -> ScenePriorFrameBinding:

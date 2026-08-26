@@ -103,6 +103,7 @@ def _make_processor(stable_mgr: _StableIDMgr) -> tuple[hooks._AnalyticsTelemetry
 
 
 def test_reid_embedding_extraction_requires_needs_embedding_true(monkeypatch) -> None:
+    monkeypatch.setattr(hooks, "noesis_analytics_meta_ext", None)
     obj = _ObjMeta()
     frame = _FrameMeta(object_items=[obj])
 
@@ -115,8 +116,8 @@ def test_reid_embedding_extraction_requires_needs_embedding_true(monkeypatch) ->
         emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         return emb
 
-    monkeypatch.setattr(proc_no, "_extract_reid_embedding_ds8", _extract_no)
-    proc_no.handle_frame_ds8(frame)
+    monkeypatch.setattr(proc_no, "_extract_reid_embedding_servicemaker", _extract_no)
+    proc_no.handle_servicemaker_frame(frame)
 
     assert calls_no["extract"] == 0
     assert tracking_no.calls
@@ -131,8 +132,8 @@ def test_reid_embedding_extraction_requires_needs_embedding_true(monkeypatch) ->
         calls_yes["extract"] += 1
         return np.array([0.2, 0.3, 0.4], dtype=np.float32)
 
-    monkeypatch.setattr(proc_yes, "_extract_reid_embedding_ds8", _extract_yes)
-    proc_yes.handle_frame_ds8(frame)
+    monkeypatch.setattr(proc_yes, "_extract_reid_embedding_servicemaker", _extract_yes)
+    proc_yes.handle_servicemaker_frame(frame)
 
     assert calls_yes["extract"] == 1
     assert tracking_yes.calls
@@ -159,7 +160,7 @@ def test_reid_embedding_contract_is_finite_float32_and_normalized(monkeypatch) -
             return [3.0, 4.0, 0.0]
 
     monkeypatch.setattr(hooks, "noesis_reid_meta_ext", _ReidNative())
-    emb = proc._extract_reid_embedding_ds8(obj)
+    emb = proc._extract_reid_embedding_servicemaker(obj)
 
     assert emb is not None
     assert calls == [(3, "fc_pred", 256, True)]

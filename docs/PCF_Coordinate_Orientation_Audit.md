@@ -6,7 +6,7 @@ Room, and Kitchen Scene Priors on 2026-08-15.
 This audit covers PCF reconstruction and alignment reviews, Scene Prior build
 and runtime serialization, offline floorplan diagnostics, the oai2-fe heatmap
 and BEV renderers, and all four depth-drawer 3D representations. It does not
-change DeepStream 8, DeepStream 9.0, or the canonical DS9.1 runtime graph.
+change the canonical DS9.1 runtime graph.
 
 ## Result
 
@@ -67,7 +67,7 @@ that implementation.
 | Raw-phone review GLB `Rx(pi)` in `inference.py:223` and supplement comparison GLB `Rx(pi)` in `supplement.py:867` | Camera/view presentation | Retained. This is a proper determinant-`+1` OpenCV/phone-local to glTF review authoring rotation. It affects only raw review GLBs. The raw NPZ, poses, PCF alignment, and backend-world artifacts do not consume it. |
 | Candidate half-turn at `tools/mapanything_phone_scan/alignment.py:101` | Physical-geometry diagnostic | Retained only as a counterfactual visibility check. If the half-turn explains the cloud, alignment fails and asks for calibration repair at lines 136-152; it never rotates the target or produces a transform. |
 | `image_flip` inference at `geometry/depth_source.py:980` | Ray/image-addressing diagnostic | Retained as payload provenance only. `geometry/depth_source.py:1031` states that the already camera-local raster must not consume it. oai2-fe records it in export metadata at `DepthDrawer.tsx:1705` but does not apply it (`DepthDrawer.tsx:1376`); `scripts/dump_floorplan_views.py:827` likewise records it and directly decodes the grid at line 833. |
-| DS9.1 ray `_apply_image_flip` helpers at `DS9/noesis/pipelines/hooks.py:3872` and `DS9/noesis/pipelines/hooks.py:9139` | Ray/image addressing | Retained for call-shape compatibility, but both authoritative inference methods return `(False, False)` at lines 3886 and 9153. The shared mirrors do the same at `noesis/pipelines/hooks.py:2998`, `noesis/pipelines/hooks.py:8006`, and `noesis/telemetry/bev.py:1126`. The historical DS8 V3DT reimplementation also returns false at `noesis/pipelines/hooks_v3dt_reimpl.py:2983` and line 8217; it is not a canonical runtime path and was not changed. No DS9 file was changed by this audit. |
+| DS9.1 ray `_apply_image_flip` helpers in `DS9/noesis/pipelines/hooks.py` | Ray/image addressing | Retained for call-shape compatibility, but both authoritative inference methods return `(False, False)`. The shared BEV presentation helper in `noesis/telemetry/bev.py` does the same. |
 | Positive `ctx.scale(dpr, dpr)` and identity `ctx.setTransform(...)` in oai2-fe | Camera/view presentation | Retained. These are device-pixel scaling and canvas-state reset, not reflections. Examples: `renderUtils.ts:315`, `renderUtils.ts:489`, `extrudedFloorplan.ts:375`, and `extrudedFloorplan.ts:437`. There is no negative canvas scale in the audited renderers. |
 | `np.transpose(HWC, CHW)` at `tools/mapanything_phone_scan/da3_inference.py:186` and `noesis/mapanything_manual_inference.py:152` | Tensor layout | Retained. These transpose channel/storage order for inference; they do not change image or world orientation. The remaining `.T` uses in the audited geometry code are matrix/vector linear algebra, not image transposition. |
 | `geometry.rotateX(-Math.PI / 2)` at `oai2-fe/src/components/Depth3DView.tsx:364` | Coordinate-frame conversion | Retained. It is a proper determinant-`+1` rotation that lays a Three.js XY `PlaneGeometry` onto XZ; it is in the separate, currently unmounted legacy `Depth3DModal`, not one of the four Depth drawer PCF subtabs. |

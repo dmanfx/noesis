@@ -61,7 +61,13 @@ class _PoseNativeStub:
             "keypoints_abs": keypoints_abs,
         }
 
-    def attach_pose_features(self, obj_meta: Any, payload_json: str, replace_existing: bool = True) -> bool:
+    def attach_pose_features(
+        self,
+        _batch_meta: Any,
+        obj_meta: Any,
+        payload_json: str,
+        replace_existing: bool = True,
+    ) -> bool:
         self.attach_calls += 1
         obj_meta._pose_payload = str(payload_json)
         return True
@@ -84,7 +90,7 @@ def test_pose_payload_limit_blocks_oversized_attach(monkeypatch) -> None:
     obj = _ObjMeta()
     frame = _FrameMeta(object_items=[obj])
 
-    proc.handle_frame_ds8(frame)
+    proc.handle_servicemaker_frame(object(), frame)
 
     assert native.attach_calls == 0
     assert obj._pose_payload == ""
@@ -103,7 +109,7 @@ def test_pose_payload_roundtrip_allows_valid_payload(monkeypatch) -> None:
     obj = _ObjMeta()
     frame = _FrameMeta(object_items=[obj])
 
-    proc.handle_frame_ds8(frame)
+    proc.handle_servicemaker_frame(object(), frame)
 
     assert native.attach_calls == 1
     assert obj._pose_payload

@@ -3661,8 +3661,8 @@
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
-            "size_bytes": 970
+            "sha256": "bb0a4e2bb244862294357e694a77318244bc3e2e06e71d81479db74eafd77050",
+            "size_bytes": 963
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
@@ -3672,7 +3672,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
+        "fingerprint_sha256": "9dbb952786da6ca5b4e701547e52c2d1d84479b03290686afc0cc1918d3497ec",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -3984,7 +3984,7 @@
         3.6184754371643066,
         14.211116790771484
       ],
-      "registration_id": "family-room:00b4146829372956cb11a0506c214c5b76364a5ba9c3128c901b28116ccf9843",
+      "registration_id": "family-room:0b3a6cbc77e1214670ddf3f07205f8173047570d9a3121f6bd8c7e6104429bbb",
       "sample_counts": {
         "input_pairs": 297,
         "num_knots": 7,
@@ -7661,8 +7661,8 @@
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
-            "size_bytes": 970
+            "sha256": "bb0a4e2bb244862294357e694a77318244bc3e2e06e71d81479db74eafd77050",
+            "size_bytes": 963
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
@@ -7672,7 +7672,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
+        "fingerprint_sha256": "9dbb952786da6ca5b4e701547e52c2d1d84479b03290686afc0cc1918d3497ec",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -7984,7 +7984,7 @@
         5.549107789993286,
         14.828376293182373
       ],
-      "registration_id": "kitchen:824a05b74372b5b9e181f0f64595266a2ecd1eb50898e8c192dfb977f2debfd7",
+      "registration_id": "kitchen:29271c108ae19727b2735688a377f5eb53fbd660a84b335204b87e5ae60bc0da",
       "sample_counts": {
         "input_pairs": 221,
         "num_knots": 7,
@@ -11661,8 +11661,8 @@
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
-            "size_bytes": 970
+            "sha256": "bb0a4e2bb244862294357e694a77318244bc3e2e06e71d81479db74eafd77050",
+            "size_bytes": 963
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
@@ -11672,7 +11672,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
+        "fingerprint_sha256": "9dbb952786da6ca5b4e701547e52c2d1d84479b03290686afc0cc1918d3497ec",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -11984,7 +11984,7 @@
         8.385019779205322,
         11.797159671783447
       ],
-      "registration_id": "living-room:a5e6c1244e357c27407c5852752ba9775898017c408ffa8db6579e36e2e3b530",
+      "registration_id": "living-room:f5278810a82a50e75962c2aa8902ed6790c3f2ca00d1d6384246801c33d9a55c",
       "sample_counts": {
         "input_pairs": 96,
         "num_knots": 7,

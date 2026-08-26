@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI helper for the DS8 ReID alias REST API."""
+"""CLI helper for the canonical ReID alias REST API."""
 
 from __future__ import annotations
 

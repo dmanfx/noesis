@@ -12,8 +12,16 @@ from urllib.parse import urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DS9_ROOT = ROOT / "DS9"
+DS9_NATIVE_EXTENSIONS = DS9_ROOT / "native_extensions"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(DS9_ROOT) in sys.path:
+    sys.path.remove(str(DS9_ROOT))
+sys.path.insert(0, str(DS9_ROOT))
+if str(DS9_NATIVE_EXTENSIONS) in sys.path:
+    sys.path.remove(str(DS9_NATIVE_EXTENSIONS))
+sys.path.insert(0, str(DS9_NATIVE_EXTENSIONS))
 
 from noesis_core.private_paths import atomic_write_private_file
 

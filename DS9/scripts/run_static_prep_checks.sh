@@ -25,7 +25,6 @@ require_dir() {
 
 echo "[INFO] Running DS9 static prep checks"
 
-require_file "DS9/DS9_PREP_DECISIONS.md"
 require_file "DS9/scripts/ds9_build_env.sh"
 require_file "DS9/scripts/check_ds9_prereqs.sh"
 require_file "DS9/scripts/build_all_native_ds9.sh"
@@ -39,6 +38,7 @@ require_file "DS9/gst-plugins/noesiseos/gstnoesiseos.cpp"
 require_file "DS9/gst-plugins/noesiseos/CMakeLists.txt"
 require_file "DS9/noesis/ds9_runtime.py"
 require_file "DS9/noesis/ds9_runtime_core.py"
+require_file "DS9/noesis/pipelines/deepstream_pipeline.py"
 require_file "DS9/noesis/runtime_config.py"
 require_file "noesis/mosaic_glib_context.py"
 require_file "noesis/mosaic_h264_bridge.py"
@@ -49,22 +49,14 @@ require_file "noesis_core/world_service.py"
 require_file "noesis/server/health_api.py"
 require_file "noesis/server/scene_api.py"
 require_file "DS9/docs/runtime_ownership.yaml"
-require_file "DS9/docs/runtime_container_boundary.md"
+require_file "DS9/docs/runtime_host_boundary.md"
 require_file "DS9/asset_manifest.yaml"
 require_file "DS9/docs/asset_manifest.schema.json"
 require_file "DS9/scripts/validate_runtime_ownership.py"
 require_file "DS9/scripts/validate_asset_manifest.py"
-require_file "DS9/scripts/secondary_docker.sh"
-require_file "DS9/scripts/build_secondary_dev_image.sh"
-require_file "DS9/scripts/build_secondary_runtime_image.sh"
-require_file "DS9/scripts/stage_canonical_sources.py"
-require_file "DS9/scripts/run_canonical_engine_maintenance.sh"
+require_file "DS9/scripts/run_canonical_engine_maintenance_host.sh"
 require_file "DS9/scripts/build_v3dt_tracker_engine.py"
-require_file "DS9/scripts/validate_runtime_secrets_container.sh"
-require_file "DS9/scripts/run_canonical_runtime_container.py"
-require_file "DS9/docker/Dockerfile"
-require_file "DS9/docker/Dockerfile.runtime"
-require_file "DS9/docker/requirements.lock.txt"
+require_file "DS9/scripts/run_canonical_runtime_host.py"
 require_file "DS9/csrc/nvdsroiexclude/gstnvdsroiexclude.cpp"
 require_file "DS9/csrc/nvdsroiexclude/CMakeLists.txt"
 require_file "DS9/config/infer.yaml"
@@ -96,11 +88,14 @@ require_file "DS9/pipelines/config_infer_secondary_mapanything.ini"
 if [[ -e "DS9/noesis/ds8_runtime.py" ]]; then
   fail "Stale DS8 runtime copy exists under DS9/noesis"
 fi
+if [[ -e "DS9/noesis/pipelines/ds8_pipeline.py" ]]; then
+  fail "Stale DS8 pipeline module exists under DS9/noesis"
+fi
 
 rg -q "from noesis.ds9_runtime_core import main" DS9/noesis/ds9_runtime.py \
   || fail "DS9 launcher does not delegate to noesis.ds9_runtime_core"
 
-if rg --no-ignore -n "from noesis\\.ds8_(runtime|preflight)|import noesis\\.ds8_(runtime|preflight)|noesis/ds8_runtime\\.py" \
+if rg --no-ignore -n "from noesis\\.ds8_(runtime|preflight)|import noesis\\.ds8_(runtime|preflight)" \
   DS9/noesis/ds9_runtime.py DS9/noesis/ds9_runtime_core.py DS9/scripts -g '*.py' \
   >/tmp/ds9_old_runtime_refs.txt; then
   cat /tmp/ds9_old_runtime_refs.txt >&2
@@ -110,7 +105,9 @@ fi
 if [[ -d "DS9/pipelines/nvdsinfer_yolo26_pose" ]]; then
   fail "No-op YOLO26 pose parser is still in active DS9 parser path"
 fi
-require_dir "DS9/archive/nvdsinfer_yolo26_pose"
+if [[ -d "DS9/archive/nvdsinfer_yolo26_pose" ]]; then
+  fail "Retired YOLO26 pose parser source still exists in the live checkout"
+fi
 
 if rg -n "custom-lib-path|parse-bbox" DS9/pipelines/config_infer_secondary_yolo26_pose.ini >/tmp/ds9_pose_parser_refs.txt; then
   cat /tmp/ds9_pose_parser_refs.txt >&2
@@ -121,8 +118,7 @@ if rg -ni "osnet" \
   DS9/config/infer.yaml \
   DS9/pipelines/config_infer_secondary_reid_swin.ini \
   DS9/scripts/rebuild_engines.py \
-  DS9/scripts/stage_canonical_sources.py \
-  DS9/scripts/run_canonical_engine_maintenance.sh \
+  DS9/scripts/run_canonical_engine_maintenance_host.sh \
   DS9/asset_manifest.yaml \
   >/tmp/ds9_active_reid_osnet_refs.txt; then
   cat /tmp/ds9_active_reid_osnet_refs.txt >&2
@@ -223,19 +219,18 @@ for raw in (
     "DS9/noesis/pipelines/hooks.py",
     "DS9/noesis/metadata/intrinsics.py",
     "DS9/noesis/telemetry/latency_metrics.py",
-    "DS9/noesis/metadata/object_depth.py",
-    "DS9/noesis/metadata/pose_features.py",
-    "DS9/noesis/metadata/depth_result.py",
+    "noesis/metadata/object_depth.py",
+    "noesis/metadata/pose_features.py",
+    "noesis/metadata/depth_result.py",
     "DS9/noesis/runtime_config.py",
     "DS9/noesis/v3dt_assets.py",
     "DS9/noesis/telemetry/publishers.py",
     "DS9/noesis/telemetry/world_contract_adapter.py",
     "DS9/scripts/validate_runtime_ownership.py",
     "DS9/scripts/validate_asset_manifest.py",
-    "DS9/scripts/stage_canonical_sources.py",
     "DS9/scripts/build_v3dt_tracker_engine.py",
     "DS9/scripts/sv3dt_meta_smoke_test.py",
-    "DS9/scripts/run_canonical_runtime_container.py",
+    "DS9/scripts/run_canonical_runtime_host.py",
 ):
     path = Path(raw)
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

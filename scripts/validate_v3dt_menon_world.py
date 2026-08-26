@@ -528,7 +528,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ws", default="ws://127.0.0.1:6008")
     parser.add_argument("--duration", type=float, default=20.0)
-    parser.add_argument("--pipeline-config", default="config/infer_v3dt_reimpl_fast1056_mp4.yaml")
+    parser.add_argument("--pipeline-config", default="DS9/config/infer_v3dt.yaml")
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
     parser.add_argument("--camera-calibration", default="config/camera_calibration.json")
     parser.add_argument("--ply-alignment", default="config/ply_alignment.json")

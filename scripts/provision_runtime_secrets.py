@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pipeline-config",
         type=Path,
-        default=REPO_ROOT / "config" / "infer.yaml",
+        default=REPO_ROOT / "DS9" / "config" / "infer.yaml",
     )
     parser.add_argument(
         "--cameras-config",

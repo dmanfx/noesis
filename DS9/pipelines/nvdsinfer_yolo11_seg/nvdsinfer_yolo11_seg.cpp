@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Noesis
 // SPDX-License-Identifier: MIT
 //
-// DeepStream 8 custom parser for YOLO11-Seg (fused output)
+// DeepStream 9.1 custom parser for YOLO11-Seg (fused output)
 //
 // Assumes the ONNX was exported with TensorRT plugins:
 //  - TRT::EfficientNMSX_TRT returns [x1,y1,x2,y2,score,class]

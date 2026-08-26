@@ -229,10 +229,8 @@ else:
                     ]
                 self.assertEqual(actual_outputs, expected_outputs)
 
-    def test_ds9_parser_source_matches_ds8_and_exports_both_entrypoints(self) -> None:
-        root_source = REPO_ROOT / "pipelines" / "nvdsinfer_deimv2_wholebody49" / "nvdsinfer_deimv2_wholebody49.cpp"
+    def test_ds9_parser_source_exports_the_required_entrypoints(self) -> None:
         ds9_source = DS9_ROOT / "pipelines" / "nvdsinfer_deimv2_wholebody49" / "nvdsinfer_deimv2_wholebody49.cpp"
-        self.assertEqual(ds9_source.read_bytes(), root_source.read_bytes())
         text = ds9_source.read_text(encoding="utf-8")
         self.assertIn("resolve_exact_layers", text)
         self.assertIn('kLabelLayerName[] = "label_xyxy_score"', text)
@@ -262,20 +260,16 @@ else:
             destinations,
         )
 
-        maintenance = (DS9_ROOT / "scripts" / "run_canonical_engine_maintenance.sh").read_text(
-            encoding="utf-8"
-        )
+        maintenance = (DS9_ROOT / "scripts" / "rebuild_engines.py").read_text(encoding="utf-8")
         for token in (
-            '[wholebody49_s_masks]="deimv2_wholebody49_dinov3_s_masks_640_b3_fp16.engine"',
-            '[wholebody49_x_boxes]="deimv2_wholebody49_dinov3_x_boxes_640_b3_fp16.engine"',
-            "NOESIS_WHOLEBODY49_S_TRT_TIMEOUT_SECONDS:-2400",
-            "NOESIS_WHOLEBODY49_S_GPU_GUARD_MB:-10000",
-            "NOESIS_WHOLEBODY49_X_TRT_TIMEOUT_SECONDS:-2400",
-            "NOESIS_WHOLEBODY49_X_GPU_GUARD_MB:-11000",
+            '"wholebody49_s_masks"',
+            '"deimv2_wholebody49_dinov3_s_masks_640_ds8norm.onnx"',
+            '"deimv2_wholebody49_dinov3_s_masks_640_b3_fp16.engine"',
+            '"wholebody49_x_boxes"',
+            '"deimv2_wholebody49_dinov3_x_boxes_640_ds8norm.onnx"',
+            '"deimv2_wholebody49_dinov3_x_boxes_640_b3_fp16.engine"',
         ):
             self.assertIn(token, maintenance)
-        self.assertEqual(maintenance.count("NOESIS_WHOLEBODY49_S_GPU_GUARD_MB:-10000"), 1)
-        self.assertEqual(maintenance.count("NOESIS_WHOLEBODY49_X_GPU_GUARD_MB:-11000"), 1)
 
     def test_staged_source_provenance_matches_local_bytes(self) -> None:
         for name in (

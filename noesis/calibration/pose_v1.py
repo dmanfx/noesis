@@ -1,7 +1,7 @@
-"""PoseV1 conversion helpers for DS8 calibration.
+"""PoseV1 conversion helpers for canonical calibration.
 
 PoseV1 can appear in either canonical backend world meters or legacy Menon
-scene coordinates. The ray math in DS8 always expects backend world meters
+scene coordinates. Canonical ray math always expects backend world meters
 with the OpenCV-style image-camera basis, so scene-space poses must be mapped
 through alignment and unit conversion before extrinsics are synthesized.
 """

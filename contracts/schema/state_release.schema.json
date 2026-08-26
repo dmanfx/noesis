@@ -41,8 +41,7 @@
           "enum": [
             "fresh",
             "clone",
-            "migrate",
-            "import_ds8"
+            "migrate"
           ],
           "title": "Mode",
           "type": "string"

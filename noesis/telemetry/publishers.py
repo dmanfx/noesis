@@ -502,7 +502,7 @@ class TrackingTelemetryPublisher:
 
 
 def bind_occupancy_publisher(pipeline: Any, occupancy_publisher: Optional[Any]) -> None:
-    """Expose occupancy publisher to DS8 pipeline probes."""
+    """Expose the occupancy publisher to DS9.1 pipeline probes."""
     setattr(pipeline, "occupancy_publisher", occupancy_publisher)
     logger.info(
         "Occupancy publisher %s bound to pipeline",

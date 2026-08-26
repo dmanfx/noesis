@@ -276,20 +276,11 @@ export type CheckoutBinding = {
   readonly software_revision: string;
 };
 
-export type DS8RuntimeSelector = {
-  readonly family: "ds8";
-  readonly pgie_profile: "yolo11" | "yolo11_seg" | "yolo26" | "yolo26_seg" | "rfdetr" | "rfdetr_seg" | "wholebody49";
-  readonly model_size: "n" | "s" | "m" | "l" | "x";
-  readonly tracking_mode: "baseline" | "v3dt";
-};
-
 export type DS9RuntimeSelector = {
   readonly family: "ds9";
   readonly lane: "baseline" | "v3dt" | "wholebody49-s" | "wholebody49-x";
   readonly supervisor_path: string;
-  readonly runtime_image_id: string;
-  readonly build_image_id: string;
-  readonly docker_root: string;
+  readonly native_root: string;
   readonly artifact_root: string;
   readonly runtime_root: string;
   readonly asset_realization_sha256: string;
@@ -302,7 +293,7 @@ export type DeploymentHealth = {
   readonly deployment_id: string;
   readonly selector_sha256: string;
   readonly state_release_id: string;
-  readonly runtime_family: "ds8" | "ds9";
+  readonly runtime_family: "ds9";
   readonly runtime_variant: string;
   readonly instance_id: string;
   readonly run_id: string;
@@ -322,7 +313,7 @@ export type DeploymentSelector = {
   readonly noesis_checkout: CheckoutBinding;
   readonly state_release: StateReleaseBinding;
   readonly endpoints: ApplianceEndpoints;
-  readonly runtime: DS8RuntimeSelector | DS9RuntimeSelector;
+  readonly runtime: DS9RuntimeSelector;
   readonly readiness: ApplianceReadinessVersions;
 };
 
@@ -351,7 +342,7 @@ export type IdentityAuthorityCutoverArtifact = {
   readonly contract_version: 1;
   readonly approved_at_us: number;
   readonly approved_by: string;
-  readonly runtime: "ds8" | "ds9";
+  readonly runtime: "ds9";
   readonly model_sha256: string;
   readonly model_layer: string;
   readonly embedding_dim: number;
@@ -552,7 +543,7 @@ export type RuntimeDeploymentContext = {
   readonly deployment_id: string;
   readonly selector_sha256: string;
   readonly state_release_id: string;
-  readonly runtime_family: "ds8" | "ds9";
+  readonly runtime_family: "ds9";
   readonly runtime_variant: string;
   readonly boot_id: string;
   readonly software_revision: string;
@@ -804,7 +795,7 @@ export type StateBaselineFile = {
 };
 
 export type StateMigration = {
-  readonly mode: "fresh" | "clone" | "migrate" | "import_ds8";
+  readonly mode: "fresh" | "clone" | "migrate";
   readonly tool_sha256: string;
   readonly report_sha256: string;
 };
@@ -860,7 +851,7 @@ export type WebSocketDeploymentHealth = {
   readonly deployment_id: string;
   readonly selector_sha256: string;
   readonly state_release_id: string;
-  readonly runtime_family: "ds8" | "ds9";
+  readonly runtime_family: "ds9";
   readonly runtime_variant: string;
   readonly instance_id: string;
   readonly run_id: string;

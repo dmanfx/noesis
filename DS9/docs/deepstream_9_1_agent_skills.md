@@ -78,6 +78,6 @@ exercised without an external service/state lifecycle transition. A missing
 private asset or unavailable GPU is a reported blocker, not a reason to widen
 the validation ceremony.
 
-The upstream `docker_containers.md` reference is not an execution option for
-Noesis. Read it only when comparing a generic vendor example; do not copy its
-commands, image pins, mounts, or installation assumptions into this repository.
+Use the skill's `references/native_host_setup.md` for the supported environment
+and virtual-environment steps. Container setup is outside the Noesis execution
+route.

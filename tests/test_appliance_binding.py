@@ -26,7 +26,7 @@ from noesis_core.contracts.appliance import (
     ApplianceReadinessVersions,
     CheckoutBinding,
     DeploymentSelector,
-    DS8RuntimeSelector,
+    DS9RuntimeSelector,
     StateBaseline,
     StateBaselineBinding,
     StateBaselineFile,
@@ -67,6 +67,9 @@ def _fixture(
     release_root = _private_directory(tmp_path / "state-release")
     build_root = _private_directory(release_root / "runtime" / "noesis-build")
     selector_root = _private_directory(tmp_path / "selectors")
+    native_root = _private_directory(tmp_path / "ds91-native")
+    artifact_root = _private_directory(tmp_path / "ds9-artifacts")
+    runtime_root = _private_directory(tmp_path / "ds9-runtime")
     state_payloads = {
         "payload/analytics/nvdsanalytics.yaml": b"analytics:\n  stages: {}\n",
         "payload/analytics/config_nvdsanalytics_exclude.ini": b"[property]\nenable=1\n",
@@ -144,11 +147,20 @@ def _fixture(
             rest="http://127.0.0.1:8080",
             rtsp="rtsp://127.0.0.1:8554/ds-test",
         ),
-        runtime=DS8RuntimeSelector(
-            family="ds8",
-            pgie_profile="yolo26",
-            model_size="m",
-            tracking_mode="baseline",
+        runtime=DS9RuntimeSelector(
+            family="ds9",
+            lane="baseline",
+            supervisor_path=os.fspath(
+                noesis_root
+                / "DS9"
+                / "scripts"
+                / "run_canonical_runtime_host.py"
+            ),
+            native_root=os.fspath(native_root),
+            artifact_root=os.fspath(artifact_root),
+            runtime_root=os.fspath(runtime_root),
+            asset_realization_sha256=SHA_A,
+            ownership_matrix_sha256=SHA_B,
         ),
         readiness=ApplianceReadinessVersions(
             capability_contract_version=1,
@@ -167,7 +179,10 @@ def _fixture(
         "NOESIS_STATE_RELEASE_ID": "release-alpha",
         "NOESIS_STATE_RELEASE_MANIFEST": os.fspath(manifest_path),
         "NOESIS_STATE_RELEASE_ROOT": os.fspath(release_root),
-        "NOESIS_RUNTIME_FAMILY": "ds8",
+        "NOESIS_RUNTIME_FAMILY": "ds9",
+        "NOESIS_DS91_NATIVE_ROOT": os.fspath(native_root),
+        "NOESIS_DS9_ARTIFACT_ROOT": os.fspath(artifact_root),
+        "NOESIS_DS9_RUNTIME_ROOT": os.fspath(runtime_root),
         "NOESIS_ANALYTICS_CONFIG": os.fspath(
             release_root / "payload/analytics/nvdsanalytics.yaml"
         ),
@@ -191,10 +206,8 @@ def _load(tmp_path: Path, **overrides: object):
         "selector_sha256": selector_sha256,
         "repo_root": noesis_root,
         "env": env,
-        "expected_family": "ds8",
-        "expected_profile": "yolo26",
-        "expected_size": "m",
-        "expected_tracking_mode": "baseline",
+        "expected_family": "ds9",
+        "expected_lane": "baseline",
         "verify_checkout": False,
     }
     arguments.update(overrides)
@@ -204,7 +217,7 @@ def _load(tmp_path: Path, **overrides: object):
 def test_exact_selector_release_and_environment_binding_is_accepted(tmp_path: Path) -> None:
     binding = _load(tmp_path)
     assert binding.deployment_id == "deploy-alpha"
-    assert binding.runtime_variant == "ds8:yolo26:m:baseline"
+    assert binding.runtime_variant == "ds9:baseline"
     assert binding.state.release.schemas == {
         "analytics_roi": 1,
         "identity": 1,
@@ -214,9 +227,9 @@ def test_exact_selector_release_and_environment_binding_is_accepted(tmp_path: Pa
     assert binding.selector.noesis_checkout.snapshot_kind == "noesis-runtime-v1"
 
 
-def test_selector_rejects_wrong_runtime_tuple_and_inherited_binding(tmp_path: Path) -> None:
-    with pytest.raises(ApplianceConfigurationError, match="arguments"):
-        _load(tmp_path, expected_size="s")
+def test_selector_rejects_wrong_runtime_lane_and_inherited_binding(tmp_path: Path) -> None:
+    with pytest.raises(ApplianceConfigurationError, match="lane"):
+        _load(tmp_path, expected_lane="v3dt")
 
     selector_path, selector_sha256, noesis_root, env = _fixture(tmp_path / "env")
     env["NOESIS_STATE_RELEASE_ID"] = "release-other"
@@ -226,10 +239,8 @@ def test_selector_rejects_wrong_runtime_tuple_and_inherited_binding(tmp_path: Pa
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -243,10 +254,8 @@ def test_selector_and_state_files_require_private_canonical_bytes(tmp_path: Path
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -262,10 +271,8 @@ def test_selected_mutable_state_and_build_directory_require_private_modes(
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -277,10 +284,8 @@ def test_selected_mutable_state_and_build_directory_require_private_modes(
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -294,10 +299,8 @@ def test_selected_build_directory_environment_cannot_drift(tmp_path: Path) -> No
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -338,36 +341,52 @@ def test_noesis_rejects_nested_state_lease_environment(tmp_path: Path) -> None:
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
 
-def test_ds9_selector_freezes_the_exact_checkout_supervisor(tmp_path: Path) -> None:
+def test_ds9_selector_freezes_the_exact_native_host_supervisor(tmp_path: Path) -> None:
     selector_path, _selector_sha256, noesis_root, _env = _fixture(tmp_path)
     payload = json.loads(selector_path.read_text(encoding="utf-8"))
-    runtime = {
-        "family": "ds9",
-        "lane": "baseline",
-        "supervisor_path": os.fspath(noesis_root / "DS9" / "scripts" / "alternate.py"),
-        "runtime_image_id": f"sha256:{SHA_A}",
-        "build_image_id": f"sha256:{SHA_B}",
-        "docker_root": os.fspath(tmp_path / "docker"),
-        "artifact_root": os.fspath(tmp_path / "artifacts"),
-        "runtime_root": os.fspath(tmp_path / "runtime"),
-        "asset_realization_sha256": SHA_A,
-        "ownership_matrix_sha256": SHA_B,
-    }
-    with pytest.raises(ValidationError, match="canonical runtime supervisor"):
+    runtime = dict(payload["runtime"])
+    runtime["supervisor_path"] = os.fspath(
+        noesis_root / "DS9" / "scripts" / "alternate.py"
+    )
+    with pytest.raises(ValidationError, match="canonical native host supervisor"):
         DeploymentSelector.model_validate({**payload, "runtime": runtime})
 
     runtime["supervisor_path"] = os.fspath(
-        noesis_root / "DS9" / "scripts" / "run_canonical_runtime_container.py"
+        noesis_root / "DS9" / "scripts" / "run_canonical_runtime_host.py"
     )
-    assert DeploymentSelector.model_validate({**payload, "runtime": runtime}).runtime.family == "ds9"
+    accepted = DeploymentSelector.model_validate({**payload, "runtime": runtime})
+    assert accepted.runtime.family == "ds9"
+
+
+@pytest.mark.parametrize(
+    "environment_name",
+    (
+        "NOESIS_DS91_NATIVE_ROOT",
+        "NOESIS_DS9_ARTIFACT_ROOT",
+        "NOESIS_DS9_RUNTIME_ROOT",
+    ),
+)
+def test_selected_ds9_root_environment_cannot_drift(
+    tmp_path: Path, environment_name: str
+) -> None:
+    selector_path, selector_sha256, noesis_root, env = _fixture(tmp_path)
+    env[environment_name] = os.fspath(tmp_path / "unselected-root")
+    with pytest.raises(ApplianceConfigurationError, match=environment_name):
+        load_appliance_binding(
+            selector_file=selector_path,
+            selector_sha256=selector_sha256,
+            repo_root=noesis_root,
+            env=env,
+            expected_family="ds9",
+            expected_lane="baseline",
+            verify_checkout=False,
+        )
 
 
 def test_runtime_build_content_cannot_enter_activation_baseline(tmp_path: Path) -> None:
@@ -381,10 +400,8 @@ def test_runtime_build_content_cannot_enter_activation_baseline(tmp_path: Path) 
             selector_sha256=selector_sha256,
             repo_root=noesis_root,
             env=env,
-            expected_family="ds8",
-            expected_profile="yolo26",
-            expected_size="m",
-            expected_tracking_mode="baseline",
+            expected_family="ds9",
+            expected_lane="baseline",
             verify_checkout=False,
         )
 
@@ -400,11 +417,15 @@ def test_closed_models_reject_old_git_only_kind_and_coercive_counts() -> None:
     with pytest.raises(ValidationError):
         StateBaselineFile(sha256=SHA_A, bytes="17")
     with pytest.raises(ValidationError):
-        DS8RuntimeSelector(
-            family="ds8",
-            pgie_profile="wholebody49",
-            model_size="m",
-            tracking_mode="baseline",
+        DS9RuntimeSelector(
+            family="ds9",
+            lane="baseline",
+            supervisor_path="/srv/noesis/DS9/scripts/run_canonical_runtime_host.py",
+            native_root="/srv/noesis-runtime/native",
+            artifact_root="/srv/noesis-runtime/native/artifacts",
+            runtime_root="/srv/noesis-runtime/state",
+            asset_realization_sha256=SHA_A,
+            ownership_matrix_sha256=SHA_B,
         )
 
 

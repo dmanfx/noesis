@@ -58,13 +58,13 @@ attest_ds9_native_artifacts(
 )
 require_ds9_native_extension_origins(_DS9_NATIVE_EXTENSION_DIR)
 
-from calibration_bundle import pose_to_E_col_major
+from noesis.calibration.bundle import pose_to_E_col_major
 from geometry.depth_source import (
     DepthStorageManager,
     StorageFailure,
     _floorplan_calibration_fingerprint,
 )
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis.calibration.depth_registration import (
     DepthRegistrationError,
     DepthRegistrationManager,
@@ -129,7 +129,7 @@ from noesis.manual_depth_models import (
     build_manual_depth_overlay,
     normalize_manual_depth_model,
 )
-from noesis.pipelines import ds8_pipeline, hooks
+from noesis.pipelines import deepstream_pipeline, hooks
 from noesis.depth_capture_event import DepthStorageCaptureEventAdapter
 from noesis.runtime_storage import close_depth_storage, storage_close_evidence
 require_ds9_native_extension_origins(_DS9_NATIVE_EXTENSION_DIR)
@@ -182,7 +182,7 @@ from noesis.v3dt_assets import (
     materialize_v3dt_tracker_config,
     validate_v3dt_assets,
 )
-from websocket_server import (
+from noesis.server.websocket import (
     WebSocketServer,
     WebSocketStartupError,
     WebSocketStartupReceipt,
@@ -780,7 +780,7 @@ def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
         raise SystemExit(f"[FATAL] {exc}") from exc
     size_norm = str(size).strip().lower()
     # The shared resolver owns supported-size/name semantics. DS9 owns every
-    # runtime artifact path and must never inherit root/DS8 binaries from it.
+    # runtime artifact path and must never inherit historical root binaries from it.
     return {
         **shared,
         "template": (_pipeline_dir() / "config_infer_primary_yolo26_seg.template.ini").resolve(),
@@ -929,7 +929,7 @@ def _preflight_reid_profile(
             "[FATAL] Canonical DS9 TAO Swin-Tiny ReID engine missing.\n"
             f"engine: {engine_path}\n"
             "Build it during an exclusive-GPU window with:\n"
-            "  DS9/scripts/run_canonical_engine_maintenance.sh --only reid_swin"
+            "  DS9/scripts/run_canonical_engine_maintenance_host.sh --only reid_swin"
         )
     logger.info(
         "Canonical DS9 TAO Swin-Tiny ReID profile found: engine=%s",
@@ -1321,7 +1321,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
                 f"PGIE INI: {pgie_ini}\n"
                 f"custom-lib-path: {lib_raw or '<unset>'}\n"
                 f"resolved: {lib_path}\n"
-                "Build it with: make -C pipelines/nvdsinfer_yolo26_seg\n"
+                "Build it with: make -C DS9/pipelines/nvdsinfer_yolo26_seg\n"
             )
 
         gie_uid = str(props.get("gie-unique-id", "") or "").strip()
@@ -2874,7 +2874,6 @@ def _load_world_measurement_fusion_policy(
     ]
     policy = load_world_fusion_policy(
         path,
-        runtime_lane="ds9",
         active_camera_ids=active,
         depth_registration=depth_registration,
     )
@@ -3323,7 +3322,7 @@ def _build_stable_id_manager(
 
 
 def _build_stats_callback(
-    pipeline: ds8_pipeline.DS8Pipeline,
+    pipeline: deepstream_pipeline.DeepStreamPipeline,
     camera_labels: Dict[int, str],
     ws_metrics_getter: Optional[Callable[[], Dict[str, Any]]] = None,
     ws_metrics_resetter: Optional[Callable[[], None]] = None,
@@ -3666,14 +3665,14 @@ def _build_stats_callback(
         stats_payload = {
             "timestamp": now,
             "uptime": now - start_time,
-            "stack": "ds8",
+            "stack": "ds9",
             "application": {
                 "running": pipeline.activated,
                 "cameras_active": len(camera_labels),
                 "processors_active": 1 if pipeline.activated else 0,
             },
             "pipeline": {
-                "stack": "ds8",
+                "stack": "ds9",
                 "prepared": pipeline.prepared,
                 "activated": pipeline.activated,
                 "depth_enabled": pipeline.depth_enabled,
@@ -4130,7 +4129,7 @@ def _stop_rest_server(
 
 
 def _build_mosaic_keyframe_requester(
-    pipeline: ds8_pipeline.DS8Pipeline,
+    pipeline: deepstream_pipeline.DeepStreamPipeline,
     logger: logging.Logger,
     *,
     failure_callback: Optional[Callable[[BaseException], None]] = None,
@@ -4214,7 +4213,7 @@ def _on_bus_message(
             name = message.src.get_name()
             old, new, pending = message.parse_state_changed()
             # Log pipeline-level and RTSP element transitions
-            if name == "noesis-ds8" or name == "noesis_rtsp_out" or "rtsp" in name:
+            if name == "noesis-ds9" or name == "noesis_rtsp_out" or "rtsp" in name:
                 logger.info(
                     "🔄 [%s] state: %s → %s (pending: %s)",
                     name,
@@ -4227,7 +4226,7 @@ def _on_bus_message(
 
 
 def _start_glib_mainloop(
-    pipeline: "ds8_pipeline.DS8Pipeline",
+    pipeline: "deepstream_pipeline.DeepStreamPipeline",
     shutdown_event: threading.Event,
     logger: logging.Logger,
 ) -> Tuple[Optional[threading.Thread], Optional["GLib.MainLoop"]]:
@@ -4282,12 +4281,7 @@ def _on_pyservicemaker_message(
 
     # State transition messages are extremely chatty and (depending on the backend build)
     # attribute access can be unsafe. Keep them OFF by default and enable only when needed.
-    log_state = (
-        str(os.environ.get("NOESIS_DS9_STATE_LOG", "") or os.environ.get("NOESIS_DS8_STATE_LOG", ""))
-        .strip()
-        .lower()
-        in _ENV_TRUE
-    )
+    log_state = str(os.environ.get("NOESIS_DS9_STATE_LOG", "")).strip().lower() in _ENV_TRUE
 
     if isinstance(message, EOSMessage):
         shutdown_requested = shutdown_event.is_set()
@@ -4830,7 +4824,6 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         return 1
 
     os.environ["NOESIS_DS9_PIPELINE_CONFIG"] = str(pipeline_path)
-    os.environ["NOESIS_DS8_PIPELINE_CONFIG"] = str(pipeline_path)
     try:
         from noesis.server import analytics_api
 
@@ -4988,7 +4981,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             ]
         return [capture_camera_aliases.canonicalize(camera_id)]
 
-    def _ds8_auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
+    def _auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
         if not auto_calibrate_lock.acquire(blocking=False):
             return {"ok": False, "results": [], "updated": [], "error": "busy"}
         try:
@@ -5174,7 +5167,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         finally:
             auto_calibrate_lock.release()
 
-    def _ds8_ma_depth_provider(
+    def _ma_depth_provider(
         cam_id: str,
         ts_max_us: Optional[object] = None,
         request_id: Optional[str] = None,
@@ -5228,7 +5221,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     ) -> Optional[Mapping[str, Any]]:
         return active_floorplan_registry.bounds_for(camera_key)
 
-    def _ds8_floorplan_provider(
+    def _floorplan_provider(
         camera: Optional[str] = None,
         max_age_sec: float = 60.0,
         grid_res_m: float = 0.5,
@@ -5412,7 +5405,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             logger.error("Scene-prior floorplan composition failed: %s", exc)
             return _with_scene_fusion(result)
 
-    pipeline = ds8_pipeline.build_pipeline(pipeline_path)
+    pipeline = deepstream_pipeline.build_pipeline(pipeline_path)
     setattr(pipeline, "active_floorplan_registry", active_floorplan_registry)
     runtime_state["expected_eos"] = pipeline_expects_finite_source_eos(pipeline)
     runtime_state["pipeline_eos_seen"] = False
@@ -5444,7 +5437,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         return _abort_startup("scene_fusion_invalid")
     setattr(pipeline, "scene_fusions", scene_fusion_set)
     # Parse mosaic_output toggles from the *built pipeline config* (source of truth).
-    # Do not re-apply env overrides here: env vars are consumed during build in ds8_pipeline,
+    # Do not re-apply env overrides here: env vars are consumed during pipeline build,
     # and re-applying them here can desync runtime behavior from the actual pipeline graph.
     mosaic_cfg = pipeline.config.get("mosaic_output") or {}
     mosaic_webrtc_enabled = bool(mosaic_cfg.get("mosaic_webrtc_enabled", False))
@@ -5757,10 +5750,10 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             pass
 
     ws_server.toggle_callback = _toggle_handler
-    ws_server.ma_depth_provider = _ds8_ma_depth_provider
-    ws_server.floorplan_provider = _ds8_floorplan_provider
+    ws_server.ma_depth_provider = _ma_depth_provider
+    ws_server.floorplan_provider = _floorplan_provider
     ws_server.calibration_getter = calibration_provider.calibration_bundle
-    ws_server.auto_calibrate_handler = _ds8_auto_calibrate_handler
+    ws_server.auto_calibrate_handler = _auto_calibrate_handler
 
     def _broadcast_calibration_bundle() -> None:
         try:
@@ -6376,7 +6369,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     if shutdown_event.is_set():
         return _abort_startup("shutdown_requested_before_prepare")
     logger.info("Preparing DS9 pipeline")
-    if not ds8_pipeline.prepare(on_message=_psm_message_cb):
+    if not deepstream_pipeline.prepare(on_message=_psm_message_cb):
         logger.error("DS9 pipeline preparation failed: %s", pipeline.errors)
         return _abort_startup("pipeline_prepare_failed")
     startup_transaction.mark_prepared()
@@ -6431,7 +6424,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     if shutdown_event.is_set():
         return _abort_startup("shutdown_requested_before_activation")
     startup_transaction.mark_activation_attempted()
-    if not ds8_pipeline.activate():
+    if not deepstream_pipeline.activate():
         logger.error("DS9 pipeline activation failed: %s", pipeline.errors)
         _abort_ambiguous_and_wait("pipeline_activation_failed")
     ds = getattr(pipeline, "ds_pipeline", None)

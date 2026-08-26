@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from noesis.metadata.depth_result import DepthResult
 from noesis.telemetry.publishers import DepthTelemetryPublisher
+from noesis_core.runtime_publication import RuntimePublicationGate
 
 
 class _Recorder:
@@ -14,7 +15,7 @@ class _Recorder:
 
 def test_depth_telemetry_replaces_filesystem_path_with_opaque_reference() -> None:
     recorder = _Recorder()
-    publisher = DepthTelemetryPublisher(recorder)
+    publisher = DepthTelemetryPublisher(recorder, RuntimePublicationGate())
     private_path = "/private/noesis/depth/living-room/frame.zarr"
     result = DepthResult(
         source_id=0,

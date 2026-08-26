@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for MapAnything depth RPC over WebSocket (DS8 runtime)."""
+"""Smoke test for the DS9.1 MapAnything depth RPC over WebSocket."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def _spawn_runtime(
 ) -> subprocess.Popen:
     cmd = [
         sys.executable,
-        "noesis/ds8_runtime.py",
+        "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
         str(args.pipeline_config),
         "--cameras-config",
@@ -166,7 +166,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="MapAnything depth RPC smoke test")
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
     parser.add_argument(
-        "--pipeline-config", type=Path, default=Path("config/infer.yaml")
+        "--pipeline-config", type=Path, default=Path("DS9/config/infer.yaml")
     )
     parser.add_argument(
         "--cameras-config", type=Path, default=Path("config/cameras.yaml")
@@ -179,7 +179,7 @@ def main() -> int:
     parser.add_argument(
         "--no-spawn",
         action="store_true",
-        help="Do not spawn ds8_runtime; assume external runtime",
+        help="Do not spawn the DS9 runtime; assume an external runtime",
     )
     parser.add_argument(
         "--camera",

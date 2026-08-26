@@ -40,11 +40,10 @@ start another runtime.
 Select the smallest files that directly cover the change. Examples:
 
 ```bash
-"$PYTHON" -m pytest -q DS9/tests/test_runtime_container_boundary.py
+"$PYTHON" -m pytest -q DS9/tests/test_runtime_host_boundary.py
 ```
 
-The historical filename above contains both boundary contracts; choose a more
-specific test when available. Do not infer container authority from the name.
+Choose a more specific test when one covers the changed boundary.
 
 ```bash
 "$PYTHON" -m pytest -q \

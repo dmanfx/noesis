@@ -32,7 +32,7 @@ from noesis.mosaic_glib_context import shared_default_glib_context
 
 if TYPE_CHECKING:
     from noesis.mosaic_h264_bridge import MosaicH264ShmFeeder
-    from websocket_server import WebSocketServer
+    from noesis.server.websocket import WebSocketServer
 
 Gst.init(None)
 

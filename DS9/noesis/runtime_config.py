@@ -1,6 +1,6 @@
 """DS9-owned helpers for materializing runtime configuration.
 
-This module deliberately has no dependency on the DS8 runtime or DS8 preflight
+This module deliberately has no dependency on a historical runtime or preflight
 layer.  It is safe to import before Service Maker or native extensions are
 loaded, which keeps DS9 configuration policy testable on non-DS9 hosts.
 """

@@ -1,5 +1,5 @@
 # Camera topology for household identity overlap permits.
-# source_id values match config/v3dt/reimpl/cameras.yaml and typical infer.yaml order:
+# source_id values match the canonical DS9/config/infer.yaml source order:
 #   0 = living-room, 1 = kitchen, 2 = family-room
 # Verify against the active sources list before production use.
 version: 1

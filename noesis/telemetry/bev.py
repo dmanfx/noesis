@@ -1364,7 +1364,7 @@ class BevRenderer:
         return float(u), float(v)
 
     def _infer_image_flips(self, calib: CalibrationSnapshot) -> Tuple[bool, bool]:
-        # Vestigial after menon_world_unification / DS8 design decisions (flips retired from canonical path).
+        # Vestigial after world/presentation unification (flips retired from the canonical path).
         # If this ever returns non-(False, False) in the future, something has gone wrong with the unification.
         # We keep the machinery for now but force the safe no-flip result.
         return False, False

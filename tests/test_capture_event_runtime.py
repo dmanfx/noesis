@@ -545,20 +545,13 @@ def test_stale_registry_rejection_is_stable_and_nonfatal() -> None:
     assert harness.failures == []
 
 
-def test_runtime_mains_have_one_shared_controller_path_and_no_second_reader() -> None:
-    for relative in (
-        "noesis/ds8_runtime.py",
-        "noesis/ds8_runtime_v3dt_reimpl.py",
-        "DS9/noesis/ds9_runtime_core.py",
-    ):
+def test_ds9_runtime_has_one_shared_controller_path_and_no_second_reader() -> None:
+    for relative in ("DS9/noesis/ds9_runtime_core.py",):
         source = (REPO_ROOT / relative).read_text(encoding="utf-8")
         assert "CaptureEventController(" in source
         assert "capture_event_runtime_providers" in source
         assert "_fuse_capture_event_snapshots" not in source
         assert "candidate_keys" not in source
-    root_source = (REPO_ROOT / "noesis/ds8_runtime.py").read_text(encoding="utf-8")
-    assert "VideoCapture" not in root_source
-    assert "_capture_camera_rgb_for_depth_snapshot" not in root_source
     ds9_source = (REPO_ROOT / "DS9/noesis/ds9_runtime_core.py").read_text(
         encoding="utf-8"
     )

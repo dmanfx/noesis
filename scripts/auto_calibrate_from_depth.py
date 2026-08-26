@@ -27,18 +27,14 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import yaml
 
-from calibration_bundle import (
-    load_intrinsics,
-    save_extrinsics,
-    _derive_k_from_intrinsics_model,  # type: ignore
-    _resolution_from_spec,  # type: ignore
-)
-from config import AppConfig
+from noesis.calibration.bundle import save_extrinsics
 from geometry.depth_source import MapAnythingDepthSource
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 
 # Defaults match the FE camera keys
 DEFAULT_CAMERAS = ["living-room", "kitchen", "family-room"]
+CAMERAS_CONFIG_PATH = ROOT / "config" / "cameras.yaml"
+CAMERA_CALIBRATION_PATH = ROOT / "config" / "camera_calibration.json"
 logger = logging.getLogger(__name__)
 
 
@@ -49,17 +45,21 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+@lru_cache(maxsize=1)
+def _load_cameras_config() -> Dict[str, Any]:
+    """Load the canonical camera identities and intrinsics configuration."""
+    try:
+        data = yaml.safe_load(CAMERAS_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _load_camera_height_priors() -> Dict[str, float]:
     """
     Returns camera->expected_height_m from config/cameras.yaml if available.
     """
-    cfg_path = ROOT / "config/cameras.yaml"
-    if not cfg_path.exists():
-        return {}
-    try:
-        data = yaml.safe_load(cfg_path.read_text()) or {}
-    except Exception:
-        return {}
+    data = _load_cameras_config()
     cams = data.get("cameras") or {}
     priors: Dict[str, float] = {}
     if isinstance(cams, dict):
@@ -77,10 +77,7 @@ def _load_camera_model_map() -> Tuple[Dict[str, Any], Dict[str, str]]:
     """
     Returns (intrinsics_models, camera->model) from config/cameras.yaml
     """
-    cfg_path = ROOT / "config/cameras.yaml"
-    if not cfg_path.exists():
-        return {}, {}
-    data = yaml.safe_load(cfg_path.read_text()) or {}
+    data = _load_cameras_config()
     models = data.get("intrinsics_models") or {}
     cam_entries = data.get("cameras") or {}
     cam_to_model: Dict[str, str] = {}
@@ -134,78 +131,20 @@ def _intrinsics_from_model(model: str, shape: Tuple[int, int]) -> Optional[np.nd
 
 
 @lru_cache(maxsize=1)
-def _load_intrinsics_bundle() -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, Any]]:
-    """
-    Load canonical intrinsics models, camera->model map, and camera specs from CalibrationSettings.
-    """
-    cfg = AppConfig()
-    intr_path = Path(cfg.calibration.INTRINSICS_PATH)
-    if not intr_path.is_absolute():
-        intr_path = ROOT / intr_path
-    intrinsics_models = load_intrinsics(str(intr_path))
-    model_map = dict(getattr(cfg.calibration, "CAMERA_INTRINSICS_MODEL_MAP", {}) or {})
-    camera_specs = dict(getattr(cfg.calibration, "CAMERA_SPECS", {}) or {})
-    return intrinsics_models, model_map, camera_specs
-
-
-@lru_cache(maxsize=1)
 def _resolve_extrinsics_path() -> Path:
-    cfg = AppConfig()
-    calib_path = Path(cfg.calibration.CAMERA_CALIBRATION_PATH)
-    if not calib_path.is_absolute():
-        calib_path = ROOT / calib_path
-    return calib_path
-
-
-_FALLBACK_WARNED: set[str] = set()
+    return CAMERA_CALIBRATION_PATH
 
 
 def _intrinsics_for_camera(cam_id: str, shape: Tuple[int, int]) -> Optional[np.ndarray]:
     """
-    Build a 3x3 K using canonical intrinsics.json + CalibrationSettings, scaling to match depth shape.
+    Build a 3x3 K from canonical config/cameras.yaml, scaled to the depth shape.
     """
-    intr_models, model_map, camera_specs = _load_intrinsics_bundle()
-    model_key = model_map.get(cam_id)
-    k_tuple = _derive_k_from_intrinsics_model(model_key, intr_models or {})
-    if k_tuple is not None:
-        fx, fy, cx, cy = k_tuple
-        base_res = None
-        spec = camera_specs.get(cam_id) if isinstance(camera_specs, dict) else None
-        if spec:
-            base_res = _resolution_from_spec(spec)  # type: ignore[arg-type]
-        if base_res is None and model_key and intr_models:
-            model_entry = intr_models.get(model_key)
-            if isinstance(model_entry, dict):
-                base_res = _resolution_from_spec(model_entry)  # type: ignore[arg-type]
-                if base_res is None:
-                    intr = model_entry.get("intrinsics")
-                    if isinstance(intr, dict):
-                        base_res = _resolution_from_spec(intr)  # type: ignore[arg-type]
-        width = float(shape[1])
-        height = float(shape[0])
-        if base_res:
-            base_w, base_h = base_res
-            if base_w > 0 and base_h > 0 and (base_w != width or base_h != height):
-                sx = width / float(base_w)
-                sy = height / float(base_h)
-                fx *= sx
-                cx *= sx
-                fy *= sy
-                cy *= sy
-        return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-    # Fallback to config/cameras.yaml model-mapped intrinsics when canonical lookup fails.
     models, cam_to_model = _load_camera_model_map()
-    fallback_model_key = cam_to_model.get(cam_id, "")
-    K = _intrinsics_from_model(fallback_model_key, shape)
-    if K is not None and cam_id not in _FALLBACK_WARNED:
-        logger.warning(
-            "Using fallback intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
-            cam_id,
-            fallback_model_key or "unknown",
-        )
-        _FALLBACK_WARNED.add(cam_id)
-    return K
+    model_key = cam_to_model.get(cam_id, "")
+    if not model_key or model_key not in models:
+        logger.warning("No canonical intrinsics model is bound for camera '%s'", cam_id)
+        return None
+    return _intrinsics_from_model(model_key, shape)
 
 
 def _decode_float32(b64: str, shape: Tuple[int, int]) -> np.ndarray:

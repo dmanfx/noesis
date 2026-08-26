@@ -79,7 +79,6 @@ def _depth_only_policy() -> WorldFusionPolicy:
     )
     return WorldFusionPolicy(
         policy_id="test-depth-only",
-        runtime_lane="ds9",
         evidence={},
         cameras={"cam0": profile},
     )
@@ -255,7 +254,7 @@ def _run_pose_depth_sample(
         buf_pts=pts_us * 1000,
         object_items=[obj_meta],
     )
-    processor.handle_frame_ds8(SimpleNamespace(frame_items=[frame_meta]), frame_meta)
+    processor.handle_servicemaker_frame(SimpleNamespace(frame_items=[frame_meta]), frame_meta)
     assert len(attached) == 1
     return attached[0], device, processor
 

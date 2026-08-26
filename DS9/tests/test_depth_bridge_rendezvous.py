@@ -140,7 +140,7 @@ def test_ds9_depth_bridge_rendezvous_and_counters_match_canonical_contract() -> 
                 attached_payloads.append(json.loads(payload)) or True
             ),
         )
-        processor.handle_frame_ds8(
+        processor.handle_servicemaker_frame(
             batch_meta,
             SimpleNamespace(
                 source_id=0,
@@ -177,7 +177,7 @@ def test_ds9_depth_bridge_rendezvous_and_counters_match_canonical_contract() -> 
         assert bbox_payload["depth_tensor_age_frames"] == 0
         assert bbox_payload["depth_tensor_age_us"] == 0
 
-        processor.handle_frame_ds8(
+        processor.handle_servicemaker_frame(
             batch_meta,
             SimpleNamespace(
                 source_id=0,
@@ -229,7 +229,7 @@ def test_ds9_depth_bridge_rendezvous_and_counters_match_canonical_contract() -> 
             depth_unit="m",
             depth_is_metric=True,
         )
-        capture.handle_frame_ds8(
+        capture.handle_servicemaker_frame(
             SimpleNamespace(
                 source_id=0,
                 frame_number=42,
@@ -332,7 +332,7 @@ def test_pending_depth_miss_retries_next_frame_without_negative_cache(monkeypatc
 
     hooks.reset_core_path_instrumentation()
     batch = SimpleNamespace(frame_items=[])
-    processor.handle_frame_ds8(batch, metadata(1))
+    processor.handle_servicemaker_frame(batch, metadata(1))
     assert attached == []
     assert processor._result_cache == {}
     assert (0, 7) in processor._depth_retry_tracks
@@ -354,7 +354,7 @@ def test_pending_depth_miss_retries_next_frame_without_negative_cache(monkeypatc
         depth_device_frame=StatsDevice(),
     )
     store.put(ready)
-    processor.handle_frame_ds8(batch, metadata(2))
+    processor.handle_servicemaker_frame(batch, metadata(2))
     assert len(attached) == 1
     assert (0, 7) not in processor._depth_retry_tracks
     assert (0, 7) in processor._result_cache
@@ -452,7 +452,7 @@ def test_pending_depth_retry_preserves_a_valid_cached_measurement(monkeypatch) -
     )
 
     hooks.reset_core_path_instrumentation()
-    processor.handle_frame_ds8(SimpleNamespace(frame_items=[]), frame)
+    processor.handle_servicemaker_frame(SimpleNamespace(frame_items=[]), frame)
 
     assert len(attached) == 1
     assert attached[0]["measurement_cached"] is True

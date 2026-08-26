@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mapanything_config import load_service_config
+from noesis.config.mapanything import load_service_config
 from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.virtual_twin.builder import (
     VirtualTwinBuildError,
@@ -460,7 +460,7 @@ def parse_args() -> argparse.Namespace:
         description="Build an offline virtual twin from fisheye-rectified RGB, fresh MapAnything, and fresh ZeroPlane."
     )
     parser.add_argument("--camera", default="living-room")
-    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml")
+    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "DS9" / "config" / "infer.yaml")
     parser.add_argument("--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml")
     parser.add_argument("--alignment-config", type=Path, default=REPO_ROOT / "config" / "ply_alignment.json")
     parser.add_argument("--model-obj", type=Path, default=None)

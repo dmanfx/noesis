@@ -1,7 +1,5 @@
-# Native-host constraints matching the accepted DS9.1 runtime image.
-# Install with:
-#   python -m pip install -r DS9/docker/requirements.lock.txt \
-#     -c DS9/native/requirements.host.constraints.txt
+# Exact dependency pins checked in the canonical DS9.1 native-host venv.
+# `run_canonical_runtime_host.py check` verifies these installed versions.
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1

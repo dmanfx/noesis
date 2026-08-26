@@ -464,7 +464,7 @@ def _spawn_runtime(
 ) -> subprocess.Popen[str]:
     cmd = [
         sys.executable,
-        "noesis/ds8_runtime.py",
+        "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
         str(pipeline_config),
         "--cameras-config",
@@ -480,7 +480,7 @@ def _spawn_runtime(
     env = dict(os.environ)
     configure_required_auth_environment(env, auth)
     if stub:
-        env["NOESIS_DS8_STUB_PIPELINE"] = "1"
+        env["NOESIS_DS9_STUB_PIPELINE"] = "1"
     if skip_cuda_preflight:
         env["NOESIS_SKIP_CUDA_PREFLIGHT"] = "1"
     env.setdefault("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
@@ -537,7 +537,9 @@ def _parse_args() -> argparse.Namespace:
         description="Zero-copy smoke gate (runtime + WS stats + boundary traffic)"
     )
     parser.add_argument(
-        "--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml"
+        "--pipeline-config",
+        type=Path,
+        default=REPO_ROOT / "DS9" / "config" / "infer.yaml",
     )
     parser.add_argument(
         "--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml"

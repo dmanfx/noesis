@@ -44,7 +44,7 @@ py::list measure_buffer_latency(const deepstream::Buffer& buffer) {
 }  // namespace
 
 PYBIND11_MODULE(noesis_latency_ext, m) {
-  m.doc() = "Noesis DS8 helper bindings for DeepStream Service Maker latency sampling";
+  m.doc() = "Noesis DS9.1 Service Maker bindings for latency sampling";
   m.def("measure_buffer_latency", &measure_buffer_latency,
         py::arg("buffer"),
         "Return a list of {source_id, frame_num, latency_ms} for the given Service Maker Buffer.");

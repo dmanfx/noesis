@@ -35,10 +35,6 @@ semantic = _load(
     "immutable_evidence_semantic_gate",
     "DS9/scripts/ds9_semantic_observation_smoke_test.py",
 )
-v3dt = _load(
-    "immutable_evidence_v3dt_gate",
-    "DS9/scripts/v3dt_world_contract_smoke_test.py",
-)
 wholebody = _load(
     "immutable_evidence_wholebody_gate",
     "DS9/scripts/wholebody49_occupied_scene_smoke_test.py",
@@ -70,7 +66,6 @@ Writer = Callable[[Path, Mapping[str, object]], object]
             semantic.CANONICAL_REPORT_FILENAME,
             semantic._write_report,
         ),
-        ("v3dt", v3dt.CANONICAL_REPORT_FILENAME, v3dt._write_private_json),
         (
             "wholebody",
             wholebody.CANONICAL_REPORT_FILENAME,
@@ -108,7 +103,6 @@ def test_behavior_evidence_writers_are_owner_private_and_no_replace(
         identity._write_private_json,
         floorplan._write_private_json,
         semantic._write_report,
-        v3dt._write_private_json,
         wholebody._write_private_json,
         media._write_private_json,
     ),
@@ -131,7 +125,6 @@ def test_behavior_evidence_writers_reject_noncanonical_filenames(
             identity.BASELINE_CANONICAL_REPORT_FILENAME,
             identity._write_private_json,
         ),
-        (v3dt.CANONICAL_REPORT_FILENAME, v3dt._write_private_json),
         (
             wholebody.CANONICAL_REPORT_FILENAME,
             wholebody._write_private_json,
@@ -179,12 +172,6 @@ def test_create_once_writers_reject_nonfinite_before_publication(
             semantic.CANONICAL_REPORT_FILENAME,
         ),
         (
-            v3dt,
-            "_parse_args",
-            v3dt.CANONICAL_SOURCE_TRANSCRIPT_FILENAME,
-            v3dt.CANONICAL_REPORT_FILENAME,
-        ),
-        (
             wholebody,
             "_parse_args",
             wholebody.CANONICAL_SOURCE_TRANSCRIPT_FILENAME,
@@ -226,9 +213,6 @@ def test_behavior_gate_main_requires_fresh_bundle_before_filling_partial_session
         runtime_lane="v3dt",
     )
     monkeypatch.setattr(module, parser_name, lambda *_args, **_kwargs: arguments)
-    if module is v3dt:
-        monkeypatch.setattr(module, "build_config_binding", lambda **_kwargs: {})
-
     result = module.main([]) if parser_name == "_parse_args" else module.main()
 
     assert result == 1

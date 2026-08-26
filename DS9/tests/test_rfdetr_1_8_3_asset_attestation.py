@@ -214,7 +214,7 @@ def runtime_tree(
         "DS9/pipelines/nvdsinfer_rfdetr/nvdsinfer_rfdetr.cpp"
     )
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_id": "noesis-ds9-artifacts",
         "schema": "DS9/docs/asset_manifest.schema.json",
         "target": {

@@ -1,8 +1,9 @@
-# Legacy ONNX-to-TensorRT helper
+# MapAnything ONNX export helper
 
-Status: inactive pre-native utility. Its former MapAnything/YOLO configuration
-instructions are archived under `docs/history/experiments/onnx2trt/` and must
-not be used with the current application.
+Status: DS9.1 model-export support utility invoked by
+`DS9/scripts/mapanything_profile_tool.py`. It does not own runtime selection or
+engine realization. Former generic ONNX-to-TensorRT instructions are archived
+under `docs/history/experiments/onnx2trt/`.
 
 Canonical DS9.1 engines are built and finalized through
 `DS9/scripts/run_canonical_engine_maintenance_host.sh` against TensorRT

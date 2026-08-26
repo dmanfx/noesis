@@ -36,10 +36,7 @@ def test_object_items_must_be_materialized_before_double_pass():
 def test_hooks_do_not_list_object_items_for_second_pass():
     """Crash fix: never list(object_items) then re-touch stored wrappers."""
     repo = Path(__file__).resolve().parents[1]
-    for rel in (
-        "noesis/pipelines/hooks.py",
-        "noesis/pipelines/hooks_v3dt_reimpl.py",
-    ):
+    for rel in ("DS9/noesis/pipelines/hooks.py",):
         text = (repo / rel).read_text(encoding="utf-8")
         assert "object_items = list(" not in text, (
             f"{rel} still materializes object_items into a list for a second pass; "

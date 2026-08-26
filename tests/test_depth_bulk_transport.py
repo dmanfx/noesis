@@ -714,16 +714,10 @@ def test_runtime_auth_middleware_protects_bulk_component_stream(tmp_path: Path) 
         _close(manager)
 
 
-def test_ds8_ds9_api_and_all_runtime_storage_wiring_remain_in_parity() -> None:
+def test_shared_depth_api_and_ds9_runtime_storage_wiring_remain_connected() -> None:
     root = Path(__file__).resolve().parents[1]
-    assert (root / "noesis/server/depth_api.py").read_bytes() == (
-        root / "DS9/noesis/server/depth_api.py"
-    ).read_bytes()
-    for relative in (
-        "noesis/ds8_runtime.py",
-        "noesis/ds8_runtime_v3dt_reimpl.py",
-        "DS9/noesis/ds9_runtime_core.py",
-    ):
+    assert (root / "noesis/server/depth_api.py").is_file()
+    for relative in ("DS9/noesis/ds9_runtime_core.py",):
         source = (root / relative).read_text(encoding="utf-8")
         assert "rest_app.state.depth_storage = storage_manager" in source
 

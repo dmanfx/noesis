@@ -589,12 +589,6 @@ print(json.dumps(info))
         _fail(f"pyservicemaker is not from the native venv: {pysm}")
     if not payload.get("torch_cuda"):
         _fail("Torch does not see CUDA")
-    ds8 = payload.get("ds8_spec")
-    if ds8:
-        # Presence of the archived module file is allowed; executing it is not.
-        # The check process must not import it. find_spec locating the file is
-        # reported but not a failure unless the origin is already loaded.
-        pass
     return {
         "python": payload["executable"],
         "pyservicemaker": str(pysm),
@@ -608,7 +602,7 @@ def verify_native_dependency_constraints(
     python: Path,
     constraints_path: Path = NATIVE_DEPENDENCY_CONSTRAINTS,
 ) -> dict[str, Any]:
-    """Require the native venv to match the accepted image's drifting deps."""
+    """Require the native venv to match the accepted native-host dependency pins."""
 
     expected: dict[str, str] = {}
     try:

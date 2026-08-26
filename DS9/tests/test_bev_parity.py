@@ -329,21 +329,16 @@ def test_ds9_has_no_bev_shadow_and_resolves_the_canonical_owner() -> None:
     assert Path(bev.__file__).resolve() == CANONICAL_BEV.resolve()
 
 
-def test_ds8_and_ds9_use_the_same_bev_coverage_envelope_contract() -> None:
-    canonical_config = yaml.safe_load(
-        (REPO_ROOT / "config" / "infer.yaml").read_text(encoding="utf-8")
-    )
+def test_ds91_uses_the_approved_bev_coverage_envelope_contract() -> None:
     ds9_config = yaml.safe_load(
         (DS9_ROOT / "config" / "infer.yaml").read_text(encoding="utf-8")
     )
 
-    canonical_coverage = canonical_config["bev"]["coverage_envelopes"]
-    ds9_coverage = ds9_config["bev"]["coverage_envelopes"]
-    assert ds9_coverage == canonical_coverage
-    assert set(canonical_coverage["cameras"]) == {"living-room"}
+    coverage = ds9_config["bev"]["coverage_envelopes"]
+    assert set(coverage["cameras"]) == {"living-room"}
     assert [
         region["id"]
-        for region in canonical_coverage["cameras"]["living-room"]["regions"]
+        for region in coverage["cameras"]["living-room"]["regions"]
     ] == ["living-room", "foyer"]
 
 

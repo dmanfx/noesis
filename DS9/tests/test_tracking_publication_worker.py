@@ -1533,7 +1533,7 @@ def test_handler_shadow_stable_id_none_dispatches_off_callback_without_blocking(
     )
     monkeypatch.setattr(
         processor,
-        "_build_track_dict_ds8",
+        "_build_track_dict_servicemaker",
         lambda _obj, _camera: {
             "track_id": 7,
             "bbox": [10.0, 20.0, 40.0, 80.0],
@@ -1547,7 +1547,7 @@ def test_handler_shadow_stable_id_none_dispatches_off_callback_without_blocking(
     )
     monkeypatch.setattr(
         processor,
-        "_extract_reid_embedding_ds8",
+        "_extract_reid_embedding_servicemaker",
         lambda _obj: np.asarray([1.0, 0.0], dtype=np.float32),
     )
     monkeypatch.setattr(processor, "_maybe_assign_stable_id", lambda **_kwargs: None)
@@ -1572,10 +1572,10 @@ def test_handler_shadow_stable_id_none_dispatches_off_callback_without_blocking(
         "_apply_public_depth_fields",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(processor, "_stamp_osd_label_ds8", lambda *_a, **_k: None)
+    monkeypatch.setattr(processor, "_stamp_osd_label_servicemaker", lambda *_a, **_k: None)
     monkeypatch.setattr(
         processor,
-        "_apply_instance_mask_color_ds8",
+        "_apply_instance_mask_color_servicemaker",
         lambda *_a, **_k: None,
     )
     monkeypatch.setattr(processor, "_footpoint_from_track", lambda *_a, **_k: None)
@@ -1603,7 +1603,7 @@ def test_handler_shadow_stable_id_none_dispatches_off_callback_without_blocking(
         buf_pts=2_000_010_000,
         object_items=(obj,),
     )
-    processor.handle_frame_ds8(frame)
+    processor.handle_servicemaker_frame(frame)
 
     assert scoring_started.wait(timeout=2.0)
     assert received_stable_ids == [None]

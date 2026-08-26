@@ -341,12 +341,9 @@ def test_finish_timeout_is_a_bounded_conflict_not_a_type_error(
     assert raised.value.status_code == 409
 
 
-def test_ds8_and_ds9_mount_the_same_shared_alignment_controller() -> None:
+def test_ds9_mounts_the_shared_alignment_controller() -> None:
     root = Path(__file__).resolve().parents[1]
-    for runtime_path in (
-        root / "noesis" / "ds8_runtime.py",
-        root / "DS9" / "noesis" / "ds9_runtime_core.py",
-    ):
+    for runtime_path in (root / "DS9" / "noesis" / "ds9_runtime_core.py",):
         source = runtime_path.read_text(encoding="utf-8")
         assert "alignment_walk_api.install_alignment_walk_api(" in source
         assert "auth_config=auth_config" in source

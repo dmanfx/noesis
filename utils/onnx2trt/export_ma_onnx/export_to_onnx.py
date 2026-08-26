@@ -262,7 +262,7 @@ def parse_args() -> ExportConfig:
         help="Refuse to replace any ONNX, sidecar, derived graph, or report output.",
     )
     # For 1920x1080 sources, MapAnything preprocess uses max side=518 and rounds to patch-size (14):
-    # 518x294 (W×H). Keep these as the default export dims for DS8 full-frame inference.
+    # 518x294 (W×H). Keep these as the default export dims for DS9.1 full-frame inference.
     parser.add_argument("--h", type=int, default=294, help="Input image height (default: 294 for 16:9 sources)")
     parser.add_argument("--w", type=int, default=518, help="Input image width (default: 518 for 16:9 sources)")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
@@ -325,7 +325,7 @@ def parse_args() -> ExportConfig:
             "--return-conf-mask",
             action=argparse.BooleanOptionalAction,  # type: ignore[attr-defined]
             default=True,
-            help="Return depth + conf + mask outputs (for DS8 tensor meta postprocess).",
+            help="Return depth + conf + mask outputs (for DS9.1 tensor meta postprocess).",
         )
     else:  # pragma: no cover
         parser.add_argument("--include-intrinsics", dest="include_intrinsics", action="store_true", default=False, help=intrinsics_help)

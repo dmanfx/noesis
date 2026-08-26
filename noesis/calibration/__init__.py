@@ -1,4 +1,4 @@
-"""DS8 Calibration module — single owner for K/E/align loading, validation, broadcasting."""
+"""Canonical calibration module for K/E/align loading and validation."""
 
 from noesis.calibration.manager import (
     CalibrationManager,

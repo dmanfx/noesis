@@ -33,9 +33,9 @@ import requests
 import scipy.ndimage as ndi
 import zarr
 
-from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
+from noesis.adapters.mapanything import ViewBuildResult, build_mono_view
 from geometry.homography import img_to_plane_homography, parse_extrinsics
-from mapanything_config import ServiceConfig, load_service_config
+from noesis.config.mapanything import ServiceConfig, load_service_config
 from noesis_core.depth_bulk import (
     DEPTH_BULK_MAX_COMPONENT_BYTES,
     DEPTH_BULK_MAX_PIXELS,
@@ -955,7 +955,7 @@ def resolve_depth_store_commit_timeout_s(value: Optional[Any] = None) -> float:
 
 
 def _increment_core_boundary_copy_bytes(path: str, payload_bytes: int) -> None:
-    """Best-effort bridge into DS8 core counters without import-time cycles."""
+    """Best-effort bridge into canonical core counters without import-time cycles."""
     global _CORE_COUNTER_FN, _CORE_COUNTER_RESOLVED
     delta = max(0, int(payload_bytes))
     if delta <= 0:
@@ -6470,7 +6470,7 @@ class DepthStorageManager:
         if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
             raise ValueError("invalid_intrinsics")
 
-        # DS8 MapAnything depth is aligned to frame coordinates before it is persisted.
+        # Canonical MapAnything depth is aligned to frame coordinates before persistence.
         # Keep K as the runtime-calibrated canonical source and avoid a second letterbox
         # transform here, which introduces per-camera geometric drift in floorplans.
         return fx, fy, cx, cy

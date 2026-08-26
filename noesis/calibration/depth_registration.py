@@ -59,7 +59,7 @@ MAX_DEPTH_REGISTRATION_BYTES = 32 * 1024 * 1024
 
 
 class DepthRegistrationError(Exception):
-    """Raised when the DS8 depth-registration artifact is invalid or mismatched."""
+    """Raised when a depth-registration artifact is invalid or mismatched."""
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> str:

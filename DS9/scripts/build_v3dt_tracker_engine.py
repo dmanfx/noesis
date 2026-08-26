@@ -24,12 +24,12 @@ from engine_maintenance_common import (  # noqa: E402
     EngineMaintenanceRun,
     copy_regular_file_exclusive,
     engine_maintenance_lock,
-    maintenance_provenance_from_environment,
+    native_host_build_authority,
+    native_host_maintenance_platform,
     new_run_id,
     require_absent_candidate_path,
     sha256_file,
     validate_maintenance_build_contract,
-    validate_prepared_transaction_authority,
     validate_source_contract,
 )
 
@@ -141,26 +141,7 @@ def build_tracker_engine(
     dry_run: bool,
     validate_load: bool,
     evidence_root: Path | None = None,
-    transaction_manifest: Path | None = None,
-    expected_transaction_sha256: str | None = None,
 ) -> None:
-    prepared_authority: dict[str, object] | None = None
-    if not dry_run:
-        if transaction_manifest is None or not expected_transaction_sha256:
-            raise RuntimeError(
-                "real DS9 tracker builds require a prepared host transaction"
-            )
-        prepared = validate_prepared_transaction_authority(
-            transaction_manifest=transaction_manifest,
-            expected_sha256=expected_transaction_sha256,
-            engine_name="v3dt_tracker_reid",
-            engine_target=TRACKER_ENGINE,
-        )
-        prepared_authority = {
-            "transaction_id": prepared["transaction_id"],
-            "transaction_sha256": expected_transaction_sha256,
-            "transaction_manifest": str(transaction_manifest.expanduser().absolute()),
-        }
     deepstream_home = Path(
         os.environ.get(
             "NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1"
@@ -332,6 +313,7 @@ def build_tracker_engine(
                 staged_source=staged_source,
                 generated_engine=generated_engine,
             )
+            platform = native_host_maintenance_platform()
             run = EngineMaintenanceRun(
                 name="v3dt_tracker_reid",
                 target=TRACKER_ENGINE,
@@ -355,9 +337,8 @@ def build_tracker_engine(
                 repo_root=REPO_ROOT,
                 run_id=run_id,
                 metadata={
-                    "platform": maintenance_provenance_from_environment(),
+                    "platform": platform,
                     "build_contract": build_contract,
-                    "host_transaction": prepared_authority,
                     "staged_tracker_reid_source_copy": staged_source_copy,
                 },
             )
@@ -388,23 +369,24 @@ def build_tracker_engine(
                     proof="generic",
                     timeout_seconds=120,
                 )
+                build_command = [
+                    helper,
+                    "--tracker-config",
+                    generated_config,
+                    "--tracker-lib",
+                    tracker_library,
+                    "--streams",
+                    "3",
+                    "--width",
+                    "1920",
+                    "--height",
+                    "1080",
+                    "--gpu-id",
+                    str(TRACKER_GPU_ID),
+                ]
                 run.run_command(
                     "build-tracker-engine",
-                    [
-                        helper,
-                        "--tracker-config",
-                        generated_config,
-                        "--tracker-lib",
-                        tracker_library,
-                        "--streams",
-                        "3",
-                        "--width",
-                        "1920",
-                        "--height",
-                        "1080",
-                        "--gpu-id",
-                        str(TRACKER_GPU_ID),
-                    ],
+                    build_command,
                     proof="generic",
                     timeout_seconds=900,
                 )
@@ -418,7 +400,14 @@ def build_tracker_engine(
                     temporary_engine,
                     workspace_root=sdk_source_root,
                 )
-                run.record_candidate(temporary_engine)
+                candidate_record = run.record_candidate(temporary_engine)
+                run.record_native_host_build(
+                    native_host_build_authority(
+                        source_sha256=str(tracker_source_contract["sha256"]),
+                        output_sha256=str(candidate_record["sha256"]),
+                        command=build_command,
+                    )
+                )
                 run.run_command(
                     "load-candidate",
                     [
@@ -461,8 +450,6 @@ def main() -> int:
         action="store_true",
         help="Compatibility flag; guarded real builds always validate candidate and installed paths.",
     )
-    parser.add_argument("--transaction-manifest", type=Path)
-    parser.add_argument("--expected-transaction-sha256")
     parser.add_argument(
         "--evidence-root",
         type=Path,
@@ -473,8 +460,6 @@ def main() -> int:
         dry_run=bool(args.dry_run),
         validate_load=bool(args.validate_load),
         evidence_root=args.evidence_root,
-        transaction_manifest=args.transaction_manifest,
-        expected_transaction_sha256=args.expected_transaction_sha256,
     )
     return 0
 

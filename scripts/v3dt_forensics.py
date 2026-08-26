@@ -47,9 +47,8 @@ def _default_pipeline() -> Path:
     candidates = [
         Path("build/effective_pipeline_yolo11_seg.yaml"),
         Path("build/effective_pipeline_rfdetr_seg.yaml"),
-        Path("config/infer_v3dt_medium.yaml"),
-        Path("config/infer_v3dt_sv3dt.yaml"),
-        Path("config/infer.yaml"),
+        Path("DS9/config/infer_v3dt.yaml"),
+        Path("DS9/config/infer.yaml"),
     ]
     for path in candidates:
         if path.exists():

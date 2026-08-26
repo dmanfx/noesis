@@ -28,7 +28,7 @@ _FORCE_PIPELINE_STUB = os.environ.get(FORCE_STUB_ENV, "").strip().lower() in {
 try:
     if _FORCE_PIPELINE_STUB:
         raise ImportError(f"{FORCE_STUB_ENV} requested pipeline stub")
-    from noesis.pipelines.ds8_pipeline import (
+    from noesis.pipelines.deepstream_pipeline import (
         activate,
         build_pipeline,
         get_pipeline,
@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover - explicit test-only stub path
     USING_PIPELINE_STUB = True
 
     class _StubPipeline:
-        """Minimal in-memory graph used when the DS8 pipeline is unavailable."""
+        """Minimal in-memory graph used when the DS9 pipeline is unavailable."""
 
         def __init__(self) -> None:
             self.depth_enabled: bool = False
@@ -113,12 +113,12 @@ except Exception:  # pragma: no cover - explicit test-only stub path
         return True
 
 
-app = FastAPI(title="Noesis DS8 Depth API")
+app = FastAPI(title="Noesis DS9 Depth API")
 app.router.route_class = BoundaryMetricsRoute
 logger = logging.getLogger(__name__)
 
-PIPELINE_CONFIG_ENV = "NOESIS_DS8_PIPELINE_CONFIG"
-DEFAULT_PIPELINE_CONFIG = Path("config/infer.yaml")
+PIPELINE_CONFIG_ENV = "NOESIS_DS9_PIPELINE_CONFIG"
+DEFAULT_PIPELINE_CONFIG = Path(__file__).resolve().parents[2] / "DS9/config/infer.yaml"
 _STUB_WARNING_EMITTED = False
 
 
@@ -175,14 +175,14 @@ def _resolve_pipeline_config() -> Optional[Path]:
 
 
 def ensure_pipeline_ready() -> bool:
-    """Ensure the DS8 pipeline graph is built and primed.
+    """Ensure the DS9 pipeline graph is built and primed.
 
     Returns True when the pipeline is ready; False otherwise.
     """
     global _STUB_WARNING_EMITTED
     if USING_PIPELINE_STUB and not _STUB_WARNING_EMITTED:
         logger.warning(
-            "Depth API running with stub pipeline (NOESIS_DEPTH_API_FORCE_STUB=%s or DS8 libs unavailable)",
+            "Depth API running with stub pipeline (NOESIS_DEPTH_API_FORCE_STUB=%s or DS9 bindings unavailable)",
             os.environ.get(FORCE_STUB_ENV, ""),
         )
         _STUB_WARNING_EMITTED = True
@@ -205,7 +205,7 @@ def ensure_pipeline_ready() -> bool:
             activate()
             return True
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("Failed to initialize DS8 pipeline: %s", exc)
+            logger.exception("Failed to initialize DS9 pipeline: %s", exc)
             return False
 
 

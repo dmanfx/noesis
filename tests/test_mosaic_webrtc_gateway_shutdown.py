@@ -7,7 +7,7 @@ import pytest
 
 from noesis import mosaic_webrtc_gateway as gateway_module
 from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 Gst = gateway_module.Gst

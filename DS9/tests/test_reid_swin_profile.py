@@ -108,17 +108,16 @@ print(json.dumps({
 
 
 class ReidSwinProfileTests(unittest.TestCase):
-    def test_ds8_and_ds9_declare_one_exact_profile(self) -> None:
-        ds8_yaml = yaml.safe_load((REPO_ROOT / "config" / "infer.yaml").read_text(encoding="utf-8"))
+    def test_ds91_declares_one_exact_profile(self) -> None:
         ds9_yaml = yaml.safe_load((DS9_ROOT / "config" / "infer.yaml").read_text(encoding="utf-8"))
-        validate_reid_swin_model_config(ds8_yaml["models"]["reid"])
         validate_reid_swin_model_config(ds9_yaml["models"]["reid"])
 
-        ds8_ini = REPO_ROOT / "pipelines" / "config_infer_secondary_reid_swin.ini"
         ds9_ini = DS9_ROOT / "pipelines" / "config_infer_secondary_reid_swin.ini"
-        validate_reid_swin_nvinfer_properties(load_reid_swin_nvinfer_properties(ds8_ini))
         validate_reid_swin_nvinfer_properties(load_reid_swin_nvinfer_properties(ds9_ini))
-        self.assertEqual(_normalized_properties(ds8_ini), _normalized_properties(ds9_ini))
+        properties = _normalized_properties(ds9_ini)
+        self.assertEqual(properties["onnx-file"], REID_SWIN_ONNX_NAME)
+        self.assertNotIn("output-blob-names", properties)
+        self.assertEqual(ds9_yaml["models"]["reid"]["layer"], REID_SWIN_OUTPUT_LAYER)
 
     def test_staged_onnx_is_exact_tao_deployable_contract(self) -> None:
         path = SOURCE_ONNX_ROOT / REID_SWIN_ONNX_NAME
@@ -151,15 +150,13 @@ class ReidSwinProfileTests(unittest.TestCase):
             "ddcac1498c68ad4d27065ffe0ecd3e1ba034fb9aa747bc3119d42cbc0c5cde99",
         )
 
-    def test_ds8_ds9_hooks_request_fc_pred_256_from_native_bridge(self) -> None:
+    def test_ds91_hooks_request_fc_pred_256_from_native_bridge(self) -> None:
         expected = {
             "call": [3, "fc_pred", 256, True],
             "dimension": 256,
             "layer_field": "fc_pred",
             "dimension_field": 256,
         }
-        self.assertEqual(_characterize_hook(REPO_ROOT), expected)
-        self.assertEqual(_characterize_hook(REPO_ROOT, "hooks_v3dt_reimpl"), expected)
         self.assertEqual(_characterize_hook(DS9_ROOT), expected)
 
     def test_runtime_preflight_fails_closed_on_missing_ds9_engine(self) -> None:
@@ -179,6 +176,9 @@ from noesis import ds9_runtime_core as runtime
 
 config_path = ds9 / "config" / "infer.yaml"
 cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+cfg["models"]["reid"]["engine"] = str(
+    ds9 / "missing" / "reid_swin_tiny_aicity156_dyn_b16_fp16.engine"
+)
 try:
     runtime._preflight_reid_profile(cfg, config_path, logging.getLogger("test"))
 except SystemExit as exc:
@@ -203,7 +203,7 @@ else:
             DS9_ROOT / "pipelines" / "config_infer_secondary_reid_swin.ini",
             DS9_ROOT / "scripts" / "rebuild_engines.py",
             DS9_ROOT / "scripts" / "stage_canonical_sources.py",
-            DS9_ROOT / "scripts" / "run_canonical_engine_maintenance.sh",
+            DS9_ROOT / "scripts" / "run_canonical_engine_maintenance_host.sh",
             DS9_ROOT / "asset_manifest.yaml",
         )
         for path in active:
@@ -215,8 +215,8 @@ else:
         maintenance = active[4].read_text(encoding="utf-8")
         for token in (
             f'[reid_swin]="{REID_SWIN_ENGINE_NAME}"',
-            "NOESIS_REID_SWIN_TRT_TIMEOUT_SECONDS:-2400",
-            "NOESIS_REID_SWIN_GPU_GUARD_MB:-11000",
+            '[reid_swin]="engine.reid_swin_tiny"',
+            'CANONICAL_ENGINES=(yolo26_m reid_swin',
         ):
             self.assertIn(token, maintenance)
 

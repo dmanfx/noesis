@@ -105,9 +105,10 @@ provides dots and trails. PCF does not synthesize people.
 - RTSP: disabled, even though inactive config keys remain for compatibility.
 - BEV: JSON/metadata only, `camera_local_ground_m`, no JPEG branch.
 
-## Disabled paths
+## Non-baseline and disabled paths
 
-- MV3DT/AMC: geometry-gated and disabled.
+- MV3DT: explicit opt-in for the accepted Kitchen/Family Room peer edge only;
+  baseline NvDCF tracking remains the default. AMC remains deferred.
 - Alternate detectors, segmentation, Wholebody49, RF-DETR, and DA3Metric are
   research/manual profiles, not the baseline graph unless explicitly selected
   for a scoped experiment.

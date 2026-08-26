@@ -1,7 +1,7 @@
-schema_version: 2
+schema_version: 3
 manifest_id: noesis-ds9-artifacts
 schema: DS9/docs/asset_manifest.schema.json
-updated_at: "2026-08-12"
+updated_at: "2026-08-26"
 
 target:
   platform: linux-x86_64-dgpu
@@ -12,28 +12,20 @@ target:
     home: /opt/nvidia/deepstream/deepstream-9.1
   cuda: "13.2"
   tensorrt: "10.16.0.72"
-  build_image:
-    reference: noesis-ds9-dev:9.1-20260812
-    image_id: sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872
-    base_digest: sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994
-    tensorrt_version: 10.16.0.72
-    cuda_version: 13.2.0.046
-    dockerfile: DS9/docker/Dockerfile
-    dockerfile_sha256: 9f5f63a18c41256e06cab5514dcb6c5b47d290b8ea06a172490026776c56f01a
-    requirements: DS9/docker/requirements.lock.txt
-    requirements_sha256: de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48
+  native_host:
+    operating_system: ubuntu-24.04
+    architecture: x86_64
+    driver_minimum: "595.58.03"
+    gstreamer: "1.24.2"
+    sdk_root: /opt/nvidia/deepstream/deepstream-9.1
+    cuda_root: /usr/local/cuda-13.2
+    native_root_env: NOESIS_DS91_NATIVE_ROOT
 
 runtime:
-  image:
-    reference: noesis-ds9-runtime:9.1-20260812
-    image_id: sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e
-    parent_reference: noesis-ds9-dev:9.1-20260812
-    parent_image_id: sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872
-    base_digest: sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994
-    tensorrt_version: 10.16.0.72
-    cuda_version: 13.2.0.046
-    dockerfile: DS9/docker/Dockerfile.runtime
-    dockerfile_sha256: 4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133
+  backend: native_host
+  supervisor: DS9/scripts/run_canonical_runtime_host.py
+  artifact_root_env: NOESIS_DS9_ARTIFACT_ROOT
+  runtime_root_env: NOESIS_DS9_RUNTIME_ROOT
   entrypoint: DS9/noesis/ds9_runtime.py
   implementation: DS9/noesis/ds9_runtime_core.py
   pipeline_config: DS9/config/infer.yaml
@@ -164,11 +156,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: 766d137e6d00a8b3a1e2d87142843405212e5fa6407a04cde12a63f9df1e4bd8
-      output_sha256: 71a70b692069115c2130bb3929f34b0f27d12b07f20ac7735e03a461f524f482
-      built_at_utc: "2026-08-12T14:48:00Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_native_extensions.sh
+      source_sha256: c1c24f6d296ea6584891e0539d9072b8556e4ae19b5f1b02463c1128ef487f82
+      output_sha256: ab37d3a924287a352197ab3c97696f902b04118bf021745ccaf4a840fc21e5e5
+      built_at_utc: "2026-08-26T06:30:40Z"
+      build_host: "native-host:TauntonMainframe (driver 595.71.05)"
+      command: bash DS9/scripts/build_noesis_latency_ext.sh
 
   - id: plugin.roi_exclude
     kind: gstreamer_plugin
@@ -263,11 +255,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: "10.16.0.72"}
     provenance:
-      source_sha256: c1a508d1f2f0ba313063a31049fadf995f6a577e7d548ed07051a47e5cdb9416
+      source_sha256: 6865cd952475b15232647762558cb61ad7aab672e179a5b9c84163f280d06bcb
       output_sha256: c40cc98228f16173bef89850d712469360693a94e2ea0a02974bc3fc01224be3
-      built_at_utc: "2026-08-12T14:48:01Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_custom_parsers.sh
+      built_at_utc: "2026-08-26T06:30:40Z"
+      build_host: "native-host:TauntonMainframe (driver 595.71.05)"
+      command: make -C DS9/pipelines/nvdsinfer_yolo11_seg
   - id: parser.yolo26_seg
     kind: nvinfer_parser
     role: YOLO26 instance segmentation output parser
@@ -278,11 +270,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: "10.16.0.72"}
     provenance:
-      source_sha256: 9b98dfedf8bda7c41ebcde62fb1ebc6d661434b0f9008d0b4ea88d66251cbb71
+      source_sha256: d8677886b698f43512ea521d0435d9734da02b2aa7666de3b88cd7988ed22cea
       output_sha256: 2d70659a8110be5a51d22fbb5b57ebe6a4fcb16e7099b7ea30315846840dbcab
-      built_at_utc: "2026-08-12T14:48:01Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_custom_parsers.sh
+      built_at_utc: "2026-08-26T06:30:40Z"
+      build_host: "native-host:TauntonMainframe (driver 595.71.05)"
+      command: make -C DS9/pipelines/nvdsinfer_yolo26_seg
   - id: parser.yolo_detect
     kind: nvinfer_parser
     role: YOLO11 and YOLO26 detect-only bbox parser
@@ -632,8 +624,8 @@ artifacts:
 
 shared_app_data:
   - config/cameras.yaml
-  - config/depth_registration.json
-  - config/nvtracker.yaml
+  - DS9/config/depth_registration.json
+  - DS9/config/nvtracker.yaml
   - config/config_nvdsanalytics_post.ini
   - config/nvdsanalytics.yaml
   - config/config_nvdsanalytics_exclude.ini

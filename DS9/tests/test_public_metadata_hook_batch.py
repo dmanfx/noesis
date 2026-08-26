@@ -29,7 +29,7 @@ def test_ds9_public_metadata_attach_paths_receive_owning_batch() -> None:
         operator_calls = []
 
         class Processor:
-            def handle_frame_ds8(self, batch, frame):
+            def handle_servicemaker_frame(self, batch, frame):
                 operator_calls.append((batch, frame))
 
         hooks._PoseFeatureOperator(Processor()).handle_metadata(batch_meta)

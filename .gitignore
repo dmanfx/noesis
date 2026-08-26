@@ -1,220 +1,97 @@
-# Ignore node modules and build output
+# Dependency installs and package-manager output
 node_modules/
-oai2-fe/dist/
-csrc/
-build/
+*.egg-info/
+/oai2-fe/dist/
+/oai2-fe/.vite/
 
-
-# Python cache
+# Python environments, caches, and test coverage
+/.venv_ds/
+/.venv/
+/venv/
 __pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/coverage/
+/htmlcov/
 
-# IDE and OS files
-.DS_Store
-.vscode/
+# Native and model build products
+/build/
+/csrc/
+*.o
+*.a
+*.so
+*.engine
+*.plan
+*.trt
+*.pt
+*.pth
+*.onnx
+*.etlt
+*.ckpt
+*.safetensors
 
-# Log files
-logs/
-*.log
-output/
-.cursor/
-diagnostics/
-
-#ignore archived folders
-legacy/
-orchestration/
-noesis_template/
-config/archive*
-
-#ignore dev docs
-docs/completed/
-docs/deprecated/
-docs/fixes/
-docs/implementation/
-docs/plans/
-docs/*.md
-docs/ma-integration/*.md
-*.md
-
-# Always track agent policy docs and all docs/ content
-!AGENTS.md
-!**/AGENTS.md
-!README.md
-!contracts/README.md
-!docs/
-!docs/**
-!plans/archive/README.md
-!plans/ds91_native_host_only_migration.md
-!testpipelines/*/README.md
-!utils/onnx2trt/README.md
-
-# Archive docs are not tracked
-docs/history/
-docs/completed/
-docs/deprecated/
-docs/fixes/
-docs/implementation/
-docs/plans/
-docs/ma-integration/
-
-# Generated/local analysis docs
-docs/UNCOMMITTED_CHANGES_ANALYSIS.md
-docs/chromecastLogicmerm.html
-docs/screenshot-quick-settings-setup.md
-
-#model folders
-data/*
-!data/.gitkeep
-data/depth/
-models/
-*/__init__.py
-!noesis_core/__init__.py
-!reid/__init__.py
-external/
-!external/
-external/*
-!external/ds_preprocess_shim/
-!external/ds_preprocess_shim/Makefile
-!external/ds_preprocess_shim/*.cpp
+# Local credentials and editor state
 .env
-tests/
+.env.*
+!.env.example
+!.env.sample
+.DS_Store
+/.vscode/
+/.playwright-mcp/
+/.cursor/*.log
+/.cursor/debug*.log
+/.cursor/ds8_runtime_last.log
+/.cursor/plans/
+
+# Runtime logs, diagnostics, and local captures
+/logs/
+/output/
+/diagnostics/
+*.log
+/bev-debug-*.json
+/bev-debug-*.png
+/bev-height-restored.png
+/bev-live-*.png
+/oai2-fe-bev-*.png
+/Untitled
+
+# Local model, dataset, and conversion artifacts
+/data/*
+!/data/.gitkeep
+/models
 ma_onnx_out/
 ma_onnx_out_fused/
 ma_onnx_out_clean/
 ma_onnx_out_forward/
 ma_onnxTRT/
-./ma_onnx_out.tar.gz
-.git/
-pipelines/*.so
-*.so
-*.pt
-!gst-plugins/noesisforceidr/README.md
-!gst-plugins/noesiseos/README.md
-!gst-plugins/nvdsroiexclude/README.md
-!pipelines/mapanything_preprocess_fused/README.md
+/ma_onnx_out.tar.gz
 
-#external folders/files
-.venv_ds/
-newvisions-redesign-mockup
-Labs/
+# External source checkouts are pinned in third_party/dependencies.lock.json.
+# The in-repo preprocessing shim remains ordinary tracked source.
+/external/*
+!/external/ds_preprocess_shim/
+!/external/ds_preprocess_shim/**
+/external/ds_preprocess_shim/*.so
+/src/mapanything/
 
-# Local browser/runtime traces and debug captures
-.playwright-mcp/
-bev-debug-*.json
-bev-debug-*.png
-bev-height-restored.png
-bev-live-*.png
-oai2-fe-bev-*.png
-Untitled
+# DS9 generated runtime state and realized artifacts. DS9 source, configs,
+# documentation, services, scripts, and tests are intentionally not ignored.
+/DS9/build/
+/DS9/artifacts/
+/DS9/data/
+/DS9/logs/
+/DS9/models/engines/
 
-# DS9 source tree: keep source-controlled app files visible, but leave generated
-# models, runtime logs, build products, and native/parser/plugin binaries local.
-DS9/*
-!DS9/AGENTS.md
-!DS9/README.md
-!DS9/DS9_PREP_DECISIONS.md
-!DS9/DS9_REBUILD_AND_SMOKE_GATES.md
-!DS9/PIPELINE_GRAPH.md
-!DS9/asset_manifest.yaml
-!DS9/requirements-runtime.txt
-!DS9/archive/
-DS9/archive/*
-!DS9/archive/README.md
-!DS9/archive/nvdsinfer_yolo26_pose/
-DS9/archive/nvdsinfer_yolo26_pose/*
-!DS9/archive/nvdsinfer_yolo26_pose/Makefile
-!DS9/archive/nvdsinfer_yolo26_pose/nvdsinfer_yolo26_pose.cpp
-!DS9/config/
-!DS9/config/**
-!DS9/csrc/
-!DS9/csrc/**
-!DS9/docs/
-!DS9/docs/**
-!DS9/docker/
-!DS9/docker/**
-!DS9/native/
-!DS9/native/**
-!DS9/noesis/
-!DS9/noesis/**
-!DS9/pipelines/
-!DS9/pipelines/**
-DS9/pipelines/**/*.so
-!DS9/reports/
-!DS9/reports/**
-!DS9/scripts/
-!DS9/scripts/**
-!DS9/services/
-!DS9/services/**
-DS9/**/__pycache__/
-DS9/**/*.pyc
-!DS9/build/
-DS9/build/*
-!DS9/build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
-!DS9/models/
-DS9/models/*
-!DS9/models/coco_labels.txt
-!DS9/models/deimv2_wholebody49/
-!DS9/models/deimv2_wholebody49/classes.txt
-!DS9/models/onnx/
-DS9/models/onnx/*
-!DS9/models/onnx/*.provenance.json
-!DS9/models/tracker_reid/
-DS9/models/tracker_reid/*
-!DS9/models/tracker_reid/*.provenance.json
-DS9/artifacts/
-DS9/data/
-DS9/gst-plugins/
-!DS9/gst-plugins/
-DS9/gst-plugins/*
-!DS9/gst-plugins/build_noesisforceidr.sh
-!DS9/gst-plugins/noesisforceidr/
-!DS9/gst-plugins/noesisforceidr/**
-!DS9/gst-plugins/build_noesiseos.sh
-!DS9/gst-plugins/noesiseos/
-!DS9/gst-plugins/noesiseos/**
-DS9/logs/
-DS9/native_extensions/
-DS9/plugins/
-src/mapanything/
+# Prototype-local generated state; prototype source and tests remain trackable.
+/testpipelines/**/build/
+/testpipelines/**/sources.yaml
+/testpipelines/**/viewer/dist/
 
-# Local prototype work and generated viewer outputs
-testpipelines/sapiens2-human/
-testpipelines/yolo26-seg-depth-3d/
-testpipelines/**/sources.yaml
-testpipelines/**/viewer/dist/
-
-# Track the DEIMv2 Wholebody49 prototype source package.
-!testpipelines/deimv2-wholebody49/README.md
-!testpipelines/deimv2-wholebody49/__init__.py
-!testpipelines/deimv2-wholebody49/tests/
-!testpipelines/deimv2-wholebody49/tests/*.py
-
-# Track Noesis/Menon validation planning docs and focused tests.
-!plans/noesis_menon_validation/*.md
-!plans/household_identity/*.md
-!plans/spatial_os/*.md
-!plans/menon_world_unification/*.md
-!tests/
-tests/*
-!tests/test_validation_toolbox.py
-!tests/test_mapanything_normals_fusion.py
-!tests/test_virtual_twin_geometry.py
-!tests/test_virtual_twin_builder.py
-!tests/test_person_ground_state.py
-!tests/test_household_state_archive.py
-!tests/test_object_items_oneshot_regression.py
-!tests/test_stable_id_assignment.py
-!tests/test_stable_id_exclusivity.py
-!tests/test_stable_id_gallery_quality.py
-!tests/test_stable_id_overlap_permit.py
-!tests/test_stable_id_provisional.py
-!tests/test_stable_id_resident_visitor.py
-!tests/test_world_before_stable_id_ordering.py
-!tests/test_v3dt_world_ground_state.py
-
-# The test suite is product source, not a local artifact. Keep Python/shell
-# tests discoverable while continuing to ignore bytecode caches.
-!tests/**/
-!tests/**/*.py
-!tests/**/*.sh
-tests/**/__pycache__/
-tests/**/*.pyc
+# Known generated/local documentation snapshots only. All other Markdown and
+# documentation history is intentionally visible to Git.
+/docs/UNCOMMITTED_CHANGES_ANALYSIS.md
+/docs/chromecastLogicmerm.html
+/docs/screenshot-quick-settings-setup.md

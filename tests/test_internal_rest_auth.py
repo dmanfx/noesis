@@ -15,7 +15,7 @@ from noesis.server.internal_auth import (
     load_or_create_internal_token,
     validate_internal_auth_listener,
 )
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 def _app(env: dict[str, str]) -> FastAPI:
@@ -90,13 +90,9 @@ def test_short_or_symlinked_token_files_fail_loudly(tmp_path: Path) -> None:
         load_or_create_internal_token(link)
 
 
-def test_ds8_v3dt_and_ds9_composition_roots_install_the_same_boundary() -> None:
+def test_ds9_composition_root_installs_the_shared_boundary() -> None:
     root = Path(__file__).resolve().parents[1]
-    for relative in (
-        "noesis/ds8_runtime.py",
-        "noesis/ds8_runtime_v3dt_reimpl.py",
-        "DS9/noesis/ds9_runtime_core.py",
-    ):
+    for relative in ("DS9/noesis/ds9_runtime_core.py",):
         source = (root / relative).read_text(encoding="utf-8")
         assert "configure_internal_rest_app(app)" in source
         assert "validate_internal_auth_listener" in source

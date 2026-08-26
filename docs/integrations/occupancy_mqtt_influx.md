@@ -17,18 +17,18 @@ producer and its direct consumer.
 
 ## Credential contract
 
-Secrets must never be stored in `config.py`, JSON config, command-line arguments,
-or plaintext environment variables. `AppConfig.integrations` contains only
-non-secret connection metadata, disabled sink flags, and optional secret-file
-paths:
+Secrets must never be stored in version-controlled config, command-line
+arguments, or plaintext environment variables.
+`geometry.depth_publisher.DiagnosticsSettings` contains only non-secret
+connection metadata, disabled sink flags, and optional secret-file paths:
 
-- MQTT enable: `ENABLE_DEPTH_DIAGNOSTICS_MQTT`
-- MQTT metadata: `BASE_TOPIC`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`,
-  `MQTT_QOS`, `MQTT_RETAIN`
-- MQTT credential path: `MQTT_PASSWORD_FILE`
-- Influx enable: `ENABLE_DEPTH_DIAGNOSTICS_INFLUX`
-- Influx metadata: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_BUCKET_RAW`
-- Influx credential path: `INFLUX_TOKEN_FILE`
+- MQTT enable: `mqtt_enabled`
+- MQTT metadata: `base_topic`, `mqtt_host`, `mqtt_port`, `mqtt_username`,
+  `mqtt_qos`, `mqtt_retain`
+- MQTT credential path: `mqtt_password_file`
+- Influx enable: `influx_enabled`
+- Influx metadata: `influx_url`, `influx_org`, `influx_bucket`
+- Influx credential path: `influx_token_file`
 
 Deployment tooling may override only the paths with
 `NOESIS_MQTT_PASSWORD_FILE` and `NOESIS_INFLUX_TOKEN_FILE`. Raw
@@ -69,17 +69,19 @@ change does not rotate credentials or restart live services.
 
 The hardening audit also found the two retired defaults in a stale ignored
 `crash.log`, produced in 2025 when the deprecated runtime logged the complete
-configuration object. Only the exact credential byte sequences were redacted;
-the remaining forensic log and its timestamp were preserved, and its mode was
-tightened to `0600`. Current code must never log a complete configuration object
-that could contain credential material.
+configuration object. Only the exact credential byte sequences were redacted.
+The remaining forensic log was removed from the checkout and retained in the
+private checksummed archive identified by
+`archive/manifests/root_evidence_20260826.json`. Current code must never log a
+complete configuration object that could contain credential material.
 
 ## Explicit future activation
 
-`DepthDiagnosticsPublisher.from_settings(...)` is the supported construction
-boundary. When both sink flags are false, it returns without reading either
-credential file. If a sink is true, its private credential, Python dependency,
-and client initialization are mandatory. Multi-sink startup is transactional:
+`DepthDiagnosticsPublisher.from_settings(DiagnosticsSettings(...))` is the
+supported construction boundary. When both sink flags are false, it returns
+without reading either credential file. If a sink is true, its private
+credential, Python dependency, and client initialization are mandatory.
+Multi-sink startup is transactional:
 if either enabled sink fails, any client already initialized by that attempt is
 closed and startup raises an error.
 

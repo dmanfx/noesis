@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "archive_id": "orphaned_workspace_material_20260826",
+  "purpose": "Preserve explicitly retired orphaned workspace text material before removal from the live checkout.",
+  "source_repository_head": "e83851634e087ea74424bc7f4b418aacc04539c8",
+  "source_branch": "DS9",
+  "capture_date_utc": "2026-08-26",
+  "archive_root_env": "NOESIS_WORKSPACE_PRESERVATION_ROOT",
+  "archive_relative_path": "2026-08-26/orphaned_workspace_material/noesis_orphaned_workspace_material_20260826.tar.gz",
+  "archive_sha256": "84bf53708ddada9e5c13a2980636902a486d0f6969fa624fdfd73d09780e5299",
+  "archive_size_bytes": 106218,
+  "archive_format": "deterministic tar.gz with normalized ownership, modes, timestamps, ordering, and gzip header",
+  "source_path_count": 36,
+  "unique_payload_count": 36,
+  "exact_duplicate_path_count": 0,
+  "source_bytes": 442586,
+  "included_sources": [
+    {
+      "path": ".agents/skills/source-command-modelinfo/SKILL.md",
+      "file_count": 1
+    },
+    {
+      "path": ".cursor/commands/modelinfo.md",
+      "file_count": 1
+    },
+    {
+      "path": "testpipelines/sapiens2-human/",
+      "file_count": 11
+    },
+    {
+      "path": "testpipelines/yolo26-seg-depth-3d/",
+      "file_count": 20
+    },
+    {
+      "path": "menon-room-reconstruction-after-recalibration-snapshot.md",
+      "file_count": 1
+    },
+    {
+      "path": "oai2-fe-bev-snapshot.md",
+      "file_count": 1
+    },
+    {
+      "path": "wordpress_to_react_migration_plan.md",
+      "file_count": 1
+    }
+  ],
+  "contents": "The archive-internal MANIFEST.json maps every original repo-relative text-source path to its stored member, SHA-256 digest, and byte size.",
+  "validation": {
+    "source_paths_resolved": 36,
+    "source_paths_missing": 0,
+    "deterministic_second_build_match": true,
+    "path_safety_verified": true,
+    "fresh_extraction_verified": true,
+    "member_sizes_verified": true,
+    "member_sha256_verified": true,
+    "checksum_sidecar_verified": true
+  }
+}

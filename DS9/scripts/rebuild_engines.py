@@ -26,15 +26,14 @@ from engine_maintenance_common import (  # noqa: E402
     fsync_directory,
     fsync_file,
     load_source_contracts,
-    maintenance_provenance_from_environment,
     mapanything_quality_gate_from_source_contracts,
     native_host_build_authority,
+    native_host_maintenance_platform,
     new_run_id,
     require_absent_candidate_path,
     required_regular_file,
     validate_wholebody_memory_pool_limits,
     validate_maintenance_build_contract,
-    validate_prepared_transaction_authority,
     validate_source_contract,
     sha256_file,
 )
@@ -256,29 +255,10 @@ def _build(
     build_timeout_seconds: int = 1800,
     load_timeout_seconds: int = 120,
     inspect_onnx_contract: bool = True,
-    transaction_manifest: Path | None = None,
-    expected_transaction_sha256: str | None = None,
 ) -> None:
-    prepared_authority: dict[str, object] | None = None
     source_contract: dict[str, object] | None = None
     quality_authority: dict[str, object] | None = None
     quality_fixture: Path | None = None
-    if not dry_run and inspect_onnx_contract:
-        if transaction_manifest is None or not expected_transaction_sha256:
-            raise RuntimeError(
-                "real DS9 engine builds require a prepared host transaction"
-            )
-        prepared = validate_prepared_transaction_authority(
-            transaction_manifest=transaction_manifest,
-            expected_sha256=expected_transaction_sha256,
-            engine_name=spec.name,
-            engine_target=spec.engine,
-        )
-        prepared_authority = {
-            "transaction_id": prepared["transaction_id"],
-            "transaction_sha256": expected_transaction_sha256,
-            "transaction_manifest": str(transaction_manifest.expanduser().absolute()),
-        }
     _stage_onnx(spec.source_onnx, spec.staged_onnx, dry_run=dry_run)
     if inspect_onnx_contract:
         validate_source_contract(spec.name, spec.source_onnx, SOURCE_CONTRACTS)
@@ -365,10 +345,9 @@ def _build(
         if spec.name == "mapanything":
             if quality_authority is None or quality_fixture is None:
                 raise RuntimeError("MapAnything quality authority was not resolved")
-            quality_output = Path(
-                "/workspace/DS9/models/engine_maintenance/PLAN-mapanything/"
-                + MAPANYTHING_QUALITY_OUTPUT_NAME
-            )
+            quality_output = (
+                evidence_root or DS9_MODEL_ROOT / "engine_maintenance"
+            ) / "PLAN-mapanything" / MAPANYTHING_QUALITY_OUTPUT_NAME
             _print_run(
                 [
                     trtexec,
@@ -410,6 +389,7 @@ def _build(
         f".{spec.engine.name}.building-{run_id}"
     )
     require_absent_candidate_path(temporary_engine)
+    platform = native_host_maintenance_platform()
     run = EngineMaintenanceRun(
         name=spec.name,
         target=spec.engine,
@@ -418,24 +398,11 @@ def _build(
         repo_root=REPO_ROOT,
         run_id=run_id,
         metadata={
-            "platform": maintenance_provenance_from_environment(),
+            "platform": platform,
             "build_contract": build_contract,
-            "host_transaction": prepared_authority,
             **(
                 {"quality_gate_authority": quality_authority}
                 if quality_authority is not None
-                else {}
-            ),
-            **(
-                {
-                    "native_host": native_host_build_authority(
-                        source_sha256="",
-                        output_sha256="",
-                        command=["trtexec"],
-                    )
-                }
-                if str(os.environ.get("NOESIS_DS9_MAINT_BACKEND") or "").strip()
-                == "native_host"
                 else {}
             ),
         },
@@ -537,7 +504,18 @@ def _build(
             proof=build_proof,
             timeout_seconds=build_timeout_seconds,
         )
-        run.record_candidate(temporary_engine)
+        candidate_record = run.record_candidate(temporary_engine)
+        run.record_native_host_build(
+            native_host_build_authority(
+                source_sha256=(
+                    str(source_contract["sha256"])
+                    if source_contract is not None
+                    else sha256_file(spec.staged_onnx)
+                ),
+                output_sha256=str(candidate_record["sha256"]),
+                command=build_command,
+            )
+        )
         run.run_command(
             "load-candidate",
             [trtexec, f"--loadEngine={temporary_engine}", "--skipInference"],
@@ -844,8 +822,6 @@ def main() -> int:
         help="Durable manifest/log/prior-engine evidence root.",
     )
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--transaction-manifest", type=Path)
-    parser.add_argument("--expected-transaction-sha256")
     args = parser.parse_args()
 
     trtexec = shutil.which("trtexec")
@@ -858,16 +834,6 @@ def main() -> int:
             "--only is required; unscoped DS9 engine rebuilds are forbidden"
         )
     _require_explicit_model_root()
-    if not args.dry_run and (
-        args.transaction_manifest is None
-        or not str(args.expected_transaction_sha256 or "").strip()
-    ):
-        raise SystemExit(
-            "real DS9 engine builds require --transaction-manifest and "
-            "--expected-transaction-sha256"
-        )
-    if not args.dry_run and len(selected) != 1:
-        raise SystemExit("one prepared transaction may authorize exactly one engine")
     specs = _specs(include_mapanything=bool(args.include_mapanything))
     reviewed = set(load_source_contracts(SOURCE_CONTRACTS))
     known = {spec.name for spec in specs if spec.name in reviewed}
@@ -889,8 +855,6 @@ def main() -> int:
                 dry_run=bool(args.dry_run),
                 validate_load=bool(args.validate_load),
                 evidence_root=args.evidence_root,
-                transaction_manifest=args.transaction_manifest,
-                expected_transaction_sha256=args.expected_transaction_sha256,
             )
 
     print("[OK] DS9 engine rebuild complete")

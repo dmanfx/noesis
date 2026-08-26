@@ -1,8 +1,9 @@
 # Living-room + family-room optimized V3DT profile
 
-Status: validated, opt-in per-camera SV3DT profile. MV3DT remains disabled in
-the canonical native DS9.1 application. This profile is isolated from the
-non-V3DT lane and does not replace its tracker, analytics, identity settings,
+Status: validated, opt-in per-camera SV3DT profile. This Living/Family profile
+does not enable MV3DT: those rooms do not overlap. The only accepted MV3DT lane
+is the separate Kitchen/Family Room explicit opt-in. This profile is isolated
+from baseline and does not replace its tracker, analytics, identity settings,
 or camera assets.
 
 This cumulative DS9 profile keeps the accepted living-room tuning and adds the
@@ -93,10 +94,10 @@ Kitchen now has an accepted per-room phone-walk Scene Prior and its own
 validated opt-in SV3DT profile. Synchronized July clips also demonstrate a
 short Kitchen/Family doorway overlap at approximately 47.0-49.5 seconds.
 
-The fused Kitchen/Family/Living reconstruction is not tracking authority. Its
-latest registration is `rejected` and the artifact remains `review_only` due
-to training and held-out observation error, per-view deformation, and temporal
-holdout failure. Family Room therefore remains validated only in its accepted
-per-room frame. Do not enable MV3DT until a common Kitchen/Family transform
-passes those gates; Living/Family remain non-overlapping and Kitchen/Living
-remain adjacency-only.
+The fused Kitchen/Family/Living reconstruction evaluated by this SV3DT profile
+is not tracking authority. Its recorded registration was `rejected` and the
+artifact remains `review_only` due to training and held-out observation error,
+per-view deformation, and temporal holdout failure. That dated result predates
+the separately accepted Kitchen/Family binding used by
+`DS9/config/infer_mv3dt.yaml`; it does not invalidate or configure that lane.
+Living/Family remain non-overlapping and Kitchen/Living remain adjacency-only.

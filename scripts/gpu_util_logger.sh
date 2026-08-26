@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Simple GPU utilization logger for DS8 debugging.
+# Simple GPU utilization logger for DS9.1 debugging.
 # Usage: scripts/gpu_util_logger.sh [log_path] [interval_seconds]
 
 set -euo pipefail
 
-LOG_PATH="${1:-/tmp/gpu_util_ds8.log}"
+LOG_PATH="${1:-/tmp/gpu_util_ds9.log}"
 INTERVAL="${2:-1}"
 
 mkdir -p "$(dirname "$LOG_PATH")"
@@ -21,4 +21,3 @@ while true; do
   fi
   sleep "$INTERVAL"
 done
-

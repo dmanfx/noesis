@@ -12,7 +12,7 @@ import pytest
 from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
 
-from websocket_server import (
+from noesis.server.websocket import (
     BoundaryResponseModelContractError,
     CanonicalOutboundRouteRequired,
     FrozenOutboundJSON,
@@ -153,7 +153,9 @@ def test_webrtc_gateway_does_not_persist_or_log_full_sdp() -> None:
     assert "stun.l.google.com" not in source
     assert "candidate[:" not in source
 
-    websocket_source = (ROOT / "websocket_server.py").read_text(encoding="utf-8")
+    websocket_source = (ROOT / "noesis" / "server" / "websocket.py").read_text(
+        encoding="utf-8"
+    )
     assert "candidate[:" not in websocket_source
 
     replay_source = (
@@ -227,7 +229,9 @@ def test_telemetry_client_capacity_environment_is_hard_clamped(
 
 
 def test_retired_noop_websocket_controls_are_not_public_routes() -> None:
-    source = (ROOT / "websocket_server.py").read_text(encoding="utf-8")
+    source = (ROOT / "noesis" / "server" / "websocket.py").read_text(
+        encoding="utf-8"
+    )
     for retired_type in (
         "update_detection_config",
         "detection_config_update",
@@ -471,7 +475,9 @@ def test_blocking_calibration_rpc_runs_off_event_loop() -> None:
 
 
 def test_all_calibration_handlers_use_owned_provider_admission() -> None:
-    source = (ROOT / "websocket_server.py").read_text(encoding="utf-8")
+    source = (ROOT / "noesis" / "server" / "websocket.py").read_text(
+        encoding="utf-8"
+    )
     message_types = (
         "pixel_to_world",
         "set_extrinsics",
@@ -1200,7 +1206,9 @@ def test_cancelled_provider_waiter_does_not_release_shutdown_lease() -> None:
 
 
 def test_all_blocking_websocket_callbacks_use_owned_provider_executor() -> None:
-    source = (ROOT / "websocket_server.py").read_text(encoding="utf-8")
+    source = (ROOT / "noesis" / "server" / "websocket.py").read_text(
+        encoding="utf-8"
+    )
     assert "asyncio.to_thread(" not in source
     handle_start = source.index("    async def handle_client(")
     handler_patterns = (
@@ -2117,12 +2125,12 @@ def test_authority_gated_api_has_only_publisher_production_call_sites() -> None:
         ):
             bev_hits.add(relative.as_posix())
     assert hits == {
-        "websocket_server.py",
+        "noesis/server/websocket.py",
         "noesis/telemetry/publishers.py",
         "DS9/noesis/telemetry/publishers.py",
     }
     assert bev_hits == {
-        "websocket_server.py",
+        "noesis/server/websocket.py",
         "noesis/telemetry/bev.py",
     }
 
@@ -2194,7 +2202,7 @@ def test_batch_json_rejects_nested_nonfinite_all_or_none(
 def test_sync_json_is_encoded_once_and_reused_for_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import websocket_server as websocket_module
+    from noesis.server import websocket as websocket_module
 
     scheduled: list[object] = []
     encode_calls = 0
@@ -2415,7 +2423,9 @@ def test_cancelled_outbound_submission_releases_bytes_without_underflow(
 
 
 def test_client_handler_re_raises_closed_connections_to_outer_lifecycle() -> None:
-    source = (ROOT / "websocket_server.py").read_text(encoding="utf-8")
+    source = (ROOT / "noesis" / "server" / "websocket.py").read_text(
+        encoding="utf-8"
+    )
     assert "except websockets.exceptions.ConnectionClosed:\n" in source
     assert "Treating it as a request" in source
 

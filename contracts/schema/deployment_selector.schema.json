@@ -89,56 +89,6 @@
       "title": "CheckoutBinding",
       "type": "object"
     },
-    "DS8RuntimeSelector": {
-      "additionalProperties": false,
-      "properties": {
-        "family": {
-          "const": "ds8",
-          "title": "Family",
-          "type": "string"
-        },
-        "model_size": {
-          "enum": [
-            "n",
-            "s",
-            "m",
-            "l",
-            "x"
-          ],
-          "title": "Model Size",
-          "type": "string"
-        },
-        "pgie_profile": {
-          "enum": [
-            "yolo11",
-            "yolo11_seg",
-            "yolo26",
-            "yolo26_seg",
-            "rfdetr",
-            "rfdetr_seg",
-            "wholebody49"
-          ],
-          "title": "Pgie Profile",
-          "type": "string"
-        },
-        "tracking_mode": {
-          "enum": [
-            "baseline",
-            "v3dt"
-          ],
-          "title": "Tracking Mode",
-          "type": "string"
-        }
-      },
-      "required": [
-        "family",
-        "pgie_profile",
-        "model_size",
-        "tracking_mode"
-      ],
-      "title": "DS8RuntimeSelector",
-      "type": "object"
-    },
     "DS9RuntimeSelector": {
       "additionalProperties": false,
       "properties": {
@@ -149,15 +99,6 @@
         "asset_realization_sha256": {
           "pattern": "^[a-f0-9]{64}$",
           "title": "Asset Realization Sha256",
-          "type": "string"
-        },
-        "build_image_id": {
-          "pattern": "^sha256:[a-f0-9]{64}$",
-          "title": "Build Image Id",
-          "type": "string"
-        },
-        "docker_root": {
-          "title": "Docker Root",
           "type": "string"
         },
         "family": {
@@ -175,14 +116,13 @@
           "title": "Lane",
           "type": "string"
         },
+        "native_root": {
+          "title": "Native Root",
+          "type": "string"
+        },
         "ownership_matrix_sha256": {
           "pattern": "^[a-f0-9]{64}$",
           "title": "Ownership Matrix Sha256",
-          "type": "string"
-        },
-        "runtime_image_id": {
-          "pattern": "^sha256:[a-f0-9]{64}$",
-          "title": "Runtime Image Id",
           "type": "string"
         },
         "runtime_root": {
@@ -198,9 +138,7 @@
         "family",
         "lane",
         "supervisor_path",
-        "runtime_image_id",
-        "build_image_id",
-        "docker_root",
+        "native_root",
         "artifact_root",
         "runtime_root",
         "asset_realization_sha256",
@@ -275,22 +213,7 @@
       "$ref": "#/$defs/ApplianceReadinessVersions"
     },
     "runtime": {
-      "discriminator": {
-        "mapping": {
-          "ds8": "#/$defs/DS8RuntimeSelector",
-          "ds9": "#/$defs/DS9RuntimeSelector"
-        },
-        "propertyName": "family"
-      },
-      "oneOf": [
-        {
-          "$ref": "#/$defs/DS8RuntimeSelector"
-        },
-        {
-          "$ref": "#/$defs/DS9RuntimeSelector"
-        }
-      ],
-      "title": "Runtime"
+      "$ref": "#/$defs/DS9RuntimeSelector"
     },
     "state_release": {
       "$ref": "#/$defs/StateReleaseBinding"

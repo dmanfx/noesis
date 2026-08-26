@@ -320,12 +320,12 @@ def _artifact_records(manifest: Mapping[str, Any]) -> Mapping[str, Mapping[str, 
 
 def _require_manifest_authority(manifest: Mapping[str, Any]) -> None:
     if (
-        manifest.get("schema_version") != 2
+        manifest.get("schema_version") != 3
         or manifest.get("manifest_id") != "noesis-ds9-artifacts"
         or manifest.get("schema") != "DS9/docs/asset_manifest.schema.json"
     ):
         raise DS9NativeArtifactProvenanceError(
-            "DS9 asset manifest schema authority is not the reviewed v2 contract"
+            "DS9 asset manifest schema authority is not the reviewed native v3 contract"
         )
     target = manifest.get("target")
     deepstream = target.get("deepstream") if isinstance(target, Mapping) else None

@@ -14,13 +14,9 @@ sys.modules[SPEC.name] = sanity
 SPEC.loader.exec_module(sanity)
 
 
-def test_ds8_and_ds9_repo_relative_paths_resolve_from_the_real_repository_root() -> None:
-    ds8_pipeline = REPO_ROOT / "config" / "infer_v3dt_baseline.yaml"
+def test_ds9_repo_relative_paths_resolve_from_the_real_repository_root() -> None:
     ds9_pipeline = REPO_ROOT / "DS9" / "config" / "infer_v3dt.yaml"
 
-    assert sanity.resolve_like_noesis(
-        ds8_pipeline, "config/v3dt/nvtracker_v3dt_baseline.yml"
-    ) == REPO_ROOT / "config" / "v3dt" / "nvtracker_v3dt_baseline.yml"
     assert sanity.resolve_like_noesis(
         ds9_pipeline, "DS9/config/v3dt/nvtracker_v3dt.yaml"
     ) == REPO_ROOT / "DS9" / "config" / "v3dt" / "nvtracker_v3dt.yaml"

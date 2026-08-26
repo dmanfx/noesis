@@ -2,8 +2,8 @@
 """Calibrate camera intrinsics from ChArUco images or video frames.
 
 This tool estimates intrinsics (fx, fy, cx, cy) and distortion coefficients
-using OpenCV's ChArUco calibration. It can optionally update intrinsics.json
-and/or config/cameras.yaml so V3DT camInfo generation uses the new intrinsics.
+using OpenCV's ChArUco calibration. It can optionally update the selected model
+in canonical config/cameras.yaml.
 """
 from __future__ import annotations
 
@@ -122,50 +122,15 @@ def _compute_view_error(
     return float(np.mean(err)) if len(err) else float("nan")
 
 
-def _load_json(path: Path) -> Dict:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _write_json(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _update_intrinsics_json(
-    json_path: Path,
-    model_key: str,
-    model_name: str,
-    resolution: Tuple[int, int],
-    K: np.ndarray,
-    dist: np.ndarray,
-    meta: Dict,
-) -> None:
-    data = _load_json(json_path)
-    entry = dict(data.get(model_key) or {})
-    entry["model"] = model_name or entry.get("model") or model_key
-    entry["resolution"] = [int(resolution[0]), int(resolution[1])]
-    entry["intrinsics"] = {
-        "fx": float(K[0, 0]),
-        "fy": float(K[1, 1]),
-        "cx": float(K[0, 2]),
-        "cy": float(K[1, 2]),
-        "distortion_coeffs": [float(x) for x in dist.flatten().tolist()],
-        "K_matrix": [
-            [float(K[0, 0]), 0.0, float(K[0, 2])],
-            [0.0, float(K[1, 1]), float(K[1, 2])],
-            [0.0, 0.0, 1.0],
-        ],
-    }
-    entry["calibration"] = meta
-    data[model_key] = entry
-    _write_json(json_path, data)
-
-
 def _update_cameras_yaml(
     yaml_path: Path,
     model_key: str,
+    resolution: Tuple[int, int],
     K: np.ndarray,
     dist: np.ndarray,
     meta: Dict,
@@ -177,6 +142,7 @@ def _update_cameras_yaml(
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     models = data.setdefault("intrinsics_models", {})
     entry = dict(models.get(model_key) or {})
+    entry["resolution"] = [int(resolution[0]), int(resolution[1])]
     entry["intrinsics"] = {
         "fx": float(K[0, 0]),
         "fy": float(K[1, 1]),
@@ -206,9 +172,6 @@ def main() -> int:
     parser.add_argument("--min-corners", type=int, default=12, help="Minimum ChArUco corners per frame")
     parser.add_argument("--min-frames", type=int, default=15, help="Minimum accepted frames")
     parser.add_argument("--output", default="", help="Write calibration JSON to this path")
-    parser.add_argument("--update-intrinsics-json", default="", help="Update intrinsics.json at this path")
-    parser.add_argument("--json-model-key", default="", help="Model key to update in intrinsics.json")
-    parser.add_argument("--json-model-name", default="", help="Model name string for intrinsics.json")
     parser.add_argument("--update-cameras-yaml", default="", help="Update cameras.yaml at this path")
     parser.add_argument("--yaml-model-key", default="", help="Model key to update in cameras.yaml")
     args = parser.parse_args()
@@ -358,22 +321,9 @@ def main() -> int:
           f"cx={output['intrinsics']['cx']:.2f} cy={output['intrinsics']['cy']:.2f} "
           f"reproj={meta['reprojection_error_px']:.3f}px")
 
-    if args.update_intrinsics_json and args.json_model_key:
-        json_path = Path(args.update_intrinsics_json).expanduser().resolve()
-        _update_intrinsics_json(
-            json_path,
-            args.json_model_key,
-            args.json_model_name,
-            image_size,
-            K,
-            dist,
-            meta,
-        )
-        print(f"Updated intrinsics.json: {json_path} (model={args.json_model_key})")
-
     if args.update_cameras_yaml and args.yaml_model_key:
         yaml_path = Path(args.update_cameras_yaml).expanduser().resolve()
-        _update_cameras_yaml(yaml_path, args.yaml_model_key, K, dist, meta)
+        _update_cameras_yaml(yaml_path, args.yaml_model_key, image_size, K, dist, meta)
         print(f"Updated cameras.yaml: {yaml_path} (model={args.yaml_model_key})")
 
     return 0

@@ -2,6 +2,7 @@ from .actions import ActionApproval, ActionIntent, AuditEntry, ExecutionReceipt
 from .appliance import (
     DeploymentHealth,
     DeploymentSelector,
+    DS9RuntimeSelector,
     RuntimeDeploymentContext,
     StateBaseline,
     StateRelease,
@@ -99,6 +100,7 @@ __all__ = [
     "CapabilityHealth",
     "DeploymentHealth",
     "DeploymentSelector",
+    "DS9RuntimeSelector",
     "RuntimeDeploymentContext",
     "CONTRACT_MODELS",
     "CONTRACT_MODELS_BY_NAME",

@@ -1027,11 +1027,11 @@ def _clean_osd_base_label(label: str) -> str:
 
 
 def attach_intrinsics_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     config_path: str | Path | None = None,
 ) -> None:
-    """Attach a per-frame intrinsics hook to the DS8 pipeline."""
+    """Attach a per-frame intrinsics hook to the canonical pipeline."""
     loader = _resolve_intrinsics_loader(config_path)
     component = pipeline.components.get("streammux")
     if component is None:
@@ -1053,7 +1053,7 @@ def attach_intrinsics_hook(
 
 
 def attach_mapanything_postprocess_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     storage: DepthStorageManager,
     depth_pub: "DepthTelemetryPublisher" | None = None,
@@ -1169,7 +1169,7 @@ def attach_mapanything_postprocess_hook(
 
 
 def attach_pose_feature_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     camera_labels: Optional[Mapping[int, str]] = None,
 ) -> None:
@@ -1375,13 +1375,13 @@ def attach_pose_feature_hook(
 
 
 def attach_object_depth_fusion_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     camera_labels: Optional[Mapping[int, str]] = None,
     calibration_resolver: Any | None = None,
     depth_every_n_frames: int = 2,
 ) -> None:
-    """Attach the baseline DS8 object-depth fusion path.
+    """Attach the canonical object-depth fusion path.
 
     This is the canonical baseline-only DAv2 lane used to provide concurrent
     range observations for the pose-first world estimator.
@@ -1447,7 +1447,7 @@ def attach_object_depth_fusion_hook(
 
 
 def attach_analytics_telemetry_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     tracking_pub: "TrackingTelemetryPublisher",
     tracking_mode: Optional[str] = None,
@@ -1526,7 +1526,7 @@ def attach_analytics_telemetry_hook(
 
 
 def attach_identity_v2_post_resolution_osd_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     camera_labels: Mapping[int, str],
     sensor_id_map: Mapping[int, int],
@@ -1571,11 +1571,11 @@ def attach_identity_v2_post_resolution_osd_hook(
 
 
 def attach_trail_overlay_hook(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     config: Mapping[str, Any] | None = None,
 ) -> None:
-    """Attach a DS8 trail overlay hook for mosaic trails.
+    """Attach a trail overlay hook for mosaic trails.
 
     This renders per-person motion trails (time-window history) into the mosaic
     stream using NvDsDisplayMeta line primitives.
@@ -1618,7 +1618,7 @@ def attach_trail_overlay_hook(
 
 
 def attach_v3dt_cuboid_overlay_hook(
-    pipeline: "DS8Pipeline", *, tracking_mode: str
+    pipeline: "DeepStreamPipeline", *, tracking_mode: str
 ) -> None:
     """Replace nvtracker's debug projection with a person-base anchored cuboid."""
     vis_cfg = pipeline.config.get("visualization") or {}
@@ -1665,8 +1665,8 @@ def attach_v3dt_cuboid_overlay_hook(
     )
 
 
-def attach_pose_keypoint_overlay_hook(pipeline: "DS8Pipeline") -> None:
-    """Attach a DS8 pose keypoint overlay hook (draws skeletons on the mosaic)."""
+def attach_pose_keypoint_overlay_hook(pipeline: "DeepStreamPipeline") -> None:
+    """Attach a pose keypoint overlay hook (draws skeletons on the mosaic)."""
     vis_cfg = pipeline.config.get("visualization") or {}
     enabled = False
     if isinstance(vis_cfg, Mapping):
@@ -1755,8 +1755,8 @@ def attach_pose_keypoint_overlay_hook(pipeline: "DS8Pipeline") -> None:
         logger.exception("Failed to attach pose keypoint overlay probe")
 
 
-def attach_osd_label_hook(pipeline: "DS8Pipeline") -> None:
-    """Attach a DS8 hook that stamps object labels with detection confidence."""
+def attach_osd_label_hook(pipeline: "DeepStreamPipeline") -> None:
+    """Attach a hook that stamps object labels with detection confidence."""
     osd_component = pipeline.components.get("osd")
     if osd_component is None:
         raise KeyError("osd component missing; cannot attach OSD label hook")
@@ -1786,7 +1786,7 @@ class AnalyticsReloadStateAmbiguous(RuntimeError):
 
 
 def attach_analytics_reload_bridge(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     *,
     stage_name: str = "exclude",
 ) -> None:
@@ -1921,7 +1921,7 @@ def attach_analytics_reload_bridge(
 
 
 def verify_analytics_exclusion_initial_receipt(
-    pipeline: "DS8Pipeline",
+    pipeline: "DeepStreamPipeline",
     reload_context: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """Require the native exclusion element to acknowledge the prepared startup INI."""
@@ -2116,7 +2116,7 @@ def _extract_tensor_layers(tensor_meta: Any) -> Dict[str, np.ndarray]:
 
 @dataclass
 class MapAnythingProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     storage: DepthStorageManager
     depth_pub: "DepthTelemetryPublisher" | None
     gie_id: int
@@ -3403,7 +3403,7 @@ def _anchored_cuboid_segments(
 
 @dataclass
 class V3DTCuboidOverlayProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     config: V3DTCuboidOverlayConfig
     _last_log_ts: float = field(default=0.0, init=False, repr=False)
     _frames: int = field(default=0, init=False, repr=False)
@@ -3566,7 +3566,7 @@ class TrailOverlayConfig:
     # Effective history is bounded by BOTH `window_s` and this point cap.
     max_points_per_track: int = 129
     # Maximum number of line segments per track rendered each frame.
-    # This is the primary CPU control knob in DS8 (each segment is a Python→C call).
+    # This is the primary CPU control knob (each segment is a Python→C call).
     max_segments_per_track: int = 64
     # Maximum number of tracks rendered per tile/frame.
     max_tracks: int = 8
@@ -3932,7 +3932,7 @@ class _AlignedDepthFrameStore:
 
 @dataclass
 class TrailOverlayProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     config: TrailOverlayConfig
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _enabled: bool = field(default=True, init=False)
@@ -4772,7 +4772,7 @@ class TrailOverlayProcessor:
             point_factory=_factory,
         )
 
-    def handle_batch_ds8(self, batch_meta: Any) -> None:
+    def handle_servicemaker_batch(self, batch_meta: Any) -> None:
         if ds_osd is None:
             return
 
@@ -5347,7 +5347,7 @@ _POSE_SKELETON = [
 
 @dataclass
 class PoseFeatureProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     gie_id: int
     model_size: Tuple[int, int] = (640, 640)
     score_threshold: float = 0.25
@@ -5996,7 +5996,7 @@ class PoseFeatureProcessor:
                 self._rfdetr_diag_last_log = now
         return matches
 
-    def handle_frame_ds8(self, batch_meta: Any, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any) -> None:
         object_items = getattr(frame_meta, "object_items", None) or []
         rfdetr_matches: Dict[
             int, Tuple[float, np.ndarray, np.ndarray]
@@ -6033,7 +6033,9 @@ class PoseFeatureProcessor:
                 )
             if not self._missing_native_logged:
                 logger.warning(
-                    "Pose meta attach skipped; noesis_pose_meta_ext is unavailable or missing attach_pose_features (build scripts/build_noesis_pose_meta_ext.sh)"
+                    "Pose meta attach skipped; noesis_pose_meta_ext is unavailable "
+                    "or missing attach_pose_features "
+                    "(build DS9/scripts/build_noesis_pose_meta_ext.sh)"
                 )
                 self._missing_native_logged = True
         pose_budget = self._features_per_frame_max()
@@ -6177,7 +6179,7 @@ class PoseFeatureProcessor:
 
 @dataclass
 class PoseKeypointOverlayProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     gie_id: int
     model_size: Tuple[int, int] = (640, 640)
     score_threshold: float = 0.25
@@ -6318,7 +6320,7 @@ class PoseKeypointOverlayProcessor:
         r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.60, 0.80)
         return float(r), float(g), float(b)
 
-    def handle_batch_ds8(self, batch_meta: Any) -> None:
+    def handle_servicemaker_batch(self, batch_meta: Any) -> None:
         if ds_osd is None:
             return
         frame_items = getattr(batch_meta, "frame_items", None)
@@ -6512,7 +6514,7 @@ class _DepthTrackingFrameProcessor:
             logger.exception("Native DAv2 GPU depth capture failed")
             return None
 
-    def handle_frame_ds8(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
         frame_w, frame_h = _canonical_frame_size(frame_meta, self.fallback_frame_size)
         if frame_w <= 0 or frame_h <= 0:
             return
@@ -8216,7 +8218,7 @@ class _ObjectDepthFusionProcessor:
             evidence_reason=anchor.anchor_rejection_reason,
         )
 
-    def handle_frame_ds8(self, batch_meta: Any, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any) -> None:
         source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
         frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
         pts_us = _frame_pts_key_us(frame_meta)
@@ -8329,9 +8331,9 @@ class _DepthTrackingFrameOperator(_BatchMetadataOperatorBase):  # pragma: no cov
             return
         for frame_meta in frame_items:
             try:
-                self.processor.handle_frame_ds8(frame_meta)
+                self.processor.handle_servicemaker_frame(frame_meta)
             except Exception:
-                logger.exception("Failed to capture aligned DAv2 depth frame within batch metadata (DS8)")
+                logger.exception("Failed to capture aligned DAv2 depth frame within batch metadata")
 
 
 class _ObjectDepthFusionOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DS runtime
@@ -8345,9 +8347,9 @@ class _ObjectDepthFusionOperator(_BatchMetadataOperatorBase):  # pragma: no cove
             return
         for frame_meta in frame_items:
             try:
-                self.processor.handle_frame_ds8(batch_meta, frame_meta)
+                self.processor.handle_servicemaker_frame(batch_meta, frame_meta)
             except Exception:
-                logger.exception("Failed to fuse object depth within batch metadata (DS8)")
+                logger.exception("Failed to fuse object depth within batch metadata")
 
 
 def _copy_public_scalar(value: Any) -> Any:
@@ -9015,7 +9017,7 @@ class _TrackingPublicationWorker:
 
 @dataclass
 class _AnalyticsTelemetryProcessor:
-    pipeline: "DS8Pipeline"
+    pipeline: "DeepStreamPipeline"
     tracking_pub: "TrackingTelemetryPublisher"
     camera_labels: Mapping[int, str]
     sensor_id_map: Mapping[int, int]
@@ -10600,7 +10602,7 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             logger.debug("Failed to log V3DT diagnostics session start", exc_info=True)
 
-    def _extract_v3dt_meta_ds8(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
+    def _extract_v3dt_meta_servicemaker(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
         if not self._v3dt_meta_enabled or not self._tracking_mode_is_v3dt():
             return None
         if noesis_v3dt_meta_ext is None:
@@ -10662,27 +10664,30 @@ class _AnalyticsTelemetryProcessor:
         _increment_core_counter("tensor_host_copies_total.reid")
         return (emb / n).astype(np.float32, copy=False)
 
-    def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
+    def _extract_reid_embedding_servicemaker(self, obj_meta: Any) -> Optional[np.ndarray]:
         """Extract the configured ReID embedding from object tensor metadata."""
         emb_native = self._extract_reid_embedding_native(obj_meta)
         if emb_native is not None:
             return emb_native
         global _REID_NATIVE_MISSING_LOGGED
         if not _REID_NATIVE_MISSING_LOGGED and noesis_reid_meta_ext is None:
-            logger.warning("ReID native extraction unavailable; build scripts/build_noesis_reid_meta_ext.sh")
+            logger.warning(
+                "ReID native extraction unavailable; build "
+                "DS9/scripts/build_noesis_reid_meta_ext.sh"
+            )
             _REID_NATIVE_MISSING_LOGGED = True
         return None
 
-    def handle_frame_ds8(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
         lease = self.publication_gate.acquire()
         if lease is None:
             _increment_core_counter("runtime_publication_gate_rejected_frames_total")
             return
         with lease:
-            self._handle_frame_ds8_admitted(frame_meta)
+            self._handle_servicemaker_frame_admitted(frame_meta)
 
-    def _handle_frame_ds8_admitted(self, frame_meta: Any) -> None:
-        """Extract tracking telemetry for a single frame using DS8 pyservicemaker API."""
+    def _handle_servicemaker_frame_admitted(self, frame_meta: Any) -> None:
+        """Extract tracking telemetry for one Service Maker frame."""
         frame_start_ns = time.perf_counter_ns()
         try:
             source_id = self._frame_source_id(frame_meta)
@@ -10732,7 +10737,7 @@ class _AnalyticsTelemetryProcessor:
             for obj_meta in object_items:
                 _increment_core_counter("detection_wake.objects_seen")
                 track_build_start_ns = time.perf_counter_ns()
-                raw = self._build_track_dict_ds8(obj_meta, camera_id)
+                raw = self._build_track_dict_servicemaker(obj_meta, camera_id)
                 _record_core_stage_timing(
                     "analytics.track_build",
                     track_build_start_ns,
@@ -10767,7 +10772,7 @@ class _AnalyticsTelemetryProcessor:
 
                 # People-only public identity. Do not show raw tracker IDs.
                 if class_id != 0:
-                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    self._stamp_osd_label_servicemaker(obj_meta, sensor_id=sensor_id, stable_id=None)
                     diagnostics_tracks.append(diag_track)
                     continue
 
@@ -10819,7 +10824,7 @@ class _AnalyticsTelemetryProcessor:
                         else:
                             reid_budget_remaining = max(0, reid_budget_remaining - 1)
                             reid_start_ns = time.perf_counter_ns()
-                            emb = self._extract_reid_embedding_ds8(obj_meta)
+                            emb = self._extract_reid_embedding_servicemaker(obj_meta)
                             _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
                             if emb is None:
                                 _increment_core_counter("detection_wake.reid_emb_missing")
@@ -10846,7 +10851,7 @@ class _AnalyticsTelemetryProcessor:
                     _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
                     if not identity_v2_authoritative and not identity_v2_shadow:
-                        self._stamp_osd_label_ds8(
+                        self._stamp_osd_label_servicemaker(
                             obj_meta, sensor_id=sensor_id, stable_id=None
                         )
                         diagnostics_tracks.append(diag_track)
@@ -11006,7 +11011,7 @@ class _AnalyticsTelemetryProcessor:
                 # Stamp OSD after world/depth augmentation so ``depth=`` reflects
                 # registered optical range without implying canonical world Z.
                 osd_start_ns = time.perf_counter_ns()
-                self._stamp_osd_label_ds8(
+                self._stamp_osd_label_servicemaker(
                     obj_meta,
                     sensor_id=sensor_id,
                     # Zero is an explicit neutral override.  None would ask the
@@ -11014,7 +11019,7 @@ class _AnalyticsTelemetryProcessor:
                     stable_id=0 if identity_v2_authoritative else stable_id_int,
                 )
                 if not identity_v2_authoritative:
-                    self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
+                    self._apply_instance_mask_color_servicemaker(obj_meta, stable_id=stable_id_int)
                 _record_core_stage_timing(
                     "analytics.osd_object",
                     osd_start_ns,
@@ -11279,10 +11284,10 @@ class _AnalyticsTelemetryProcessor:
                 post_frame_start_ns,
                 item_count=len(tracks),
             )
-            _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=len(tracks))
+            _record_core_stage_timing("analytics.handle_servicemaker_frame", frame_start_ns, item_count=len(tracks))
         except Exception:  # pragma: no cover - defensive guardrail
-            logger.exception("Failed to process analytics telemetry for frame (DS8)")
-            _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns)
+            logger.exception("Failed to process analytics telemetry for frame")
+            _record_core_stage_timing("analytics.handle_servicemaker_frame", frame_start_ns)
 
     def handle_frame(self, frame_meta: Any) -> None:
         lease = self.publication_gate.acquire()
@@ -11644,7 +11649,7 @@ class _AnalyticsTelemetryProcessor:
         r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.60, 0.80)
         return float(r), float(g), float(b)
 
-    def _apply_instance_mask_color_ds8(self, obj_meta: Any, *, stable_id: int) -> None:
+    def _apply_instance_mask_color_servicemaker(self, obj_meta: Any, *, stable_id: int) -> None:
         """Force instance mask color to be stable-id keyed (matches FE hue math)."""
         rect = getattr(obj_meta, "rect_params", None)
         if rect is None:
@@ -11678,7 +11683,7 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             pass
 
-        # Ensure masks aren't clipped by box border thickness (bboxes are disabled by default in DS8).
+        # Ensure masks are not clipped by box borders, which are disabled by default.
         try:
             setattr(rect, "border_width", 0)
         except Exception:
@@ -17184,8 +17189,8 @@ class _AnalyticsTelemetryProcessor:
                 continue
             yield entry
 
-    def _build_track_dict_ds8(self, obj_meta: Any, camera_id: str) -> Optional[Dict[str, Any]]:
-        """Build track dictionary from DS8 pyservicemaker ObjectMetadata."""
+    def _build_track_dict_servicemaker(self, obj_meta: Any, camera_id: str) -> Optional[Dict[str, Any]]:
+        """Build a track dictionary from Service Maker ObjectMetadata."""
         try:
             track_id = int(getattr(obj_meta, "object_id", -1))
         except Exception:
@@ -17215,7 +17220,7 @@ class _AnalyticsTelemetryProcessor:
         }
 
         if self._tracking_mode_is_v3dt():
-            v3dt_meta = self._extract_v3dt_meta_ds8(obj_meta)
+            v3dt_meta = self._extract_v3dt_meta_servicemaker(obj_meta)
             if v3dt_meta:
                 track.update(v3dt_meta)
                 bbox3d = v3dt_meta.get("bbox3d")
@@ -17261,7 +17266,7 @@ class _AnalyticsTelemetryProcessor:
             selected_items = list(analytics_items)
 
         if not selected_items:
-            logger.debug(f"DS8 track {track_id} has no analytics items")
+            logger.debug(f"Track {track_id} has no analytics items")
         if len(selected_items) > 1:
             logger.warning(
                 "DS9 track %s has duplicate post-analytics metadata for unique-id=%s",
@@ -17270,7 +17275,7 @@ class _AnalyticsTelemetryProcessor:
             )
             selected_items = []
         for analytics_info in selected_items:
-            analytics_meta = self._extract_analytics_from_ds8(analytics_info)
+            analytics_meta = self._extract_analytics_from_servicemaker(analytics_info)
             if analytics_meta:
                 track["analytics"] = analytics_meta
                 zone = _primary_zone_from_analytics(analytics_meta)
@@ -17278,17 +17283,17 @@ class _AnalyticsTelemetryProcessor:
                     track["zone"] = zone
                     track["zone_source"] = "nvdsanalytics_roi"
                     track["zone_authoritative"] = True
-                    logger.debug(f"DS8 track {track_id} assigned zone: {zone}")
+                    logger.debug(f"Track {track_id} assigned zone: {zone}")
                 break  # Use first analytics item
 
         # Debug: if no zone but we have analytics, log it
         if not track.get("zone") and track.get("analytics"):
-            logger.debug(f"DS8 track {track_id} has analytics but no zone: {track['analytics']}")
+            logger.debug(f"Track {track_id} has analytics but no zone: {track['analytics']}")
 
         return track
 
-    def _extract_analytics_from_ds8(self, analytics_info: Any) -> Optional[Dict[str, Any]]:
-        """Extract analytics info from DS8 AnalyticsObjInfo."""
+    def _extract_analytics_from_servicemaker(self, analytics_info: Any) -> Optional[Dict[str, Any]]:
+        """Extract analytics info from Service Maker AnalyticsObjInfo."""
         if analytics_info is None:
             return None
         try:
@@ -17858,7 +17863,7 @@ class _AnalyticsTelemetryProcessor:
             else None
         )
 
-    def _stamp_osd_label_ds8(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
+    def _stamp_osd_label_servicemaker(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
         proc = self.osd_label_processor
         if proc is None:
             proc = getattr(self.pipeline, "osd_label_processor", None)
@@ -17867,7 +17872,7 @@ class _AnalyticsTelemetryProcessor:
         try:
             proc._apply_label(obj_meta, sensor_id=int(sensor_id), stable_id_override=stable_id)
         except Exception:
-            logger.debug("OSD label stamp failed (DS8)", exc_info=True)
+            logger.debug("OSD label stamp failed", exc_info=True)
 
     def _stamp_osd_label(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
         proc = self.osd_label_processor
@@ -17931,7 +17936,7 @@ class _OsdLabelProcessor:
             show_both_ids=show_both,
         )
 
-    def handle_frame_ds8(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
         sensor_id = self._frame_source_id(frame_meta)
         object_items = getattr(frame_meta, "object_items", None) or []
         for obj_meta in object_items:
@@ -18136,9 +18141,9 @@ class _OsdLabelOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requi
             return
         for frame_meta in frame_items:
             try:
-                self._processor.handle_frame_ds8(frame_meta)
+                self._processor.handle_servicemaker_frame(frame_meta)
             except Exception:
-                logger.exception("Failed to stamp OSD labels within batch metadata (DS8)")
+                logger.exception("Failed to stamp OSD labels within batch metadata")
 
 
 class _IdentityV2PostResolutionOsdOperator(
@@ -18166,9 +18171,9 @@ class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cov
             return
         for frame_meta in frame_items:
             try:
-                self._processor.handle_frame_ds8(frame_meta)
+                self._processor.handle_servicemaker_frame(frame_meta)
             except Exception:
-                logger.exception("Failed to process analytics telemetry within batch metadata (DS8)")
+                logger.exception("Failed to process analytics telemetry within batch metadata")
 
 
 class _TrailOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
@@ -18183,13 +18188,13 @@ class _TrailOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - r
         if frame_items is None:
             return
         try:
-            self._processor.handle_batch_ds8(batch_meta)
+            self._processor.handle_servicemaker_batch(batch_meta)
         except Exception:
-            logger.exception("Failed to render trail overlay within batch metadata (DS8)")
+            logger.exception("Failed to render trail overlay within batch metadata")
 
 
 class _IntrinsicsProcessor:
-    def __init__(self, loader: intrinsics_module.CameraConfigLoader, pipeline: "DS8Pipeline") -> None:
+    def __init__(self, loader: intrinsics_module.CameraConfigLoader, pipeline: "DeepStreamPipeline") -> None:
         self._loader = loader
         self._pipeline = pipeline
 
@@ -18219,7 +18224,7 @@ class _IntrinsicsOperator(_BatchMetadataOperatorBase):  # pragma: no cover - req
             try:
                 self._processor.apply(frame_meta)
             except Exception:
-                logger.exception("Failed to apply intrinsics within batch metadata probe (DS8)")
+                logger.exception("Failed to apply intrinsics within batch metadata probe")
 
 
 class _MapAnythingBufferOperator(_BufferOperatorBase):  # pragma: no cover - requires DeepStream runtime
@@ -18346,10 +18351,10 @@ class _PoseFeatureOperator(_BatchMetadataOperatorBase):  # pragma: no cover - re
             return
         for frame_meta in frame_items:
             try:
-                self._processor.handle_frame_ds8(batch_meta, frame_meta)
+                self._processor.handle_servicemaker_frame(batch_meta, frame_meta)
             except Exception:
                 logger.exception(
-                    "Failed to compute pose features within batch metadata (DS8)"
+                    "Failed to compute pose features within batch metadata"
                 )
                 if self._processor.tensor_source == "rfdetr_pgie_frame":
                     raise
@@ -18367,9 +18372,9 @@ class _PoseKeypointOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no co
         if frame_items is None:
             return
         try:
-            self._processor.handle_batch_ds8(batch_meta)
+            self._processor.handle_servicemaker_batch(batch_meta)
         except Exception:
-            logger.exception("Failed to render pose keypoints within batch metadata (DS8)")
+            logger.exception("Failed to render pose keypoints within batch metadata")
 
 
 def _select_tensor(tensors: Mapping[str, np.ndarray], keys: Sequence[str]) -> Optional[np.ndarray]:
@@ -18551,6 +18556,6 @@ def _fallback_zone_from_camera(camera_id: Any) -> Optional[str]:
 from typing import TYPE_CHECKING  # noqa: E402  (import at end to satisfy linter)
 
 if TYPE_CHECKING:  # pragma: no cover - used for type hints only
-    from noesis.pipelines.ds8_pipeline import DS8Pipeline  # noqa: F401
+    from noesis.pipelines.deepstream_pipeline import DeepStreamPipeline  # noqa: F401
     from noesis.telemetry.publishers import DepthTelemetryPublisher  # noqa: F401
     from noesis.telemetry.publishers import TrackingTelemetryPublisher  # noqa: F401

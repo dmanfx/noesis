@@ -148,6 +148,17 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+NATIVE_PLATFORM_FIXTURE = {
+    **maintenance_common.NATIVE_HOST_PLATFORM,
+    "driver_version": "595.71.05",
+    "gpu_name": "fixture-gpu",
+    "gpu_uuid": "GPU-fixture",
+    "gpu_compute_capability": "8.6",
+    "gpu_memory_mib": "12288",
+    "expected_trtexec_banner": maintenance_common.DS9_TRTEXEC_BANNER,
+}
+
+
 def _write_minimal_onnx(path: Path) -> None:
     input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
     output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
@@ -227,7 +238,7 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             self.assertEqual(adoption["status"], "verified")
             self.assertEqual(
                 adoption["failure_cleanup_authority"],
-                "host_engine_finalize_transaction",
+                "native_host_manual_recovery",
             )
             self.assertEqual(
                 adoption["copy"]["method"], "exclusive_nofollow_stream_copy"
@@ -303,7 +314,7 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             wrong_candidate = run.target.with_name(
                 f".{run.target.name}.building-wrong-run"
             )
-            with self.assertRaisesRegex(EngineMaintenanceError, "exact host-authorized"):
+            with self.assertRaisesRegex(EngineMaintenanceError, "exact run-owned"):
                 run.adopt_derived_candidate(
                     derived,
                     wrong_candidate,
@@ -357,7 +368,7 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["candidate_adoption"]["failure_cleanup_authority"],
-                "host_engine_finalize_transaction",
+                "native_host_manual_recovery",
             )
 
     def test_both_builders_delegate_failed_candidate_cleanup_to_host(self) -> None:
@@ -375,16 +386,14 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("::unlink", wholebody_source)
 
-    def test_canonical_wrapper_explicitly_maps_external_model_root(self) -> None:
+    def test_canonical_wrapper_requires_external_native_artifact_root(self) -> None:
         wrapper = (
-            REPO_ROOT / "DS9/scripts/run_canonical_engine_maintenance.sh"
+            REPO_ROOT / "DS9/scripts/run_canonical_engine_maintenance_host.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn(
-            "--env NOESIS_MODEL_DIR=/workspace/DS9/models",
-            wrapper,
-        )
+        self.assertIn("NOESIS_DS9_ARTIFACT_ROOT must be set", wrapper)
+        self.assertIn("native maintenance refuses NOESIS_DS9_DOCKER_ROOT", wrapper)
 
-    def test_wholebody_partial_build_is_left_for_host_transaction_rollback(self) -> None:
+    def test_wholebody_partial_build_is_left_for_native_manual_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             module, base_spec, engine, evidence = self._fixture(root)
@@ -403,8 +412,19 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     os.environ,
-                    {"FAKE_TRT_MODE": "ok", "FAKE_TRT_STATE": str(state)},
+                    {
+                        "FAKE_TRT_MODE": "ok",
+                        "FAKE_TRT_STATE": str(state),
+                        "NOESIS_DS9_MAINT_BACKEND": "native_host",
+                        "NOESIS_DS9_MAINT_COMPILER": "fixture nvcc",
+                        "NOESIS_DS9_MAINT_PYTHON_ABI": "cp312",
+                    },
                     clear=False,
+                ),
+                mock.patch.object(
+                    module,
+                    "native_host_maintenance_platform",
+                    return_value=dict(NATIVE_PLATFORM_FIXTURE),
                 ),
                 mock.patch.object(module.shutil, "which", return_value=str(fake_gpp)),
                 self.assertRaisesRegex(EngineMaintenanceError, "build exited 1"),
@@ -459,8 +479,18 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
         state = root / "fake-state"
         with mock.patch.dict(
             os.environ,
-            {"FAKE_TRT_MODE": mode, "FAKE_TRT_STATE": str(state)},
+            {
+                "FAKE_TRT_MODE": mode,
+                "FAKE_TRT_STATE": str(state),
+                "NOESIS_DS9_MAINT_BACKEND": "native_host",
+                "NOESIS_DS9_MAINT_COMPILER": "fixture nvcc",
+                "NOESIS_DS9_MAINT_PYTHON_ABI": "cp312",
+            },
             clear=False,
+        ), mock.patch.object(
+            module,
+            "native_host_maintenance_platform",
+            return_value=dict(NATIVE_PLATFORM_FIXTURE),
         ):
             module._build(
                 spec,
@@ -540,6 +570,14 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             self.assertEqual(engine.read_bytes(), b"new-candidate-engine")
             manifest_path, manifest = self._manifest(evidence)
             self.assertEqual(manifest["status"], "complete")
+            self.assertNotIn("host_transaction", manifest["metadata"])
+            self.assertEqual(
+                manifest["metadata"]["native_host"]["backend"], "native_host"
+            )
+            self.assertEqual(
+                manifest["metadata"]["native_host"]["output_sha256"],
+                hashlib.sha256(engine.read_bytes()).hexdigest(),
+            )
             self.assertEqual(
                 [row["label"] for row in manifest["commands"]],
                 ["probe-trtexec", "build", "load-candidate", "load-installed"],
@@ -658,28 +696,6 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
                 trtexec_args=spec.trtexec_args,
                 precision_arg="--bf16",
             )
-            transaction = root / "transaction.json"
-            transaction.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "contract": "noesis.ds9.engine_finalize_transaction",
-                        "state": "prepared",
-                        "transaction_id": "unit-transaction",
-                        "engine": spec.name,
-                        "container_engine_output": str(engine.absolute()),
-                        "prior_engine": {
-                            "exists": True,
-                            "sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
-                            "size_bytes": engine.stat().st_size,
-                            "mode": f"{_mode(engine):04o}",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            transaction.chmod(0o600)
-            transaction_sha = hashlib.sha256(transaction.read_bytes()).hexdigest()
             fake = _fake_trtexec(root)
             with mock.patch.object(module, "SOURCE_CONTRACTS", contracts):
                 with self.assertRaisesRegex(
@@ -691,8 +707,6 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
                         evidence_root=evidence,
                         build_timeout_seconds=10,
                         load_timeout_seconds=10,
-                        transaction_manifest=transaction,
-                        expected_transaction_sha256=transaction_sha,
                     )
             self.assertEqual(engine.read_bytes(), b"known-good-engine")
             self.assertFalse(evidence.exists())
@@ -741,25 +755,30 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
             "rollback_after_install_failure",
         ):
             self.assertIn(token, v3dt)
-        wrapper = (SCRIPTS_ROOT / "run_canonical_engine_maintenance.sh").read_text(
-            encoding="utf-8"
-        )
+        wrapper = (
+            SCRIPTS_ROOT / "run_canonical_engine_maintenance_host.sh"
+        ).read_text(encoding="utf-8")
         self.assertIn("engine_maintenance", wrapper)
         self.assertIn("--evidence-root", wrapper)
         self.assertIn(
-            "CANONICAL_ORDER=(yolo26_m reid_swin yolo26_pose_n depth_anything_v2_tracking mapanything)",
+            "CANONICAL_ENGINES=(yolo26_m reid_swin yolo26_pose_n depth_anything_v2_tracking mapanything)",
             wrapper,
         )
-        self.assertIn('[yolo26_seg_s]="yolo26s-seg_fused_b3_fp16.engine"', wrapper)
         self.assertIn(
             '[mapanything]="mapanything_images_294x518_b3_fp32.plan"', wrapper
         )
-        self.assertIn('"mapanything-functional-quality"', wrapper)
-        self.assertIn('"trtexec_inference"', wrapper)
-        self.assertIn('"--dumpOutput"', wrapper)
+        self.assertNotIn("docker run", wrapper.lower())
         rebuild = _load_module(
             "ds9_rebuild_profile_route_test", "DS9/scripts/rebuild_engines.py"
         )
+        rebuild_source = (SCRIPTS_ROOT / "rebuild_engines.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("MAPANYTHING_QUALITY_COMMAND_LABEL", rebuild_source)
+        self.assertIn('proof="trtexec_inference"', rebuild_source)
+        self.assertIn('"--dumpOutput"', rebuild_source)
+        self.assertNotIn("container_engine_output", rebuild_source)
+        self.assertNotIn("transaction_manifest", rebuild_source)
         specs = {row.name for row in rebuild._specs(include_mapanything=True)}
         self.assertTrue(
             {
@@ -787,24 +806,18 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
         )
         self.assertEqual(
             v3dt["models"]["pgie"]["engine"],
-            "DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine",
+            "DS9/models/engines/yolo26m_b3_fp16.engine",
         )
         self.assertEqual(
             v3dt["preprocess"]["config-file"],
-            "DS9/pipelines/config_preproc_yolo26_seg_s.ini",
+            "DS9/pipelines/config_preproc_yolo26_m.ini",
         )
-        for relative in (
-            "DS9/pipelines/config_infer_primary_yolo26_m.ini",
-            "DS9/pipelines/config_infer_primary_yolo26_seg_s.ini",
-        ):
+        for relative in ("DS9/pipelines/config_infer_primary_yolo26_m.ini",):
             parser = configparser.ConfigParser(interpolation=None)
             parser.read(REPO_ROOT / relative)
             self.assertNotIn("onnx-file", parser["property"])
             self.assertTrue(parser["property"]["model-engine-file"].startswith("DS9/models/engines/"))
-        for relative in (
-            "DS9/pipelines/config_preproc_yolo26_m.ini",
-            "DS9/pipelines/config_preproc_yolo26_seg_s.ini",
-        ):
+        for relative in ("DS9/pipelines/config_preproc_yolo26_m.ini",):
             parser = configparser.ConfigParser(interpolation=None)
             parser.read(REPO_ROOT / relative)
             self.assertEqual(parser["property"]["tensor-name"], "images")

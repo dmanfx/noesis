@@ -12,10 +12,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DS8_PLUGIN_ROOT = ROOT / "gst-plugins"
-DS9_PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
-DS8_SOURCE = DS8_PLUGIN_ROOT / "nvdsroiexclude" / "gstnvdsroiexclude.cpp"
-DS9_SOURCE = ROOT / "DS9" / "csrc" / "nvdsroiexclude" / "gstnvdsroiexclude.cpp"
+PLUGIN_ROOT = ROOT / "DS9" / "gst-plugins"
+SOURCE = ROOT / "DS9" / "csrc" / "nvdsroiexclude" / "gstnvdsroiexclude.cpp"
 
 
 def _config(*, offset: int = 0, stream_suffix: str = "0") -> bytes:
@@ -273,12 +271,9 @@ SERVICEMAKER_PROGRAM = textwrap.dedent(
 
 
 class RoiExcludePluginSourceTests(unittest.TestCase):
-    def test_ds8_and_ds9_sources_are_owned_mirrors(self) -> None:
-        self.assertFalse(DS8_SOURCE.is_symlink())
-        self.assertFalse(DS9_SOURCE.is_symlink())
-        self.assertEqual(DS8_SOURCE.read_bytes(), DS9_SOURCE.read_bytes())
-
-        source = DS8_SOURCE.read_text(encoding="utf-8")
+    def test_canonical_source_preserves_the_reload_and_safety_contract(self) -> None:
+        self.assertFalse(SOURCE.is_symlink())
+        source = SOURCE.read_text(encoding="utf-8")
         self.assertIn("nvds_remove_obj_meta_from_frame", source)
         self.assertIn("O_NOFOLLOW", source)
         self.assertIn("kMaxConfigBytes", source)
@@ -291,65 +286,22 @@ class RoiExcludePluginSourceTests(unittest.TestCase):
         self.assertNotIn("gst_buffer_map", source)
         self.assertNotIn("gst_buffer_make_writable", source)
 
-    def test_builds_are_sdk_major_scoped_and_fail_closed(self) -> None:
-        ds8_cmake = (DS8_SOURCE.parent / "CMakeLists.txt").read_text(
+    def test_build_is_pinned_to_ds91_and_fails_closed(self) -> None:
+        ds9_cmake = (SOURCE.parent / "CMakeLists.txt").read_text(
             encoding="utf-8"
         )
-        ds9_cmake = (DS9_SOURCE.parent / "CMakeLists.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn('NOESIS_DEEPSTREAM_MAJOR="8"', ds8_cmake)
-        self.assertNotIn('NOESIS_DEEPSTREAM_MAJOR="9"', ds8_cmake)
-        self.assertIn('NVDS_VERSION_MAJOR[ \\t]+8', ds8_cmake)
-        self.assertIn("-Werror", ds8_cmake)
         self.assertIn('NOESIS_DEEPSTREAM_MAJOR="9"', ds9_cmake)
         self.assertNotIn('NOESIS_DEEPSTREAM_MAJOR="8"', ds9_cmake)
         self.assertIn('NVDS_VERSION_MAJOR[ \\t]+9', ds9_cmake)
         self.assertIn('NVDS_VERSION_MINOR[ \\t]+1', ds9_cmake)
         self.assertIn("-Werror", ds9_cmake)
 
-        ds8_build = (DS8_PLUGIN_ROOT / "build_nvdsroiexclude.sh").read_text(
-            encoding="utf-8"
-        )
         ds9_build = (ROOT / "DS9" / "scripts" / "build_gst_plugins.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('NVDS_VERSION_MAJOR[[:space:]]+8', ds8_build)
-        self.assertIn('-DDEEPSTREAM_HOME="${DS_HOME}"', ds8_build)
+        self.assertIn('NVDS_VERSION_MAJOR[[:space:]]+9', ds9_build)
+        self.assertIn('NVDS_VERSION_MINOR[[:space:]]+1', ds9_build)
         self.assertIn('-DDEEPSTREAM_HOME="${DS_HOME}"', ds9_build)
-
-    def test_cmake_rejects_cross_major_sdk_roots(self) -> None:
-        ds8_home = Path("/opt/nvidia/deepstream/deepstream-8.0")
-        ds9_home = Path("/opt/nvidia/deepstream/deepstream-9.1")
-        if not ds8_home.is_dir() or not ds9_home.is_dir():
-            self.skipTest("both DS8 and DS9 SDK roots are required for cross-major guard")
-
-        cases = (
-            (DS8_SOURCE.parent, ds9_home, "DeepStream major 8"),
-            (DS9_SOURCE.parent, ds8_home, "DeepStream major 9"),
-        )
-        with tempfile.TemporaryDirectory(prefix="noesis-roi-cmake-guard-") as raw:
-            root = Path(raw)
-            for index, (source_dir, wrong_home, expected) in enumerate(cases):
-                with self.subTest(source_dir=source_dir, wrong_home=wrong_home):
-                    result = subprocess.run(
-                        [
-                            "cmake",
-                            "--fresh",
-                            "-S",
-                            str(source_dir),
-                            "-B",
-                            str(root / f"build-{index}"),
-                            f"-DDEEPSTREAM_HOME={wrong_home}",
-                        ],
-                        cwd=ROOT,
-                        text=True,
-                        capture_output=True,
-                        timeout=30,
-                        check=False,
-                    )
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(expected, result.stdout + result.stderr)
 
 
 class RoiExcludePluginRuntimeTests(unittest.TestCase):
@@ -363,7 +315,7 @@ class RoiExcludePluginRuntimeTests(unittest.TestCase):
         self,
         program: str,
         *,
-        plugin_root: Path = DS8_PLUGIN_ROOT,
+        plugin_root: Path = PLUGIN_ROOT,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         binary = self._plugin_binary(plugin_root)
@@ -384,7 +336,7 @@ class RoiExcludePluginRuntimeTests(unittest.TestCase):
                 check=False,
             )
 
-    def test_ds8_and_ds9_binaries_register_reload_contract(self) -> None:
+    def test_binary_registers_reload_contract(self) -> None:
         properties = (
             "config-file",
             "id-mode",
@@ -398,27 +350,25 @@ class RoiExcludePluginRuntimeTests(unittest.TestCase):
             "objects-removed-count",
             "last-reload-error",
         )
-        for plugin_root in (DS8_PLUGIN_ROOT, DS9_PLUGIN_ROOT):
-            with self.subTest(plugin_root=plugin_root):
-                binary = self._plugin_binary(plugin_root)
-                with tempfile.TemporaryDirectory(prefix="noesis-roi-inspect-") as raw:
-                    env = os.environ.copy()
-                    env["GST_PLUGIN_PATH"] = str(plugin_root)
-                    env["GST_REGISTRY"] = str(Path(raw) / "registry.bin")
-                    result = subprocess.run(
-                        ["gst-inspect-1.0", "nvdsroiexclude"],
-                        cwd=ROOT,
-                        env=env,
-                        text=True,
-                        capture_output=True,
-                        timeout=30,
-                        check=False,
-                    )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(str(binary), result.stdout)
-                for prop in properties:
-                    self.assertIn(prop, result.stdout)
-                self.assertIn("Capabilities:\n      ANY", result.stdout)
+        binary = self._plugin_binary(PLUGIN_ROOT)
+        with tempfile.TemporaryDirectory(prefix="noesis-roi-inspect-") as raw:
+            env = os.environ.copy()
+            env["GST_PLUGIN_PATH"] = str(PLUGIN_ROOT)
+            env["GST_REGISTRY"] = str(Path(raw) / "registry.bin")
+            result = subprocess.run(
+                ["gst-inspect-1.0", "nvdsroiexclude"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(binary), result.stdout)
+        for prop in properties:
+            self.assertIn(prop, result.stdout)
+        self.assertIn("Capabilities:\n      ANY", result.stdout)
 
     def _assert_gi_reload_contract(self, plugin_root: Path) -> None:
         with tempfile.TemporaryDirectory(prefix="noesis-roi-reload-") as raw:
@@ -488,39 +438,32 @@ class RoiExcludePluginRuntimeTests(unittest.TestCase):
         self.assertIn("invalid ROI coordinate", payload["invalid"]["error"])
 
     def test_gi_reload_acknowledges_exact_hash_and_retains_prior_on_failure(self) -> None:
-        for plugin_root in (DS8_PLUGIN_ROOT, DS9_PLUGIN_ROOT):
-            with self.subTest(plugin_root=plugin_root):
-                self._assert_gi_reload_contract(plugin_root)
+        self._assert_gi_reload_contract(PLUGIN_ROOT)
 
     def test_disabled_empty_stream_is_a_valid_reload_policy(self) -> None:
-        for plugin_root in (DS8_PLUGIN_ROOT, DS9_PLUGIN_ROOT):
-            with self.subTest(plugin_root=plugin_root):
-                with tempfile.TemporaryDirectory(prefix="noesis-roi-disabled-empty-") as raw:
-                    root = Path(raw)
-                    config_path = root / "active.ini"
-                    next_path = root / "next.ini"
-                    invalid_path = root / "invalid.ini"
-                    config_path.write_bytes(_config())
-                    disabled = _disabled_empty_config()
-                    next_path.write_bytes(disabled)
-                    invalid_path.write_bytes(
-                        _config().replace(b"30;2", b"nan;2", 1)
-                    )
-                    result = self._run(
-                        GI_RELOAD_PROGRAM,
-                        plugin_root=plugin_root,
-                        extra_env={
-                            "NOESIS_ROI_CONFIG": str(config_path),
-                            "NOESIS_ROI_NEXT_CONFIG": str(next_path),
-                            "NOESIS_ROI_INVALID_CONFIG": str(invalid_path),
-                        },
-                    )
+        with tempfile.TemporaryDirectory(prefix="noesis-roi-disabled-empty-") as raw:
+            root = Path(raw)
+            config_path = root / "active.ini"
+            next_path = root / "next.ini"
+            invalid_path = root / "invalid.ini"
+            config_path.write_bytes(_config())
+            disabled = _disabled_empty_config()
+            next_path.write_bytes(disabled)
+            invalid_path.write_bytes(_config().replace(b"30;2", b"nan;2", 1))
+            result = self._run(
+                GI_RELOAD_PROGRAM,
+                extra_env={
+                    "NOESIS_ROI_CONFIG": str(config_path),
+                    "NOESIS_ROI_NEXT_CONFIG": str(next_path),
+                    "NOESIS_ROI_INVALID_CONFIG": str(invalid_path),
+                },
+            )
 
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                payload = json.loads(result.stdout.strip().splitlines()[-1])
-                self.assertEqual(payload["accepted"]["accepted"], 7)
-                self.assertEqual(payload["accepted"]["active"], _sha256(disabled))
-                self.assertTrue(payload["accepted"]["ok"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["accepted"]["accepted"], 7)
+        self.assertEqual(payload["accepted"]["active"], _sha256(disabled))
+        self.assertTrue(payload["accepted"]["ok"])
 
     def test_unsafe_or_ambiguous_configs_fail_at_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="noesis-roi-invalid-") as raw:

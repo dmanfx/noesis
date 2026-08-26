@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from websocket_server import WebSocketServer
+from noesis.server.websocket import WebSocketServer
 
 
 class _Socket:

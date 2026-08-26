@@ -19,10 +19,9 @@ When this skill is active, **ALWAYS read the relevant reference documents** befo
 ## Noesis repository override
 
 For this repository the canonical target is DeepStream **9.1 on the native
-host**, never Docker. Root `AGENTS.md`, `DS9/AGENTS.md`, the installed SDK, and
-`DS9/docs/deepstream_9_1_agent_skills.md` override older sample versions or
-container recipes in the bundled vendor references. Do not use the Docker
-reference for Noesis implementation, build, validation, or operation.
+host**. Root `AGENTS.md`, `DS9/AGENTS.md`, the installed SDK, and
+`DS9/docs/deepstream_9_1_agent_skills.md` define the implementation, build,
+validation, and operation route.
 
 ## SDK and Architecture Quick Reference
 
@@ -138,7 +137,7 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
     python3 -m venv venv
     source venv/bin/activate
     pip install /opt/nvidia/deepstream/deepstream-9.1/service-maker/python/pyservicemaker*.whl pyyaml
-    pip install -r requirements.txt  # other dependencies
+    pip install -r DS9/requirements-runtime.txt
     ```
     **Symptom if missing**: `ModuleNotFoundError: No module named 'pyservicemaker'` when running the app inside the venv.
 
@@ -170,7 +169,7 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
 | [references/troubleshooting.md](references/troubleshooting.md) | Error messages and solutions |
 | [references/rest_api_dynamic.md](references/rest_api_dynamic.md) | REST API, dynamic source add/remove, nvmultiurisrcbin |
 | [references/metamux_config.md](references/metamux_config.md) | nvdsmetamux config, parallel multi-model inference, metadata merging, source ID filtering |
-| [references/docker_containers.md](references/docker_containers.md) | Generic upstream reference only; prohibited for the native Noesis runtime |
+| [references/native_host_setup.md](references/native_host_setup.md) | Native DS9.1 environment, venv, and codec setup |
 | [references/nvds_msgapi_adapter.md](references/nvds_msgapi_adapter.md) | Building custom protocol adapters: nvds_msgapi |
 
 ## Quick Error Reference

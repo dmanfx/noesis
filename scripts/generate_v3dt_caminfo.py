@@ -232,11 +232,9 @@ def main() -> None:
         default=str(REPO_ROOT / "config" / "camera_calibration.json"),
         help="Path to camera_calibration.json",
     )
-    default_pipeline = REPO_ROOT / "config" / "infer_v3dt_sv3dt.yaml"
+    default_pipeline = REPO_ROOT / "DS9" / "config" / "infer_v3dt.yaml"
     if not default_pipeline.exists():
-        default_pipeline = REPO_ROOT / "config" / "infer_v3dt.yaml"
-    if not default_pipeline.exists():
-        default_pipeline = REPO_ROOT / "config" / "infer.yaml"
+        default_pipeline = REPO_ROOT / "DS9" / "config" / "infer.yaml"
     parser.add_argument(
         "--pipeline-config",
         default=str(default_pipeline),

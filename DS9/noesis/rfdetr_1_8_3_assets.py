@@ -515,7 +515,7 @@ def _attest_parser(
     target = manifest.get("target")
     deepstream = target.get("deepstream") if isinstance(target, Mapping) else None
     if (
-        manifest.get("schema_version") != 2
+        manifest.get("schema_version") != 3
         or manifest.get("manifest_id") != "noesis-ds9-artifacts"
         or manifest.get("schema") != "DS9/docs/asset_manifest.schema.json"
         or not isinstance(target, Mapping)

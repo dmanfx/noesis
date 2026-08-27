@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from noesis.scene_prior_builder import (
+    _CameraMapLockInput,
     _authored_grid,
     _camera_local_raster_to_preview_image,
     _camera_local_preview_arrays,
@@ -749,6 +750,52 @@ def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> Non
     np.testing.assert_allclose(frame.camera_forward_world_xz, (1, 0), atol=1e-12)
     assert frame.target_revision_id == "vt_camera-a_exact"
     assert frame.source_floor_offset_m == pytest.approx(2.0)
+
+
+def test_scene_prior_preview_frame_applies_yaw_map_lock_about_camera_center() -> None:
+    evidence = ArtifactFingerprint(
+        role="camera_to_pcf_map_lock",
+        sha256="a" * 64,
+        version="noesis.scene_prior.camera_map_lock.input.v1",
+        producer="test",
+    )
+    frame = _camera_preview_frame(
+        {
+            "reference_camera_id": "family-room",
+            "camera_calibration_row": {
+                "E": np.eye(4, dtype=np.float64).flatten(order="F").tolist(),
+            },
+            "camera_calibration_bytes": b"camera-calibration",
+            "target_revision_metadata": {
+                "schema": "target.v1",
+                "revision_id": "vt_family-room_exact",
+                "floor_alignment": {
+                    "world_correction_col_major": np.eye(4, dtype=np.float64)
+                    .flatten(order="F")
+                    .tolist(),
+                    "target_floor_y": 0.0,
+                },
+            },
+            "target_revision_metadata_bytes": b"target-metadata",
+        },
+        camera_map_lock=_CameraMapLockInput(
+            evidence=evidence,
+            yaw_correction_deg=18.25,
+        ),
+    )
+
+    radians = np.deg2rad(18.25)
+    np.testing.assert_allclose(frame.camera_position_world_m, (0.0, 0.0, 0.0))
+    np.testing.assert_allclose(
+        frame.camera_forward_world_xz,
+        (np.sin(radians), np.cos(radians)),
+        atol=1e-12,
+    )
+    assert frame.camera_map_lock is not None
+    assert frame.camera_map_lock.evidence == evidence
+    assert frame.camera_map_lock.yaw_correction_deg == pytest.approx(18.25)
+    assert frame.source_floor_normal == pytest.approx((0.0, 1.0, 0.0))
+    assert frame.source_floor_offset_m == pytest.approx(0.0)
 
 
 def test_scene_prior_preview_frame_derives_reference_locked_source_floor() -> None:

@@ -1,7 +1,7 @@
 # Prior-Conditioned Fusion (PCF) workflow
 
 Status: canonical room-reconstruction and Scene Prior handoff runbook,
-2026-08-16.
+2026-08-26.
 
 Use this document when someone asks to **run PCF**, **reconstruct another room
 with PCF**, or **publish a PCF room to Noesis**. It is the single end-to-end
@@ -478,13 +478,13 @@ provider evidence merely because a later raster or mesh looks better.
 
 ## Current deployed PCF inventory
 
-The current `data/scene_priors/catalog.json` snapshot on 2026-08-15 binds these
+The current `data/scene_priors/catalog.json` snapshot on 2026-08-26 binds these
 full-evidence v2 revisions in `shadow` mode:
 
 | Camera / space | Capture | Active prior | Source points | Cell size |
 | --- | --- | --- | ---: | ---: |
 | Living Room | `20260802-162254-8bcc7dd7` | `sceneprior_living-room_20260802T202254Z_737f02e4f303` | 150,901 | 2.5 cm |
-| Family Room | `20260810-215847-571c6efe` | `sceneprior_family-room_20260811T015847Z_ffdc144a8f59` | 119,554 | 2.5 cm |
+| Family Room | `20260810-215847-571c6efe` | `sceneprior_family-room_20260811T015847Z_8b80dc69a7c4` | 119,554 | 2.5 cm |
 | Kitchen | `20260814-190412-ea26c040` | `sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483` | 168,795 | 2.5 cm |
 
 Treat this table as a dated deployed-state record. Inspect the catalog and each

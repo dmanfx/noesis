@@ -33,6 +33,7 @@ from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
     ScenePriorArtifact,
     ScenePriorBounds,
+    ScenePriorCameraMapLock,
     ScenePriorCameraBinding,
     ScenePriorCatalog,
     ScenePriorCatalogEntry,
@@ -65,6 +66,7 @@ MAX_ROOM_GROUP_MAP_BYTES = 512 * 1024
 MAX_WORLD_TO_SCENE_BYTES = 4 * 1024 * 1024
 MAX_SHA256SUMS_BYTES = 512 * 1024
 MAX_TARGET_REVISION_METADATA_BYTES = 4 * 1024 * 1024
+MAX_CAMERA_MAP_LOCK_BYTES = 512 * 1024
 MAX_PREVIEW_DIMENSION = 2_048
 MAX_REVIEW_POINTS = 250_000
 
@@ -83,6 +85,7 @@ class ScenePriorBuildConfig:
     room_group_map: Path
     world_to_scene: Path
     output_root: Path
+    camera_map_lock: Path | None = None
     camera_ids: tuple[str, ...] = ()
     grid_resolution_m: float = 0.05
     floor_support_band_m: float = 0.12
@@ -172,6 +175,7 @@ class _CameraPreviewFrame:
     camera_calibration: ArtifactFingerprint
     target_revision_metadata: ArtifactFingerprint
     target_revision_id: str
+    camera_map_lock: ScenePriorCameraMapLock | None
     target_from_source_col_major: tuple[float, ...]
     source_floor_normal: tuple[float, float, float]
     source_floor_offset_m: float
@@ -536,7 +540,89 @@ def _bundle_inputs(bundle_root: Path) -> dict[str, Any]:
     }
 
 
-def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
+@dataclass(frozen=True)
+class _CameraMapLockInput:
+    evidence: ArtifactFingerprint
+    yaw_correction_deg: float
+
+
+def _load_camera_map_lock(
+    path: Path | None,
+    inputs: Mapping[str, Any],
+) -> _CameraMapLockInput | None:
+    if path is None:
+        return None
+    try:
+        source = read_scene_file(
+            path,
+            label="scene-prior camera map lock",
+            max_bytes=MAX_CAMERA_MAP_LOCK_BYTES,
+        )
+    except SceneFileError as exc:
+        raise ScenePriorBuildError(str(exc)) from exc
+    payload = load_strict_json(source.data, label="scene-prior camera map lock")
+    expected_fields = {
+        "contract",
+        "contract_version",
+        "camera_id",
+        "source_camera_calibration_sha256",
+        "target_revision_id",
+        "target_revision_metadata_sha256",
+        "yaw_correction_deg",
+        "rotation_pivot",
+        "evidence",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+        raise ScenePriorBuildError("camera map-lock fields do not match its contract")
+    if (
+        payload.get("contract") != "noesis.scene_prior.camera_map_lock.input"
+        or payload.get("contract_version") != 1
+        or payload.get("rotation_pivot")
+        != "camera_optical_center_target_world_m"
+    ):
+        raise ScenePriorBuildError("camera map-lock contract is unsupported")
+    camera_id = str(inputs["reference_camera_id"])
+    calibration_sha256 = _sha256(inputs["camera_calibration_bytes"])
+    target_metadata = inputs["target_revision_metadata"]
+    target_metadata_sha256 = _sha256(inputs["target_revision_metadata_bytes"])
+    if str(payload.get("camera_id") or "") != camera_id:
+        raise ScenePriorBuildError("camera map lock belongs to another camera")
+    if str(payload.get("source_camera_calibration_sha256") or "") != calibration_sha256:
+        raise ScenePriorBuildError("camera map-lock calibration revision mismatch")
+    if str(payload.get("target_revision_id") or "") != str(
+        target_metadata.get("revision_id") or ""
+    ):
+        raise ScenePriorBuildError("camera map-lock target revision mismatch")
+    if str(payload.get("target_revision_metadata_sha256") or "") != target_metadata_sha256:
+        raise ScenePriorBuildError("camera map-lock target metadata mismatch")
+    if not isinstance(payload.get("evidence"), Mapping):
+        raise ScenePriorBuildError("camera map lock has no evidence")
+    try:
+        yaw_correction_deg = float(payload["yaw_correction_deg"])
+    except (TypeError, ValueError) as exc:
+        raise ScenePriorBuildError("camera map-lock yaw is invalid") from exc
+    if (
+        not math.isfinite(yaw_correction_deg)
+        or abs(yaw_correction_deg) > 45.0
+        or abs(yaw_correction_deg) < 0.01
+    ):
+        raise ScenePriorBuildError("camera map-lock yaw must be in [-45, 45] degrees")
+    return _CameraMapLockInput(
+        evidence=ArtifactFingerprint(
+            role="camera_to_pcf_map_lock",
+            sha256=source.sha256,
+            version="noesis.scene_prior.camera_map_lock.input.v1",
+            producer="noesis.static_pcf_video_fit",
+        ),
+        yaw_correction_deg=yaw_correction_deg,
+    )
+
+
+def _camera_preview_frame(
+    inputs: Mapping[str, Any],
+    *,
+    camera_map_lock: _CameraMapLockInput | None = None,
+) -> _CameraPreviewFrame:
     calibration = inputs["camera_calibration_row"]
     target_metadata = inputs["target_revision_metadata"]
     try:
@@ -559,6 +645,32 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
         camera_to_world = world_correction @ np.linalg.inv(camera_from_backend)
     except np.linalg.LinAlgError as exc:
         raise ScenePriorBuildError("reference camera transform is singular") from exc
+    base_camera_frame = None
+    map_lock_contract = None
+    if camera_map_lock is not None:
+        try:
+            base_camera_frame = camera_ground_frame_from_camera_to_world(
+                camera_to_world
+            )
+        except CoordinateFrameError as exc:
+            raise ScenePriorBuildError(str(exc)) from exc
+        pivot = np.asarray(base_camera_frame.camera_world_m, dtype=np.float64)
+        radians = math.radians(float(camera_map_lock.yaw_correction_deg))
+        cosine = math.cos(radians)
+        sine = math.sin(radians)
+        rotation = np.asarray(
+            [
+                [cosine, 0.0, sine, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [-sine, 0.0, cosine, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        target_residual = rotation.copy()
+        target_residual[:3, 3] = pivot - (rotation[:3, :3] @ pivot)
+        world_correction = target_residual @ world_correction
+        camera_to_world = world_correction @ np.linalg.inv(camera_from_backend)
     try:
         camera_frame = camera_ground_frame_from_camera_to_world(camera_to_world)
     except CoordinateFrameError as exc:
@@ -567,6 +679,19 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
     right = camera_frame.camera_right_world[[0, 2]]
     position = camera_frame.camera_world_m
     camera_id = str(inputs["reference_camera_id"])
+    if camera_map_lock is not None and base_camera_frame is not None:
+        base_forward = base_camera_frame.camera_forward_world[[0, 2]]
+        map_lock_contract = ScenePriorCameraMapLock(
+            contract="noesis.scene_prior.camera_map_lock",
+            contract_version=1,
+            evidence=camera_map_lock.evidence,
+            camera_id=camera_id,
+            yaw_correction_deg=float(camera_map_lock.yaw_correction_deg),
+            rotation_pivot="camera_optical_center_target_world_m",
+            pivot_world_m=tuple(float(value) for value in position),
+            base_camera_forward_world_xz=tuple(float(value) for value in base_forward),
+            corrected_camera_forward_world_xz=tuple(float(value) for value in forward),
+        )
     floor_alignment = target_metadata.get("floor_alignment")
     if not isinstance(floor_alignment, Mapping):
         raise ScenePriorBuildError("reference target floor alignment is missing")
@@ -634,6 +759,7 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
             producer="noesis.virtual_twin",
         ),
         target_revision_id=target_revision_id,
+        camera_map_lock=map_lock_contract,
         target_from_source_col_major=tuple(
             float(value) for value in world_correction.flatten(order="F")
         ),
@@ -1437,7 +1563,11 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
             producer="noesis",
         ),
     )
-    preview_frame = _camera_preview_frame(inputs)
+    camera_map_lock = _load_camera_map_lock(cfg.camera_map_lock, inputs)
+    preview_frame = _camera_preview_frame(
+        inputs,
+        camera_map_lock=camera_map_lock,
+    )
     preview_arrays, preview_bounds = _camera_local_preview_arrays(
         arrays,
         grid=grid,
@@ -1452,6 +1582,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         reference_camera_id=preview_frame.camera_id,
         camera_calibration=preview_frame.camera_calibration,
         target_revision_metadata=preview_frame.target_revision_metadata,
+        camera_map_lock=preview_frame.camera_map_lock,
         camera_position_world_m=preview_frame.camera_position_world_m,
         camera_right_world_xz=preview_frame.camera_right_world_xz,
         camera_forward_world_xz=preview_frame.camera_forward_world_xz,

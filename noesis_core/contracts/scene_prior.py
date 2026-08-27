@@ -81,6 +81,44 @@ class ScenePriorGrid(ContractModel):
         return self
 
 
+class ScenePriorCameraMapLock(ContractModel):
+    """Revision-bound static-camera registration residual applied in target world."""
+
+    contract: Literal["noesis.scene_prior.camera_map_lock"]
+    contract_version: Literal[1]
+    evidence: ArtifactFingerprint
+    camera_id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+    )
+    yaw_correction_deg: float = Field(ge=-45.0, le=45.0)
+    rotation_pivot: Literal["camera_optical_center_target_world_m"]
+    pivot_world_m: tuple[float, float, float]
+    base_camera_forward_world_xz: tuple[float, float]
+    corrected_camera_forward_world_xz: tuple[float, float]
+
+    @model_validator(mode="after")
+    def _valid_map_lock(self) -> "ScenePriorCameraMapLock":
+        values = (
+            self.yaw_correction_deg,
+            *self.pivot_world_m,
+            *self.base_camera_forward_world_xz,
+            *self.corrected_camera_forward_world_xz,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("scene-prior camera map lock must be finite")
+        for axis in (
+            self.base_camera_forward_world_xz,
+            self.corrected_camera_forward_world_xz,
+        ):
+            if abs(math.hypot(*axis) - 1.0) > 1e-6:
+                raise ValueError(
+                    "scene-prior camera map-lock forward axes must be unit vectors"
+                )
+        return self
+
+
 class ScenePriorPreview(ContractModel):
     coordinate_frame: Literal["camera_local_ground_m"]
     units: Literal["meters"]
@@ -99,6 +137,7 @@ class ScenePriorPreview(ContractModel):
     )
     camera_calibration: ArtifactFingerprint
     target_revision_metadata: ArtifactFingerprint
+    camera_map_lock: ScenePriorCameraMapLock | None = None
     camera_position_world_m: tuple[float, float, float]
     camera_right_world_xz: tuple[float, float]
     camera_forward_world_xz: tuple[float, float]
@@ -523,6 +562,7 @@ __all__ = [
     "MAX_SCENE_PRIOR_ARTIFACT_BYTES",
     "ScenePriorArtifact",
     "ScenePriorBounds",
+    "ScenePriorCameraMapLock",
     "ScenePriorCameraBinding",
     "ScenePriorCatalog",
     "ScenePriorCatalogEntry",

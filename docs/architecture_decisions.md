@@ -650,3 +650,33 @@ publication worker creates backlog even after query-level optimization. The
 journal can be reconstructed from canonical publications; making live tracking
 wait for disk violates the accepted hot-path boundary without improving the
 world estimate.
+
+## ADR-026 — Static-camera PCF map lock is a revision-bound frame edge
+
+**Accepted:** 2026-08-27
+
+A residual found by matching a calibrated static-camera recording to its PCF
+belongs at the camera-to-PCF frame boundary. It does not rewrite the shared raw
+camera-calibration bundle, rotate only the dashboard raster, or introduce a
+room-selected localization algorithm. The Scene Prior builder may compose one
+explicit, content-hashed yaw residual around the camera optical center in the
+target world frame. The resulting immutable prior records the base and corrected
+camera axes, pivot, residual, and evidence fingerprint; its frame-transform
+digest is consumed by the same world estimator, PCF rasterizer, BEV, and later
+3D consumers.
+
+The current Family Room target-world correction is `+18.25` degrees. The raw
+image/BEV edge-fit residual is `-18.25` degrees and is sign-inverted when
+expressed as target-world yaw, so the visible PCF center moves counter-clockwise
+from the uncorrected camera center. The correction is bound to the exact
+camera-calibration digest, static reconstruction revision/metadata digest, and
+recorded-clip evidence in
+`config/scene_prior_camera_map_lock_family_room.json`. Kitchen and Living Room
+bindings remain byte-for-byte unchanged. A stale calibration or reconstruction
+causes the builder to fail closed instead of carrying the residual forward.
+
+**Why:** The Family PCF/video comparison exposed an azimuth error after floor
+leveling was already correct. Rotating around the camera center corrects the
+ray-to-map relationship without moving the camera or floor, preserves the raw
+multi-camera/depth identities, and makes the correction reproducible rather
+than a presentation-only offset.

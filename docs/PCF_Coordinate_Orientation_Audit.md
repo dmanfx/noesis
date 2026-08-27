@@ -140,7 +140,7 @@ raster.
 | Camera | Scene Prior | Raster rows x columns | Camera row fraction from top | Metric E determinant | Display determinant | Axis probes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | Living Room | `sceneprior_living-room_20260802T202254Z_737f02e4f303` | 391 x 466 | 0.9437 | +1.000000 | -1.000000 | camera `(0,0)`, right `(1,0)`, forward `(0,1)` |
-| Family Room | `sceneprior_family-room_20260811T015847Z_ffdc144a8f59` | 291 x 517 | 0.9313 | +1.000000 | -1.000000 | camera `(0,0)`, right `(1,0)`, forward `(0,1)` |
+| Family Room | `sceneprior_family-room_20260811T015847Z_8b80dc69a7c4` | 291 x 517 | 0.9313 | +1.000000 | -1.000000 | camera `(0,0)`, right `(1,0)`, forward `(0,1)` |
 | Kitchen | `sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483` | 448 x 698 | 0.8929 | +1.000000 | -1.000000 | camera `(0,0)`, right `(1,0)`, forward `(0,1)` |
 
 The validation command was:

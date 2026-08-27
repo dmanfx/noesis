@@ -135,6 +135,13 @@ the same space. Do not broaden the semantic selection merely because the scan
 reconstructs through a doorway: the complete measured geometry is retained,
 while the authored map independently owns room membership.
 
+When accepted static-image evidence proves that one fixed camera still has a
+camera-to-PCF yaw residual, pass its revision-bound contract with
+`--camera-map-lock <path>`. The builder rejects camera, calibration, target
+revision, or target-metadata mismatches. This corrects the camera-to-map edge
+around the optical center; it does not alter shared image calibration or add a
+runtime camera/room policy.
+
 The output root defaults to `data/scene_priors/`:
 
 ```text
@@ -217,7 +224,7 @@ in `shadow` mode:
   and 22,733 authored floor-supported cells (36.52%). Across the complete
   reconstruction it retains 45,516 observed cells, 26,189 floor-supported
   cells, and 11,171 obstacle-candidate cells.
-- Family Room: `sceneprior_family-room_20260811T015847Z_ffdc144a8f59`,
+- Family Room: `sceneprior_family-room_20260811T015847Z_8b80dc69a7c4`,
   bound to camera and space `family-room`. At 2.5 cm resolution it contains
   119,554 source points, 118,819 vertically admitted full-reconstruction
   selections, 49,762 authored cells, 24,960 authored observed cells (50.16%),
@@ -236,16 +243,17 @@ All three revisions use the prior-conditioned MapAnything + DA3 consensus with
 the DA3 trajectory as pose carrier. Phone-walk inputs remain phone-only; the
 calibrated static reconstruction is the alignment authority and independent
 validation target. The immutable Family Room lineage resolved an earlier
-local-X/Z target-frame mismatch before admission. Current alignment treats the
-target cloud and calibrated camera as authoritative, validates forward
-visibility, and refuses a mismatch instead of rotating either one. No
-room-specific correction is applied during Scene Prior serialization or
-presentation.
+local-X/Z target-frame mismatch before admission. Its current camera binding
+additionally carries the revision-bound `+18.25` degree target-world
+static-camera PCF map
+lock described by ADR-026. That edge rotates metric camera rays around the
+unchanged optical center; it is not a dashboard transform or room-selected
+localization policy.
 
 The Living Room preview uses camera-right `(-0.973939, -0.226811)` and
 camera-forward `(-0.226811, 0.973939)` in backend-world X/Z. The Family Room
-preview uses camera-right `(0.929727, 0.368249)` and camera-forward
-`(0.368249, -0.929727)`. The Kitchen preview uses camera-right
+preview uses camera-right `(0.998283, 0.058569)` and camera-forward
+`(0.058569, -0.998283)`. The Kitchen preview uses camera-right
 `(-0.994522, 0.104528)` and camera-forward `(0.104528, 0.994522)`. These values
 describe review orientation, not production tracking acceptance.
 

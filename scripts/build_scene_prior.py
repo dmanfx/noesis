@@ -41,6 +41,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--room-group-map", type=Path, required=True)
     parser.add_argument("--world-to-scene", type=Path, required=True)
     parser.add_argument(
+        "--camera-map-lock",
+        type=Path,
+        help=(
+            "Optional revision-bound static-camera yaw residual to compose at "
+            "the camera-to-PCF boundary."
+        ),
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=REPO_ROOT / "data" / "scene_priors",
@@ -77,6 +85,7 @@ def main() -> int:
         room_group_map=args.room_group_map,
         world_to_scene=args.world_to_scene,
         output_root=args.output_root,
+        camera_map_lock=args.camera_map_lock,
         camera_ids=tuple(args.camera_ids),
         grid_resolution_m=args.grid_resolution_m,
         floor_support_band_m=args.floor_support_band_m,

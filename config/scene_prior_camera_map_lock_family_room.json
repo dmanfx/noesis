@@ -1,0 +1,23 @@
+{
+  "contract": "noesis.scene_prior.camera_map_lock.input",
+  "contract_version": 1,
+  "camera_id": "family-room",
+  "source_camera_calibration_sha256": "9b34e3ea8a3808475584a55383afcff96373a9e0845d33dc026a6659c975be93",
+  "target_revision_id": "vt_family_room_stream_rgbmesh_20260623T215850_645134993",
+  "target_revision_metadata_sha256": "67dee858ad3c5b0564e7d364b9522e59842f14b7c7de1c07659216e1defedd9c",
+  "yaw_correction_deg": 18.25,
+  "rotation_pivot": "camera_optical_center_target_world_m",
+  "evidence": {
+    "method": "static_pcf_video_edge_fit_v1",
+    "clip_basename": "familyroomclip.mp4",
+    "clip_sha256": "1d5f4c17ddb18fa09c48c15c3a2303f83637888be79341e6409837015b35bcf5",
+    "clip_size_bytes": 33679229,
+    "rectified_frame_samples": 9,
+    "sample_times_s": [3, 12, 21, 30, 39, 48, 57, 66, 75],
+    "robust_edge_fit_residual_deg": -18.25,
+    "observed_space_centroid_residual_deg": -18.059,
+    "target_world_yaw_correction_deg": 18.25,
+    "sign_conversion": "invert_image_bev_residual_for_target_world_yaw",
+    "review_selection": "static_pcf_video_fit_counter_clockwise"
+  }
+}

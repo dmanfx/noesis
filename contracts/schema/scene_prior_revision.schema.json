@@ -114,6 +114,101 @@
       "title": "ScenePriorBounds",
       "type": "object"
     },
+    "ScenePriorCameraMapLock": {
+      "additionalProperties": false,
+      "description": "Revision-bound static-camera registration residual applied in target world.",
+      "properties": {
+        "base_camera_forward_world_xz": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Base Camera Forward World Xz",
+          "type": "array"
+        },
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "contract": {
+          "const": "noesis.scene_prior.camera_map_lock",
+          "title": "Contract",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "corrected_camera_forward_world_xz": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Corrected Camera Forward World Xz",
+          "type": "array"
+        },
+        "evidence": {
+          "$ref": "#/$defs/ArtifactFingerprint"
+        },
+        "pivot_world_m": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Pivot World M",
+          "type": "array"
+        },
+        "rotation_pivot": {
+          "const": "camera_optical_center_target_world_m",
+          "title": "Rotation Pivot",
+          "type": "string"
+        },
+        "yaw_correction_deg": {
+          "maximum": 45.0,
+          "minimum": -45.0,
+          "title": "Yaw Correction Deg",
+          "type": "number"
+        }
+      },
+      "required": [
+        "contract",
+        "contract_version",
+        "evidence",
+        "camera_id",
+        "yaw_correction_deg",
+        "rotation_pivot",
+        "pivot_world_m",
+        "base_camera_forward_world_xz",
+        "corrected_camera_forward_world_xz"
+      ],
+      "title": "ScenePriorCameraMapLock",
+      "type": "object"
+    },
     "ScenePriorDerivation": {
       "additionalProperties": false,
       "properties": {
@@ -246,6 +341,17 @@
           ],
           "title": "Camera Forward World Xz",
           "type": "array"
+        },
+        "camera_map_lock": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScenePriorCameraMapLock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "camera_position_world_m": {
           "maxItems": 3,

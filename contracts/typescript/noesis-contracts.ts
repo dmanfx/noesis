@@ -592,6 +592,18 @@ export type ScenePriorCameraBinding = {
   readonly frame_binding?: ScenePriorFrameBinding | null;
 };
 
+export type ScenePriorCameraMapLock = {
+  readonly contract: "noesis.scene_prior.camera_map_lock";
+  readonly contract_version: 1;
+  readonly evidence: ArtifactFingerprint;
+  readonly camera_id: string;
+  readonly yaw_correction_deg: number;
+  readonly rotation_pivot: "camera_optical_center_target_world_m";
+  readonly pivot_world_m: readonly [number, number, number];
+  readonly base_camera_forward_world_xz: readonly [number, number];
+  readonly corrected_camera_forward_world_xz: readonly [number, number];
+};
+
 export type ScenePriorCatalog = {
   readonly contract: "noesis.scene_prior.catalog";
   readonly contract_version: 1;
@@ -661,6 +673,7 @@ export type ScenePriorPreview = {
   readonly reference_camera_id: string;
   readonly camera_calibration: ArtifactFingerprint;
   readonly target_revision_metadata: ArtifactFingerprint;
+  readonly camera_map_lock?: ScenePriorCameraMapLock | null;
   readonly camera_position_world_m: readonly [number, number, number];
   readonly camera_right_world_xz: readonly [number, number];
   readonly camera_forward_world_xz: readonly [number, number];

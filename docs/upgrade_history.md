@@ -3,6 +3,21 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-27 — Family Room camera-to-PCF yaw map lock
+
+- Replaced the temporary dashboard yaw comparison markers with an authoritative
+  revision-bound Family Room camera-to-PCF map lock. The selected static
+  PCF/video fit applies `+18.25` target-world degrees around the camera optical
+  center, changing the active heading from `158.39` to `176.64` degrees while keeping
+  camera position and floor elevation unchanged.
+- Rebuilt and bound
+  `sceneprior_family-room_20260811T015847Z_8b80dc69a7c4`; its manifest carries
+  the map-lock evidence fingerprint and its corrected frame transform is
+  consumed by tracking/world localization and PCF presentation together.
+- Preserved the raw shared calibration bundle, image-space depth-registration
+  fingerprints, and the Kitchen/Living Scene Prior bindings. Focused contract,
+  calibration, and orientation checks passed before the runtime restart.
+
 ## 2026-08-25 — Universal uncertainty-aware person localization
 
 - Replaced the active Family/Kitchen/Living room-specific measurement policy

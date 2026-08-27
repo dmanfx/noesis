@@ -660,20 +660,20 @@ def _family_active_frame_binding(repo_root: Path) -> ScenePriorFrameBinding:
     assert source.revision == "b73b6a742e2d0d5936876875d904aa74c98996088f06efd04d552dac3f96a214"
     target = RevisionedFrame(
         BACKEND_WORLD_FRAME_ID,
-        "sceneprior_family-room_20260811T015847Z_ffdc144a8f59",
+        "sceneprior_family-room_20260811T015847Z_8b80dc69a7c4",
     )
     world_correction = (
-        0.9958827241807826, -0.09059934064225462, 0.0030592733536001456, 0.0,
-        0.09059934064225462, 0.9936095819714693, -0.06731833397872138, 0.0,
-        0.0030592733536001456, 0.06731833397872138, 0.9977268577906867, 0.0,
-        -0.0035292452401627372, 0.17446172385443262, 0.0026223470070050325, 1.0,
+        0.9467470066425219, -0.09059934064225462, -0.30896903548513316, 0.0,
+        0.0649604489274947, 0.9936095819714693, -0.09230459733740415, 0.0,
+        0.31535732984752884, 0.06731833397872138, 0.9465822713434718, 0.0,
+        -3.1508635068958624, 0.17446172385443262, 5.462715819965061, 1.0,
     )
     transform_sha256 = revisioned_transform_sha256(
         source,
         target,
         world_correction,
     )
-    assert transform_sha256 == "7c040ed440b0008d7d5da369af32ba0a729f47da610d77595f9bfdce97e31969"
+    assert transform_sha256 == "5bec221621ad20d64d5fc8477945b3d33ca90b75264184ea59194575167de217"
     return ScenePriorFrameBinding(
         contract="noesis.scene_prior.frame_binding",
         contract_version=1,

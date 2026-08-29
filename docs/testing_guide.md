@@ -199,6 +199,30 @@ sources and makes their decode queues non-leaky. It is intentionally absent
 from the canonical live configuration; do not infer it from a file URI or use
 it as a throughput benchmark.
 
+Generate a restartable replay config from the canonical pipeline instead of
+editing `infer.yaml` or depending on a temporary dotfile:
+
+```bash
+python DS9/scripts/render_recorded_replay_config.py \
+  --output /private/runtime/config/infer-replay.yaml \
+  --source living-room=/absolute/path/living-room.mp4 \
+  --source kitchen=/absolute/path/kitchen.mp4 \
+  --source family-room=/absolute/path/family-room.mp4
+```
+
+The renderer preserves the configured models, resolution, tracker, canonical
+world resolver, dewarpers, and outputs. It changes only the three source URIs,
+marks the mux inputs non-live, and enables real-time frame-preserving replay.
+Run that generated file through the same native-host supervisor and explicit
+model size used by the test:
+
+```bash
+python DS9/scripts/run_canonical_runtime_host.py check \
+  --pipeline-config /private/runtime/config/infer-replay.yaml --model-size l
+python DS9/scripts/run_canonical_runtime_host.py run \
+  --pipeline-config /private/runtime/config/infer-replay.yaml --model-size l
+```
+
 ## Performance checks
 
 Performance work starts with the `deepstream-profile-pipeline` skill and uses

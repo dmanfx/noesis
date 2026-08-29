@@ -133,6 +133,29 @@ def test_mv3dt_command_is_an_explicit_native_host_lane(tmp_path: Path) -> None:
     assert argv[argv.index("--tracking-mode") + 1] == "mv3dt"
 
 
+def test_baseline_replay_can_use_an_explicit_config_without_changing_quality(tmp_path: Path) -> None:
+    storage = tmp_path / "depth"
+    replay = tmp_path / "infer-replay.yaml"
+    replay.write_text("version: 1\n", encoding="utf-8")
+    argv = host.canonical_runtime_arguments(
+        storage_base=storage,
+        pipeline_config=replay,
+        model_size="l",
+    )
+    assert argv[argv.index("--pipeline-config") + 1] == str(replay)
+    assert argv[argv.index("--size") + 1] == "l"
+    assert argv[argv.index("--tracking-mode") + 1] == "baseline"
+
+
+def test_mv3dt_rejects_a_pipeline_override(tmp_path: Path) -> None:
+    with pytest.raises(host.NativeRuntimeError, match="baseline lane"):
+        host.canonical_runtime_arguments(
+            storage_base=tmp_path / "depth",
+            tracking_mode="mv3dt",
+            pipeline_config=tmp_path / "infer-replay.yaml",
+        )
+
+
 def test_run_environment_strips_selector_and_docker(tmp_path: Path) -> None:
     env = _config_env(tmp_path)
     env.update(

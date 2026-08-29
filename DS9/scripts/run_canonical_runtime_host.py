@@ -285,18 +285,28 @@ def canonical_runtime_arguments(
     *,
     storage_base: Path,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pipeline_config: str | Path | None = None,
+    model_size: str | None = None,
 ) -> list[str]:
     lane = _runtime_lane(tracking_mode)
+    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+        _fail("a pipeline config override is supported only for the baseline lane")
+    if model_size is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+        _fail("a model size override is supported only for the baseline lane")
+    selected_pipeline = os.fspath(pipeline_config or lane["pipeline_config"])
+    selected_size = str(model_size or lane["model_size"]).strip().lower()
+    if selected_size not in {"m", "l"}:
+        _fail("model size must be m or l")
     return [
         "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
-        lane["pipeline_config"],
+        selected_pipeline,
         "--cameras-config",
         lane["cameras_config"],
         "--pgie-profile",
         lane["pgie_profile"],
         "--size",
-        lane["model_size"],
+        selected_size,
         "--tracking-mode",
         lane["tracking_mode"],
         "--ws-host",
@@ -833,15 +843,18 @@ def run_preflight(
     env: Mapping[str, str],
     *,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pipeline_config: Path | None = None,
 ) -> None:
     lane = _runtime_lane(tracking_mode)
+    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+        _fail("a pipeline config override is supported only for the baseline lane")
     script = DS9_ROOT / "scripts" / "ds9_preflight.py"
     result = subprocess.run(
         [
             str(config.venv_python),
             str(script),
             "--config",
-            str(config.repo_root / lane["pipeline_config"]),
+            str(pipeline_config or (config.repo_root / lane["pipeline_config"])),
             "--cameras-config",
             str(config.repo_root / lane["cameras_config"]),
         ],
@@ -858,6 +871,8 @@ def check_native(
     config: NativeHostConfig,
     *,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pipeline_config: Path | None = None,
+    model_size: str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     lane = _runtime_lane(tracking_mode)
@@ -877,7 +892,12 @@ def check_native(
         build_root=config.runtime / "build" / "check",
         tracking_mode=lane["tracking_mode"],
     )
-    run_preflight(config, check_env, tracking_mode=lane["tracking_mode"])
+    run_preflight(
+        config,
+        check_env,
+        tracking_mode=lane["tracking_mode"],
+        pipeline_config=pipeline_config,
+    )
     return {
         "ok": True,
         "contract": CONTRACT,
@@ -890,9 +910,12 @@ def check_native(
         "artifacts": artifacts,
         "ports": occupancy,
         "lane": {
-            key: lane[key]
-            for key in ("name", "pgie_profile", "model_size", "tracking_mode")
+            "name": lane["name"],
+            "pgie_profile": lane["pgie_profile"],
+            "model_size": str(model_size or lane["model_size"]),
+            "tracking_mode": lane["tracking_mode"],
         },
+        "pipeline_config": str(pipeline_config or lane["pipeline_config"]),
     }
 
 
@@ -902,6 +925,8 @@ def build_run_command(
     session_id: str,
     storage_base: Path,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pipeline_config: Path | None = None,
+    model_size: str | None = None,
 ) -> list[str]:
     return [
         str(config.venv_python),
@@ -909,6 +934,8 @@ def build_run_command(
         *canonical_runtime_arguments(
             storage_base=storage_base,
             tracking_mode=tracking_mode,
+            pipeline_config=pipeline_config,
+            model_size=model_size,
         )[1:],
     ]
 
@@ -917,6 +944,8 @@ def run_native(
     config: NativeHostConfig,
     *,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pipeline_config: Path | None = None,
+    model_size: str | None = None,
 ) -> NoReturn:
     lane = _runtime_lane(tracking_mode)
     occupancy = port_occupancy()
@@ -940,6 +969,8 @@ def run_native(
         session_id=session_id,
         storage_base=directories["storage_base"],
         tracking_mode=lane["tracking_mode"],
+        pipeline_config=pipeline_config,
+        model_size=model_size,
     )
     os.execve(command[0], command, env)
 
@@ -956,6 +987,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "explicit Kitchen/Family Room opt-in."
         ),
     )
+    parser.add_argument(
+        "--pipeline-config",
+        type=Path,
+        help=(
+            "explicit baseline pipeline config, primarily for generated local-video replay; "
+            "the canonical live config remains the default"
+        ),
+    )
+    parser.add_argument(
+        "--model-size",
+        choices=("m", "l"),
+        help="explicit baseline detector size; the canonical lane default remains unchanged",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -963,12 +1007,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         config = load_native_config()
+        pipeline_config = None
+        if args.pipeline_config is not None:
+            pipeline_config = _absolute_path(
+                os.fspath(args.pipeline_config),
+                label="pipeline config override",
+                must_exist=True,
+            )
+            if not pipeline_config.is_file():
+                _fail(f"pipeline config override must be a regular file: {pipeline_config}")
         if args.mode == "check":
-            payload = check_native(config, tracking_mode=args.tracking_mode)
+            payload = check_native(
+                config,
+                tracking_mode=args.tracking_mode,
+                pipeline_config=pipeline_config,
+                model_size=args.model_size,
+            )
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
-        run_native(config, tracking_mode=args.tracking_mode)
+        run_native(
+            config,
+            tracking_mode=args.tracking_mode,
+            pipeline_config=pipeline_config,
+            model_size=args.model_size,
+        )
     except NativeRuntimeError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1

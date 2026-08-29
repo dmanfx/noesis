@@ -3,6 +3,28 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-28 — Guarded missing-contact continuity and target-frame dashboard projection
+
+- Added one camera-agnostic detector-bottom hypothesis for tracked person rows
+  that have no usable pose/depth ground contact. Admission requires a bounded
+  confident upright/tall-narrow box; seated/lying evidence remains excluded,
+  the candidate cannot train body height, and the universal resolver, PCF
+  evidence, and `PersonGroundState` retain final authority.
+- Made the admission signal honor either current detector confidence or NvDCF
+  tracker confidence, so DeepStream's detector-confidence sentinel on
+  tracker-generated frames no longer makes a visible tracked box disappear
+  from candidate generation between detector observations.
+- Corrected dashboard world-to-camera-local projection to transform raw camera
+  center and axes through the exact revision-bound calibration-to-target edge
+  and horizontalize them before projection. This removes the pitch/height Z
+  offset and preserves the accepted Family Room map lock without changing
+  Kitchen raw extrinsics.
+- In a 24-second paced three-MP4 application run, the guarded bbox hypothesis
+  supplied accepted canonical continuity rows in all three rooms (219 Family,
+  29 Kitchen, and 10 Living in that sample) with no pipeline/runtime error and
+  no new image, surface, or tensor copy. Focused resolver/ground tests and
+  dashboard geometry/admission tests passed.
+
 ## 2026-08-27 — Family Room camera-to-PCF yaw map lock
 
 - Replaced the temporary dashboard yaw comparison markers with an authoritative

@@ -48,6 +48,36 @@ export const resolveBevDisplayBounds = ({
   return expected || advertised;
 };
 
+/**
+ * Resolve the metric viewport used to fit the visible raster.
+ *
+ * The producer's display bounds may intentionally include a presentation
+ * margin so canonical points just outside the authored PCF remain
+ * displayable. That margin is still used for point admission, but it should
+ * not shrink the floorplan image when there is no coverage geometry to show.
+ * A coverage envelope opts back into the wider viewport because its boundary
+ * is part of the visual contract.
+ */
+export const resolveBevRenderBounds = ({
+  floorplanBounds,
+  displayBounds,
+  coverageBounds,
+  coverageToleranceM = 0,
+} = {}) => {
+  const floorplan = metricBounds(floorplanBounds);
+  const display = metricBounds(displayBounds);
+  const coverage = metricBounds(coverageBounds);
+  if (coverage) {
+    return resolveBevDisplayBounds({
+      floorplanBounds: floorplan,
+      advertisedBounds: display,
+      coverageBounds: coverage,
+      coverageToleranceM,
+    });
+  }
+  return floorplan || display;
+};
+
 const pointSegmentDistance = (x, z, ax, az, bx, bz) => {
   const dx = bx - ax;
   const dz = bz - az;

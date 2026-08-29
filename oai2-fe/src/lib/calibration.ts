@@ -3,9 +3,14 @@ import { CameraKey, detectCameraKey } from './camera';
 type CameraTables = {
   K?: Record<string, number[]>;
   E?: Record<string, number[]>;
+  frame_bindings?: Record<string, CameraFrameBinding>;
 };
 
 type CalBundle = { cameras?: CameraTables };
+
+type CameraFrameBinding = {
+  target_from_calibration_col_major?: number[];
+};
 
 let bundle: CalBundle = {};
 
@@ -28,6 +33,19 @@ export function getExtrinsics(cam: CameraKey): number[] | null {
     if (detectCameraKey(key) === cam && Array.isArray(E)) return E as number[];
   }
 
+  return null;
+}
+
+export function getFrameBinding(cam: CameraKey): CameraFrameBinding | null {
+  const cams = bundle.cameras || {};
+  const bindings = asRecord<CameraFrameBinding>(cams.frame_bindings);
+  if (!bindings) return null;
+  if (bindings[cam] && typeof bindings[cam] === 'object') return bindings[cam];
+  for (const [key, binding] of Object.entries(bindings)) {
+    if (detectCameraKey(key) === cam && binding && typeof binding === 'object') {
+      return binding;
+    }
+  }
   return null;
 }
 

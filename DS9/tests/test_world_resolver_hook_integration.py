@@ -343,6 +343,28 @@ def test_resolver_config_rejects_coercion_and_out_of_range_values(
         _processor({"canonical_world": {"measurement_resolver": config}})
 
 
+@pytest.mark.parametrize(
+    "person_admission",
+    (
+        {},
+        {"min_unposed_detection_confidence": "0.5"},
+        {"min_unposed_detection_confidence": True},
+        {"min_unposed_detection_confidence": -0.1},
+        {"min_unposed_detection_confidence": 1.1},
+        {"unexpected": 0.5},
+    ),
+)
+def test_person_admission_config_rejects_missing_coercion_and_out_of_range_values(
+    person_admission: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="person_admission"):
+        _processor({"canonical_world": {"person_admission": person_admission}})
+
+
+def test_person_admission_config_uses_explicit_default_when_omitted() -> None:
+    assert _processor()._min_unposed_detection_confidence == pytest.approx(0.50)
+
+
 def test_filtered_covariance_includes_resolver_to_emitted_displacement() -> None:
     processor = _processor()
     cohort = _cohort()

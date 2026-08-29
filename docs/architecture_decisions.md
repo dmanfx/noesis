@@ -597,6 +597,17 @@ after the current measurement is physically accepted and is enlarged by any
 resolver-to-filter displacement. Body root and semantic support surfaces are
 separate future quantities, not aliases of ground footprint.
 
+A tracker row may remain visually valid while neither pose nor object depth
+contains a current floor contact. In that bounded case the detector silhouette
+may contribute one low-confidence `bbox_bottom` floor-ray hypothesis, but only
+for a sufficiently confident, tall/narrow person box with no seated or lying
+evidence. DeepStream detector confidence and NvDCF tracker confidence are
+alternate current observation signals: the detector field's documented
+`-0.1` tracker-frame sentinel is not treated as a low-confidence detection.
+This hypothesis cannot establish learned height, bypass range or PCF evidence,
+or skip `PersonGroundState` physical admission. It is a continuity measurement
+candidate, not a dashboard-only fabricated dot.
+
 Revision-matched PCF contributes soft extent, authored-boundary,
 observed-confidence, and floor-height evidence. It never clamps or snaps a
 track. A strong authored-boundary or measured-extent contradiction keeps the
@@ -674,6 +685,16 @@ recorded-clip evidence in
 `config/scene_prior_camera_map_lock_family_room.json`. Kitchen and Living Room
 bindings remain byte-for-byte unchanged. A stale calibration or reconstruction
 causes the builder to fail closed instead of carrying the residual forward.
+
+Dashboard camera-local presentation composes that same revision-bound edge:
+camera center/right/forward are transformed by
+`target_from_calibration_col_major` after inverting raw camera-from-calibration
+`E`, then right/forward are projected onto the target-world ground plane. Raw
+pitched camera-space Z is not a floor-display coordinate because camera height
+and pitch introduce a false forward offset. Missing or invalid frame bindings
+fail closed. Kitchen requires no residual map lock; its active optical center
+is approximately 0.10 m inside the nearest authored floor boundary, so that
+small visible wall offset is expected geometry rather than an extrinsics error.
 
 **Why:** The Family PCF/video comparison exposed an azimuth error after floor
 leveling was already correct. Rotating around the camera center corrects the

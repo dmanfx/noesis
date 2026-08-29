@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   resolveBevDisplayBounds,
   resolveBevMetricPoint,
+  resolveBevRenderBounds,
 } from './bevDisplayGeometry.js';
 
 const pcfBounds = {
@@ -106,4 +107,29 @@ test('a producer displayBounds narrower than the semantic raster is not accepted
     advertisedBounds: { min_x: -2, max_x: 2, min_z: 1, max_z: 7 },
   });
   assert.deepEqual(displayBounds, pcfBounds);
+});
+
+test('raster fit uses the semantic floorplan bounds when no coverage envelope is visible', () => {
+  const displayBounds = resolveBevDisplayBounds({
+    floorplanBounds: pcfBounds,
+    advertisedBounds: producerDisplayBounds,
+  });
+  assert.deepEqual(resolveBevRenderBounds({
+    floorplanBounds: pcfBounds,
+    displayBounds,
+  }), pcfBounds);
+});
+
+test('coverage geometry keeps the wider display viewport for the raster fit', () => {
+  const coverageBounds = { min_x: -1, max_x: 3, min_z: 0, max_z: 4 };
+  const displayBounds = resolveBevDisplayBounds({
+    floorplanBounds: pcfBounds,
+    advertisedBounds: { min_x: -4, max_x: 4, min_z: 0, max_z: 8 },
+    coverageBounds,
+  });
+  assert.deepEqual(resolveBevRenderBounds({
+    floorplanBounds: pcfBounds,
+    displayBounds,
+    coverageBounds,
+  }), displayBounds);
 });

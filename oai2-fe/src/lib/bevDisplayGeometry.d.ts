@@ -33,6 +33,13 @@ export function resolveBevDisplayBounds(args?: {
   coverageToleranceM?: number;
 }): BevMetricBounds | null;
 
+export function resolveBevRenderBounds(args?: {
+  floorplanBounds?: BevMetricBounds | null;
+  displayBounds?: BevMetricBounds | null;
+  coverageBounds?: BevMetricBounds | null;
+  coverageToleranceM?: number;
+}): BevMetricBounds | null;
+
 export function coverageRegionForPoint(
   coverage: BevCoverageEnvelope | null | undefined,
   x: number,

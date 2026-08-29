@@ -9131,6 +9131,7 @@ class _AnalyticsTelemetryProcessor:
     _world_resolver_max_range_m: float = field(default=22.0, init=False, repr=False)
     _world_resolver_max_disagreement_m: float = field(default=1.25, init=False, repr=False)
     _world_resolver_diag_max_candidates: int = field(default=4, init=False, repr=False)
+    _min_unposed_detection_confidence: float = field(default=0.50, init=False, repr=False)
     # Rich candidate diagnostics are optional presentation work.  Canonical
     # resolution and the compact public summary remain enabled independently;
     # keeping this false avoids recursively copying and serializing the full
@@ -9416,6 +9417,45 @@ class _AnalyticsTelemetryProcessor:
             if isinstance(canonical_cfg, Mapping)
             else None
         )
+        person_admission_cfg = (
+            canonical_cfg.get("person_admission")
+            if isinstance(canonical_cfg, Mapping)
+            else None
+        )
+        if person_admission_cfg is None:
+            # Fixtures and legacy callers may omit the optional block.  The
+            # canonical config supplies the same explicit default, while an
+            # empty/unknown block is rejected rather than silently changing
+            # world-contact admission semantics.
+            self._min_unposed_detection_confidence = 0.50
+        else:
+            if not isinstance(person_admission_cfg, Mapping):
+                raise ValueError("canonical_world.person_admission must be a mapping")
+            try:
+                allowed_person_admission_keys = {
+                    "min_unposed_detection_confidence",
+                }
+                if set(person_admission_cfg) != allowed_person_admission_keys:
+                    raise ValueError(
+                        "person_admission fields do not match the exact contract"
+                    )
+                raw_min_unposed_confidence = person_admission_cfg.get(
+                    "min_unposed_detection_confidence"
+                )
+                if isinstance(raw_min_unposed_confidence, bool) or not isinstance(
+                    raw_min_unposed_confidence, (int, float)
+                ):
+                    raise ValueError(
+                        "person_admission min_unposed_detection_confidence must be numeric"
+                    )
+                min_unposed_confidence = float(raw_min_unposed_confidence)
+                if not math.isfinite(min_unposed_confidence) or not 0.0 <= min_unposed_confidence <= 1.0:
+                    raise ValueError(
+                        "person_admission min_unposed_detection_confidence is outside [0, 1]"
+                    )
+                self._min_unposed_detection_confidence = min_unposed_confidence
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("canonical_world.person_admission is invalid") from exc
         if resolver_cfg is not None:
             if not isinstance(resolver_cfg, Mapping):
                 raise ValueError("canonical_world.measurement_resolver must be a mapping")
@@ -12795,6 +12835,64 @@ class _AnalyticsTelemetryProcessor:
         )
 
     @staticmethod
+    def _resolve_bbox_floor_anchor(
+        bbox: Optional[Sequence[float]],
+    ) -> Optional[_PoseAnchorCandidate]:
+        """Return a conservative detector-bottom contact for an unposed person.
+
+        A class-0 tracker row can be valid while pose/depth has no contact
+        evidence (the common far/partially occluded case).  The detector
+        silhouette's bottom-center is the only image contact available then;
+        keep it explicitly lower-confidence and never use it for a height
+        lock.  Callers gate this fallback by posture/lifecycle evidence.
+        """
+
+        if bbox is None or len(bbox) < 4:
+            return None
+        try:
+            left, top, width, height = (float(value) for value in bbox[:4])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in (left, top, width, height)):
+            return None
+        if width <= 1.0 or height <= 1.0:
+            return None
+        return _PoseAnchorCandidate(
+            u=float(left + 0.5 * width),
+            v=float(top + height),
+            source="bbox_bottom",
+            contact_basis="bbox:bottom_center",
+            quality="estimated",
+            quality_reason="detector_bbox_bottom",
+            height_lock_eligible=False,
+            score=0.50,
+        )
+
+    @staticmethod
+    def _person_admission_confidence(track: Mapping[str, Any]) -> float:
+        """Return the best current DeepStream person-observation confidence.
+
+        DeepStream may set ``NvDsObjectMeta.confidence`` to its ``-0.1``
+        sentinel for tracker-generated rows even though NvDCF still publishes
+        a valid ``tracker_confidence`` for the visible box.  Treating that
+        sentinel as a detector rejection makes an otherwise continuous track
+        lose its bbox-floor hypothesis between detector observations.  Use
+        the strongest finite non-negative detector/tracker signal and clamp
+        only at this admission boundary; neither value changes estimator
+        weighting or bypasses the geometric/PCF/physical gates.
+        """
+
+        best = 0.0
+        for field_name in ("confidence", "tracker_confidence"):
+            try:
+                value = float(track.get(field_name, 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value) and value >= 0.0:
+                best = max(best, value)
+        return min(1.0, best)
+
+    @staticmethod
     def _anchor_is_verified_ground_contact(
         anchor: Optional[_PoseAnchorCandidate],
     ) -> bool:
@@ -12817,6 +12915,7 @@ class _AnalyticsTelemetryProcessor:
             "pose_single_ankle_floor",
             "pose_ankle_support",
             "pose_leg_floor",
+            "bbox_bottom",
         }:
             return True
         if source != "person_mask_floor":
@@ -15723,6 +15822,64 @@ class _AnalyticsTelemetryProcessor:
                 anchor_candidate = person_anchor
             else:
                 anchor_candidate = pose_anchor
+
+            # A tracked class-0 detection can legitimately outlive both
+            # contact-producing branches: small/far people often have no
+            # usable pose payload and the native depth capsule reports
+            # ``no_ground_contact``.  Preserve a bounded detector-bottom
+            # hypothesis for that case so the universal resolver has a
+            # current candidate.  Never use it for a seated/lying posture;
+            # pose-without-contact requires an already walking or height-
+            # locked lifecycle, while a genuinely unposed row may start from
+            # the detector silhouette itself.
+            if anchor_candidate is None:
+                depth_allows_bbox = bool(
+                    depth_result is None or depth_reports_no_ground_contact
+                )
+                admission_confidence = self._person_admission_confidence(track)
+                confidence_allows_bbox = bool(
+                    admission_confidence
+                    >= float(self._min_unposed_detection_confidence)
+                )
+                pose_lifecycle_support = bool(
+                    confidence_allows_bbox
+                    and (
+                        pose_kpts_abs is None
+                        or (
+                            state is not None
+                            and (
+                                (
+                                    str(state.motion_mode) == "walk"
+                                    and state.last_good_world is not None
+                                )
+                                or (
+                                    state.height_ref_scene is not None
+                                    and float(state.last_full_body_ts) >= 0.0
+                                    and float(now_ts) - float(state.last_full_body_ts)
+                                    <= float(self._human_ground_cfg.occlusion_upright_memory_s)
+                                )
+                            )
+                        )
+                        or (
+                            pose_kpts_abs is not None
+                            and posture == "standing"
+                        )
+                    )
+                )
+                try:
+                    bbox_width_px = float(bbox_project[2])
+                    bbox_height_px = float(bbox_project[3])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    bbox_width_px = 0.0
+                    bbox_height_px = 0.0
+                if (
+                    depth_allows_bbox
+                    and pose_lifecycle_support
+                    and posture not in ("sitting", "lying")
+                    and bbox_height_px >= 48.0
+                    and bbox_width_px / max(1.0, bbox_height_px) <= 0.85
+                ):
+                    anchor_candidate = self._resolve_bbox_floor_anchor(bbox_project)
 
             contact_basis = (
                 str(anchor_candidate.contact_basis or anchor_candidate.source)

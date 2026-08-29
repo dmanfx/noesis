@@ -17,6 +17,7 @@ import {
 } from '../lib/bevTrails';
 import {
   resolveBevDisplayBounds,
+  resolveBevRenderBounds,
   resolveBevMetricPoint,
 } from '../lib/bevDisplayGeometry';
 import {
@@ -939,17 +940,26 @@ export const BevView: React.FC<BevViewProps> = ({
         coordMode === 'world'
           ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasFloorplanCompatibleUnits)
           : !floorplanFrame || isFloorplanCameraLocal;
+      const floorplanMetricBounds = rawFloorplanBounds(floorplanNow);
+      const renderBounds = resolveBevRenderBounds({
+        floorplanBounds: isFloorplanCompatible && floorplanHasRenderableGrid(floorplanNow)
+          ? floorplanMetricBounds
+          : null,
+        displayBounds,
+        coverageBounds: coverageEnvelope?.bounds,
+        coverageToleranceM: coverageEnvelope?.boundaryToleranceM,
+      });
 
       let xMin = DEFAULT_X_MIN;
       let xMax = DEFAULT_X_MAX;
       let zMin = DEFAULT_Z_MIN;
       let zMax = DEFAULT_Z_MAX;
 
-      if (displayBounds) {
-        xMin = displayBounds.min_x;
-        xMax = displayBounds.max_x;
-        zMin = displayBounds.min_z;
-        zMax = displayBounds.max_z;
+      if (renderBounds) {
+        xMin = renderBounds.min_x;
+        xMax = renderBounds.max_x;
+        zMin = renderBounds.min_z;
+        zMax = renderBounds.max_z;
       } else if (
         metaNow &&
         typeof metaNow.xMin === 'number' && typeof metaNow.xMax === 'number' &&
@@ -977,7 +987,6 @@ export const BevView: React.FC<BevViewProps> = ({
       const hasComposite = visual.hasComposite;
       const basePalette = infernoColor;
       const hasFloorplan = visual.hasFloorplan;
-      const floorplanMetricBounds = rawFloorplanBounds(floorplanNow);
 
       // Cache the floorplan render so we don't re-decode base64 every animation frame.
       const dpr = window.devicePixelRatio || 1;
@@ -1053,8 +1062,8 @@ export const BevView: React.FC<BevViewProps> = ({
         const placeFloorplanInMetricBounds = Boolean(
           hasFloorplan
           && floorplanMetricBounds
-          && displayBounds
-          && !boundsNearlyEqual(floorplanMetricBounds, displayBounds)
+          && renderBounds
+          && !boundsNearlyEqual(floorplanMetricBounds, renderBounds)
         );
         if (coverageEnvelope || placeFloorplanInMetricBounds) {
           cvs.width = expectedW;
@@ -2009,6 +2018,7 @@ export const BevView: React.FC<BevViewProps> = ({
       const cameraOrigin = resolveForDraw(0, 0) ?? { x: (xMin + xMax) * 0.5, y: zMin, mapped: false };
       const camPx = drawX(cameraOrigin.x);
       const camPy = drawY(cameraOrigin.y);
+
       ctx.fillStyle = 'rgba(255, 215, 64, 0.95)';
       ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
       ctx.lineWidth = 2;

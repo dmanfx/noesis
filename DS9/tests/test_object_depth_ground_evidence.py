@@ -799,6 +799,302 @@ def test_no_ground_contact_drops_leg_extension_anchor_even_when_posture_unknown(
     assert state.last_good_world is None
 
 
+def test_unposed_no_ground_detection_gets_bounded_bbox_floor_candidate() -> None:
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    calibration.camera_calibration_sha256 = "b" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(
+            config={
+                "canonical_world": {
+                    "measurement_resolver": {
+                        "enabled": True,
+                        "max_range_m": 22.0,
+                        "max_disagreement_m": 1.25,
+                        "max_candidates": 4,
+                    },
+                    "person_admission": {
+                        "min_unposed_detection_confidence": 0.75,
+                    },
+                }
+            }
+        ),
+        tracking_pub=SimpleNamespace(),
+        camera_labels={0: "cam0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(
+            snapshot=lambda _sensor_id, _camera_id: calibration
+        ),
+    )
+    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=80,
+        class_id=0,
+        bbox=bbox,
+        score=0.8,
+        sampling_mode="pose_capsule_native",
+        status="no_ground_contact",
+        unit="m",
+        is_metric=True,
+        sample_count=400,
+        valid_fraction=1.0,
+        depth_median=8.0,
+        depth_center=8.0,
+    )
+    track = {
+        "tracker_id": 80,
+        "frame_id": 1,
+        "source_id": 0,
+        "observed_at_us": 1_000_000,
+        "tracker_lifecycle_generation": 1,
+        "bbox": bbox,
+        "image_size": list(calibration.image_size),
+        "confidence": 0.80,
+    }
+
+    processor._augment_track_with_world(
+        0,
+        "cam0",
+        track,
+        pose_kpts_abs=None,
+        depth_result=depth_result,
+        world_now_ts=1.0,
+    )
+
+    assert track["world_valid"] is True
+    assert track["world_source"] == "person_anchor_floor_only"
+    assert track["world_resolver_selected_id"] == "floor_ray"
+    assert track["world_resolver_contact_basis"] == "bbox_bottom"
+    assert track["world_quality"] in ("good", "estimated")
+
+
+def test_tracker_confidence_admits_bbox_floor_when_detector_confidence_is_sentinel() -> None:
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    calibration.camera_calibration_sha256 = "b" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(
+            config={
+                "canonical_world": {
+                    "measurement_resolver": {
+                        "enabled": True,
+                        "max_range_m": 22.0,
+                        "max_disagreement_m": 1.25,
+                        "max_candidates": 4,
+                    },
+                    "person_admission": {
+                        "min_unposed_detection_confidence": 0.75,
+                    },
+                }
+            }
+        ),
+        tracking_pub=SimpleNamespace(),
+        camera_labels={0: "cam0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(
+            snapshot=lambda _sensor_id, _camera_id: calibration
+        ),
+    )
+    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=83,
+        class_id=0,
+        bbox=bbox,
+        score=0.8,
+        sampling_mode="pose_capsule_native",
+        status="no_ground_contact",
+        unit="m",
+        is_metric=True,
+        sample_count=400,
+        valid_fraction=1.0,
+    )
+    track = {
+        "tracker_id": 83,
+        "frame_id": 1,
+        "source_id": 0,
+        "observed_at_us": 1_000_000,
+        "tracker_lifecycle_generation": 1,
+        "bbox": bbox,
+        "image_size": list(calibration.image_size),
+        "confidence": -0.1,
+        "tracker_confidence": 0.80,
+    }
+
+    processor._augment_track_with_world(
+        0,
+        "cam0",
+        track,
+        pose_kpts_abs=None,
+        depth_result=depth_result,
+        world_now_ts=1.0,
+    )
+
+    assert track["world_valid"] is True
+    assert track["world_resolver_selected_id"] == "floor_ray"
+    assert track["world_resolver_contact_basis"] == "bbox_bottom"
+
+
+def test_partial_pose_without_contact_gets_bbox_floor_candidate_for_confident_upright_box() -> None:
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    calibration.camera_calibration_sha256 = "b" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(
+            config={
+                "canonical_world": {
+                    "measurement_resolver": {
+                        "enabled": True,
+                        "max_range_m": 22.0,
+                        "max_disagreement_m": 1.25,
+                        "max_candidates": 4,
+                    },
+                    "person_admission": {
+                        "min_unposed_detection_confidence": 0.75,
+                    },
+                }
+            }
+        ),
+        tracking_pub=SimpleNamespace(),
+        camera_labels={0: "cam0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(
+            snapshot=lambda _sensor_id, _camera_id: calibration
+        ),
+    )
+    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    # Keep pose data present while removing both ankle contacts.  The narrow
+    # upright detector box supplies the only current, generic contact cue.
+    keypoints[hooks._POSE_KPT_INDEX["left_ankle"], 2] = 0.0
+    keypoints[hooks._POSE_KPT_INDEX["right_ankle"], 2] = 0.0
+    left, top, width, height = bbox
+    bbox = [left + 0.25 * width, top, 0.50 * width, height]
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=81,
+        class_id=0,
+        bbox=bbox,
+        score=0.80,
+        sampling_mode="pose_capsule_native",
+        status="no_ground_contact",
+        unit="m",
+        is_metric=True,
+        sample_count=400,
+        valid_fraction=1.0,
+    )
+    track = {
+        "tracker_id": 81,
+        "frame_id": 1,
+        "source_id": 0,
+        "observed_at_us": 1_000_000,
+        "tracker_lifecycle_generation": 1,
+        "bbox": bbox,
+        "confidence": 0.80,
+        "image_size": list(calibration.image_size),
+    }
+
+    processor._augment_track_with_world(
+        0,
+        "cam0",
+        track,
+        pose_kpts_abs=keypoints,
+        depth_result=depth_result,
+        world_now_ts=1.0,
+    )
+
+    assert track["world_valid"] is True
+    assert track["world_resolver_selected_id"] == "floor_ray"
+    assert track["world_resolver_contact_basis"] == "bbox_bottom"
+    assert track["world_quality"] in ("good", "estimated")
+
+
+def test_bbox_floor_fallback_rejects_partial_pose_below_configured_confidence() -> None:
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    calibration.camera_calibration_sha256 = "b" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(
+            config={
+                "canonical_world": {
+                    "measurement_resolver": {
+                        "enabled": True,
+                        "max_range_m": 22.0,
+                        "max_disagreement_m": 1.25,
+                        "max_candidates": 4,
+                    },
+                    "person_admission": {
+                        "min_unposed_detection_confidence": 0.75,
+                    },
+                }
+            }
+        ),
+        tracking_pub=SimpleNamespace(),
+        camera_labels={0: "cam0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(
+            snapshot=lambda _sensor_id, _camera_id: calibration
+        ),
+    )
+    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    keypoints[hooks._POSE_KPT_INDEX["left_ankle"], 2] = 0.0
+    keypoints[hooks._POSE_KPT_INDEX["right_ankle"], 2] = 0.0
+    left, top, width, height = bbox
+    bbox = [left + 0.25 * width, top, 0.50 * width, height]
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=82,
+        class_id=0,
+        bbox=bbox,
+        score=0.70,
+        sampling_mode="pose_capsule_native",
+        status="no_ground_contact",
+        unit="m",
+        is_metric=True,
+        sample_count=400,
+        valid_fraction=1.0,
+    )
+    track = {
+        "tracker_id": 82,
+        "frame_id": 1,
+        "source_id": 0,
+        "observed_at_us": 1_000_000,
+        "tracker_lifecycle_generation": 1,
+        "bbox": bbox,
+        "confidence": 0.70,
+        "image_size": list(calibration.image_size),
+    }
+
+    processor._augment_track_with_world(
+        0,
+        "cam0",
+        track,
+        pose_kpts_abs=keypoints,
+        depth_result=depth_result,
+        world_now_ts=1.0,
+    )
+
+    assert track["world_valid"] is False
+    assert "world" not in track
+    assert track.get("world_quality_reason") == "no_valid_measurement_or_process_continuation"
+
+
 def test_universal_resolver_keeps_independent_upright_body_scale_when_depth_has_no_contact(
     monkeypatch,
 ) -> None:
@@ -845,8 +1141,6 @@ def test_universal_resolver_keeps_independent_upright_body_scale_when_depth_has_
         is_metric=True,
         sample_count=400,
         valid_fraction=1.0,
-        depth_median=8.0,
-        depth_center=8.0,
     )
     state = hooks._WorldAnchorState(
         height_ref_scene=1.8,

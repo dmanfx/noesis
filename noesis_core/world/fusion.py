@@ -26,7 +26,10 @@ class WorldFusionConfig:
     present_ttl_us: int = 750_000
     lost_ttl_us: int = 2_000_000
     conflict_distance_m: float = 1.25
-    max_velocity_mps: float = 4.5
+    # Match the canonical human-ground/output contract. A fused entity must
+    # never reintroduce a faster velocity than the producer is allowed to
+    # publish, even when identity continuity spans a tracker transition.
+    max_velocity_mps: float = 4.0
     min_variance_m2: float = 0.0025
     max_entities: int = 64
 
@@ -45,12 +48,34 @@ class WorldFusionConfig:
 class _ResolvedObservation:
     envelope: ObservationEnvelope
     subject: SubjectRef
+    trail_segment_id: int | None = None
+    trail_break_required: bool = False
+    tracker_lifecycle_generation: int | None = None
+    source_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class _FusedState:
     observed_at_us: int
+    media_pts_ns: int | None
+    position_source: tuple[str, int, str, int | None] | None
     position: Vector3
+    continuity_identity: tuple[str, str, str | None] | None
+    last_trail_reset_tokens: tuple[
+        tuple[str, int, str, int, int | None, int], ...
+    ]
+    last_trail_segment_tokens: tuple[
+        tuple[str, int, str, int, int | None, int], ...
+    ]
+    entity: WorldEntity
+
+
+@dataclass(frozen=True)
+class _PositionStep:
+    dt_s: float
+    distance_m: float
+    speed_mps: float
+    velocity: Vector3
 
 
 class GlobalWorldFusion:
@@ -59,6 +84,12 @@ class GlobalWorldFusion:
     The service keeps raw per-camera observations, fuses only contemporaneous
     compatible positions, and exposes conflicts rather than averaging them.
     """
+
+    # Retain only a bounded number of camera-local trail reset/segment tokens
+    # per fused identity. Normal deployments have far fewer contributing
+    # cameras, while the hard cap prevents identity churn from growing private
+    # continuity state without bound.
+    MAX_TRAIL_SOURCE_TOKENS = 64
 
     def __init__(self, producer: ProducerRef, *, config: WorldFusionConfig | None = None) -> None:
         self.producer = producer
@@ -92,9 +123,43 @@ class GlobalWorldFusion:
         candidate._snapshot_sequence = int(self._snapshot_sequence)
         return candidate
 
-    def ingest(self, envelope: ObservationEnvelope, subject: SubjectRef) -> None:
+    def ingest(
+        self,
+        envelope: ObservationEnvelope,
+        subject: SubjectRef,
+        *,
+        trail_segment_id: int | None = None,
+        trail_break_required: bool = False,
+        tracker_lifecycle_generation: int | None = None,
+        source_epoch: int | None = None,
+    ) -> None:
         if envelope.payload.world is None:
             return
+        try:
+            normalized_trail_segment_id = (
+                int(trail_segment_id)
+                if trail_segment_id is not None and int(trail_segment_id) >= 0
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            normalized_trail_segment_id = None
+        try:
+            normalized_lifecycle_generation = (
+                int(tracker_lifecycle_generation)
+                if tracker_lifecycle_generation is not None
+                and int(tracker_lifecycle_generation) >= 0
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            normalized_lifecycle_generation = None
+        try:
+            normalized_source_epoch = (
+                int(source_epoch)
+                if source_epoch is not None and int(source_epoch) >= 0
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            normalized_source_epoch = None
         source_base = (envelope.payload.tracklet.camera_id, envelope.payload.tracklet.source_id)
         previous_run = self._source_runs.get(source_base)
         if previous_run is not None and previous_run != envelope.producer.run_id:
@@ -146,7 +211,17 @@ class GlobalWorldFusion:
             )
             if replaced_key != tracklet_key:
                 self._entity_by_tracklet.pop(replaced_key, None)
-        entity_observations[camera_id] = _ResolvedObservation(envelope=envelope, subject=subject)
+        entity_observations[camera_id] = _ResolvedObservation(
+            envelope=envelope,
+            subject=subject,
+            trail_segment_id=normalized_trail_segment_id,
+            trail_break_required=bool(
+                trail_break_required is True
+                and normalized_trail_segment_id is not None
+            ),
+            tracker_lifecycle_generation=normalized_lifecycle_generation,
+            source_epoch=normalized_source_epoch,
+        )
         self._entity_by_tracklet[tracklet_key] = subject.subject_id
         self._by_entity.move_to_end(subject.subject_id)
         while len(self._by_entity) > self.config.max_entities:
@@ -304,7 +379,40 @@ class GlobalWorldFusion:
             for item in usable
             if latest_at - item.envelope.observed_at_us <= self.config.simultaneous_window_us
         ]
-        anchor = min(contemporaneous, key=self._anchor_sort_key)
+        authoritative = [
+            item
+            for item in contemporaneous
+            if item.envelope.payload.world is not None
+            and item.envelope.payload.world.quality != "held"
+        ]
+        ignored_held: list[tuple[_ResolvedObservation, str]] = []
+        if authoritative:
+            # A state-integrated held point keeps one camera current, but it is
+            # not an independent metric hypothesis and must not pull a fresh
+            # camera observation through covariance intersection.
+            fusion_candidates = authoritative
+            ignored_held = [
+                (item, "non_authoritative_held_continuation")
+                for item in contemporaneous
+                if item not in authoritative
+            ]
+        else:
+            # With no fresh metric camera, use the newest held continuation
+            # exactly.  Never average two process-model continuations: their
+            # errors can be correlated and the resulting point would exist in
+            # neither tracking cohort.
+            selected_held = min(
+                contemporaneous,
+                key=self._held_continuation_sort_key,
+            )
+            fusion_candidates = [selected_held]
+            ignored_held = [
+                (item, "non_authoritative_held_continuation")
+                for item in contemporaneous
+                if item is not selected_held
+            ]
+
+        anchor = min(fusion_candidates, key=self._anchor_sort_key)
         anchor_world = anchor.envelope.payload.world
         assert anchor_world is not None
         anchor_target_identity = self._target_frame_identity(anchor_world)
@@ -312,7 +420,7 @@ class GlobalWorldFusion:
 
         accepted: list[_ResolvedObservation] = []
         rejected: list[tuple[_ResolvedObservation, str]] = []
-        for item in contemporaneous:
+        for item in fusion_candidates:
             world = item.envelope.payload.world
             assert world is not None
             item_has_any_identity = self._has_any_registration_identity(world)
@@ -341,10 +449,11 @@ class GlobalWorldFusion:
         position, covariance = self._weighted_position(accepted)
         source_evidence: list[WorldSourceEvidence] = []
         rejected_ids = {id(item): reason for item, reason in rejected}
+        ignored_held_ids = {id(item): reason for item, reason in ignored_held}
         for item in contemporaneous:
             world = item.envelope.payload.world
             assert world is not None
-            reason = rejected_ids.get(id(item))
+            reason = rejected_ids.get(id(item)) or ignored_held_ids.get(id(item))
             source_evidence.append(
                 WorldSourceEvidence(
                     observation_id=item.envelope.observation_id,
@@ -373,9 +482,109 @@ class GlobalWorldFusion:
         }
         room_id = next(iter(accepted_zones)) if len(accepted_zones) == 1 else None
         room_conflict = len(accepted_zones) > 1
-        velocity = self._velocity(entity_id, latest_at, position)
+        position_observed_at: int | None = None
+        continuity_identity: tuple[str, str, str | None] | None = None
+        accepted_trail_reset_tokens: tuple[
+            tuple[str, int, str, int, int | None, int], ...
+        ] = ()
+        accepted_trail_segment_tokens: tuple[
+            tuple[str, int, str, int, int | None, int], ...
+        ] = ()
+        consumed_trail_reset_tokens: tuple[
+            tuple[str, int, str, int, int | None, int], ...
+        ] = ()
+        position_media_pts_ns: int | None = None
+        position_source: tuple[str, int, str, int | None] | None = None
+        if authoritative:
+            position_observed_at = max(
+                item.envelope.observed_at_us for item in accepted
+            )
+            position_media_pts_ns, position_source = self._position_clock(accepted)
+            continuity_identity = self._fusion_continuity_identity(accepted)
+            accepted_trail_reset_tokens = (
+                self._accepted_trail_tokens(
+                    accepted,
+                    explicit_breaks_only=True,
+                )
+            )
+            accepted_trail_segment_tokens = (
+                self._accepted_trail_tokens(
+                    accepted,
+                    explicit_breaks_only=False,
+                )
+            )
+            previous = self._last_fused.get(entity_id)
+            step = self._position_step(
+                previous,
+                observed_at_us=position_observed_at,
+                media_pts_ns=position_media_pts_ns,
+                position_source=position_source,
+                position=position,
+            )
+            continuity_matches = bool(
+                previous is not None
+                and continuity_identity is not None
+                and continuity_identity == previous.continuity_identity
+            )
+            previous_trail_reset_tokens = (
+                previous.last_trail_reset_tokens
+                if previous is not None
+                else ()
+            )
+            previous_trail_segment_tokens = (
+                previous.last_trail_segment_tokens
+                if previous is not None
+                else ()
+            )
+            trail_reset_applies = bool(
+                continuity_matches
+                and self._contains_new_trail_token(
+                    previous_trail_reset_tokens,
+                    accepted_trail_reset_tokens,
+                )
+            )
+            changed_trail_segment_tokens = self._changed_trail_segment_tokens(
+                previous_trail_segment_tokens,
+                accepted_trail_segment_tokens,
+            )
+            trail_segment_reset_applies = bool(
+                continuity_matches and changed_trail_segment_tokens
+            )
+            consumed_trail_reset_tokens = self._merge_trail_tokens(
+                accepted_trail_reset_tokens,
+                changed_trail_segment_tokens,
+            )
+            trail_reset_applies = bool(
+                trail_reset_applies or trail_segment_reset_applies
+            )
+            if (
+                continuity_matches
+                and not trail_reset_applies
+                and step is not None
+                and step.speed_mps > self.config.max_velocity_mps
+            ):
+                return self._retain_after_velocity_rejection(
+                    previous=previous,
+                    now_us=now_us,
+                    step=step,
+                    accepted=accepted,
+                    source_evidence=source_evidence,
+                    simultaneous_conflict=bool(rejected),
+                    room_conflict=room_conflict,
+                )
+            velocity = (
+                step.velocity
+                if continuity_matches
+                and not trail_reset_applies
+                and step is not None
+                else None
+            )
+        else:
+            # Held continuation is already the output of the per-track process
+            # model.  Do not feed it back into the independent global velocity
+            # baseline or report a second derived velocity as fresh evidence.
+            velocity = None
         subject = anchor.subject
-        self._last_fused[entity_id] = _FusedState(observed_at_us=latest_at, position=position)
         conflict_reasons: list[str] = []
         if rejected:
             conflict_reasons.append(
@@ -406,7 +615,7 @@ class GlobalWorldFusion:
             for item in accepted
             if item.envelope.payload.world is not None
         }
-        return WorldEntity(
+        entity = WorldEntity(
             entity_id=entity_id,
             subject=subject,
             lifecycle=lifecycle,
@@ -439,6 +648,118 @@ class GlobalWorldFusion:
             conflict=bool(rejected) or room_conflict,
             conflict_reason="; ".join(conflict_reasons) or None,
         )
+        if authoritative and position_observed_at is not None:
+            previous = self._last_fused.get(entity_id)
+            if (
+                previous is None
+                or continuity_identity != previous.continuity_identity
+                or position_observed_at >= previous.observed_at_us
+            ):
+                carried_trail_reset_tokens = (
+                    previous.last_trail_reset_tokens
+                    if previous is not None
+                    and continuity_identity == previous.continuity_identity
+                    else ()
+                )
+                carried_trail_segment_tokens = (
+                    previous.last_trail_segment_tokens
+                    if previous is not None
+                    and continuity_identity == previous.continuity_identity
+                    else ()
+                )
+                self._last_fused[entity_id] = _FusedState(
+                    observed_at_us=position_observed_at,
+                    media_pts_ns=position_media_pts_ns,
+                    position_source=position_source,
+                    position=position,
+                    continuity_identity=continuity_identity,
+                    last_trail_reset_tokens=self._merge_trail_tokens(
+                        carried_trail_reset_tokens,
+                        consumed_trail_reset_tokens,
+                    ),
+                    last_trail_segment_tokens=self._merge_trail_tokens(
+                        carried_trail_segment_tokens,
+                        accepted_trail_segment_tokens,
+                    ),
+                    entity=entity,
+                )
+        return entity
+
+    def _retain_after_velocity_rejection(
+        self,
+        *,
+        previous: _FusedState,
+        now_us: int,
+        step: _PositionStep,
+        accepted: list[_ResolvedObservation],
+        source_evidence: list[WorldSourceEvidence],
+        simultaneous_conflict: bool,
+        room_conflict: bool,
+    ) -> WorldEntity | None:
+        age_us = max(0, now_us - previous.observed_at_us)
+        if age_us > self.config.lost_ttl_us:
+            return None
+
+        rejection_reason = (
+            f"velocity_gate:{step.distance_m:.3f}m/{step.dt_s:.3f}s="
+            f"{step.speed_mps:.3f}mps>{self.config.max_velocity_mps:.3f}mps"
+        )[:200]
+        rejected_observation_ids = {
+            item.envelope.observation_id for item in accepted
+        }
+        rejected_current = tuple(
+            evidence.model_copy(
+                update={
+                    "accepted": False,
+                    "rejection_reason": rejection_reason,
+                }
+            )
+            if evidence.observation_id in rejected_observation_ids
+            else evidence
+            for evidence in source_evidence
+        )
+        prior_sources = previous.entity.sources
+        # A prior source may also be present in the current simultaneous
+        # cohort and have been rejected only because the implausible candidate
+        # temporarily became that cohort's anchor.  Retaining the prior fused
+        # position must retain the exact evidence that authorized it as well;
+        # only genuinely new current observations are appended as rejected.
+        sources_by_observation = {
+            source.observation_id: source
+            for source in (*rejected_current, *prior_sources)
+        }
+
+        conflict_reasons = [
+            "implausible same-identity position step rejected; prior fused position retained"
+        ]
+        if simultaneous_conflict:
+            conflict_reasons.append("simultaneous source position conflict")
+        if room_conflict:
+            conflict_reasons.append("simultaneous source room conflict")
+        if previous.entity.conflict_reason:
+            conflict_reasons.append(previous.entity.conflict_reason)
+        conflict_reason = "; ".join(dict.fromkeys(conflict_reasons))[:240]
+        lifecycle = (
+            EntityLifecycle.PRESENT
+            if age_us <= self.config.present_ttl_us
+            else EntityLifecycle.HELD
+        )
+        return previous.entity.model_copy(
+            update={
+                "lifecycle": lifecycle,
+                "velocity_mps": None,
+                "observed_at_us": previous.observed_at_us,
+                "stale_after_us": previous.observed_at_us + self.config.lost_ttl_us,
+                "sources": tuple(
+                    sorted(
+                        sources_by_observation.values(),
+                        key=lambda item: (item.camera_id, item.observed_at_us),
+                    )
+                ),
+                "conflict": True,
+                "conflict_reason": conflict_reason,
+            }
+        )
 
     def _anchor_sort_key(self, item: _ResolvedObservation) -> tuple[int, float, float, int, str]:
         world = item.envelope.payload.world
@@ -449,6 +770,20 @@ class GlobalWorldFusion:
             variance,
             -float(world.confidence),
             -int(item.envelope.observed_at_us),
+            item.envelope.payload.tracklet.camera_id,
+        )
+
+    def _held_continuation_sort_key(
+        self,
+        item: _ResolvedObservation,
+    ) -> tuple[int, int, float, float, str]:
+        world = item.envelope.payload.world
+        assert world is not None
+        return (
+            -int(item.envelope.observed_at_us),
+            0 if self._has_canonical_identity(world) else 1,
+            self._variance_sum(world.covariance),
+            -float(world.confidence),
             item.envelope.payload.tracklet.camera_id,
         )
 
@@ -627,11 +962,162 @@ class GlobalWorldFusion:
             getattr(world, "calibration_revision", None),
         )
 
-    def _velocity(self, entity_id: str, observed_at_us: int, position: Vector3) -> Vector3 | None:
-        previous = self._last_fused.get(entity_id)
-        if previous is None or observed_at_us <= previous.observed_at_us:
+    @classmethod
+    def _fusion_continuity_identity(
+        cls,
+        accepted: list[_ResolvedObservation],
+    ) -> tuple[str, str, str | None] | None:
+        run_ids = {item.envelope.producer.run_id for item in accepted}
+        target_identities = {
+            cls._target_frame_identity(item.envelope.payload.world)
+            for item in accepted
+            if item.envelope.payload.world is not None
+        }
+        if len(run_ids) != 1 or len(target_identities) != 1:
             return None
-        dt_s = (observed_at_us - previous.observed_at_us) / 1_000_000.0
+        world_frame, world_frame_revision = next(iter(target_identities))
+        if world_frame != "backend_world_m":
+            return None
+        return (
+            next(iter(run_ids)),
+            world_frame,
+            world_frame_revision,
+        )
+
+    @staticmethod
+    def _accepted_trail_tokens(
+        accepted: list[_ResolvedObservation],
+        *,
+        explicit_breaks_only: bool,
+    ) -> tuple[tuple[str, int, str, int, int | None, int], ...]:
+        tokens: list[tuple[str, int, str, int, int | None, int]] = []
+        for item in accepted:
+            if item.trail_segment_id is None:
+                continue
+            if explicit_breaks_only and not item.trail_break_required:
+                continue
+            tracklet = item.envelope.payload.tracklet
+            tokens.append(
+                (
+                    tracklet.camera_id,
+                    int(tracklet.source_id),
+                    item.envelope.producer.run_id,
+                    int(tracklet.tracker_id),
+                    item.tracker_lifecycle_generation,
+                    int(item.trail_segment_id),
+                )
+            )
+        return tuple(
+            sorted(
+                tokens,
+                key=lambda token: (
+                    token[0],
+                    token[1],
+                    token[2],
+                    token[3],
+                    token[4] if token[4] is not None else -1,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _contains_new_trail_token(
+        previous: tuple[tuple[str, int, str, int, int | None, int], ...],
+        current: tuple[tuple[str, int, str, int, int | None, int], ...],
+    ) -> bool:
+        previous_by_source = {token[:5]: token for token in previous}
+        return any(previous_by_source.get(token[:5]) != token for token in current)
+
+    @staticmethod
+    def _changed_trail_segment_tokens(
+        previous: tuple[tuple[str, int, str, int, int | None, int], ...],
+        current: tuple[tuple[str, int, str, int, int | None, int], ...],
+    ) -> tuple[tuple[str, int, str, int, int | None, int], ...]:
+        previous_by_source = {token[:5]: token for token in previous}
+        return tuple(
+            token
+            for token in current
+            if (prior := previous_by_source.get(token[:5])) is not None
+            and prior[5] != token[5]
+        )
+
+    @classmethod
+    def _merge_trail_tokens(
+        cls,
+        previous: tuple[tuple[str, int, str, int, int | None, int], ...],
+        current: tuple[tuple[str, int, str, int, int | None, int], ...],
+    ) -> tuple[tuple[str, int, str, int, int | None, int], ...]:
+        merged: OrderedDict[
+            tuple[str, int, str, int, int | None],
+            tuple[str, int, str, int, int | None, int],
+        ] = OrderedDict()
+        for token in (*previous, *current):
+            source_key = token[:5]
+            merged.pop(source_key, None)
+            merged[source_key] = token
+        while len(merged) > cls.MAX_TRAIL_SOURCE_TOKENS:
+            merged.popitem(last=False)
+        return tuple(merged.values())
+
+    @staticmethod
+    def _position_clock(
+        accepted: list[_ResolvedObservation],
+    ) -> tuple[int | None, tuple[str, int, str, int | None] | None]:
+        # A fused position spanning cameras has no single media clock. Use the
+        # arrival clock for that cohort and across the subsequent handoff. A
+        # single-source position can retain its private media clock identity.
+        if len(accepted) != 1:
+            return None, None
+        item = accepted[0]
+        tracklet = item.envelope.payload.tracklet
+        return (
+            item.envelope.media_pts_ns,
+            (
+                tracklet.camera_id,
+                int(tracklet.source_id),
+                item.envelope.producer.run_id,
+                item.source_epoch,
+            ),
+        )
+
+    @staticmethod
+    def _position_step(
+        previous: _FusedState | None,
+        *,
+        observed_at_us: int,
+        media_pts_ns: int | None,
+        position_source: tuple[str, int, str, int | None] | None,
+        position: Vector3,
+    ) -> _PositionStep | None:
+        if previous is None:
+            return None
+        if (
+            position_source is not None
+            and previous.position_source is not None
+            and position_source[:3] == previous.position_source[:3]
+            and position_source[3] is not None
+            and previous.position_source[3] is not None
+            and position_source[3] != previous.position_source[3]
+        ):
+            # A source reconnect can rewind PTS while retaining the process run.
+            # The private epoch is the clock identity boundary: seed this exact
+            # position without deriving velocity across unrelated timelines.
+            return None
+        if (
+            position_source is not None
+            and position_source == previous.position_source
+            and media_pts_ns is not None
+            and previous.media_pts_ns is not None
+            and media_pts_ns > previous.media_pts_ns
+        ):
+            dt_s = (media_pts_ns - previous.media_pts_ns) / 1_000_000_000.0
+        elif observed_at_us > previous.observed_at_us:
+            # Cross-source steps and missing, repeated, or regressed media PTS
+            # have no common valid media clock, so retain the service-arrival
+            # fallback used by the public snapshot lifecycle.
+            dt_s = (observed_at_us - previous.observed_at_us) / 1_000_000.0
+        else:
+            return None
         if dt_s <= 0.0:
             return None
         velocity = Vector3(
@@ -640,7 +1126,12 @@ class GlobalWorldFusion:
             z=(position.z - previous.position.z) / dt_s,
         )
         speed = math.sqrt((velocity.x**2) + (velocity.y**2) + (velocity.z**2))
-        return velocity if speed <= self.config.max_velocity_mps else None
+        return _PositionStep(
+            dt_s=dt_s,
+            distance_m=GlobalWorldFusion._distance(previous.position, position),
+            speed_mps=speed,
+            velocity=velocity,
+        )
 
     @staticmethod
     def _diagonal(matrix: Matrix3) -> tuple[float, float, float]:

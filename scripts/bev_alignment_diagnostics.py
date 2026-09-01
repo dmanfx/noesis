@@ -25,6 +25,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
+
 
 def _now_run_id() -> str:
     return time.strftime("bev_alignment_%Y%m%d_%H%M%S")
@@ -182,6 +189,7 @@ async def _recv_json(ws: Any, timeout_s: float) -> dict[str, Any] | None:
 async def _capture_ws(
     ws_url: str,
     *,
+    auth: RequiredInternalAuth,
     cameras: list[str],
     duration_s: float,
     grid_res_m: float,
@@ -194,7 +202,7 @@ async def _capture_ws(
         raise RuntimeError(f"websockets package required: {exc}") from exc
 
     messages: list[dict[str, Any]] = []
-    async with websockets.connect(ws_url, max_size=None) as ws:
+    async with connect_required_websocket(ws_url, auth, max_size=None) as ws:
         for camera in cameras:
             request_id = f"bev-align-{camera}-{int(time.time() * 1000)}"
             await ws.send(
@@ -603,12 +611,20 @@ def summarize_messages(messages: list[Mapping[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def _wait_for_ws(ws_url: str, timeout_s: float) -> None:
+def _wait_for_ws(
+    ws_url: str,
+    timeout_s: float,
+    *,
+    auth: RequiredInternalAuth,
+) -> None:
     async def _probe() -> bool:
         try:
-            import websockets  # type: ignore
-
-            async with websockets.connect(ws_url, max_size=None, open_timeout=2.0):
+            async with connect_required_websocket(
+                ws_url,
+                auth,
+                max_size=None,
+                open_timeout=2.0,
+            ):
                 return True
         except Exception:
             return False
@@ -661,7 +677,9 @@ def main() -> int:
     parser.add_argument("--disable-rest", action="store_true")
     parser.add_argument("--disable-mosaic", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
+    add_auth_token_file_argument(parser)
     args = parser.parse_args()
+    auth = load_required_internal_auth(args.auth_token_file)
 
     run_id = str(args.run_id or _now_run_id())
     out_dir = (REPO_ROOT / args.output_root / run_id).resolve()
@@ -688,7 +706,7 @@ def main() -> int:
     if not args.no_spawn:
         proc = _spawn_runtime(args, generated_config)
         try:
-            _wait_for_ws(str(args.ws), timeout_s=45.0)
+            _wait_for_ws(str(args.ws), timeout_s=75.0, auth=auth)
         except Exception:
             if proc.poll() is not None:
                 raise RuntimeError(f"Runtime exited early with code {proc.returncode}")
@@ -698,6 +716,7 @@ def main() -> int:
         messages = asyncio.run(
             _capture_ws(
                 str(args.ws),
+                auth=auth,
                 cameras=[str(c) for c in args.cameras],
                 duration_s=float(args.duration),
                 grid_res_m=float(args.grid_res_m),

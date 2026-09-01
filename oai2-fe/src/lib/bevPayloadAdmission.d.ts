@@ -7,6 +7,7 @@ export type BevAdmissionResult<T> = {
 export function bevCameraId(payload: unknown): string;
 export function bevCohort(payload: unknown): {
   sourceId: number;
+  sourceEpoch: number;
   frameId: number;
   observedAtUs: number;
   sequence: number;

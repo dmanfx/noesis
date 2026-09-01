@@ -44,6 +44,9 @@ cases = {
     "pose_far_healthy_incidence": ((178.48, 439.68), 0.123),
     # The detector bottom is the physically plausible cross-room contact.
     "bbox_bottom_near_horizon": ((177.75, 489.0), 0.123),
+    # A hallucinated ankle materially below its detector silhouette is
+    # impossible regardless of ray incidence.
+    "pose_below_bbox_healthy_incidence": ((177.75, 516.0), 0.25),
 }
 result = {}
 for name, (anchor_uv, incidence_sin) in cases.items():
@@ -163,6 +166,11 @@ def test_family_pose_contact_gate_rejects_far_near_horizon_ankle() -> None:
     # bbox padding into a global pose rejection.
     assert result["pose_far_healthy_incidence"]["admitted"] is True
     assert result["bbox_bottom_near_horizon"]["admitted"] is True
+
+    below = result["pose_below_bbox_healthy_incidence"]
+    assert below["admitted"] is False
+    assert below["gap_px"] == pytest.approx(-27.0)
+    assert below["reason"] == "floor_contact_below_detector_silhouette"
 
     range_rejected = result["pose_range_disagreement_full_gate"]
     assert range_rejected["admitted"] is False

@@ -138,6 +138,7 @@ class ScenePriorPreview(ContractModel):
     camera_calibration: ArtifactFingerprint
     target_revision_metadata: ArtifactFingerprint
     camera_map_lock: ScenePriorCameraMapLock | None = None
+    camera_pose_anchor: ArtifactFingerprint | None = None
     camera_position_world_m: tuple[float, float, float]
     camera_right_world_xz: tuple[float, float]
     camera_forward_world_xz: tuple[float, float]

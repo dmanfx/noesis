@@ -37,6 +37,20 @@ def _track_bbox(value: object) -> tuple[float, float, float, float] | None:
     return left, top, width, height
 
 
+def _media_pts_ns(value: object) -> int | None:
+    """Normalize one usable source PTS without accepting CLOCK_TIME_NONE."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed <= 0 or parsed >= (1 << 64) - 1:
+        return None
+    return parsed
+
+
 def pair_safe_publication_interval_s(
     *,
     track_count: int,
@@ -75,6 +89,7 @@ class _ActiveTrackLifecycle:
     generation: int
     last_seen_frame_id: int
     last_seen_observed_at_us: int
+    last_seen_media_pts_ns: int | None = None
     bbox: tuple[float, float, float, float] | None = None
 
 
@@ -101,9 +116,10 @@ class TrackingLifecycleRegistry:
     """Stamp process-frame tracker generations and explicit disappearance rows.
 
     The registry is updated for every processed frame, including frames that are
-    later skipped by WebSocket rate limiting.  Reappearance after even one
-    processed absence therefore receives a new generation.  Published presence
-    is committed separately after telemetry publication succeeds, so a
+    later skipped by WebSocket rate limiting.  A brief same-source reappearance
+    may reuse its generation only when the numeric tracker ID, source-media
+    elapsed time, and bounding-box continuity all agree. Published presence is
+    committed separately after telemetry publication succeeds, so a
     disappearance tombstone always names the exact last *published* frame/time,
     never a processed frame that downstream consumers did not observe.
     """
@@ -111,7 +127,7 @@ class TrackingLifecycleRegistry:
     def __init__(
         self,
         *,
-        reappearance_grace_s: float = 0.35,
+        reappearance_grace_s: float = 0.75,
         max_retired_per_source: int = 256,
         max_center_displacement_norm: float = 0.65,
         max_bbox_size_ratio: float = 1.8,
@@ -126,6 +142,7 @@ class TrackingLifecycleRegistry:
             0,
             int(float(reappearance_grace_s) * 1_000_000),
         )
+        self._reappearance_grace_ns = int(self._reappearance_grace_us) * 1_000
         self._max_retired_per_source = max(1, int(max_retired_per_source))
         self._max_center_displacement_norm = max(
             0.0,
@@ -142,7 +159,7 @@ class TrackingLifecycleRegistry:
         # source frame so two people in one frame cannot both use the same
         # value before update_frame commits the final public subset.
         self._generation_preview_by_source: dict[
-            int, tuple[int, int, dict[int, int]]
+            int, tuple[int, int, int | None, dict[int, int]]
         ] = {}
 
     def reset_source(self, source_id: int) -> int:
@@ -171,19 +188,45 @@ class TrackingLifecycleRegistry:
         with self._lock:
             return int(self._source_epoch_by_source.get(source, 0))
 
-    def _prune_retired_locked(self, source_id: int, observed_at_us: int) -> None:
+    @staticmethod
+    def _reappearance_gap_ns(
+        lifecycle: _ActiveTrackLifecycle,
+        *,
+        observed_at_us: int,
+        media_pts_ns: int | None,
+    ) -> int | None:
+        """Prefer strictly advancing source time; use host time only as fallback."""
+
+        prior_media = lifecycle.last_seen_media_pts_ns
+        if prior_media is not None and media_pts_ns is not None:
+            if int(media_pts_ns) <= int(prior_media):
+                # Decreasing PTS is a source-boundary condition in the DS9
+                # producer. Equal PTS cannot prove any elapsed media interval.
+                return None
+            return int(media_pts_ns) - int(prior_media)
+        gap_us = int(observed_at_us) - int(lifecycle.last_seen_observed_at_us)
+        if gap_us <= 0:
+            return None
+        return int(gap_us) * 1_000
+
+    def _prune_retired_locked(
+        self,
+        source_id: int,
+        observed_at_us: int,
+        media_pts_ns: int | None,
+    ) -> None:
         retired = self._retired_by_source.get(int(source_id))
         if not retired:
             return
-        expired = [
-            tracker_id
-            for tracker_id, lifecycle in retired.items()
-            if int(observed_at_us) >= int(lifecycle.last_seen_observed_at_us)
-            and (
-                int(observed_at_us) - int(lifecycle.last_seen_observed_at_us)
-                > int(self._reappearance_grace_us)
+        expired: list[int] = []
+        for tracker_id, lifecycle in retired.items():
+            gap_ns = self._reappearance_gap_ns(
+                lifecycle,
+                observed_at_us=int(observed_at_us),
+                media_pts_ns=media_pts_ns,
             )
-        ]
+            if gap_ns is not None and gap_ns > int(self._reappearance_grace_ns):
+                expired.append(int(tracker_id))
         for tracker_id in expired:
             retired.pop(int(tracker_id), None)
         if not retired:
@@ -236,11 +279,17 @@ class TrackingLifecycleRegistry:
         lifecycle: _ActiveTrackLifecycle,
         *,
         observed_at_us: int,
+        media_pts_ns: int | None,
         bbox: tuple[float, float, float, float] | None,
     ) -> bool:
-        gap_us = int(observed_at_us) - int(lifecycle.last_seen_observed_at_us)
+        gap_ns = self._reappearance_gap_ns(
+            lifecycle,
+            observed_at_us=int(observed_at_us),
+            media_pts_ns=media_pts_ns,
+        )
         return bool(
-            0 < gap_us <= int(self._reappearance_grace_us)
+            gap_ns is not None
+            and 0 < gap_ns <= int(self._reappearance_grace_ns)
             and self._bbox_is_compatible(lifecycle.bbox, bbox)
         )
 
@@ -269,6 +318,7 @@ class TrackingLifecycleRegistry:
         *,
         frame_id: int | None = None,
         observed_at_us: int | None = None,
+        media_pts_ns: object = None,
         bbox: object = None,
     ) -> int:
         """Return the generation that the next observation would receive.
@@ -293,12 +343,13 @@ class TrackingLifecycleRegistry:
                 )
                 if observed <= 0:
                     raise ValueError("observed_at_us must be positive")
-                self._prune_retired_locked(source, observed)
+                media = _media_pts_ns(media_pts_ns)
+                self._prune_retired_locked(source, observed, media)
                 preview = self._generation_preview_by_source.get(source)
-                if preview is None or preview[:2] != (frame, observed):
-                    preview = (frame, observed, {})
+                if preview is None or preview[:3] != (frame, observed, media):
+                    preview = (frame, observed, media, {})
                     self._generation_preview_by_source[source] = preview
-                generations = preview[2]
+                generations = preview[3]
                 reserved = generations.get(tracker)
                 if reserved is None:
                     next_generation = self._next_generation_by_source.get(
@@ -309,6 +360,7 @@ class TrackingLifecycleRegistry:
                     if retired is not None and self._retired_is_reusable_locked(
                         retired,
                         observed_at_us=observed,
+                        media_pts_ns=media,
                         bbox=current_bbox,
                     ):
                         reserved = int(retired.generation)
@@ -332,6 +384,7 @@ class TrackingLifecycleRegistry:
         camera_id: str,
         frame_id: int,
         observed_at_us: int,
+        media_pts_ns: object = None,
         tracks: Sequence[MutableMapping[str, Any]],
     ) -> TrackingContinuityUpdate:
         source = _exact_nonnegative_int(source_id, "source_id")
@@ -339,6 +392,7 @@ class TrackingLifecycleRegistry:
         observed = _exact_nonnegative_int(observed_at_us, "observed_at_us")
         if observed <= 0:
             raise ValueError("observed_at_us must be positive")
+        media = _media_pts_ns(media_pts_ns)
         camera = str(camera_id or "").strip()
         if not camera:
             raise ValueError("camera_id is required")
@@ -365,14 +419,14 @@ class TrackingLifecycleRegistry:
 
             previous_ids = set(previous)
             current_id_set = set(current_ids)
-            self._prune_retired_locked(source, observed)
+            self._prune_retired_locked(source, observed, media)
             for tracker in sorted(previous_ids - current_id_set):
                 self._retire_lifecycle_locked(source, previous[tracker])
             next_generation = self._next_generation_by_source.get(source, 1)
             preview = self._generation_preview_by_source.get(source)
             preview_generations: dict[int, int] = {}
-            if preview is not None and preview[:2] == (frame, observed):
-                preview_generations = dict(preview[2])
+            if preview is not None and preview[:3] == (frame, observed, media):
+                preview_generations = dict(preview[3])
             current: dict[int, _ActiveTrackLifecycle] = {}
             for tracker in current_ids:
                 prior = previous.get(tracker)
@@ -385,6 +439,7 @@ class TrackingLifecycleRegistry:
                         if retired is not None and self._retired_is_reusable_locked(
                             retired,
                             observed_at_us=observed,
+                            media_pts_ns=media,
                             bbox=indexed_bbox[tracker],
                         ):
                             generation = int(retired.generation)
@@ -412,6 +467,7 @@ class TrackingLifecycleRegistry:
                     generation=generation,
                     last_seen_frame_id=frame,
                     last_seen_observed_at_us=observed,
+                    last_seen_media_pts_ns=media,
                     bbox=indexed_bbox[tracker],
                 )
 

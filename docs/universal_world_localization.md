@@ -82,16 +82,34 @@ The DS9 analytics hook constructs each candidate independently:
   for the depth sample's own anchor. The object-geometry and GPU depth-tensor
   frame/PTS must both match; a current bbox sampled against a lagged tensor is
   retained as diagnostics rather than mislabeled as current evidence.
-- `pose_scale`: reserved by the bounded contract for a future independent body
-  scale measurement; it is not fabricated when evidence is absent.
+- `pose_scale`: an exact-current, typed body-to-floor projection for people
+  whose physical floor contact is hidden. A standing solve intersects calibrated
+  nose, shoulder, and hip rays with their anatomical height planes and solves
+  the common height/footprint without using detector-box bottom. Five retained
+  planes spanning all three height bands are required for one-frame strong
+  proof. One three- or four-plane row never establishes canonical world state.
+  As the narrow cold-start exception, exactly two compatible current
+  four-plane solves may establish the first coordinate on the second solve
+  when they remain on the same lifecycle/body-plane basis, arrive within
+  `reacquire_max_gap_s`, and pass the ordinary physical-step bound. The first
+  solve may survive intervening no-measurement callbacks, but its timestamp is
+  never renewed. Three-plane, mixed, incompatible, expired, or basis-changing
+  evidence cannot form this proof. For an established relocation, moderate
+  rows may accumulate same-basis trajectory evidence, but only a current
+  verified five-plane row may finalize the reanchor. A seated solve projects
+  the observed torso to the support footprint with broad height covariance and
+  never relabels the pelvis itself as the ground point.
 - `gravity_reconstruction`: a deliberately weak upright-height reconstruction
   used only when the existing PersonGroundState evidence permits it.  It is not
   a seated/lying floor contact.
 
 A failure in one source does not suppress an independently valid source.
-Cached depth is not current evidence.  Bbox-only, torso-only, contaminated, or
-unsupported samples remain diagnostic rather than becoming authoritative floor
-contacts.
+Cached depth is not current evidence. Bbox-only, untyped torso-range,
+contaminated, or unsupported samples remain diagnostic rather than becoming
+authoritative floor contacts. When an exact upright body-plane candidate is
+available, the resolver does not also add the learned-height gravity hypothesis
+from the same current body; correlated body estimates cannot masquerade as
+independent fusion evidence.
 
 ## Uncertainty and resolution
 
@@ -104,6 +122,9 @@ one of three fixed quality buckets:
 - registered-depth covariance includes anchor pixel support, within-anchor
   spread, the camera's occupied-person registration residuals, posture, and
   occlusion;
+- body-plane covariance includes plane scatter, solved-height uncertainty, and
+  a conservative floor-plane term; side-profile foreshortening is not rejected
+  merely because left/right joints overlap in image space;
 - floor-plane uncertainty remains explicit;
 - covariance is finite, symmetric, PSD, bounded, and transformed with the same
   Jacobian as the point at every view boundary.
@@ -155,6 +176,13 @@ and observed PCF cells. A person visible through a doorway can therefore be
 correctly located outside the current room-only raster without implying a
 frame-transform failure.
 
+Because unobserved PCF space is neutral, it cannot by itself reject every
+mirror ray. Before a lifecycle owns a queue-published metric point, any selected
+`floor_ray` must also have ray-incidence sine of at least `0.20`; shallower
+geometry is intrinsically too sensitive to pixel error to establish first
+metric authority. Body projection, registered depth, or a later adequately
+conditioned floor ray may still establish the lifecycle.
+
 An authored-boundary or source-grid violation remains uncertainty-aware. It
 becomes a strong contradiction only when it exceeds both the universal margin
 and three horizontal standard deviations. The candidate stays at its measured
@@ -164,6 +192,18 @@ hypotheses cannot fuse away a shared strong contradiction. A continuation
 outside a room-only raster is shown as predicted/held rather than mislabeled as
 a fresh measurement; a future registered multi-room prior can display that
 same canonical coordinate without re-estimation.
+
+A cold ankle ray that strongly contradicts the bound prior cannot normally
+bootstrap from repetition alone because reflections can reproduce coherent
+ankle motion. The narrow exception is two bounded, mutually consistent exact
+ankle-pair samples under one immutable lifecycle/revision/calibration binding:
+every contributing sample must have admitted plausible floor contact, tight
+silhouette/range agreement, adequate ray incidence, current detector semantic
+confidence, and no current no-ground contradiction. The second current sample
+supplies the coordinate; the saved sample is corroboration, not a position.
+Independent registered person-floor depth may also establish the lifecycle;
+after that, current ankle evidence can override an imperfect prior through the
+normal physical gate.
 
 ## Canonical and diagnostic outputs
 
@@ -185,6 +225,11 @@ tracker-lifecycle generation, exact track key, frame, observation time, world
 revision, transform SHA-256, calibration revision, and active PCF revision
 match the rendered cohort. It projects candidate positions and covariance for
 display without re-estimating them.
+
+When a callback transitions a lifecycle from no queue-published metric output
+to a valid accepted current metric point, that exact tracking/world/BEV cohort
+is forced through the publication cadence immediately. Predictions, holds, and
+saved proof samples do not trigger this rule.
 
 The full exact-cohort candidate tree is never copied into the canonical
 tracking publication. The normal dashboard has a `Localization details`

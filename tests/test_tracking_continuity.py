@@ -309,6 +309,88 @@ def test_compatible_one_frame_reappearance_reuses_generation_after_tombstone() -
     assert update.active_lifecycles[0].generation == 1
 
 
+def test_compatible_reappearance_within_ground_quarantine_reuses_generation() -> None:
+    registry = TrackingLifecycleRegistry()
+    bbox = (100.0, 80.0, 60.0, 120.0)
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=1,
+        observed_at_us=1_000_000,
+        tracks=[_track(7, bbox)],
+    )
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=2,
+        observed_at_us=1_033_333,
+        tracks=[],
+    )
+
+    reappeared_bbox = (102.0, 81.0, 61.0, 119.0)
+    reserved = registry.peek_generation(
+        0,
+        7,
+        frame_id=22,
+        observed_at_us=1_700_000,
+        bbox=reappeared_bbox,
+    )
+    reappeared = _track(7, reappeared_bbox)
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=22,
+        observed_at_us=1_700_000,
+        tracks=[reappeared],
+    )
+
+    assert reserved == 1
+    assert reappeared["tracker_lifecycle_generation"] == 1
+
+
+def test_media_time_grace_survives_host_processing_stall() -> None:
+    registry = TrackingLifecycleRegistry()
+    bbox = (717.375, 393.0, 82.875, 145.5)
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=4616,
+        observed_at_us=1_788_120_689_917_413,
+        media_pts_ns=153_933_333_333,
+        tracks=[_track(12, bbox)],
+    )
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=4617,
+        observed_at_us=1_788_120_689_952_263,
+        media_pts_ns=153_966_666_666,
+        tracks=[],
+    )
+
+    returned_bbox = (715.875, 393.0, 84.375, 145.5)
+    reserved = registry.peek_generation(
+        0,
+        12,
+        frame_id=4618,
+        observed_at_us=1_788_120_690_782_852,
+        media_pts_ns=154_000_000_000,
+        bbox=returned_bbox,
+    )
+    returned = _track(12, returned_bbox)
+    registry.update_frame(
+        source_id=0,
+        camera_id="kitchen",
+        frame_id=4618,
+        observed_at_us=1_788_120_690_782_852,
+        media_pts_ns=154_000_000_000,
+        tracks=[returned],
+    )
+
+    assert reserved == 1
+    assert returned["tracker_lifecycle_generation"] == 1
+
+
 def test_nearby_but_size_incompatible_reappearance_gets_new_generation() -> None:
     registry = TrackingLifecycleRegistry()
     first = _track(7, (100.0, 80.0, 60.0, 120.0))
@@ -372,7 +454,7 @@ def test_expired_reappearance_gap_gets_new_generation() -> None:
         source_id=0,
         camera_id="kitchen",
         frame_id=20,
-        observed_at_us=1_400_001,
+        observed_at_us=1_750_001,
         tracks=[reappeared],
     )
 

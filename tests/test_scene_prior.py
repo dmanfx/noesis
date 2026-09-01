@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from noesis.scene_prior_builder import (
     _CameraMapLockInput,
+    _CameraPoseAnchorInput,
     _authored_grid,
     _camera_local_raster_to_preview_image,
     _camera_local_preview_arrays,
@@ -750,6 +751,59 @@ def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> Non
     np.testing.assert_allclose(frame.camera_forward_world_xz, (1, 0), atol=1e-12)
     assert frame.target_revision_id == "vt_camera-a_exact"
     assert frame.source_floor_offset_m == pytest.approx(2.0)
+
+
+def test_scene_prior_preview_frame_uses_full_pcf_camera_pose_anchor() -> None:
+    radians = np.deg2rad(12.0)
+    camera_to_pcf = np.asarray(
+        [
+            [np.cos(radians), 0.0, np.sin(radians), 6.2],
+            [0.0, 1.0, 0.0, 2.1],
+            [-np.sin(radians), 0.0, np.cos(radians), 0.1],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    evidence = ArtifactFingerprint(
+        role="pcf_static_camera_pose_anchor",
+        sha256="b" * 64,
+        version="noesis.pcf.static_camera_anchor.v2",
+        producer="test",
+    )
+    frame = _camera_preview_frame(
+        {
+            "reference_camera_id": "camera-a",
+            "camera_calibration_row": {
+                "E": np.eye(4, dtype=np.float64).flatten(order="F").tolist(),
+            },
+            "camera_calibration_bytes": b"camera-calibration",
+            "target_revision_metadata": {
+                "schema": "target.v1",
+                "revision_id": "vt_camera-a_reference",
+                "floor_alignment": {
+                    "world_correction_col_major": np.eye(4, dtype=np.float64)
+                    .flatten(order="F")
+                    .tolist(),
+                    "target_floor_y": 0.0,
+                },
+            },
+            "target_revision_metadata_bytes": b"target-metadata",
+        },
+        camera_pose_anchor=_CameraPoseAnchorInput(
+            evidence=evidence,
+            camera_to_target=camera_to_pcf,
+            target_floor_y_m=0.0,
+        ),
+    )
+
+    np.testing.assert_allclose(frame.camera_position_world_m, (6.2, 2.1, 0.1))
+    np.testing.assert_allclose(
+        np.asarray(frame.target_from_source_col_major).reshape((4, 4), order="F"),
+        camera_to_pcf,
+        atol=1e-12,
+    )
+    assert frame.camera_pose_anchor == evidence
+    assert frame.camera_map_lock is None
 
 
 def test_scene_prior_preview_frame_applies_yaw_map_lock_about_camera_center() -> None:

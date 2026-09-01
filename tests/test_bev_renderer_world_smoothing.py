@@ -735,6 +735,45 @@ def test_camera_local_bev_drops_canonical_track_without_valid_world() -> None:
     assert payload["footpoints"] == []
     assert payload["droppedFootpointCount"] == 1
     assert payload["droppedFootpoints"][0]["reason"] == "canonical_world_missing"
+    assert payload["droppedFootpoints"][0]["trailRetained"] is True
+
+
+def test_canonical_drop_count_covers_complete_cohort_when_reason_list_is_capped() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.config_per_cam["cam0"] = (
+        renderer.config_per_cam.get("cam0")
+        or renderer.set_overlay("cam0", True)
+    )
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+
+    renderer.render_and_publish(
+        "cam0",
+        _calibration(),
+        footpoints=[
+            Footpoint(
+                u=640.0,
+                v=360.0,
+                stable_id=index + 1,
+                tracker_id=index,
+                tracker_lifecycle_generation=1,
+                canonical_world_required=True,
+            )
+            for index in range(65)
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 65
+    assert len(payload["droppedFootpoints"]) == 64
 
 
 def test_camera_local_bev_emits_revision_bound_world_without_image_anchor(
@@ -884,7 +923,9 @@ def test_camera_local_bev_fail_closes_canonical_world_beyond_explicit_distance_g
     payload = render(5.0, 2.0, 1_200_000)
     assert payload["footpoints"] == []
     assert payload["droppedFootpointCount"] == 1
-    assert payload["trails"] == []
+    assert [point["x"] for point in payload["trails"][0]["points"]] == pytest.approx(
+        [0.4, 0.5]
+    )
     dropped = payload["droppedFootpoints"][0]
     assert dropped["reason"] == "canonical_world_outside_max_distance"
     assert dropped["canonicalWorld"] is True
@@ -892,14 +933,28 @@ def test_camera_local_bev_fail_closes_canonical_world_beyond_explicit_distance_g
     assert dropped["y"] == pytest.approx(2.0)
     assert dropped["trackerLifecycleGeneration"] == 4
     assert dropped["trailSegmentId"] == 7
+    assert dropped["trailRetained"] is True
     returned = render(0.6, 0.6, 1_300_000)
-    assert returned["trails"] == []
+    assert [point.get("x") for point in returned["trails"][0]["points"]] == [
+        0.4,
+        0.5,
+        None,
+        0.6,
+    ]
+    assert returned["trails"][0]["points"][2] == {
+        "t": 1300,
+        "breakBefore": True,
+    }
     resumed = render(0.7, 0.6, 1_400_000)
     assert len(resumed["trails"]) == 1
     assert resumed["trails"][0]["trailSegmentId"] == 7
-    assert [point["x"] for point in resumed["trails"][0]["points"]] == pytest.approx(
-        [0.6, 0.7]
-    )
+    assert [point.get("x") for point in resumed["trails"][0]["points"]] == [
+        0.4,
+        0.5,
+        None,
+        0.6,
+        0.7,
+    ]
 
 
 def test_camera_local_bev_keeps_canonical_world_point_in_bounded_pcf_display_margin() -> None:
@@ -1612,6 +1667,45 @@ def test_camera_local_bev_reports_dropped_floor_contact_normalized_debug(monkeyp
     assert dropped["normY"] < 0.0
 
 
+def test_noncanonical_alignment_drop_reasons_are_capped_but_count_is_complete(monkeypatch) -> None:
+    monkeypatch.setenv("NOESIS_BEV_ALIGNMENT_DEBUG", "1")
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+        floorplan_bounds_provider=lambda _camera_id: _active_floorplan(
+            bounds={"min_x": -4.0, "max_x": 4.0, "min_z": 0.0, "max_z": 7.0},
+            grid_shape=[70, 80],
+        ),
+    )
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = True
+
+    renderer.render_and_publish(
+        "cam0",
+        _floor_camera_calibration(),
+        footpoints=[
+            Footpoint(
+                u=740.0,
+                v=500.0,
+                method="image_foot",
+                stable_id=index + 1,
+                tracker_id=index,
+            )
+            for index in range(65)
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpointCount"] == 65
+    assert len(payload["droppedFootpoints"]) == 64
+    assert all(row["canonicalWorld"] is False for row in payload["droppedFootpoints"])
+
+
 def test_camera_local_bev_drops_floor_contact_when_active_floorplan_bounds_exclude_all_candidates() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
@@ -1898,7 +1992,13 @@ def test_world_bev_emits_canonical_anchor_hold_with_admission_provenance() -> No
     assert payload["trails"] == []
 
 
-def test_world_bev_labels_bounded_canonical_cv_prediction() -> None:
+@pytest.mark.parametrize(
+    "prediction_source",
+    ("cv_prediction", "image_motion_prediction"),
+)
+def test_world_bev_labels_bounded_canonical_prediction(
+    prediction_source: str,
+) -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
         ws,
@@ -1929,7 +2029,7 @@ def test_world_bev_labels_bounded_canonical_cv_prediction() -> None:
                 tracker_id=101,
                 world_x=1.25,
                 world_z=2.5,
-                anchor_source="cv_prediction",
+                anchor_source=prediction_source,
                 canonical_world_required=True,
                 trail_append_allowed=True,
             )
@@ -1939,7 +2039,7 @@ def test_world_bev_labels_bounded_canonical_cv_prediction() -> None:
 
     payload = ws.messages[-1]
     assert payload["footpoints"][0]["worldAdmission"] == "predicted"
-    assert payload["footpoints"][0]["anchorSource"] == "cv_prediction"
+    assert payload["footpoints"][0]["anchorSource"] == prediction_source
     assert payload["footpoints"][0]["x"] == pytest.approx(1.25)
     assert payload["footpoints"][0]["y"] == pytest.approx(2.5)
     assert payload["footpoints"][0]["trailAppendAllowed"] is True
@@ -2155,6 +2255,194 @@ def test_backend_trails_do_not_splice_history_across_tracker_remap() -> None:
     assert math.isclose(by_tracker[202]["points"][-1]["x"], 10.5, abs_tol=1e-6)
 
 
+def test_backend_source_epoch_rewind_clears_old_trail_before_new_cohort() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "window_s": 200.0,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+            "max_tracks": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    def render(
+        *, timestamp_us: int, source_epoch: int, tracker_id: int, x: float
+    ) -> dict[str, object]:
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    stable_id=tracker_id,
+                    tracker_id=tracker_id,
+                    tracker_lifecycle_generation=1,
+                    world_x=x,
+                    world_z=0.0,
+                )
+            ],
+            timestamp_us=timestamp_us,
+            source_id=0,
+            source_epoch=source_epoch,
+        )
+        return ws.messages[-1]
+
+    render(
+        timestamp_us=101_000_000,
+        source_epoch=0,
+        tracker_id=101,
+        x=0.0,
+    )
+    old_payload = render(
+        timestamp_us=101_100_000,
+        source_epoch=0,
+        tracker_id=101,
+        x=0.5,
+    )
+    assert old_payload["trails"][0]["trackerId"] == 101  # type: ignore[index]
+
+    # The source restarts at 1 s. The first epoch-1 cohort must clear every
+    # epoch-0 trail/time state before it seeds the new tracker.
+    rewound = render(
+        timestamp_us=1_000_000,
+        source_epoch=1,
+        tracker_id=202,
+        x=10.0,
+    )
+    assert rewound["trails"] == []
+    current = render(
+        timestamp_us=1_100_000,
+        source_epoch=1,
+        tracker_id=202,
+        x=10.5,
+    )
+
+    assert current["sourceEpoch"] == 1
+    assert current["cohort"]["source_epoch"] == 1  # type: ignore[index]
+    assert renderer._trail_frame_counts["cam0"] == 2  # type: ignore[attr-defined]
+    assert len(current["trails"]) == 1
+    trail = current["trails"][0]  # type: ignore[index]
+    assert trail["trackerId"] == 202
+    assert [point["x"] for point in trail["points"]] == pytest.approx(  # type: ignore[index]
+        [10.0, 10.5]
+    )
+    assert set(renderer._trail_tracks_by_cam["cam0"]) == {  # type: ignore[attr-defined]
+        ("tracker", 202, 1)
+    }
+
+
+def test_backend_max_tracks_is_a_hard_retained_state_bound() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "window_s": 1_000.0,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+            "max_tracks": 2,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    for index, tracker_id in enumerate((101, 202, 303), start=1):
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    stable_id=tracker_id,
+                    tracker_id=tracker_id,
+                    tracker_lifecycle_generation=1,
+                    world_x=float(index),
+                    world_z=0.0,
+                )
+            ],
+            timestamp_us=index * 100_000,
+        )
+
+    retained = renderer._trail_tracks_by_cam["cam0"]  # type: ignore[attr-defined]
+    assert len(retained) == 2
+    assert set(retained) == {
+        ("tracker", 202, 1),
+        ("tracker", 303, 1),
+    }
+
+
+def test_backend_source_epoch_rewind_resets_camera_local_smoother() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={
+            "enabled": True,
+            "max_speed_mps": 0.0,
+            "max_jump_m": 0.1,
+            "alpha": 1.0,
+            "beta": 0.0,
+            "ttl_s": 1_000.0,
+            "reset_after_s": 1_000.0,
+        },
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _floor_camera_calibration()
+
+    def render(timestamp_us: int, source_epoch: int, depth_m: float) -> None:
+        renderer.render_and_publish(
+            "cam0",
+            calib,
+            footpoints=[
+                Footpoint(
+                    u=740.0,
+                    v=626.0,
+                    method="image_foot",
+                    stable_id=7,
+                    tracker_id=101,
+                    tracker_lifecycle_generation=1,
+                    depth_m=depth_m,
+                )
+            ],
+            timestamp_us=timestamp_us,
+            source_id=0,
+            source_epoch=source_epoch,
+        )
+
+    render(101_000_000, 0, 2.0)
+    render(101_100_000, 0, 2.0)
+    assert ws.messages[-1]["footpoints"][0]["y"] == pytest.approx(2.0)
+
+    # With stale epoch-0 smoother state, negative dt would return the old
+    # two-metre point. Epoch reset must seed directly from the new six-metre
+    # observation instead.
+    render(1_000_000, 1, 6.0)
+    rewound = ws.messages[-1]
+    assert rewound["footpoints"][0]["x"] == pytest.approx(0.6, abs=1.0e-3)
+    assert rewound["footpoints"][0]["y"] == pytest.approx(6.0, abs=1.0e-3)
+
+
 def test_backend_trails_drop_old_generation_when_tracker_id_is_reused() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
@@ -2208,7 +2496,7 @@ def test_backend_trails_drop_old_generation_when_tracker_id_is_reused() -> None:
     assert payload["footpoints"][0]["trackerLifecycleGeneration"] == 12
 
 
-def test_backend_trail_break_starts_new_segment_after_reacquisition() -> None:
+def test_backend_trail_break_preserves_disconnected_history_after_reacquisition() -> None:
     ws = _FakeWs()
     renderer = BevRenderer(
         ws,
@@ -2253,7 +2541,210 @@ def test_backend_trail_break_starts_new_segment_after_reacquisition() -> None:
         )
 
     trail = ws.messages[-1]["trails"][0]
-    assert [point["x"] for point in trail["points"]] == pytest.approx([10.0, 10.5])
+    assert [point.get("x") for point in trail["points"]] == [
+        0.0,
+        0.5,
+        None,
+        10.0,
+        10.5,
+    ]
+    assert trail["points"][2] == {"t": 1200, "breakBefore": True}
+
+
+def test_backend_missing_world_retains_then_breaks_trail_on_return() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    def _point(x: float | None) -> Footpoint:
+        return Footpoint(
+            u=640.0,
+            v=360.0,
+            stable_id=7,
+            tracker_id=101,
+            tracker_lifecycle_generation=11,
+            world_x=x,
+            world_z=0.0 if x is not None else None,
+            canonical_world_required=True,
+        )
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.0)], timestamp_us=1_000_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.5)], timestamp_us=1_100_000)
+    assert [point["x"] for point in ws.messages[-1]["trails"][0]["points"]] == pytest.approx([0.0, 0.5])
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(None)], timestamp_us=1_200_000)
+    missing_payload = ws.messages[-1]
+    assert [point["x"] for point in missing_payload["trails"][0]["points"]] == pytest.approx([0.0, 0.5])
+    assert missing_payload["droppedFootpoints"][0]["trailRetained"] is True
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.0)], timestamp_us=1_300_000)
+    recovered = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in recovered] == [0.0, 0.5, None, 10.0]
+    assert recovered[2] == {"t": 1300, "breakBefore": True}
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.5)], timestamp_us=1_400_000)
+    returned = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in returned] == [0.0, 0.5, None, 10.0, 10.5]
+    assert returned[2] == {"t": 1300, "breakBefore": True}
+
+
+def test_backend_exact_empty_cohort_breaks_retained_trail_on_return() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    def _point(x: float) -> Footpoint:
+        return Footpoint(
+            stable_id=7,
+            tracker_id=101,
+            tracker_lifecycle_generation=11,
+            world_x=x,
+            world_z=0.0,
+            canonical_world_required=True,
+        )
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.0)], timestamp_us=1_000_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.5)], timestamp_us=1_100_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[], timestamp_us=1_200_000)
+    assert [point["x"] for point in ws.messages[-1]["trails"][0]["points"]] == pytest.approx([0.0, 0.5])
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.0)], timestamp_us=1_300_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.5)], timestamp_us=1_400_000)
+    returned = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in returned] == [0.0, 0.5, None, 10.0, 10.5]
+    assert returned[2] == {"t": 1300, "breakBefore": True}
+
+
+def test_backend_recovered_unsampled_head_emits_trailing_break_marker() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 1,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    def _point(x: float, *, append: bool = True) -> Footpoint:
+        return Footpoint(
+            stable_id=7,
+            tracker_id=101,
+            tracker_lifecycle_generation=11,
+            world_x=x,
+            world_z=0.0,
+            canonical_world_required=True,
+            trail_append_allowed=append,
+        )
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.0)], timestamp_us=1_000_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.5)], timestamp_us=1_100_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[], timestamp_us=1_200_000)
+
+    # The current held head returns, but policy forbids adding it to path
+    # history. The trailing marker still severs old history from the live dot.
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[_point(10.0, append=False)],
+        timestamp_us=1_300_000,
+    )
+    recovered = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in recovered] == [0.0, 0.5, None]
+    assert recovered[-1] == {"t": 1300, "breakBefore": True}
+
+
+def test_backend_draw_stride_recovery_keeps_break_pending_until_sample() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={
+            "enabled": True,
+            "draw_stride": 2,
+            "smooth_tau_s": 0.0,
+            "min_dt_s": 0.0,
+            "min_step_px": 0.0,
+            "max_points_per_track": 8,
+            "max_segments_per_track": 8,
+        },
+        smoothing_cfg={"enabled": False},
+        frame="world",
+    )
+    renderer.h_cache.get = lambda *args, **kwargs: np.eye(3, dtype=np.float64)  # type: ignore[method-assign]
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    calib = _calibration()
+
+    def _point(x: float) -> Footpoint:
+        return Footpoint(
+            stable_id=7,
+            tracker_id=101,
+            tracker_lifecycle_generation=11,
+            world_x=x,
+            world_z=0.0,
+            canonical_world_required=True,
+            trail_append_allowed=True,
+        )
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.0)], timestamp_us=1_000_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.0)], timestamp_us=1_100_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.25)], timestamp_us=1_200_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(0.5)], timestamp_us=1_300_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[], timestamp_us=1_400_000)
+    renderer.render_and_publish("cam0", calib, footpoints=[], timestamp_us=1_500_000)
+
+    # Frame seven is not a sampling frame. The current head is valid, but the
+    # old trail remains terminated until frame eight seeds the new segment.
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.0)], timestamp_us=1_600_000)
+    pending = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in pending] == [0.0, 0.5, None]
+    assert pending[-1] == {"t": 1600, "breakBefore": True}
+
+    renderer.render_and_publish("cam0", calib, footpoints=[_point(10.5)], timestamp_us=1_700_000)
+    sampled = ws.messages[-1]["trails"][0]["points"]
+    assert [point.get("x") for point in sampled] == [0.0, 0.5, None, 10.5]
+    assert sampled[2] == {"t": 1700, "breakBefore": True}
 
 
 def test_backend_exact_tombstone_breaks_same_generation_return() -> None:
@@ -2385,7 +2876,14 @@ def test_backend_trail_segment_id_starts_new_segment_without_break_pulse() -> No
 
     payload = ws.messages[-1]
     trail = payload["trails"][0]
-    assert [point["x"] for point in trail["points"]] == pytest.approx([10.0, 10.5])
+    assert [point.get("x") for point in trail["points"]] == [
+        0.0,
+        0.5,
+        None,
+        10.0,
+        10.5,
+    ]
+    assert trail["points"][2] == {"t": 1200, "breakBefore": True}
     assert payload["footpoints"][0]["trailSegmentId"] == 1
 
 

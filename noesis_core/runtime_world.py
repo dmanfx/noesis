@@ -154,6 +154,13 @@ def create_runtime_world_service(
             ),
             model=model_fingerprint,
             config=config_fingerprint,
+            camera_calibration_sha256=(
+                str(getattr(snapshot, "camera_calibration_sha256"))
+                if snapshot is not None
+                and getattr(snapshot, "camera_calibration_sha256", None)
+                is not None
+                else None
+            ),
         )
 
     configured_journal = str(os.environ.get("NOESIS_WORLD_JOURNAL_PATH", "")).strip()

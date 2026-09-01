@@ -637,6 +637,11 @@ class WebSocketServer:
         self._outbound_condition = threading.Condition()
         self._canonical_outbound_token = object()
         self._frozen_outbound_token = object()
+        # Authority-gated cohorts are admitted from multiple camera threads.
+        # Hold one event-loop-owned lane from admission-task start through the
+        # complete batch send so a later tracking anchor cannot overtake the
+        # preceding cohort while its snapshot/event send is yielding.
+        self._canonical_outbound_lock: Optional[asyncio.Lock] = None
         self._outbound_admission_open = True
         self._outbound_futures: Set[concurrent.futures.Future[Any]] = set()
         self._outbound_bytes_by_future: Dict[
@@ -4853,16 +4858,21 @@ class WebSocketServer:
     ) -> Any:
         """Wait for authority resolution before beginning any batch delivery."""
 
-        resolved = await asyncio.wrap_future(decision)
-        if not resolved.release:
-            return _OUTBOUND_ABORTED
-        await self._broadcast_batch_from_sync_submission(
-            messages,
-            int(resolved.resolved_at_ns),
-            response_model_timings,
-            canonical_outbound_token=self._canonical_outbound_token,
-        )
-        return None
+        lock = self._canonical_outbound_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._canonical_outbound_lock = lock
+        async with lock:
+            resolved = await asyncio.wrap_future(decision)
+            if not resolved.release:
+                return _OUTBOUND_ABORTED
+            await self._broadcast_batch_from_sync_submission(
+                messages,
+                int(resolved.resolved_at_ns),
+                response_model_timings,
+                canonical_outbound_token=self._canonical_outbound_token,
+            )
+            return None
 
     def _freeze_outbound_message(
         self,

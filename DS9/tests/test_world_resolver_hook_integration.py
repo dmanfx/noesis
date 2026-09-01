@@ -12,10 +12,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from noesis_core.contracts.base import Matrix3, Vector3
+from geometry.homography import project_world_to_image
 from noesis_core.contracts.world_measurement import (
     WorldMeasurementCohort,
     WorldMeasurementHypothesis,
     WorldMeasurementSet,
+    WorldPriorEvidence,
 )
 from noesis.metadata.object_depth import ObjectDepthResult
 from noesis.pipelines import hooks
@@ -42,7 +44,69 @@ def _processor(config: dict[str, object] | None = None):
     )
 
 
-def _cohort() -> WorldMeasurementCohort:
+def _upright_projection_calibration() -> SimpleNamespace:
+    intrinsics = np.array(
+        [
+            [800.0, 0.0, 640.0],
+            [0.0, 800.0, 360.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera_world = np.array([0.0, 2.2, -6.0], dtype=np.float64)
+    forward = np.array([0.0, -0.25, 1.0], dtype=np.float64)
+    forward /= np.linalg.norm(forward)
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(world_up, forward)
+    right /= np.linalg.norm(right)
+    down = np.cross(right, forward)
+    down /= np.linalg.norm(down)
+    rotation_cw = np.column_stack([right, down, forward]).T
+    extrinsics = np.eye(4, dtype=np.float64)
+    extrinsics[:3, :3] = rotation_cw
+    extrinsics[:3, 3] = -rotation_cw @ camera_world
+    return SimpleNamespace(
+        intrinsics=intrinsics,
+        extrinsics_col_major=list(extrinsics.flatten(order="F")),
+        floor_y=0.0,
+        image_size=(1280, 720),
+        unit_scale=1.0,
+    )
+
+
+def _occluded_upright_pose(
+    calibration: SimpleNamespace,
+) -> tuple[np.ndarray, list[float]]:
+    def project(world_xyz: tuple[float, float, float]) -> tuple[float, float]:
+        uv = project_world_to_image(
+            world_xyz,
+            calibration.intrinsics,
+            calibration.extrinsics_col_major,
+            calibration.image_size,
+            unit_scale=1.0,
+        )
+        assert uv is not None
+        return float(uv[0]), float(uv[1])
+
+    pose = np.zeros((17, 3), dtype=np.float64)
+    for name, world_xyz in {
+        "nose": (0.0, 1.692, 6.0),
+        "left_shoulder": (-0.18, 1.476, 6.0),
+        "right_shoulder": (0.18, 1.476, 6.0),
+        "left_hip": (-0.10, 0.99, 6.0),
+        "right_hip": (0.10, 0.99, 6.0),
+    }.items():
+        u, v = project(world_xyz)
+        pose[hooks._POSE_KPT_INDEX[name]] = [u, v, 0.98]
+
+    foot_u, foot_v = project((0.0, 0.0, 6.0))
+    _head_u, head_v = project((0.0, 1.8, 6.0))
+    # The detector terminates on furniture, well above the actual floor.
+    bbox = [foot_u - 42.0, head_v, 84.0, 0.68 * (foot_v - head_v)]
+    return pose, [float(value) for value in bbox]
+
+
+def _cohort(*, pcf_revision: str | None = None) -> WorldMeasurementCohort:
     return WorldMeasurementCohort(
         track_key="5:17:3",
         tracker_lifecycle_generation=3,
@@ -53,6 +117,7 @@ def _cohort() -> WorldMeasurementCohort:
         observed_at_us=123456,
         world_revision="world-revision",
         calibration_revision="calibration-revision",
+        pcf_revision=pcf_revision,
     )
 
 
@@ -389,6 +454,79 @@ def test_filtered_covariance_includes_resolver_to_emitted_displacement() -> None
     assert covariance[0] >= 0.29
 
 
+def test_resolver_preserves_selected_anatomical_contact_basis() -> None:
+    processor = _processor()
+    processor.set_world_resolver_diagnostics_enabled(True)
+    cohort = _cohort()
+    measurement_set = WorldMeasurementSet(
+        cohort=cohort,
+        hypotheses=(_hypothesis(cohort, candidate_id="floor_ray"),),
+    )
+    track: dict[str, object] = {}
+
+    point, result = processor._apply_resolved_world_measurement(
+        track,
+        measurement_set,
+        contact_basis_by_candidate={"floor_ray": "pose:left_ankle"},
+    )
+
+    assert point is not None
+    assert result is not None and result.status == "measured"
+    assert track["world_resolver_contact_basis"] == "pose:left_ankle"
+    candidate = track["world_resolver"]["candidates"][0]
+    assert candidate["anchor"] == "pose_ankle_support"
+    assert candidate["contact_basis"] == "pose:left_ankle"
+
+
+def test_person_ground_consensus_collapses_only_observed_ankle_sides() -> None:
+    processor = _processor()
+    state = hooks._WorldAnchorState(
+        ts=0.0,
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=0.0,
+        last_good_world=(0.0, 0.0, 0.0),
+        last_good_ts=0.0,
+    )
+
+    for index, (basis, expected_count) in enumerate(
+        (
+            ("pose:left_ankle", 1),
+            ("pose:right_ankle", 2),
+            ("depth:pose_torso_support", 1),
+            ("depth:lower_body_band", 1),
+        ),
+        start=1,
+    ):
+        processor._update_track_world_state(
+            {},
+            state,
+            measurement=np.asarray([5.0 + index * 0.1, 0.0, 0.0]),
+            floor_y=0.0,
+            now_ts=index * 0.1,
+            alpha=0.45,
+            beta=0.15,
+            quality="good",
+            contact_basis=processor._person_ground_consensus_contact_basis(basis),
+            image_motion_supported=True,
+        )
+        assert state.measurement_accepted is False
+        assert state.reacquire_count == expected_count
+
+    assert processor._person_ground_consensus_contact_basis(
+        "pose:ankle_pair"
+    ) == "pose_ankle_floor"
+    assert processor._person_ground_consensus_contact_basis(
+        "pose:left_ankle"
+    ) == "pose_single_ankle_floor"
+    assert processor._person_ground_consensus_contact_basis(
+        "pose:right_ankle"
+    ) == "pose_single_ankle_floor"
+    assert processor._person_ground_consensus_contact_basis(
+        "depth:pose_torso_support"
+    ) == "depth:pose_torso_support"
+
+
 def test_resolver_apply_clears_compact_fields_on_rejection() -> None:
     processor = _processor()
     cohort = _cohort()
@@ -549,6 +687,198 @@ def test_torso_depth_remains_registered_depth_with_unknown_support() -> None:
     assert candidates[0]["support_state"] == "unknown"
 
 
+def test_moving_upright_lateral_truncation_excludes_interior_seating() -> None:
+    processor = _processor()
+    state = hooks._WorldAnchorState(
+        height_ref_scene=1.7,
+        last_full_body_ts=9.5,
+        last_non_upright_ts=-1.0,
+        upright_bbox_height_px=600.0,
+        last_accepted_bbox_geometry=(1347.0, 524.25, 283.5, 396.0),
+    )
+
+    edge = processor._moving_upright_lateral_truncation(
+        state=state,
+        classified_posture="sitting",
+        previous_posture="standing",
+        previous_motion="walk",
+        bbox=(1400.0, 200.0, 300.0, 520.0),
+        image_size=(1920, 1080),
+        now_ts=10.0,
+        queue_metric_root_available=True,
+    )
+    interior = processor._moving_upright_lateral_truncation(
+        state=state,
+        classified_posture="sitting",
+        previous_posture="standing",
+        previous_motion="walk",
+        bbox=(700.0, 400.0, 300.0, 300.0),
+        image_size=(1920, 1080),
+        now_ts=10.0,
+        queue_metric_root_available=True,
+    )
+    state.last_accepted_bbox_geometry = (1400.0, 200.0, 300.0, 520.0)
+    stationary_edge = processor._moving_upright_lateral_truncation(
+        state=state,
+        classified_posture="sitting",
+        previous_posture="standing",
+        previous_motion="walk",
+        bbox=(1400.0, 200.0, 300.0, 520.0),
+        image_size=(1920, 1080),
+        now_ts=10.0,
+        queue_metric_root_available=True,
+    )
+    hard_clip = processor._moving_upright_lateral_truncation(
+        state=state,
+        classified_posture="sitting",
+        previous_posture="standing",
+        previous_motion="walk",
+        bbox=(1558.5, 436.5, 360.0, 415.5),
+        image_size=(1920, 1080),
+        now_ts=10.0,
+        queue_metric_root_available=True,
+    )
+
+    assert edge[:3] == (True, True, False)
+    assert edge[3] == pytest.approx(520.0 / 600.0)
+    assert interior[:3] == (False, False, False)
+    assert interior[3] == pytest.approx(0.5)
+    assert stationary_edge[:3] == (False, True, False)
+    assert hard_clip[:3] == (True, True, True)
+
+
+def test_occluded_upright_body_planes_recover_floor_without_bbox_bottom() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    pose, furniture_truncated_bbox = _occluded_upright_pose(calibration)
+
+    projection = processor._upright_pose_ground_projection(
+        calibration,
+        kpts_abs=pose,
+        bbox=furniture_truncated_bbox,
+        state=None,
+        flip_u=False,
+        flip_v=False,
+    )
+
+    assert projection is not None
+    point, covariance, height_m, scatter_m, anchor_count, strong_proof = projection
+    assert point == pytest.approx([0.0, 0.0, 6.0], abs=0.20)
+    assert height_m == pytest.approx(1.8, abs=0.10)
+    assert scatter_m < 0.30
+    assert anchor_count == 5
+    assert strong_proof is True
+    assert covariance.values[0] >= 0.04
+    assert covariance.values[8] >= 0.04
+
+
+def test_torso_motion_anchor_tolerates_one_joint_dropout_only() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    pose, bbox = _occluded_upright_pose(calibration)
+
+    pose[hooks._POSE_KPT_INDEX["right_shoulder"], 2] = 0.0
+    assert processor._resolve_pose_torso_motion_anchor(pose, bbox=bbox) is not None
+
+    pose[hooks._POSE_KPT_INDEX["right_hip"], 2] = 0.0
+    assert processor._resolve_pose_torso_motion_anchor(pose, bbox=bbox) is None
+
+
+def test_four_body_planes_remain_weak_without_independent_head_plane() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    pose, bbox = _occluded_upright_pose(calibration)
+    pose[hooks._POSE_KPT_INDEX["nose"], 2] = 0.0
+
+    projection = processor._upright_pose_ground_projection(
+        calibration,
+        kpts_abs=pose,
+        bbox=bbox,
+        state=None,
+        flip_u=False,
+        flip_v=False,
+    )
+
+    assert projection is not None
+    _point, _covariance, _height_m, _scatter_m, anchor_count, strong_proof = (
+        projection
+    )
+    assert anchor_count == 4
+    assert strong_proof is False
+
+
+def test_complete_side_profile_torso_does_not_require_apparent_pair_width() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    pose, bbox = _occluded_upright_pose(calibration)
+
+    for left_name, right_name in (
+        ("left_shoulder", "right_shoulder"),
+        ("left_hip", "right_hip"),
+    ):
+        left_index = hooks._POSE_KPT_INDEX[left_name]
+        right_index = hooks._POSE_KPT_INDEX[right_name]
+        center_x = 0.5 * (pose[left_index, 0] + pose[right_index, 0])
+        pose[left_index, 0] = center_x - 1.0
+        pose[right_index, 0] = center_x + 1.0
+
+    assert processor._resolve_pose_torso_motion_anchor(pose, bbox=bbox) is not None
+    assert (
+        processor._upright_pose_ground_projection(
+            calibration,
+            kpts_abs=pose,
+            bbox=bbox,
+            state=None,
+            flip_u=False,
+            flip_v=False,
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "kind, anchor, support_state, posture, expected",
+    (
+        ("pose_scale", "seated_torso_plane", "seat", "sitting", True),
+        ("pose_scale", "upright_body_plane", "unknown", "standing", True),
+        (
+            "registered_depth",
+            "person_body_projection",
+            "seat",
+            "sitting",
+            True,
+        ),
+        (
+            "registered_depth",
+            "person_body_projection",
+            "unknown",
+            "sitting",
+            False,
+        ),
+        ("pose_scale", "seated_torso_plane", "seat", "standing", False),
+    ),
+)
+def test_only_typed_body_projections_support_ground_footprint(
+    kind: str,
+    anchor: str,
+    support_state: str,
+    posture: str,
+    expected: bool,
+) -> None:
+    candidate = SimpleNamespace(
+        kind=kind,
+        anchor=anchor,
+        support_state=support_state,
+        posture=posture,
+    )
+
+    assert (
+        hooks._AnalyticsTelemetryProcessor
+        ._resolver_candidate_is_ground_footprint_supported(candidate)
+        is expected
+    )
+
+
 @pytest.mark.parametrize(
     "field, value",
     (
@@ -677,6 +1007,161 @@ def test_weak_resolver_result_is_diagnostic_only() -> None:
     assert track["world_resolver"]["decision"] == "weak"  # type: ignore[index]
 
 
+def test_weak_bbox_requires_motion_or_trusted_lifecycle_consensus() -> None:
+    processor = _processor()
+    cohort = _cohort(pcf_revision="revision")
+    supported = WorldMeasurementHypothesis(
+        candidate_id="floor",
+        cohort=cohort,
+        kind="floor_ray",
+        position=Vector3(x=1.0, y=0.0, z=2.0),
+        covariance=Matrix3(
+            values=(0.04, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.04)
+        ),
+        anchor="bbox_bottom",
+        confidence=0.75,
+        support_score=0.72,
+        support_state="floor",
+        posture="standing",
+        pcf=WorldPriorEvidence(
+            prior_id="prior",
+            revision_id="revision",
+            status="fail",
+            inside_extent=True,
+            inside_authored_space=False,
+            boundary_signed_distance_m=-2.0,
+        ),
+    )
+    unsupported = WorldMeasurementHypothesis(
+        candidate_id="gravity",
+        cohort=cohort,
+        kind="gravity_reconstruction",
+        position=Vector3(x=1.0, y=0.0, z=2.0),
+        covariance=Matrix3(
+            values=(4.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 4.0)
+        ),
+        anchor="learned_body_height",
+        confidence=0.75,
+        support_score=0.72,
+        source_reliability=0.01,
+        support_state="floor",
+        posture="standing",
+    )
+    floor_set = WorldMeasurementSet(cohort=cohort, hypotheses=(supported,))
+    gravity_set = WorldMeasurementSet(cohort=cohort, hypotheses=(unsupported,))
+
+    floor_result = processor._world_resolver.resolve(floor_set)
+    gravity_result = processor._world_resolver.resolve(gravity_set)
+
+    assert floor_result.quality == "weak"
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        floor_result,
+        floor_set,
+    ) is False
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        floor_result,
+        floor_set,
+        image_motion_supported=True,
+    ) is True
+    trusted_state = hooks._WorldAnchorState(
+        last_good_world=(0.0, 0.0, 0.0),
+        last_good_ts=1.0,
+        last_output_world_x=0.0,
+        last_output_world_z=0.0,
+    )
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        floor_result,
+        floor_set,
+        state=trusted_state,
+    ) is True
+    assert gravity_result.quality == "weak"
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        gravity_result,
+        gravity_set,
+    ) is False
+
+
+def test_weak_observed_ankle_pcf_conflict_requires_metric_lifecycle() -> None:
+    processor = _processor()
+    cohort = _cohort(pcf_revision="revision")
+    ankle = WorldMeasurementHypothesis(
+        candidate_id="ankle",
+        cohort=cohort,
+        kind="floor_ray",
+        position=Vector3(x=1.0, y=0.0, z=2.0),
+        covariance=Matrix3(
+            values=(0.04, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.04)
+        ),
+        anchor="pose_ankle_floor",
+        confidence=0.95,
+        support_score=0.95,
+        support_state="floor",
+        posture="sitting",
+        pcf=WorldPriorEvidence(
+            prior_id="prior",
+            revision_id="revision",
+            status="fail",
+            inside_extent=True,
+            inside_authored_space=False,
+            boundary_signed_distance_m=-2.0,
+        ),
+    )
+    measurement_set = WorldMeasurementSet(cohort=cohort, hypotheses=(ankle,))
+    result = processor._world_resolver.resolve(measurement_set)
+
+    assert result.quality == "weak"
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        result,
+        measurement_set,
+    ) is False
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        result,
+        measurement_set,
+        verified_first_output_contact=True,
+    ) is True
+    trusted_state = hooks._WorldAnchorState(
+        last_good_world=(0.0, 0.0, 0.0),
+        last_good_ts=1.0,
+        last_output_world_x=0.0,
+        last_output_world_z=0.0,
+    )
+    assert processor._weak_resolver_measurement_is_ground_supported(
+        result,
+        measurement_set,
+        state=trusted_state,
+    ) is True
+
+    tight_contact = {
+        "pose_present": True,
+        "world_floor_admitted": True,
+        "world_floor_contact_plausible": True,
+        "world_floor_contact_gap_ratio": 0.0,
+        "world_floor_contact_range_delta_m": 0.0,
+        "world_floor_incidence_sin": 0.30,
+    }
+    assert processor._first_output_ankle_contact_is_tight(tight_contact) is True
+    reflected_contact = dict(
+        tight_contact,
+        world_floor_contact_gap_ratio=0.11,
+        world_floor_contact_range_delta_m=1.54,
+    )
+    assert processor._first_output_ankle_contact_is_tight(reflected_contact) is False
+    near_horizon_contact = dict(
+        tight_contact,
+        world_floor_incidence_sin=0.16,
+    )
+    assert (
+        processor._first_output_ankle_contact_is_tight(near_horizon_contact)
+        is False
+    )
+    assert (
+        processor._cold_floor_ray_incidence_is_adequate(tight_contact) is True
+    )
+    assert (
+        processor._cold_floor_ray_incidence_is_adequate(near_horizon_contact)
+        is False
+    )
+
 def test_rich_resolver_diagnostics_are_off_by_default_but_summary_remains() -> None:
     processor = _processor()
     cohort = _cohort()
@@ -715,6 +1200,7 @@ def test_canonical_tracking_copy_excludes_rich_resolver_tree(
         },
         "world_resolver_confidence": 0.9,
         "world_resolver_selected_id": "floor_ray",
+        "_world_force_first_metric_publication": True,
     }
     continuity = processor._prepare_tracking_cohort(
         sensor_id=0,
@@ -740,9 +1226,11 @@ def test_canonical_tracking_copy_excludes_rich_resolver_tree(
     assert len(published) == 1
     queued_track = published[0].tracks[0]  # type: ignore[attr-defined]
     assert "world_resolver" not in queued_track
+    assert "_world_force_first_metric_publication" not in queued_track
     assert queued_track["world_resolver_confidence"] == 0.9
     assert queued_track["world_resolver_selected_id"] == "floor_ray"
     assert "world_resolver" in track
+    assert track["_world_force_first_metric_publication"] is True
 
 
 def test_universal_resolver_source_continuity_is_evidence_not_a_veto(

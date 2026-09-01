@@ -26,6 +26,15 @@ import {
   type ResolverCandidate,
   type ResolverDiagnostics,
 } from '../lib/bevResolverDiagnostics';
+import {
+  historyKeyForBevIdentity,
+  purgeCurrentBevHeadsForDropped,
+  purgeCurrentBevHeadsMissingFromCohort,
+  purgeCurrentBevHeadState,
+  resetBevVisualContinuityState,
+  sourceTimelineKeyForBevPayload,
+  updateCurrentBevHeadState,
+} from '../lib/bevCurrentHead.js';
 
 export type BevMeta = {
   type?: string;
@@ -35,12 +44,14 @@ export type BevMeta = {
   cam_id?: string;
   ts?: number;
   sourceId?: number;
+  sourceEpoch?: number;
   frameId?: number;
   observedAtUs?: number;
   trackingPublicationSequence?: number;
   trackingOutboundSubmissionId?: number;
   cohort?: {
     source_id?: number;
+    source_epoch?: number;
     frame_id?: number;
     observed_at_us?: number;
     tracking_publication_sequence?: number;
@@ -72,6 +83,7 @@ export type BevMeta = {
     stableId?: number | null;
     trackerId?: number | null;
     trackerLifecycleGeneration?: number | null;
+    historyKey?: string | null;
     anchorSource?: string | null;
     anchorQuality?: string | null;
     anchorReason?: string | null;
@@ -95,11 +107,13 @@ export type BevMeta = {
     stableId?: number | null;
     trackerId?: number | null;
     trackerLifecycleGeneration?: number | null;
+    historyKey?: string | null;
     canonicalWorld?: boolean;
     points?: Array<{
-      x: number;
-      y: number;
+      x?: number;
+      y?: number;
       t: number;
+      breakBefore?: boolean;
       floorplanX?: number;
       floorplanZ?: number;
       normX?: number;
@@ -154,7 +168,9 @@ export type BevMeta = {
     stableId?: number | null;
     trackerId?: number | null;
     trackerLifecycleGeneration?: number | null;
+    historyKey?: string | null;
     trailSegmentId?: number | null;
+    trailRetained?: boolean;
     reason?: string;
   }>;
   droppedFootpointCount?: number;
@@ -230,6 +246,8 @@ type TrailClock = {
   lastSrcMs?: number;
   lastSampleMs?: number;
 };
+
+type BevTrailTrack = TrailTrack & { historyKey: string };
 
 type HeightRenderTuning = {
   lowPct: number;
@@ -568,7 +586,7 @@ export const BevView: React.FC<BevViewProps> = ({
   };
 
   const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number; worldAdmission?: string }>>(new Map());
-  const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
+  const trailsRef = useRef<Map<string, BevTrailTrack>>(new Map());
   const animationFrameRef = useRef<number>();
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const bgKeyRef = useRef<string>('');
@@ -577,21 +595,14 @@ export const BevView: React.FC<BevViewProps> = ({
   const historyKeyForPoint = (
     stableId?: number | null,
     trackerId?: number | null,
-    trackerLifecycleGeneration?: number | null
-  ): string | null => {
-    const trackerNum = typeof trackerId === 'number' && Number.isFinite(trackerId) ? trackerId : null;
-    const generationNum = typeof trackerLifecycleGeneration === 'number' && Number.isFinite(trackerLifecycleGeneration)
-      ? trackerLifecycleGeneration
-      : null;
-    if (trackerNum !== null && trackerNum >= 0) {
-      return generationNum !== null && generationNum >= 0
-        ? `t:${trackerNum}:g:${generationNum}`
-        : `t:${trackerNum}`;
-    }
-    const stableNum = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
-    if (stableNum !== null && stableNum > 0) return `s:${stableNum}`;
-    return null;
-  };
+    trackerLifecycleGeneration?: number | null,
+    explicitHistoryKey?: string | null,
+  ): string | null => historyKeyForBevIdentity({
+    historyKey: explicitHistoryKey,
+    stableId,
+    trackerId,
+    trackerLifecycleGeneration,
+  });
 
   const displayIdForPoint = (stableId?: number | null, trackerId?: number | null): number | null => {
     const stableNum = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
@@ -605,6 +616,7 @@ export const BevView: React.FC<BevViewProps> = ({
   const trailSceneUnitsPerPxRef = useRef<number>(1.0);
   const trailFrameCounterRef = useRef<number>(0);
   const trailSpaceKeyRef = useRef<string>('');
+  const sourceTimelineKeyRef = useRef<string | null>(null);
   const trailClockRef = useRef<TrailClock>({});
   const metaRef = useRef<BevMeta | undefined>(meta);
   const trailSmoothingOwner = useMemo(() => {
@@ -706,6 +718,21 @@ export const BevView: React.FC<BevViewProps> = ({
   }, [meta]);
 
   useEffect(() => {
+    const nextTimelineKey = sourceTimelineKeyForBevPayload(meta);
+    if (nextTimelineKey === null) return;
+    const previousTimelineKey = sourceTimelineKeyRef.current;
+    if (previousTimelineKey !== null && previousTimelineKey !== nextTimelineKey) {
+      resetBevVisualContinuityState({
+        heads: smoothState.current,
+        trails: trailsRef.current,
+        frameCounterRef: trailFrameCounterRef,
+        clockRef: trailClockRef,
+      });
+    }
+    sourceTimelineKeyRef.current = nextTimelineKey;
+  }, [meta?.sourceId, meta?.sourceEpoch, meta?.cohort?.source_id, meta?.cohort?.source_epoch]);
+
+  useEffect(() => {
     if (floorplanHasRenderableGrid(floorplan) && !floorplan?.error) {
       retainedFloorplanRef.current = floorplan;
       return;
@@ -800,15 +827,24 @@ export const BevView: React.FC<BevViewProps> = ({
       // (The drawing code later already has the `backendTracks` branch that consumes metaNow.trails verbatim.)
     }
 
-    if (!cfg.enabled) {
-      trails.clear();
-      state.clear();
-      trailFrameCounterRef.current = 0;
-      trailClockRef.current = {};
-      return;
-    }
-
     const points = Array.isArray(meta?.footpoints) ? meta.footpoints : [];
+    const droppedFootpoints = Array.isArray(meta?.droppedFootpoints) ? meta.droppedFootpoints : [];
+    // A dropped canonical point is an explicit absence for the live marker,
+    // even when the producer deliberately retains its trail across a short
+    // world-estimator gap.  Purge by lifecycle key before admitting this
+    // cohort so an old head cannot remain visible for the one-second timeout.
+    purgeCurrentBevHeadsForDropped(state, droppedFootpoints);
+    droppedFootpoints.forEach((pt) => {
+      const historyKey = historyKeyForPoint(
+        pt?.stableId,
+        pt?.trackerId,
+        pt?.trackerLifecycleGeneration,
+        pt?.historyKey,
+      );
+      if (historyKey === null) return;
+      const retainTrail = pt?.trailRetained === true || pt?.reason === 'canonical_world_missing';
+      if (!retainTrail) trails.delete(historyKey);
+    });
     const purgePriorTrackerGenerations = (trackerId: number | null, keepKey: string) => {
       if (trackerId === null || trackerId < 0) return;
       const prefix = `t:${trackerId}:g:`;
@@ -822,14 +858,21 @@ export const BevView: React.FC<BevViewProps> = ({
     const dropUnresolvedPoint = (pt: typeof points[number]) => {
       const stableNum = typeof pt?.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
       const trackerNum = typeof pt?.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-      const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
+      const historyKey = historyKeyForPoint(
+        stableNum,
+        trackerNum,
+        pt?.trackerLifecycleGeneration,
+        pt?.historyKey,
+      );
       if (historyKey === null) return;
-      state.delete(historyKey);
+      purgeCurrentBevHeadState(state, historyKey);
       trails.delete(historyKey);
     };
 
-    if (useBackendTrails) {
-      trails.clear();
+    // Current heads are a live-position surface, not a trail sample.  Admit
+    // them before the trail-enabled branch so disabling trails cannot hide a
+    // valid canonical footpoint.
+    const updateCurrentHeads = () => {
       const seenIds = new Set<string>();
       points.forEach(pt => {
         const resolved = resolvePayloadPoint(pt);
@@ -839,25 +882,52 @@ export const BevView: React.FC<BevViewProps> = ({
         }
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-        const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
+        const historyKey = historyKeyForPoint(
+          stableNum,
+          trackerNum,
+          pt?.trackerLifecycleGeneration,
+          pt?.historyKey,
+        );
         const displayId = displayIdForPoint(stableNum, trackerNum);
         if (historyKey === null || displayId === null) return;
         purgePriorTrackerGenerations(trackerNum, historyKey);
-        seenIds.add(historyKey);
-        state.set(historyKey, {
-          x: resolved.x,
-          y: resolved.y,
-          lastSeen: arrivalNow,
-          stableId: `${displayId}`,
+        updateCurrentBevHeadState({
+          state,
+          point: pt,
+          resolved,
+          nowMs: arrivalNow,
+          historyKey,
+          displayId,
           colorId: colorIdForPerson(cam, displayId),
-          worldAdmission: typeof pt.worldAdmission === 'string' ? pt.worldAdmission : undefined,
         });
+        seenIds.add(historyKey);
       });
+      if (useBackendTrails) {
+        // Canonical BEV frames are exact-current cohorts. Membership itself
+        // is the complete tombstone set, so live heads disappear immediately
+        // even when the bounded diagnostic drop list contains only its first
+        // 64 records.
+        purgeCurrentBevHeadsMissingFromCohort(state, seenIds);
+        return;
+      }
       for (const [id, data] of state.entries()) {
         if (!seenIds.has(id) && (arrivalNow - data.lastSeen > 1000)) {
           state.delete(id);
         }
       }
+    };
+
+    if (!cfg.enabled) {
+      trails.clear();
+      trailFrameCounterRef.current = 0;
+      trailClockRef.current = {};
+      updateCurrentHeads();
+      return;
+    }
+
+    if (useBackendTrails) {
+      trails.clear();
+      updateCurrentHeads();
       return;
     }
 
@@ -877,14 +947,26 @@ export const BevView: React.FC<BevViewProps> = ({
 
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-        const historyKey = historyKeyForPoint(stableNum, trackerNum, pt?.trackerLifecycleGeneration);
+        const historyKey = historyKeyForPoint(
+          stableNum,
+          trackerNum,
+          pt?.trackerLifecycleGeneration,
+          pt?.historyKey,
+        );
         const displayId = displayIdForPoint(stableNum, trackerNum);
         if (historyKey === null || displayId === null) return;
         purgePriorTrackerGenerations(trackerNum, historyKey);
         const colorId = colorIdForPerson(cam, displayId);
         const labelText = `${displayId}`;
 
-        const entry = trails.get(historyKey) ?? { points: [], lastSeen: 0, label: labelText, colorId };
+        const entry = trails.get(historyKey) ?? {
+          historyKey,
+          points: [],
+          lastSeen: 0,
+          label: labelText,
+          colorId,
+        };
+        entry.historyKey = historyKey;
         const update = upsertTrailSample(entry, {
           nowMs: effectiveNow,
           x: targetX,
@@ -894,13 +976,14 @@ export const BevView: React.FC<BevViewProps> = ({
           cfg,
         });
 
-        state.set(historyKey, {
-          x: update.headX,
-          y: update.headY,
-          lastSeen: arrivalNow,
-          stableId: `${displayId}`,
+        updateCurrentBevHeadState({
+          state,
+          point: pt,
+          resolved: { x: update.headX, y: update.headY },
+          nowMs: arrivalNow,
+          historyKey,
+          displayId,
           colorId,
-          worldAdmission: typeof pt.worldAdmission === 'string' ? pt.worldAdmission : undefined,
         });
 
         entry.label = labelText;
@@ -1834,30 +1917,32 @@ export const BevView: React.FC<BevViewProps> = ({
               typeof point?.stableId === 'number' && Number.isFinite(point.stableId) ? point.stableId : null,
               typeof point?.trackerId === 'number' && Number.isFinite(point.trackerId) ? point.trackerId : null,
               point?.trackerLifecycleGeneration,
+              point?.historyKey,
             ))
             .filter((key): key is string => key !== null),
         );
         const backendTracks = !frontendOwnsTrailSmoothing && Array.isArray(metaNow?.trails)
-          ? metaNow.trails
-            .map((tr) => {
+          ? Array.from(metaNow.trails.reduce((tracks, tr) => {
               const stableNum = typeof tr?.stableId === 'number' && Number.isFinite(tr.stableId) ? tr.stableId : null;
               const trackerNum = typeof tr?.trackerId === 'number' && Number.isFinite(tr.trackerId) ? tr.trackerId : null;
               const displayId = displayIdForPoint(stableNum, trackerNum);
-              if (displayId === null || !Array.isArray(tr?.points)) return null;
-              const hasExplicitCanonicalMarker = typeof tr?.canonicalWorld === 'boolean';
-              const legacyCanonicalKey = historyKeyForPoint(
+              const historyKey = historyKeyForPoint(
                 stableNum,
                 trackerNum,
                 tr?.trackerLifecycleGeneration,
+                tr?.historyKey,
               );
+              if (historyKey === null || displayId === null || !Array.isArray(tr?.points)) return tracks;
+              const hasExplicitCanonicalMarker = typeof tr?.canonicalWorld === 'boolean';
               const canonicalWorld = hasExplicitCanonicalMarker
                 ? tr.canonicalWorld === true
-                : legacyCanonicalKey !== null && canonicalTrailKeys.has(legacyCanonicalKey);
+                : canonicalTrailKeys.has(historyKey);
               const points = tr.points
                 .map((p) => ({
                   x: Number(p?.x),
                   y: Number(p?.y),
                   t: Number(p?.t),
+                  breakBefore: p?.breakBefore === true,
                   normX: Number(p?.normX),
                   normY: Number(p?.normY),
                   floorplanInside: p?.floorplanInside,
@@ -1867,6 +1952,9 @@ export const BevView: React.FC<BevViewProps> = ({
                 }))
                 .map((p) => {
                   if (!Number.isFinite(p.t)) return null;
+                  if (p.breakBefore) {
+                    return { x: Number.NaN, y: Number.NaN, t: p.t };
+                  }
                   const hasMetric = Number.isFinite(p.x) && Number.isFinite(p.y);
                   const hasNorm = Number.isFinite(p.normX) && Number.isFinite(p.normY);
                   if (!hasMetric && !hasNorm) return null;
@@ -1875,21 +1963,22 @@ export const BevView: React.FC<BevViewProps> = ({
                   return { x: resolved.x, y: resolved.y, t: p.t };
                 })
                 .filter((p): p is TrailPoint => p !== null);
-              if (points.length < 2) return null;
-              return {
+              if (points.length < 2) return tracks;
+              tracks.set(historyKey, {
+                historyKey,
                 points,
                 lastSeen: Number(points[points.length - 1]?.t) || now,
                 label: `${displayId}`,
                 colorId: colorIdForPerson(cam, displayId),
-              } as TrailTrack;
-            })
-            .filter((tr): tr is TrailTrack => tr !== null)
+              });
+              return tracks;
+            }, new Map<string, BevTrailTrack>()).values())
           : null;
         const tracksToDraw = backendTracks ?? Array.from(trailsRef.current.values());
-        const headByLabel = new Map<string, { x: number; y: number; colorId: number; lastSeen: number; worldAdmission?: string }>();
-        for (const [, data] of smoothState.current.entries()) {
+        const headByHistoryKey = new Map<string, { x: number; y: number; colorId: number; lastSeen: number; worldAdmission?: string }>();
+        for (const [historyKey, data] of smoothState.current.entries()) {
           if (!data.stableId) continue;
-          headByLabel.set(String(data.stableId), {
+          headByHistoryKey.set(historyKey, {
             x: data.x,
             y: data.y,
             colorId: data.colorId,
@@ -1897,9 +1986,9 @@ export const BevView: React.FC<BevViewProps> = ({
             worldAdmission: data.worldAdmission,
           });
         }
-        const drawnHeadLabels = new Set<string>();
+        const drawnHeadKeys = new Set<string>();
 
-        const drawTrailHead = (label: string, colorId: number, head: { x: number; y: number; lastSeen: number; worldAdmission?: string }, lastDrawn: TrailPoint | null) => {
+        const drawTrailHead = (historyKey: string, colorId: number, head: { x: number; y: number; lastSeen: number; worldAdmission?: string }, lastDrawn: TrailPoint | null) => {
           const headResolved = resolveForDraw(head.x, head.y);
           if (!headResolved) return;
           const headAlpha = computeTrailAgeAlpha(now, head.lastSeen, trailWindowMs, trailCfg.min_alpha);
@@ -1943,7 +2032,7 @@ export const BevView: React.FC<BevViewProps> = ({
           ctx.fill();
           ctx.stroke();
           ctx.setLineDash([]);
-          drawnHeadLabels.add(label);
+          drawnHeadKeys.add(historyKey);
         };
 
         for (const tr of tracksToDraw) {
@@ -1960,6 +2049,11 @@ export const BevView: React.FC<BevViewProps> = ({
             const resolved = Number.isFinite(p.x) && Number.isFinite(p.y) ? resolveForDraw(p.x, p.y) : null;
             if (!resolved) {
               prev = null;
+              // An explicit backend discontinuity (or any unresolved trail
+              // sample) also severs the optional tail-to-live-head connector.
+              // Keeping lastDrawn here would visually bridge the very gap the
+              // producer marked as unobservable.
+              lastDrawn = null;
               continue;
             }
             const drawPoint = { ...p, x: resolved.x, y: resolved.y };
@@ -1983,16 +2077,50 @@ export const BevView: React.FC<BevViewProps> = ({
             lastDrawn = drawPoint;
           }
 
-          const head = headByLabel.get(tr.label);
+          const head = headByHistoryKey.get(tr.historyKey);
           if (head) {
-            drawTrailHead(tr.label, tr.colorId, head, lastDrawn);
+            drawTrailHead(tr.historyKey, tr.colorId, head, lastDrawn);
           }
         }
 
-        for (const [label, head] of headByLabel.entries()) {
-          if (drawnHeadLabels.has(label)) continue;
-          drawTrailHead(label, head.colorId, head, null);
+        for (const [historyKey, head] of headByHistoryKey.entries()) {
+          if (drawnHeadKeys.has(historyKey)) continue;
+          drawTrailHead(historyKey, head.colorId, head, null);
         }
+      }
+
+      // A live point remains visible when trail history is disabled.  This
+      // deliberately uses the same resolved metric coordinates as the trail
+      // head path, but does not require a trail, a second sample, or trail
+      // smoothing to be enabled.
+      if (!trailCfg.enabled) {
+        smoothState.current.forEach((head) => {
+          if (!head.stableId) return;
+          const headResolved = Number.isFinite(head.x) && Number.isFinite(head.y)
+            ? resolveForDraw(head.x, head.y)
+            : null;
+          if (!headResolved) return;
+          const headAlpha = computeTrailAgeAlpha(now, head.lastSeen, trailWindowMs, trailCfg.min_alpha);
+          const held = head.worldAdmission === 'held';
+          const predicted = head.worldAdmission === 'predicted';
+          const px = drawX(headResolved.x);
+          const py = drawY(headResolved.y);
+          ctx.fillStyle = held
+            ? 'rgba(255, 193, 7, 0.18)'
+            : hsla(head.colorId, Math.min(1, headAlpha + (predicted ? 0.08 : 0.25)));
+          ctx.strokeStyle = held
+            ? 'rgba(255, 193, 7, 0.95)'
+            : predicted
+              ? hsla(head.colorId, Math.min(1, headAlpha * 0.95))
+              : 'rgba(0, 0, 0, 0.65)';
+          ctx.lineWidth = held ? 2.25 : predicted ? 2.0 : 1.5;
+          ctx.setLineDash(held ? [3, 2] : predicted ? [2, 2] : []);
+          ctx.beginPath();
+          ctx.arc(px, py, held ? TRAIL_HEAD_RADIUS + 1.5 : TRAIL_HEAD_RADIUS, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+          ctx.setLineDash([]);
+        });
       }
 
       smoothState.current.forEach((pt) => {

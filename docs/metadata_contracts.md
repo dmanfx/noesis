@@ -268,11 +268,21 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_resolver_selected_id": "floor_ray"|"registered_depth"|"pose_scale"|"gravity_reconstruction"|"",
   "world_resolver_fused": <bool|null>,
   "world_resolver_disagreement_m": <float|null>,
+  "world_upright_body_candidate": [<float x>, <float y>, <float z>]|null,
+  "world_upright_body_height_m": <float|null>,
+  "world_upright_body_scatter_m": <float|null>,
+  "world_upright_body_anchor_count": <int|null>,
+  "world_upright_body_strong_proof": <bool|null>,
+  "world_upright_body_reacquire_support": <bool|null>,
+  "world_seated_pose_candidate": [<float x>, <float y>, <float z>]|null,
+  "world_seated_torso_height_m": <float|null>,
+  "world_seated_stationary_lock": <bool|null>,
   "world_floor_candidate": [<float x>, <float y>, <float z>]|null,
   "world_floor_range_m": <float|null>,
   "world_floor_range_limit_m": <float|null>,
   "world_floor_incidence_sin": <float|null>,
   "world_floor_admitted": <bool|null>,
+  "world_first_output_ankle_contact_supported": <bool|null>,
   "world_floor_rejection_reason": "floor_ray_range_exceeded"|"floor_ray_geometry_invalid"|null,
   "world_depth_candidate": [<float x>, <float y>, <float z>]|null,
   "world_prefilter_measurement": [<float x>, <float y>, <float z>]|null,
@@ -339,6 +349,32 @@ for each current hypothesis. Only extent, authored boundary, observed-space
 confidence, and floor elevation are soft likelihood evidence; PCF never clamps
 or manufactures a track. A camera without an exact catalog binding omits the
 field and candidate PCF evidence.
+
+`world_upright_body_*` and `world_seated_*` are typed exact-cohort diagnostics
+for body-to-floor projection; they are not alternate dashboard coordinates.
+The upright anchor count is the number of retained anatomical planes after the
+bounded outlier check. Strong proof requires five planes spanning head,
+shoulders, and hips. `world_upright_body_reacquire_support=true` additionally
+means the current five-plane height/scatter, detector confidence, and PCF gates
+permit the ordinary physical/reacquisition path. An anchor count of three or
+four never grants authority from one row. A cold lifecycle may nevertheless
+publish on the second of two compatible exact-current four-plane rows within
+`reacquire_max_gap_s`; both rows retain
+`world_upright_body_strong_proof=false` and
+`world_upright_body_reacquire_support=false`, the first is nonpublishing
+corroboration, and the second supplies canonical `world`. Three-plane, mixed,
+incompatible, expired, or basis-changing evidence cannot form this proof. For
+an established relocation, moderate rows may accumulate same-basis trajectory
+evidence while the field remains false, but only a current verified five-plane
+row can finalize the reanchor.
+`world_first_output_ankle_contact_supported=true` identifies the current final
+sample of the bounded first-output ankle proof. Every contributing sample has
+already passed tight contact, adequate incidence, detector-semantic, and
+immutable-binding gates; the field is corroboration metadata, not a second
+coordinate. BEV still renders only the final canonical `world` admitted for
+that exact tracking cohort. If that row establishes the first queue-published
+metric point, its exact tracking/world/BEV cohort publishes immediately instead
+of waiting for the normal cadence.
 
 Zero-person camera frames still produce a tracking publication with
 `track_count=0`, `tracks=[]`, an empty observation set, and advancing frame
@@ -435,7 +471,7 @@ watermark so absence cannot be confused with replay or telemetry stall.
   active calibrated/Scene Prior world edge used for the track. A renderer or
   consumer must reject a missing or mismatched identity rather than mixing the
   point with stale camera/prior geometry.
-- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, predicted, held, or invalid. Producer-side floor-ray rejection uses the stable reasons `floor_ray_range_exceeded` and `floor_ray_geometry_invalid`; downstream renderers must not clamp or reinterpret those rejected candidates as valid world positions.
+- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, predicted, held, or invalid. Producer-side floor-ray rejection uses the stable reasons `floor_ray_range_exceeded`, `floor_ray_geometry_invalid`, `cold_floor_semantic_confidence_below_minimum`, and `cold_floor_ray_incidence_below_minimum`; the cold reasons mean first metric authority lacked current detector semantic proof or adequately conditioned ray geometry. Tracker confidence and neutral PCF coverage cannot substitute. Downstream renderers must not clamp or reinterpret those rejected candidates as valid world positions.
 - `projection_confidence`, `temporal_confidence`, `reid_confidence`,
   `reid_identity`, `appearance_id`, `occluded`, and
   `occlusion_uncertainty_m` are optional validation diagnostics. They are used

@@ -1811,6 +1811,48 @@ def test_gated_batch_withholds_exact_bytes_until_commit_then_releases_in_order()
     assert shutdown.completed_bytes == payload_bytes
 
 
+def test_concurrent_gated_batches_hold_admission_order_without_interleaving() -> None:
+    class _YieldingSocket(_FakeSocket):
+        async def send(self, payload: object) -> None:
+            self.sent.append(payload)
+            await asyncio.sleep(0)
+
+    async def _run() -> list[dict[str, object]]:
+        ws = WebSocketServer(stats_callback=None)
+        ws.event_loop = asyncio.get_running_loop()
+        client = _YieldingSocket()
+        ws.connected_clients.add(client)
+        first = ws.admit_broadcast_batch_sync(
+            _canonical_tracking_batch(ws, sequence=1)
+        )
+        second = ws.admit_broadcast_batch_sync(
+            _canonical_tracking_batch(ws, sequence=2)
+        )
+
+        # Let the first admitted task own the canonical lane, then resolve the
+        # second gate first. It must remain behind the unresolved first cohort.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        second.commit_then_release(lambda: None)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert client.sent == []
+
+        first.commit_then_release(lambda: None)
+        await ws.quiesce_outbound_submissions(timeout_s=1.0)
+        return [json.loads(str(item)) for item in client.sent]
+
+    sent = asyncio.run(_run())
+    assert [(item["type"], item["tracking_publication_sequence"]) for item in sent] == [
+        ("tracking", 1),
+        ("world_snapshot", 1),
+        ("world_event", 1),
+        ("tracking", 2),
+        ("world_snapshot", 2),
+        ("world_event", 2),
+    ]
+
+
 def test_gated_batch_commit_failure_aborts_without_delivery_or_byte_leak() -> None:
     async def _run() -> tuple[GatedOutboundAdmission, object, list[object]]:
         ws = WebSocketServer(stats_callback=None)

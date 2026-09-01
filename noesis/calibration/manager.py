@@ -127,6 +127,10 @@ class CalibrationSnapshot:
                 float(value) for value in self.extrinsics_col_major
             ),
             calibration_floor_y=float(self.floor_y),
+            target_from_calibration_col_major=tuple(
+                float(value)
+                for value in contract.target_from_source_col_major
+            ),
             calibration_frame_id=contract.source_frame.frame_id,
             calibration_frame_revision=contract.source_frame.revision,
             world_frame_id=contract.target_frame.frame_id,
@@ -138,6 +142,7 @@ class CalibrationSnapshot:
             world_alignment_sha256=self.world_alignment_sha256,
             scene_prior_id=self.scene_prior_id,
             target_revision_id=self.target_revision_id,
+            image_localization_basis="revision_target_floor",
         )
 
 
@@ -160,10 +165,29 @@ class WorldCalibrationSnapshot:
     frame_transform_sha256: str
     floor_plane_normal: Tuple[float, float, float]
     floor_plane_offset_m: float
+    target_from_calibration_col_major: Tuple[float, ...] = (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
     camera_calibration_sha256: str | None = None
     world_alignment_sha256: str | None = None
     scene_prior_id: str | None = None
     target_revision_id: str | None = None
+    image_localization_basis: str = "revision_target_floor"
 
 
 # ---------------------------------------------------------------------------

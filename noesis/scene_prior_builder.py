@@ -86,6 +86,7 @@ class ScenePriorBuildConfig:
     world_to_scene: Path
     output_root: Path
     camera_map_lock: Path | None = None
+    camera_pose_anchor: Path | None = None
     camera_ids: tuple[str, ...] = ()
     grid_resolution_m: float = 0.05
     floor_support_band_m: float = 0.12
@@ -176,6 +177,7 @@ class _CameraPreviewFrame:
     target_revision_metadata: ArtifactFingerprint
     target_revision_id: str
     camera_map_lock: ScenePriorCameraMapLock | None
+    camera_pose_anchor: ArtifactFingerprint | None
     target_from_source_col_major: tuple[float, ...]
     source_floor_normal: tuple[float, float, float]
     source_floor_offset_m: float
@@ -546,6 +548,13 @@ class _CameraMapLockInput:
     yaw_correction_deg: float
 
 
+@dataclass(frozen=True)
+class _CameraPoseAnchorInput:
+    evidence: ArtifactFingerprint
+    camera_to_target: np.ndarray
+    target_floor_y_m: float
+
+
 def _load_camera_map_lock(
     path: Path | None,
     inputs: Mapping[str, Any],
@@ -618,11 +627,138 @@ def _load_camera_map_lock(
     )
 
 
+def _load_camera_pose_anchor(
+    path: Path | None,
+    inputs: Mapping[str, Any],
+) -> _CameraPoseAnchorInput | None:
+    if path is None:
+        return None
+    try:
+        source = read_scene_file(
+            path,
+            label="PCF static-camera pose anchor",
+            max_bytes=MAX_CAMERA_MAP_LOCK_BYTES,
+        )
+    except SceneFileError as exc:
+        raise ScenePriorBuildError(str(exc)) from exc
+    payload = load_strict_json(source.data, label="PCF static-camera pose anchor")
+    if not isinstance(payload, Mapping):
+        raise ScenePriorBuildError("PCF camera pose anchor is not an object")
+    camera_id = str(inputs["reference_camera_id"])
+    if (
+        payload.get("schema") != "noesis.pcf.static_camera_anchor.v2"
+        or payload.get("status") != "passed_review_anchor"
+        or payload.get("accepted_for_canonical_use") is not True
+        or payload.get("camera_id") != camera_id
+        or payload.get("coordinate_frame") != "pcf_assembly_metric_world_m"
+        or payload.get("pose_convention")
+        != "opencv_cam2world_x_right_y_down_z_forward"
+    ):
+        raise ScenePriorBuildError("PCF camera pose anchor is not admitted")
+    constraints = payload.get("constraints")
+    estimate = payload.get("estimate")
+    evidence = payload.get("evidence")
+    floor = evidence.get("pcf_floor") if isinstance(evidence, Mapping) else None
+    anchor_inputs = payload.get("inputs")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (constraints, estimate, evidence, floor, anchor_inputs)
+    ):
+        raise ScenePriorBuildError("PCF camera pose anchor evidence is incomplete")
+    assert isinstance(constraints, Mapping)
+    assert isinstance(estimate, Mapping)
+    assert isinstance(evidence, Mapping)
+    assert isinstance(floor, Mapping)
+    assert isinstance(anchor_inputs, Mapping)
+    if (
+        constraints.get("metric_scale_fixed") is not True
+        or constraints.get("gravity_fixed") is not True
+        or constraints.get("full_pnp_translation_used") is not True
+        or constraints.get("full_pnp_rotation_used") is not True
+        or constraints.get("calibrated_pitch_roll_preserved") is not False
+        or floor.get("status") != "passed"
+        or evidence.get("early_view_supported") is not True
+        or evidence.get("late_view_supported") is not True
+        or int(evidence.get("admitted_view_count") or 0) < 8
+    ):
+        raise ScenePriorBuildError("PCF camera pose anchor gates are incomplete")
+    calibration_sha256 = _sha256(inputs["camera_calibration_bytes"])
+    if anchor_inputs.get("camera_calibration_sha256") != calibration_sha256:
+        raise ScenePriorBuildError("PCF camera pose anchor calibration mismatch")
+    target_metadata_sha256 = _sha256(inputs["target_revision_metadata_bytes"])
+    if anchor_inputs.get("static_metadata_sha256") != target_metadata_sha256:
+        raise ScenePriorBuildError("PCF camera pose anchor revision mismatch")
+    try:
+        camera_to_target = np.asarray(
+            payload["camera_to_assembly_row_major"], dtype=np.float64
+        )
+        target_floor_y_m = float(constraints["floor_y_m"])
+        translation_uncertainty_m = float(
+            estimate["translation_uncertainty_p80_m"]
+        )
+        rotation_uncertainty_deg = float(
+            estimate["rotation_uncertainty_p80_deg"]
+        )
+        floor_tilt_deg = float(floor["tilt_from_pcf_gravity_deg"])
+        floor_residual_p90_m = float(floor["residual_p90_m"])
+        camera_height_m = float(floor["camera_height_over_fitted_floor_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenePriorBuildError("PCF camera pose anchor metrics are malformed") from exc
+    if (
+        camera_to_target.shape != (4, 4)
+        or not np.isfinite(camera_to_target).all()
+        or not np.allclose(camera_to_target[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8)
+        or not np.allclose(
+            camera_to_target[:3, :3].T @ camera_to_target[:3, :3],
+            np.eye(3),
+            atol=1e-5,
+        )
+        or not math.isclose(
+            float(np.linalg.det(camera_to_target[:3, :3])),
+            1.0,
+            abs_tol=1e-5,
+        )
+        or not all(
+            math.isfinite(value)
+            for value in (
+                target_floor_y_m,
+                translation_uncertainty_m,
+                rotation_uncertainty_deg,
+                floor_tilt_deg,
+                floor_residual_p90_m,
+                camera_height_m,
+            )
+        )
+        or abs(target_floor_y_m) > 0.05
+        or translation_uncertainty_m > 0.25
+        or rotation_uncertainty_deg > 5.0
+        or floor_tilt_deg > 2.0
+        or floor_residual_p90_m > 0.06
+        or not 0.40 <= camera_height_m <= 3.50
+    ):
+        raise ScenePriorBuildError("PCF camera pose anchor failed geometry gates")
+    return _CameraPoseAnchorInput(
+        evidence=ArtifactFingerprint(
+            role="pcf_static_camera_pose_anchor",
+            sha256=source.sha256,
+            version="noesis.pcf.static_camera_anchor.v2",
+            producer="noesis.localize_pcf_static_camera",
+        ),
+        camera_to_target=camera_to_target,
+        target_floor_y_m=target_floor_y_m,
+    )
+
+
 def _camera_preview_frame(
     inputs: Mapping[str, Any],
     *,
     camera_map_lock: _CameraMapLockInput | None = None,
+    camera_pose_anchor: _CameraPoseAnchorInput | None = None,
 ) -> _CameraPreviewFrame:
+    if camera_map_lock is not None and camera_pose_anchor is not None:
+        raise ScenePriorBuildError(
+            "camera yaw map lock and full PCF pose anchor are mutually exclusive"
+        )
     calibration = inputs["camera_calibration_row"]
     target_metadata = inputs["target_revision_metadata"]
     try:
@@ -630,10 +766,16 @@ def _camera_preview_frame(
             (4, 4),
             order="F",
         )
-        world_correction = np.asarray(
-            target_metadata["floor_alignment"]["world_correction_col_major"],
-            dtype=np.float64,
-        ).reshape((4, 4), order="F")
+        if camera_pose_anchor is None:
+            world_correction = np.asarray(
+                target_metadata["floor_alignment"]["world_correction_col_major"],
+                dtype=np.float64,
+            ).reshape((4, 4), order="F")
+        else:
+            world_correction = (
+                np.asarray(camera_pose_anchor.camera_to_target, dtype=np.float64)
+                @ camera_from_backend
+            )
     except (KeyError, TypeError, ValueError) as exc:
         raise ScenePriorBuildError("reference camera transform is malformed") from exc
     if (
@@ -697,12 +839,33 @@ def _camera_preview_frame(
         raise ScenePriorBuildError("reference target floor alignment is missing")
     try:
         target_revision_id = str(target_metadata["revision_id"])
-        target_floor_y_m = float(floor_alignment["target_floor_y"])
-        has_source_normal = "source_floor_normal" in floor_alignment
-        has_source_offset = "source_floor_offset" in floor_alignment
+        target_floor_y_m = (
+            float(camera_pose_anchor.target_floor_y_m)
+            if camera_pose_anchor is not None
+            else float(floor_alignment["target_floor_y"])
+        )
+        if camera_pose_anchor is not None:
+            target_plane = np.asarray(
+                [0.0, 1.0, 0.0, -target_floor_y_m], dtype=np.float64
+            )
+            source_plane = world_correction.T @ target_plane
+            normal_norm = float(np.linalg.norm(source_plane[:3]))
+            if not math.isfinite(normal_norm) or normal_norm <= 1e-8:
+                raise ValueError("PCF anchor source floor normal is degenerate")
+            source_floor_normal = tuple(
+                float(value) / normal_norm for value in source_plane[:3]
+            )
+            source_floor_offset_m = float(source_plane[3]) / normal_norm
+            has_source_normal = False
+            has_source_offset = False
+        else:
+            has_source_normal = "source_floor_normal" in floor_alignment
+            has_source_offset = "source_floor_offset" in floor_alignment
         if has_source_normal != has_source_offset:
             raise ValueError("source floor plane is partial")
-        if has_source_normal:
+        if camera_pose_anchor is not None:
+            pass
+        elif has_source_normal:
             source_floor_normal = tuple(
                 float(value) for value in floor_alignment["source_floor_normal"]
             )
@@ -760,6 +923,11 @@ def _camera_preview_frame(
         ),
         target_revision_id=target_revision_id,
         camera_map_lock=map_lock_contract,
+        camera_pose_anchor=(
+            camera_pose_anchor.evidence
+            if camera_pose_anchor is not None
+            else None
+        ),
         target_from_source_col_major=tuple(
             float(value) for value in world_correction.flatten(order="F")
         ),
@@ -1564,9 +1732,11 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         ),
     )
     camera_map_lock = _load_camera_map_lock(cfg.camera_map_lock, inputs)
+    camera_pose_anchor = _load_camera_pose_anchor(cfg.camera_pose_anchor, inputs)
     preview_frame = _camera_preview_frame(
         inputs,
         camera_map_lock=camera_map_lock,
+        camera_pose_anchor=camera_pose_anchor,
     )
     preview_arrays, preview_bounds = _camera_local_preview_arrays(
         arrays,
@@ -1583,6 +1753,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         camera_calibration=preview_frame.camera_calibration,
         target_revision_metadata=preview_frame.target_revision_metadata,
         camera_map_lock=preview_frame.camera_map_lock,
+        camera_pose_anchor=preview_frame.camera_pose_anchor,
         camera_position_world_m=preview_frame.camera_position_world_m,
         camera_right_world_xz=preview_frame.camera_right_world_xz,
         camera_forward_world_xz=preview_frame.camera_forward_world_xz,

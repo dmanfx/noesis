@@ -12,12 +12,14 @@ const frame = (overrides = {}) => ({
   type: 'bev-frame',
   cameraId: 'family-room',
   sourceId: 2,
+  sourceEpoch: 0,
   frameId: 100,
   observedAtUs: 1_000_000,
   trackingPublicationSequence: 8,
   trackingOutboundSubmissionId: 20,
   cohort: {
     source_id: 2,
+    source_epoch: 0,
     frame_id: 100,
     observed_at_us: 1_000_000,
     tracking_publication_sequence: 8,
@@ -41,6 +43,7 @@ test('exact empty BEV frame clears people instead of retaining the previous arra
     trackingOutboundSubmissionId: 21,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 101,
       observed_at_us: 1_100_000,
       tracking_publication_sequence: 9,
@@ -62,6 +65,7 @@ test('late, malformed and unknown-frame payloads fail closed', () => {
     trackingOutboundSubmissionId: 19,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 99,
       observed_at_us: 999_999,
       tracking_publication_sequence: 7,
@@ -75,6 +79,7 @@ test('late, malformed and unknown-frame payloads fail closed', () => {
   assert.equal(admitBevFrame(previous, frame({
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 100,
       observed_at_us: 1_000_000,
     },
@@ -82,6 +87,7 @@ test('late, malformed and unknown-frame payloads fail closed', () => {
   assert.equal(admitBevFrame(previous, frame({
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 100,
       observed_at_us: null,
       tracking_publication_sequence: 8,
@@ -105,6 +111,7 @@ test('status clears points and trails', () => {
     trackingOutboundSubmissionId: 19,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 100,
       observed_at_us: 999_999,
       tracking_publication_sequence: 8,
@@ -125,6 +132,7 @@ test('status clears points and trails', () => {
     trackingOutboundSubmissionId: 1,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 1,
       observed_at_us: 2_000_000,
       tracking_publication_sequence: 1,
@@ -141,6 +149,7 @@ test('an older or unbound status cannot clear a newer admitted frame', () => {
     trackingOutboundSubmissionId: 21,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 101,
       observed_at_us: 1_100_000,
       tracking_publication_sequence: 9,
@@ -151,12 +160,14 @@ test('an older or unbound status cannot clear a newer admitted frame', () => {
     type: 'bev-status',
     cameraId: 'family-room',
     sourceId: 2,
+    sourceEpoch: 0,
     frameId: 100,
     observedAtUs: 1_000_000,
     trackingPublicationSequence: 8,
     trackingOutboundSubmissionId: 20,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 100,
       observed_at_us: 1_000_000,
       tracking_publication_sequence: 8,
@@ -178,12 +189,14 @@ test('a status for the exact failed cohort clears that cohort', () => {
     type: 'bev-status',
     cameraId: 'family-room',
     sourceId: 2,
+    sourceEpoch: 0,
     frameId: 101,
     observedAtUs: 1_100_000,
     trackingPublicationSequence: 9,
     trackingOutboundSubmissionId: 21,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 101,
       observed_at_us: 1_100_000,
       tracking_publication_sequence: 9,
@@ -198,6 +211,7 @@ test('a status for the exact failed cohort clears that cohort', () => {
     trackingOutboundSubmissionId: 21,
     cohort: {
       source_id: 2,
+      source_epoch: 0,
       frame_id: 101,
       observed_at_us: 1_100_000,
       tracking_publication_sequence: 9,
@@ -207,6 +221,79 @@ test('a status for the exact failed cohort clears that cohort', () => {
   assert.equal(admission.admitted, true);
   assert.deepEqual(admission.payload.footpoints, []);
   assert.equal(admission.payload.error, 'homography_failed');
+});
+
+test('higher source epoch admits a same-source media-clock rewind and rejects the old epoch', () => {
+  const rewound = frame({
+    sourceEpoch: 1,
+    frameId: 1,
+    observedAtUs: 100_000,
+    trackingPublicationSequence: 0,
+    trackingOutboundSubmissionId: 1,
+    cohort: {
+      source_id: 2,
+      source_epoch: 1,
+      frame_id: 1,
+      observed_at_us: 100_000,
+      tracking_publication_sequence: 0,
+      tracking_outbound_submission_id: 1,
+    },
+  });
+  const admitted = admitBevFrame(frame(), rewound);
+  assert.equal(admitted.admitted, true);
+  assert.equal(admitted.payload.sourceEpoch, 1);
+
+  const stale = frame({
+    frameId: 110,
+    observedAtUs: 2_000_000,
+    trackingPublicationSequence: 10,
+    trackingOutboundSubmissionId: 30,
+    cohort: {
+      source_id: 2,
+      source_epoch: 0,
+      frame_id: 110,
+      observed_at_us: 2_000_000,
+      tracking_publication_sequence: 10,
+      tracking_outbound_submission_id: 30,
+    },
+  });
+  assert.equal(admitBevFrame(rewound, stale).reason, 'source_epoch_stale');
+  assert.equal(admitBevFrame(frame(), frame({
+    cohort: {
+      source_id: 2,
+      source_epoch: 9,
+      frame_id: 100,
+      observed_at_us: 1_000_000,
+      tracking_publication_sequence: 8,
+      tracking_outbound_submission_id: 20,
+    },
+  })).reason, 'cohort_invalid');
+});
+
+test('higher source epoch status can clear a rewound failed cohort', () => {
+  const status = {
+    type: 'bev-status',
+    cameraId: 'family-room',
+    sourceId: 2,
+    sourceEpoch: 1,
+    frameId: 1,
+    observedAtUs: 100_000,
+    trackingPublicationSequence: 0,
+    trackingOutboundSubmissionId: 1,
+    cohort: {
+      source_id: 2,
+      source_epoch: 1,
+      frame_id: 1,
+      observed_at_us: 100_000,
+      tracking_publication_sequence: 0,
+      tracking_outbound_submission_id: 1,
+    },
+    error: 'render_failed_after_rewind',
+  };
+  const admitted = admitBevStatus(frame(), status);
+  assert.equal(admitted.admitted, true);
+  assert.equal(admitted.payload.sourceEpoch, 1);
+  assert.deepEqual(admitted.payload.footpoints, []);
 });
 
 test('camera-local BEV must match the exact floorplan revision', () => {

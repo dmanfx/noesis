@@ -50,6 +50,7 @@ def _hypothesis(
     correlation_group: str | None = None,
     pcf: WorldPriorEvidence | None = None,
     anchor: str = "lower_body_contact",
+    support_state: str = "floor",
     valid: bool = True,
     rejection_reason: str | None = None,
 ) -> WorldMeasurementHypothesis:
@@ -60,6 +61,7 @@ def _hypothesis(
         position=Vector3(x=position[0], y=position[1], z=position[2]),
         covariance=covariance or _covariance(),
         anchor=anchor,
+        support_state=support_state,  # type: ignore[arg-type]
         confidence=confidence,
         correlation_group=correlation_group,
         pcf=pcf,
@@ -196,6 +198,81 @@ def test_incompatible_candidates_choose_strongest_retain_alternate_and_inflate_c
     assert result.covariance is not None
     assert result.covariance.values[0] > selected.covariance.values[0]
     assert any(item.retained_as_alternate for item in result.diagnostics)
+
+
+def test_observed_floor_outranks_incompatible_precise_unknown_body_range() -> None:
+    cohort = _cohort()
+    floor = _hypothesis(
+        cohort,
+        "floor-contact",
+        "floor_ray",
+        (0.0, 0.0, 6.0),
+        covariance=_covariance(0.18, 0.04, 0.18),
+        confidence=0.75,
+        support_state="floor",
+    )
+    torso_range = _hypothesis(
+        cohort,
+        "torso-range",
+        "registered_depth",
+        (0.0, 0.0, 0.1),
+        covariance=_covariance(0.001, 0.02, 0.02),
+        confidence=0.90,
+        anchor="torso_core",
+        support_state="unknown",
+    )
+
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(floor, torso_range))
+    )
+
+    assert result.selected_candidate_id == "floor-contact"
+    assert result.support_state == "floor"
+    assert result.alternate_candidate_id is None
+    torso_diagnostic = next(
+        row for row in result.diagnostics if row.candidate_id == "torso-range"
+    )
+    assert torso_diagnostic.rejection_reason == (
+        "support_state_not_equivalent_to_selected"
+    )
+
+
+def test_compatible_precise_unknown_body_range_cannot_pull_floor_result() -> None:
+    cohort = _cohort()
+    floor = _hypothesis(
+        cohort,
+        "floor-contact",
+        "floor_ray",
+        (0.0, 0.0, 6.0),
+        covariance=_covariance(0.18, 0.04, 0.18),
+        confidence=0.75,
+        support_state="floor",
+    )
+    torso_range = _hypothesis(
+        cohort,
+        "torso-range",
+        "registered_depth",
+        (0.25, 0.0, 6.0),
+        covariance=_covariance(0.001, 0.02, 0.001),
+        confidence=0.99,
+        anchor="torso_core",
+        support_state="unknown",
+    )
+
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(floor, torso_range))
+    )
+
+    assert result.selected_candidate_id == "floor-contact"
+    assert result.contributor_ids == ("floor-contact",)
+    assert result.fused is False
+    assert result.position == floor.position
+    torso_diagnostic = next(
+        row for row in result.diagnostics if row.candidate_id == "torso-range"
+    )
+    assert torso_diagnostic.rejection_reason == (
+        "support_state_not_equivalent_to_selected"
+    )
 
 
 def test_large_metric_disagreement_never_fuses_even_with_broad_covariance() -> None:

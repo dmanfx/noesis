@@ -375,6 +375,12 @@ class BevTrailConfig:
 @dataclass
 class _BevTrailTrackState:
     points: "deque[Tuple[float, float, float]]" = field(default_factory=deque)
+    # Completed path segments remain visible until the normal trail window
+    # expires.  Keeping them separate from ``points`` prevents a connector
+    # from being drawn across a canonical-world gap or explicit reanchor.
+    completed_segments: "deque[Tuple[Optional[int], deque[Tuple[float, float, float]]]]" = field(
+        default_factory=deque
+    )
     last_seen_ts: float = 0.0
     stable_id: Optional[int] = None
     tracker_id: Optional[int] = None
@@ -385,6 +391,17 @@ class _BevTrailTrackState:
     ema_z: Optional[float] = None
     ema_ts: float = 0.0
     trail_segment_id: Optional[int] = None
+    # A current canonical footpoint can be absent while the producer keeps
+    # the same physical lifecycle/segment. Preserve the already accepted
+    # history during that gap, but start a fresh visible segment when a
+    # current point returns so the renderer never draws across missing world
+    # authority.
+    gap_pending: bool = False
+    # A recovered current head may arrive on a non-sampling frame or while
+    # trail growth is disabled. Keep an explicit pending discontinuity until
+    # a new current segment receives its first sample so consumers never
+    # connect retained history directly to that live head.
+    break_before_current: bool = False
 
 
 @dataclass
@@ -396,6 +413,7 @@ class BevResult:
     config: BevConfig
     timestamp_us: int
     source_id: Optional[int]
+    source_epoch: Optional[int]
     frame_id: Optional[int]
     observed_at_us: Optional[int]
     width_px: int
@@ -405,6 +423,7 @@ class BevResult:
     floorplan_space: Optional[FloorplanSpace] = None
     coverage_envelope: Optional[CoverageEnvelope] = None
     dropped_footpoints: List[Dict[str, Any]] = field(default_factory=list)
+    dropped_footpoint_count: int = 0
 
 
 class HomographyCache:
@@ -502,6 +521,13 @@ class BevRenderer:
         self._trail_tracks_by_cam: Dict[str, Dict[Hashable, _BevTrailTrackState]] = {}
         self._trail_frame_counts: Dict[str, int] = {}
         self._trail_color_cache: Dict[int, Tuple[int, int, int]] = {}
+        # BEV motion history is scoped to the physical source timeline, not
+        # merely to a camera label or reused numeric tracker id.  Canonical
+        # publication advances this tuple when a source reconnect/rewind
+        # creates a new epoch.
+        self._source_timeline_by_camera: Dict[
+            str, Tuple[Optional[int], int]
+        ] = {}
         self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
         self._smoother = MotionGatedAlphaBetaSmoother(self._smoothing_cfg)
         self._smoother_source_by_key: Dict[Hashable, str] = {}
@@ -647,6 +673,34 @@ class BevRenderer:
             if isinstance(key, tuple) and key and key[0] == camera_id:
                 self._smoother.reset(key)
                 self._smoother_source_by_key.pop(key, None)
+
+    def _bound_camera_trail_state_locked(self, camera_id: str) -> None:
+        """Retain at most the configured renderable track histories."""
+
+        cam_tracks = self._trail_tracks_by_cam.get(camera_id)
+        if not cam_tracks:
+            return
+        max_tracks = max(1, int(self._trail_cfg.max_tracks))
+        if len(cam_tracks) <= max_tracks:
+            return
+        track_items = list(cam_tracks.items())
+        # ``dict`` order is stable, so equal-timestamp current tracks use the
+        # same deterministic preference as the rendering slice below.
+        track_items.sort(
+            key=lambda item: float(
+                getattr(item[1], "last_seen_ts", 0.0)
+            ),
+            reverse=True,
+        )
+        for history_key, _state in track_items[max_tracks:]:
+            cam_tracks.pop(history_key, None)
+            smoother_key = (
+                (camera_id, *history_key)
+                if isinstance(history_key, tuple)
+                else (camera_id, history_key)
+            )
+            self._smoother.reset(smoother_key)
+            self._smoother_source_by_key.pop(smoother_key, None)
 
     def _clear_identity_motion_state(
         self,
@@ -3038,6 +3092,7 @@ class BevRenderer:
         footpoints: Optional[List[Footpoint]] = None,
         timestamp_us: int = 0,
         source_id: Optional[int] = None,
+        source_epoch: Optional[int] = None,
         frame_id: Optional[int] = None,
         observed_at_us: Optional[int] = None,
         tracking_publication_sequence: Optional[int] = None,
@@ -3051,12 +3106,34 @@ class BevRenderer:
         now_s = float(timestamp_us) / 1_000_000.0
         cfg = self.config_per_cam.get(camera_id, BevConfig())
         footpoints = footpoints or []
+        source_id_value = int(source_id) if source_id is not None else None
+        source_epoch_value = (
+            int(source_epoch) if source_epoch is not None else None
+        )
+        if source_epoch_value is not None and source_epoch_value < 0:
+            raise ValueError("BEV source_epoch must be non-negative")
 
         frame_mode = self._frame_mode
         use_world_frame = frame_mode == "world"
         flip_u, flip_v = self._infer_image_flips(calib)
 
         with self._lock:
+            if source_epoch_value is not None:
+                timeline = (source_id_value, source_epoch_value)
+                previous_timeline = self._source_timeline_by_camera.get(
+                    camera_id
+                )
+                if (
+                    previous_timeline is not None
+                    and previous_timeline != timeline
+                ):
+                    # A rewind can make every retained timestamp appear to be
+                    # in the future. Clear the camera lane before the first
+                    # point of the new epoch reaches either the smoother or
+                    # trail sampler.
+                    self._reset_camera_motion_state_locked(camera_id)
+                self._source_timeline_by_camera[camera_id] = timeline
+
             # A lifecycle tombstone is an exact ordered-cohort boundary, even
             # when a short compatible reacquisition intentionally reuses the
             # numeric generation.  Remove both presentation history and the
@@ -3109,6 +3186,8 @@ class BevRenderer:
                     cam_tracks.pop(track_id, None)
                 if not cam_tracks:
                     self._trail_tracks_by_cam.pop(camera_id, None)
+                else:
+                    self._bound_camera_trail_state_locked(camera_id)
 
         # Compute or fetch extents for this camera
         x_range = cfg.x_range
@@ -3366,6 +3445,7 @@ class BevRenderer:
         raw_points: List[Dict[str, Any]] = []
         current_by_history: Dict[Hashable, Dict[str, Any]] = {}
         dropped_footpoints: List[Dict[str, Any]] = []
+        dropped_footpoint_count = 0
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         camera_ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
@@ -3429,30 +3509,38 @@ class BevRenderer:
         # remains the place for the larger candidate diagnostics.
         max_drop_records = 64
 
-        def _break_canonical_trail(fp: Footpoint) -> None:
-            """Break stale BEV history when an authoritative point is rejected.
-
-            A rejected canonical observation is an explicit absence boundary,
-            not an ordinary missing frame.  Remove the exact tracker
-            generation (or stable-id fallback) immediately so a same-generation
-            return cannot draw a straight segment from the last accepted point
-            through the rejected interval.
-            """
-            self._clear_identity_motion_state(
-                camera_id,
-                stable_id=fp.stable_id,
-                tracker_id=fp.tracker_id,
-                tracker_lifecycle_generation=fp.tracker_lifecycle_generation,
-            )
-
         def _record_canonical_drop(
             fp: Footpoint,
             reason: str,
             *,
             x: Optional[float] = None,
             z: Optional[float] = None,
+            details: Optional[Mapping[str, Any]] = None,
         ) -> None:
-            _break_canonical_trail(fp)
+            nonlocal dropped_footpoint_count
+            dropped_footpoint_count += 1
+            # A rejected current coordinate does not invalidate already
+            # accepted path history. PersonGroundState owns lifecycle and
+            # segment authority; retain the exact generation, remove only its
+            # current head, and force a discontinuity before the next accepted
+            # point. This applies equally to a missing world row, a finite
+            # range/display rejection, or a revision mismatch: none rewrites
+            # the historical coordinates that were valid when published.
+            retain_trail = True
+            history_key = self._history_identity(
+                stable_id=fp.stable_id,
+                tracker_id=fp.tracker_id,
+                tracker_lifecycle_generation=(
+                    fp.tracker_lifecycle_generation
+                ),
+            )
+            if history_key is not None:
+                with self._lock:
+                    retained_state = self._trail_tracks_by_cam.get(
+                        str(camera_id), {}
+                    ).get(history_key)
+                    if retained_state is not None:
+                        retained_state.gap_pending = True
             if len(dropped_footpoints) >= max_drop_records:
                 return
             payload: Dict[str, Any] = {
@@ -3466,6 +3554,7 @@ class BevRenderer:
                 ),
                 "reason": str(reason),
                 "canonicalWorld": True,
+                "trailRetained": bool(retain_trail),
                 "anchorSource": (
                     str(fp.anchor_source) if fp.anchor_source not in (None, "") else None
                 ),
@@ -3475,6 +3564,8 @@ class BevRenderer:
                     else None
                 ),
             }
+            if details:
+                payload.update(dict(details))
             if x is not None and z is not None:
                 try:
                     x_value = float(x)
@@ -3543,18 +3634,13 @@ class BevRenderer:
                     observed_frame_id is None
                     or observed_frame_id != int(expected_frame_id)
                 ):
-                    _break_canonical_trail(fp)
-                    dropped_footpoints.append(
-                        {
-                            "stableId": fp.stable_id,
-                            "trackerId": fp.tracker_id,
-                            "trackKey": fp.track_key,
-                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
-                            "trailSegmentId": fp.trail_segment_id,
-                            "reason": "canonical_world_frame_id_mismatch",
+                    _record_canonical_drop(
+                        fp,
+                        "canonical_world_frame_id_mismatch",
+                        details={
                             "frameId": fp.frame_id,
                             "expectedFrameId": int(expected_frame_id),
-                        }
+                        },
                     )
                     continue
                 if (
@@ -3575,22 +3661,17 @@ class BevRenderer:
                         )
                     )
                 ):
-                    _break_canonical_trail(fp)
-                    dropped_footpoints.append(
-                        {
-                            "stableId": fp.stable_id,
-                            "trackerId": fp.tracker_id,
-                            "trackKey": fp.track_key,
-                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
-                            "trailSegmentId": fp.trail_segment_id,
-                            "reason": "canonical_world_revision_mismatch",
+                    _record_canonical_drop(
+                        fp,
+                        "canonical_world_revision_mismatch",
+                        details={
                             "worldFrame": observed_world_frame or None,
                             "worldFrameRevision": observed_world_revision or None,
                             "expectedWorldFrame": expected_world_frame,
                             "expectedWorldFrameRevision": expected_world_revision or None,
                             "worldTransformSha256": fp.world_transform_sha256,
                             "expectedWorldTransformSha256": expected_world_transform_sha256 or None,
-                        }
+                        },
                     )
                     continue
                 # A transform digest is an independent binding, not a proxy
@@ -3606,18 +3687,13 @@ class BevRenderer:
                     or observed_world_transform_sha256
                     != expected_world_transform_sha256
                 ):
-                    _break_canonical_trail(fp)
-                    dropped_footpoints.append(
-                        {
-                            "stableId": fp.stable_id,
-                            "trackerId": fp.tracker_id,
-                            "trackKey": fp.track_key,
-                            "trackerLifecycleGeneration": fp.tracker_lifecycle_generation,
-                            "trailSegmentId": fp.trail_segment_id,
-                            "reason": "canonical_world_transform_mismatch",
+                    _record_canonical_drop(
+                        fp,
+                        "canonical_world_transform_mismatch",
+                        details={
                             "worldTransformSha256": observed_world_transform_sha256 or None,
                             "expectedWorldTransformSha256": expected_world_transform_sha256 or None,
-                        }
+                        },
                     )
                     continue
             selection_debug: Optional[Dict[str, Any]] = None
@@ -4063,6 +4139,7 @@ class BevRenderer:
                             ),
                             "displaySource": str(display_source),
                             "method": str(fp.method),
+                            "canonicalWorld": False,
                             "anchorSource": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
                         }
                         try:
@@ -4091,7 +4168,9 @@ class BevRenderer:
                                 float(pz),
                             )
                         )
-                        dropped_footpoints.append(dropped_payload)
+                        dropped_footpoint_count += 1
+                        if len(dropped_footpoints) < max_drop_records:
+                            dropped_footpoints.append(dropped_payload)
                     continue
             if not math.isfinite(px) or not math.isfinite(pz):
                 continue
@@ -4204,7 +4283,11 @@ class BevRenderer:
                         else (
                             "predicted"
                             if is_canonical_track
-                            and anchor_source in ("cv_prediction", "image_motion_prediction")
+                            and anchor_source
+                            in (
+                                "cv_prediction",
+                                "image_motion_prediction",
+                            )
                             else ("accepted" if is_canonical_track else None)
                         )
                     ),
@@ -4404,7 +4487,61 @@ class BevRenderer:
             max_points = max(2, int(self._trail_cfg.max_points_per_track))
             window_s = float(self._trail_cfg.window_s)
 
+            def _archive_current_segment(state: _BevTrailTrackState) -> None:
+                """Close the current path without erasing visible history."""
+
+                if len(state.points) >= 2:
+                    state.completed_segments.append(
+                        (
+                            state.trail_segment_id,
+                            deque(state.points),
+                        )
+                    )
+                state.points.clear()
+                state.break_before_current = bool(state.completed_segments)
+
+            def _prune_and_bound_segments(state: _BevTrailTrackState) -> None:
+                retained: "deque[Tuple[Optional[int], deque[Tuple[float, float, float]]]]" = deque()
+                for segment_id, segment_points in state.completed_segments:
+                    while (
+                        segment_points
+                        and (now_s - float(segment_points[0][0])) > window_s
+                    ):
+                        segment_points.popleft()
+                    if len(segment_points) >= 2:
+                        retained.append((segment_id, segment_points))
+                state.completed_segments = retained
+                while state.points and (now_s - float(state.points[0][0])) > window_s:
+                    state.points.popleft()
+
+                # ``max_points_per_track`` bounds all retained segments, not
+                # each segment independently. Prefer dropping the oldest
+                # completed history before shortening the active segment.
+                total_points = len(state.points) + sum(
+                    len(segment_points)
+                    for _segment_id, segment_points in state.completed_segments
+                )
+                while total_points > max_points and state.completed_segments:
+                    _segment_id, oldest = state.completed_segments[0]
+                    oldest.popleft()
+                    total_points -= 1
+                    if len(oldest) < 2:
+                        total_points -= len(oldest)
+                        state.completed_segments.popleft()
+                while total_points > max_points and state.points:
+                    state.points.popleft()
+                    total_points -= 1
+
             if trails_enabled:
+                # A BEV frame is an exact-current cohort. Absence from its
+                # admitted footpoint set is therefore a real current-head gap,
+                # including a completely empty frame where no Footpoint object
+                # exists to call ``_record_canonical_drop``. Retain history,
+                # but force a discontinuity if this lifecycle returns.
+                for history_key, state in cam_tracks.items():
+                    if history_key not in current_by_history:
+                        state.gap_pending = True
+
                 for history_key, point_meta in current_by_history.items():
                     lx = float(point_meta["x"])
                     lz = float(point_meta["z"])
@@ -4454,16 +4591,26 @@ class BevRenderer:
                         and int(segment_id) != int(state.trail_segment_id)
                     )
                     if bool(point_meta.get("trail_break_required", False)) or segment_changed:
-                        state.points.clear()
+                        _archive_current_segment(state)
                         state.ema_x = None
                         state.ema_z = None
                         state.ema_ts = 0.0
+                        state.gap_pending = False
+                    elif state.gap_pending:
+                        # Retain the old segment while the current world point
+                        # is absent, then start this return as a new segment.
+                        # This preserves honest history during the outage and
+                        # prevents a line from bridging across it.
+                        _archive_current_segment(state)
+                        state.ema_x = None
+                        state.ema_z = None
+                        state.ema_ts = 0.0
+                        state.gap_pending = False
                     if segment_id is not None:
                         state.trail_segment_id = int(segment_id)
 
                     # Always prune old samples so disappeared tracks naturally fade out.
-                    while state.points and (now_s - float(state.points[0][0])) > window_s:
-                        state.points.popleft()
+                    _prune_and_bound_segments(state)
 
                     x = float(lx)
                     z = float(lz)
@@ -4527,6 +4674,7 @@ class BevRenderer:
                     # Always seed the first point even when min_step would block.
                     if not state.points:
                         state.points.append((float(now_s), float(x), float(z)))
+                        state.break_before_current = False
                     else:
                         commit_path_point(
                             state.points,
@@ -4536,16 +4684,25 @@ class BevRenderer:
                             config=path_cfg,
                             append_allowed=True,
                         )
+                    _prune_and_bound_segments(state)
 
             # Remove fully expired tracks to keep memory bounded.
             expired: List[Hashable] = []
             for history_key, state in cam_tracks.items():
-                while state.points and (now_s - float(state.points[0][0])) > window_s:
-                    state.points.popleft()
-                if not state.points and (now_s - float(state.last_seen_ts)) > window_s:
+                _prune_and_bound_segments(state)
+                if (
+                    not state.points
+                    and not state.completed_segments
+                    and (now_s - float(state.last_seen_ts)) > window_s
+                ):
                     expired.append(history_key)
             for history_key in expired:
                 cam_tracks.pop(history_key, None)
+
+            # ``max_tracks`` is a storage bound as well as a drawing bound.
+            # Otherwise a rapid sequence of tracker ids can leave an
+            # arbitrarily large set of invisible retained histories.
+            self._bound_camera_trail_state_locked(camera_id)
 
             if trails_enabled and cam_tracks:
                 # Select a bounded number of tracks to render.
@@ -4553,42 +4710,116 @@ class BevRenderer:
                 track_items.sort(key=lambda item: float(getattr(item[1], "last_seen_ts", 0.0)), reverse=True)
                 max_tracks = max(1, int(self._trail_cfg.max_tracks))
                 for history_key, state in track_items[:max_tracks]:
-                    pts = list(state.points)
-                    if len(pts) < 2:
+                    raw_segments: List[
+                        Tuple[Optional[int], List[Tuple[float, float, float]]]
+                    ] = [
+                        (segment_id, list(segment_points))
+                        for segment_id, segment_points in state.completed_segments
+                        if len(segment_points) >= 2
+                    ]
+                    if state.points:
+                        raw_segments.append(
+                            (state.trail_segment_id, list(state.points))
+                        )
+                    segments_available = sum(
+                        max(0, len(segment_points) - 1)
+                        for _segment_id, segment_points in raw_segments
+                    )
+                    if segments_available <= 0:
                         continue
-                    segments_available = len(pts) - 1
-                    segments_budget = min(segments_available, int(self._trail_cfg.max_segments_per_track))
+                    segments_budget = min(
+                        segments_available,
+                        int(self._trail_cfg.max_segments_per_track),
+                    )
                     if segments_budget <= 0:
                         continue
-                    pts = self._resample_points(pts, segments_budget)
+
+                    # Spend the bounded line-segment budget on the newest
+                    # visible segments first. A one-point active segment is
+                    # retained as a discontinuity endpoint so the frontend
+                    # cannot connect the old tail directly to the live head.
+                    selected_reversed: List[
+                        Tuple[Optional[int], List[Tuple[float, float, float]]]
+                    ] = []
+                    remaining_budget = int(segments_budget)
+                    for segment_id, segment_points in reversed(raw_segments):
+                        available = max(0, len(segment_points) - 1)
+                        if available == 0:
+                            if segment_points and not selected_reversed:
+                                selected_reversed.append(
+                                    (segment_id, segment_points)
+                                )
+                            continue
+                        if remaining_budget <= 0:
+                            continue
+                        segment_budget = min(available, remaining_budget)
+                        selected_reversed.append(
+                            (
+                                segment_id,
+                                self._resample_points(
+                                    segment_points,
+                                    segment_budget,
+                                ),
+                            )
+                        )
+                        remaining_budget -= segment_budget
+                    selected_segments = list(reversed(selected_reversed))
+                    if not selected_segments:
+                        continue
+
                     display_key = int(state.display_key) if state.display_key is not None else 0
-                    trails_to_draw.append((display_key, pts))
+                    for _segment_id, segment_points in selected_segments:
+                        if len(segment_points) >= 2:
+                            trails_to_draw.append((display_key, segment_points))
                     trail_points: List[Dict[str, Any]] = []
-                    for ts_pt, x_pt, z_pt in pts:
-                        point_out: Dict[str, Any] = {
-                            "x": float(x_pt),
-                            "y": float(z_pt),
-                            "t": int(round(float(ts_pt) * 1000.0)),
-                        }
-                        point_out.update(
-                            self._floorplan_point_fields(
-                                float(x_pt),
-                                float(z_pt),
-                                x_range,
-                                z_range,
-                                width_px,
-                                height_px,
-                                active_floorplan_space,
+                    for segment_index, (_segment_id, segment_points) in enumerate(
+                        selected_segments
+                    ):
+                        if segment_index > 0 and segment_points:
+                            trail_points.append(
+                                {
+                                    "t": int(
+                                        round(float(segment_points[0][0]) * 1000.0)
+                                    ),
+                                    "breakBefore": True,
+                                }
                             )
-                        )
-                        point_out.update(
-                            self._coverage_point_fields(
-                                coverage_envelope,
-                                float(x_pt),
-                                float(z_pt),
+                        for ts_pt, x_pt, z_pt in segment_points:
+                            point_out: Dict[str, Any] = {
+                                "x": float(x_pt),
+                                "y": float(z_pt),
+                                "t": int(round(float(ts_pt) * 1000.0)),
+                            }
+                            point_out.update(
+                                self._floorplan_point_fields(
+                                    float(x_pt),
+                                    float(z_pt),
+                                    x_range,
+                                    z_range,
+                                    width_px,
+                                    height_px,
+                                    active_floorplan_space,
+                                )
                             )
+                            point_out.update(
+                                self._coverage_point_fields(
+                                    coverage_envelope,
+                                    float(x_pt),
+                                    float(z_pt),
+                                )
+                            )
+                            trail_points.append(point_out)
+                    if state.break_before_current and trail_points:
+                        # There is retained history but the recovered current
+                        # head has not yet been sampled into a new segment.
+                        # A trailing marker prevents the frontend from drawing
+                        # a connector from the old tail to that live head.
+                        trail_points.append(
+                            {
+                                "t": int(round(float(now_s) * 1000.0)),
+                                "breakBefore": True,
+                            }
                         )
-                        trail_points.append(point_out)
                     backend_trails.append(
                         {
                             "stableId": int(state.stable_id) if state.stable_id is not None else None,
@@ -4656,7 +4887,8 @@ class BevRenderer:
             backend_trails=backend_trails,
             config=result_config,
             timestamp_us=timestamp_us,
-            source_id=int(source_id) if source_id is not None else None,
+            source_id=source_id_value,
+            source_epoch=source_epoch_value,
             frame_id=int(frame_id) if frame_id is not None else None,
             observed_at_us=(
                 int(observed_at_us) if observed_at_us is not None else None
@@ -4668,6 +4900,7 @@ class BevRenderer:
             floorplan_space=active_floorplan_space,
             coverage_envelope=coverage_envelope,
             dropped_footpoints=dropped_footpoints,
+            dropped_footpoint_count=int(dropped_footpoint_count),
         )
         return self._publish(
             result,
@@ -4768,6 +5001,7 @@ class BevRenderer:
                 "cameraId": result.camera_id,
                 "ts": result.timestamp_us,
                 "sourceId": result.source_id,
+                "sourceEpoch": result.source_epoch,
                 "frameId": result.frame_id,
                 "observedAtUs": result.observed_at_us,
                 "trackingPublicationSequence": (
@@ -4782,6 +5016,7 @@ class BevRenderer:
                 ),
                 "cohort": {
                     "source_id": result.source_id,
+                    "source_epoch": result.source_epoch,
                     "frame_id": result.frame_id,
                     "observed_at_us": result.observed_at_us,
                     "tracking_publication_sequence": (
@@ -4864,7 +5099,10 @@ class BevRenderer:
                 "fallbackTrackCount": int(len(fallback_points)),
                 "fallbackSources": (["ray_floor_fallback"] if fallback_points else []),
                 "fallbackReasonCounts": fallback_reasons,
-                "droppedFootpointCount": int(len(result.dropped_footpoints)),
+                # The reason records remain capped, but the count covers the
+                # complete exact cohort so diagnostics never under-report a
+                # large invalidation frame.
+                "droppedFootpointCount": int(result.dropped_footpoint_count),
             }
             if coverage_envelope_payload is not None:
                 status["coverageEnvelope"] = coverage_envelope_payload
@@ -4912,7 +5150,7 @@ class BevRenderer:
                     "displaySourceCounts": source_counts,
                     "sampledSnapshotCounts": snapshots,
                     "chosenOutOfBounds": int(chosen_out_of_bounds),
-                    "droppedFootpointCount": int(len(result.dropped_footpoints)),
+                    "droppedFootpointCount": int(result.dropped_footpoint_count),
                 }
             if result.dropped_footpoints:
                 status["droppedFootpoints"] = result.dropped_footpoints

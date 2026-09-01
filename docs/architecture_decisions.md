@@ -62,7 +62,10 @@ engine changes.
 
 Tracking, its world snapshot/events, and the associated BEV publication form an
 ordered committed cohort. A shared publication gate covers depth and analytics
-callbacks. Shutdown closes and drains that gate before WebSocket egress.
+callbacks. The exact callback that establishes a lifecycle's first accepted
+metric coordinate bypasses the normal scalar cadence so proof and first visible
+dot cannot be separated. Shutdown closes and drains that gate before WebSocket
+egress.
 
 **Why:** Dashboard state must never outrun committed world authority, and native
 callbacks must not race transport teardown.
@@ -436,38 +439,141 @@ calibration, alignment, and Scene Prior revisions must agree or the observation
 fails closed.
 
 Seated or lying hips and torsos are never projected as floor contacts. Visible
-ankles or supported person pixels may contribute; bbox-only, cached-as-current,
-and contaminated depth remain diagnostics. BEV, the dashboard, OSD trails, and
-later 3D clients consume the filtered world state and may only apply a
-revision-checked view transform. A 2D BEV transform uses horizontal
-camera-right and camera-forward axes, never the pitched camera frame. They
-cannot reselect depth, cast a new floor ray, or smooth the canonical point a
-second time.
+ankles or supported person pixels may contribute; the guarded `bbox_bottom`
+floor ray defined by ADR-024 may also contribute when its explicit evidence
+gates pass. Cached-as-current and contaminated depth remain diagnostics. BEV,
+the dashboard, OSD trails, and later 3D clients consume the filtered world
+state and may only apply a revision-checked view transform. A 2D BEV transform
+uses horizontal camera-right and camera-forward axes, never the pitched camera
+frame. They cannot reselect depth, cast a new floor ray, or smooth the canonical
+point a second time.
 
 A current canonical hold stays visible with explicit held provenance and does
 not extend its trail. Its normal cap is 0.40 seconds; only a trusted
-seated/lying lifecycle with exact-frame stationary bbox continuity may hold for
-up to 2.0 seconds. When a current depth sample is unavailable or stale, a
-bounded canonical constant-velocity prediction may remain visible with
-predicted provenance. Reject-driven prediction remains anchored to the last
-accepted state, is capped at 0.40 seconds, does not advance last-good state, and
-may extend history only when `trail_append_allowed=true`. Exact absence removes
-the state from active authority and places it in a 0.75-second quarantine. It
-is restored only for the same camera/tracker key when the returning bbox also
+seated/lying lifecycle with stationary bbox continuity across consecutive
+published observations may hold for up to 2.0 seconds. A published observation
+remains exact to its tracking cohort, but continuity does not require adjacent
+raw source-frame numbers: it requires a strictly increasing source frame ID and
+a positive bounded media-time gap. A missing, stale, or non-monotonic
+observation resets the motion or stationarity proof. Coherent image motion also
+requires the current anatomical/contact point and detector silhouette to move
+in the same direction on one stable image basis.
+The producer stamps the longer hold's typed stationary evidence from
+`PersonGroundState.posture`. At strict ingestion, the public tracking
+`posture` is authoritative; `world_posture` is only a resolver-diagnostic
+fallback when that field is absent. An `unknown` resolver posture therefore
+cannot suppress a proven sitting/lying hold, and a resolver-only sit/lie label
+cannot grant one over a contradictory public posture.
+
+When a current depth sample is unavailable or stale, a bounded canonical
+constant-velocity prediction may remain visible with predicted provenance.
+Reject-driven prediction remains anchored to the last accepted state, is
+capped at 0.40 seconds, does not advance last-good state, and may extend history
+only when `trail_append_allowed=true`. Exact tracker-row absence removes the
+state from active authority and places it in a 0.75-second quarantine. It is
+restored only for the same camera/tracker key when the returning bbox also
 matches the prior image position and scale; otherwise the new lifecycle starts
 cold. BEV/OSD trail history remains generation-keyed and is never restored.
-OSD joins the canonical track on the exact
-source/frame cohort, maps the declared source-image basis into the configured
-mosaic tile, and breaks history on tracker lifecycle or coordinate-basis
-changes. It never connects a missing/out-of-bounds canonical anchor to bbox
-bottom or a clamped mosaic edge.
+
+A present tracker row with no current canonical world point is a different
+boundary: BEV removes that lifecycle's live head immediately but retains its
+already accepted trail while the point is missing. A returning point begins a
+fresh visible segment, so no line crosses the authority gap. Revision,
+transform, lifecycle, and display-guard failures clear the affected history
+instead. Backend and frontend key both heads and trails by tracker lifecycle,
+not by a reusable display label; a valid current head is rendered even when
+trails are disabled or have fewer than two samples. The dashboard stores
+current heads separately from trail samples and reconciles them against each
+complete `footpoints` cohort, so a diagnostic `droppedFootpoints` cap cannot
+leave a stale dot behind and a retained backend trail cannot masquerade as a
+live head. OSD joins the canonical track on the exact source/frame cohort,
+maps the declared source-image basis
+into the configured mosaic tile, and breaks history on tracker lifecycle or
+coordinate-basis changes. It never connects a missing/out-of-bounds canonical
+anchor to bbox bottom or a clamped mosaic edge.
 
 The physical gate applies to the proposed published posterior as well as the
 raw measurement innovation. Measurement-noise slack may admit evidence for
 filtering, but it may not create a continuous step faster than
 `max_speed_mps`. Such a proposal is quarantined and uses the bounded prediction
 path; only evidence-backed reacquisition may relocate the head, and that
-relocation always increments the trail segment.
+relocation always increments the trail segment. Only the accepted current
+metric observation may consume that segment break; a prediction or hold still
+has to satisfy the visible output-speed gate and cannot use a hidden filter
+segment change to publish an instantaneous relocation. Final admission compares
+every alternate source with the last lifecycle/revision point admitted to the
+ordered tracking/BEV publication queue. Rate-suppressed callback rows may update
+internal filter state but cannot replace that visible watermark. Rejected
+alternates restore its coordinate and segment while advancing only media time.
+An exact gain-zero `bounded_output_hold` advances that visible publication
+clock but preserves a separate motion-bearing kinematic coordinate, media PTS,
+and segment. Only after such a hold may the next otherwise admissible metric or
+projective recovery reduce its filter gain along the original
+prediction-to-measurement line so the emitted point remains within 4 m/s of
+the latest displayed point. The kinematic clock still supplies the real
+elapsed motion budget, and the strict service independently checks both clocks.
+Ordinary adjacent observations do not receive this slew treatment: they retain
+the existing reject/quarantine or evidence-backed segment-break behavior, and
+no coordinate is post-hoc clipped.
+Public trail fields are bound to that admitted watermark as well: a nearby
+prediction may preserve a newer hidden metric segment internally, but it
+publishes the prior visible segment with no break until a visible metric row
+legitimately consumes the relocation.
+The strict world service is also the final positional admission boundary for
+the compatible tracking row and its BEV head. Before any bytes are released,
+the tracking publisher normalizes `world_valid` against the exact set of
+source/tracker/lifecycle/frame observations that the service committed with a
+world coordinate. A producer candidate rejected there is cleared to
+`world_valid=false`, loses its coordinate and process provenance, cannot append
+a trail, and reports `canonical_world_service_rejected`. The typed publication
+receipt binds that accepted key set to the paired BEV render, and the producer's
+queue-visible world watermark advances only after the commit and only for those
+accepted keys. Tracking, BEV, the nested/standalone world snapshot, and Menon
+therefore cannot expose different answers for the same cohort.
+Fusion rejection also cannot become hidden future authority. The service
+advances its source-local output/proof cache only for exact source evidence
+accepted into the resulting snapshot; position, registration, and velocity
+rejections leave the prior root unchanged. The one explicit exception is a
+`non_authoritative_held_continuation`, which may remain a source-local process
+origin while fresh evidence from another camera owns the fused entity. Public
+tracking and BEV admission still require `source.accepted=true`, so that
+exception cannot mint a competing displayed coordinate.
+Every canonical CV/hold row carries a versioned output-transition proof that
+binds this queue-visible watermark and the independently retained last metric
+watermark to exact media PTS, lifecycle, segment, and registration. The strict
+world service recomputes the gain-one bounded process step or gain-zero output
+hold and rejects a jointly rewritten posterior. Ordered-worker lag may bind a
+bounded CV row to an earlier exact commit only if its metric anchor still
+equals the latest metric anchor and the posterior is also speed-gated from the
+latest output. A recent-projective bridge still requires an image-motion origin
+inside 0.405 seconds and cannot chain from CV; an output hold is latest-only.
+The service output key includes source, camera, tracker ID, lifecycle
+generation, world-frame revision, world-transform SHA-256, and the active
+calibration-artifact SHA-256. A calibration artifact change therefore retires
+the old output history and every continuity root even if human-readable
+revision labels happen to match. Global fusion uses the same 4 m/s default as
+the producer and strict service, so identity continuity cannot reintroduce a
+faster published velocity after source-local admission.
+Pre-seeded/bbox3d measurements
+enter this same gate after physical rejection; they do not own a parallel
+continuation contract.
+Current observed-ankle floor
+candidates may accumulate while published-cadence image-motion consensus is
+still warming, but they cannot relocate an established state until that
+independent motion proof is current.
+
+BEV visual continuity is scoped to the exact `(sourceId, sourceEpoch)` media
+timeline. The top-level epoch and nested cohort epoch must match. A higher
+epoch for the same source admits a legitimate replay/reconnect clock rewind,
+but the dashboard clears its source-local heads, trails, smoothing, sampling
+phase, and source-time clock before consuming the first new-epoch cohort. A
+lower epoch is stale and cannot restore an earlier display timeline.
+
+World snapshot observation extents are entity-set metadata rather than stream
+watermarks. Removing the entity with the freshest retained evidence may lower
+`observed_end_us` in the next valid snapshot. Snapshot `sequence` and
+`published_at_us` remain the monotonic publication authority used by Menon and
+other consumers for freshness.
 
 **Why:** A second display estimator and two different floor revisions produced
 posture- and range-dependent metre-scale placement errors. One explicit state
@@ -509,19 +615,157 @@ authoritative video/tracking path.
 **Accepted:** 2026-08-23
 
 When a current person ground measurement is missing or physically rejected, the
-canonical producer may transport the last physically accepted image foot by
-the current detector-box affine motion and project it through the active
-corrected floor plane. This `image_motion_prediction` is bounded by lifecycle,
-short-TTL, image-step/speed, ray, and metric-speed gates; it never updates the
-world filter or its accepted image origin. Stationary `anchor_hold` remains the
-only fallback for a seated/lying box proven stationary, and failed transport
-after material bbox motion fails closed.
+canonical producer may transport the last physically accepted image foot from
+an exact current torso-motion reference, with detector-box affine motion as the
+shorter fallback, then project that transported pixel through the active
+corrected floor plane. The torso reference is current image anatomy only; it is
+never itself projected as a floor or depth hypothesis. A physically accepted,
+confident non-lying metric row, including a standing row, may arm the accepted
+foot and torso reference. A later confident non-lying row may consume that
+reference only when current floor evidence is missing or rejected and every
+projective gate below passes. The complete pose-compatible origin is stored as
+an independent immutable foot/world/bbox/torso bundle; a newer bbox-only metric
+row may refresh the short bbox origin without erasing or mixing that bundle.
+
+The transport is non-integrating in image space. Every result is recomputed
+from the last physically accepted foot, bbox, torso reference, timestamp, and
+lifecycle; a predicted row never becomes the next transport origin. The anatomy
+path applies torso translation to the accepted foot and never scales that
+offset from a detector box shortened by occlusion. Both torso references and
+the accepted and transported feet must remain within bounded silhouette
+envelopes, each foot must remain below its torso reference, and torso/bbox
+displacements must agree in direction and bounded magnitude. The ground-motion
+comparison uses detector-box bottom-center, not box center: a torso/box-center
+rise while the bottom edge remains planted is articulation, not foot
+translation. That hard rejection also blocks the bbox-affine fallback for the
+row. Lifecycle, basis, TTL, image speed, silhouette scale, ray, range,
+world-delta, and metric-speed gates bound the resulting
+`image_motion_prediction`.
+
+If policy allows it, the floor-projected weak observation must still pass
+`PersonGroundState`'s physical CV and posterior-speed admission. It may advance
+the bounded canonical process origin and append an explicitly predicted trail
+point, but it never advances `last_good_world`, accepted image geometry, or
+fresh global-measurement authority. When its fixed-origin provenance is
+complete and `state_integrated=true`, the global service carries the exact point
+into the canonical snapshot as a high-uncertainty held coordinate. This is an
+exact BEV/Menon parity rule, not permission to train cross-camera fusion. It also
+neither increments nor clears a
+pending same-basis metric reacquisition consensus; that candidate position,
+timestamp, basis, and count are restored around projective evaluation.
+
+Both bbox-affine and learned-height continuations publish one shared version-1
+filter-transition proof captured at the branch that chose the posterior. The
+proof names the exact queue-admitted source output, complete media-time basis,
+bounded prediction/hold base, gain, and process observation. The canonical
+world service retains its latest point plus a bounded same-segment history of
+its own exact commits per camera/source/tracker/lifecycle/revision. It verifies
+the named origin against that service-owned set, recomputes the posterior
+algebra, and independently enforces the fixed human speed bound from its latest
+point. This absorbs finite lag between the media estimator and ordered
+publication worker without allowing a stale origin to jump past current state.
+The service retains any exact committed output for this validation purpose for
+at most the 1.25-second filter horizon; it does not require that output itself
+to be image-derived or metrically fresh. This cache rule is intentionally
+separate from the 0.40-second, non-chainable CV-generation budget.
+The ordered producer watermark and the strict service each also own an
+immutable projective-episode root: only a committed
+`image_motion_prediction` may establish it, bounded CV/hold descendants may
+carry it, and neither descendant may renew it with its own publication PTS.
+An ordinary metric/other output or expiry terminates the lane. Producer labels
+can request the bridge but cannot create or resurrect that root.
+Mutating both `world` and
+`world_filter_prediction` therefore cannot turn an unrelated coordinate into a
+valid held observation. Learned-height alignment additionally retains the last
+metric queue output separately from later held publications; a raw-evidence gap
+beyond 0.40 seconds clears only its short medoid window. The original raw and
+trusted-world roots remain immutable for that occlusion episode. A later raw
+window may resume from them only within 1.25 seconds and only when the exact
+inferred root and a recent service-committed output carrying that same root
+match; lifecycle, segment, frame, transform, calibration-bound output key, and
+monotonic evidence time must still agree. A root mismatch, expired output, or
+gap beyond 1.25 seconds rejects that restart row. It cannot renew the root; any
+later candidate must independently satisfy the ordinary recent-evidence or
+exact-root restart gates.
+An inferred root ends only when the ordered publication queue exposes a
+committed metric or unrelated projective successor. A metric candidate accepted
+on a rate-suppressed callback is not public service authority and therefore
+cannot erase the producer root while the service still owns it. Inferred-image
+rows and their bounded CV/hold descendants retain the same root until that
+queue-visible successor, lifecycle/revision change, or expiry ends the episode.
+
+After
+accepted-foot transport becomes unavailable, exactly one short-TTL
+`cv_prediction` may bridge from an immediately preceding projective process
+posterior. Successful projective integration stamps a dedicated one-visible-row
+token. Rate-suppressed callbacks may advance only its dedicated bounded process
+timestamp; they cannot spend the token. Enqueuing the bridge in the canonical
+tracking/BEV cohort clears it, and a different metric mutation cannot
+impersonate a bridge advance. The visible CV continuation therefore cannot
+chain. Stationary
+`anchor_hold` remains the only fallback for a seated/lying box proven
+stationary, and failed transport after material bbox motion fails closed.
+Strict state-integrated `cv_prediction` and `anchor_hold` rows follow the same
+held snapshot boundary when their `bounded_cv_process` posterior exactly equals
+the emitted world coordinate. A final output-speed rejection is restamped as a
+typed `bounded_output_hold` at the exact last published coordinate instead of
+retaining diagnostics for the rejected candidate. Global fusion never averages a held process row
+with fresh camera evidence and never averages multiple held rows: fresh metric
+evidence wins, otherwise the newest held point is selected exactly. Held rows
+also do not update the independent global velocity baseline. Entity lifecycle
+remains based on observation age, so a current held row is still `present`.
+
+A current pose-confirmed standing person can extend that exact gain-zero hold
+to a fixed two-second metric horizon when detector and tracker confidence, a
+tall/narrow silhouette, torso-motion contact, floor admission, floor-contact
+plausibility, range, lifecycle, and floor-candidate distance from the public
+output all pass. Bbox stationarity and a preclassified walk/idle label are not
+authority for this lane: the output does not move, and requiring either created
+a one-frame dot hole during ordinary walking. The candidate is never promoted;
+the service independently validates the typed exact-frame evidence and holds
+only the last public coordinate.
 
 **Why:** The tracker can move coherently while DAv2/pose contact is temporarily
 unavailable. Reusing a fixed world point makes the BEV lie about position;
-integrating a rejected CV state compounds error. A one-frame projective bridge
+integrating a rejected CV state compounds error. A bounded projective bridge
 keeps all displays on the same PCF world while preserving honest authority and
-bounded failure behavior.
+bounded failure behavior. Recomputing the bounded bridge from accepted image
+geometry also prevents repeated predictions from accumulating pixel drift.
+
+For an established confidently standing lifecycle whose lower body is
+explicitly occluded, the learned upright height may also produce an
+exact-current gravity reconstruction as process-only evidence. Its absolute
+camera-space bias is removed without a camera-specific correction: the first
+eligible raw point is paired with the last queue-admitted metric world point,
+and later rows add only the raw XZ displacement from a recent three-sample
+medoid. If that medoid selects an older in-window observation, its original
+timestamp and media PTS remain explicit; it is not mislabeled as current. The
+selected sample, consensus span, and consecutive raw-evidence gap remain within
+0.40 seconds during ordinary continuation. A longer gap starts a fresh medoid
+window without changing either origin; the service-owned 1.25-second restart
+gate above decides whether that same episode may resume. Both origins are
+immutable for the occlusion episode. Lifecycle,
+target revision, trail segment, range, monotonic media time, occlusion evidence,
+and physical posterior admission must remain exact; inferred rows never renew
+accepted geometry, body height, the metric anchor, or either origin. The global
+service independently replays the algebra and admits the result only as the
+same high-uncertainty held point already published by tracking and BEV.
+
+Occlusion exit is evidence-time bounded, not callback-rate bounded. The
+producer requires both three consecutive exit rows and 0.20 seconds of
+monotonic source media time. A moving apparent sit/lie transition remains
+pending through a single missing image-motion callback and clears only after
+that same combined budget, preventing processing stalls or bursty callbacks
+from changing physical semantics.
+
+Clearing the occlusion label does not authorize a distant detector-bottom
+relocation. A reanchor requires observed ankle support, registered lower-body
+depth contact, or a floor ray paired with a high-confidence exact-current
+detector pose on the same track. Without one of those supports, bbox-only floor
+rays may continue only inside the existing physical gate; they cannot
+accumulate a same-lifecycle reanchor consensus. This keeps ordinary
+pose-dropout continuity while preventing a displaced association from earning
+a new world origin.
 
 ## ADR-023 — Shadow identity is isolated from canonical publication
 
@@ -586,8 +830,8 @@ covariance intersection. Compatibility requires both statistical agreement
 and a bounded absolute metric separation against every contributor, not only
 the primary. Substantially disagreeing candidates are not averaged: the best
 supported candidate remains primary, one incompatible alternate is retained,
-and output covariance is inflated. Prediction and hold are explicit process
-continuations, never measurements or fresh global-fusion evidence.
+and output covariance is inflated. CV, image-projective, and anchor-hold
+continuations are never measurements or fresh global-fusion evidence.
 
 `PersonGroundState` remains the only temporal filter, physical gate,
 stationary lock, reacquisition, and trail-state authority. The resolver feeds
@@ -597,16 +841,140 @@ after the current measurement is physically accepted and is enlarged by any
 resolver-to-filter displacement. Body root and semantic support surfaces are
 separate future quantities, not aliases of ground footprint.
 
+Resolver quality is not a blanket admission switch. A weak result may enter
+bounded temporal consensus only when its selected current hypothesis is typed
+as a floor-supported `floor_ray` or `registered_depth` observation and passes
+the minimum confidence, support, and source-reliability gates. Observed ankle
+contacts and registered person-mask floor support qualify directly; a weak
+bbox or extrapolated-leg ray additionally requires a trusted lifecycle or
+independent coherent image motion. Gravity reconstruction, body-height
+estimates, and non-floor torso support cannot use this path. A cold weak state
+normally requires three mutually consistent observations on one contact basis
+within the bounded reacquisition gap unless one of the typed exact-ankle or
+upright-body exceptions below supplies stronger authority. A single generic
+weak detection never creates canonical world authority.
+
+Temporal repetition alone does not override a strong revision-bound Scene Prior
+contradiction for a cold observed-ankle ray: a mirror can preserve convincing
+ankle motion without a person occupying that floor point. The narrow exception
+requires two bounded, mutually consistent exact `pose:ankle_pair` samples under
+one immutable lifecycle/revision/calibration binding. Every sample must have
+admitted plausible contact, contact-gap ratio at most `0.05`, bbox/ankle range
+disagreement at most `0.50 m`, ray-incidence sine at least `0.20`, current
+detector semantic confidence, and no current no-ground contradiction. The
+second current sample supplies the coordinate. Independent current registered
+person-floor depth may also establish the lifecycle. Once the same lifecycle
+owns accepted metric truth, observed ankles may override a sparse or stale
+prior through the ordinary physical filter; the prior still never clamps or
+supplies the coordinate.
+
+Two bounded, mutually consistent current `pose:ankle_pair` floor contacts are a
+narrower cold-start authority because both observed feet identify the
+support line. Single-ankle or mixed single/pair runs retain the normal
+three-sample rule unless the separate strong torso/silhouette motion proof is
+current. One intervening lower-authority bbox/non-floor row may not replace a
+pending ankle-family candidate; it consumes the one unavailable-row allowance
+and a second intervening row or expired gap clears the run. The point published
+on success is always the current ankle observation, never the saved candidate
+or weaker intervening hypothesis.
+
+One narrower cold-start rule covers a moving person whose ankles appear only
+intermittently. It uses a separate, stronger bootstrap-motion proof rather than
+ordinary coherent motion: three published observations of the complete
+shoulder/hip torso point and detector silhouette must exceed the stronger
+displacement threshold and agree in both direction and relative magnitude.
+That proof is basis-bound and short-lived. A later merely coherent sample may
+consume its remaining lifetime but does not renew its timestamp. A stale gap or
+basis change clears it, its TTL expires independently, and an incoherent current
+sample cannot consume it. While that proof is current, two mutually consistent
+observed-ankle floor samples may seed `ground_footprint`. Only those ankle
+samples seed metric state; the torso point supplies image motion provenance and
+never becomes a metric or floor measurement. A wrong motion basis, stationary
+or slowly drifting silhouette, or non-ankle weak source retains the normal
+consensus requirement. One unavailable anatomy row contributes no motion
+sample, but it also does not erase recent real observations inside the same
+bounded reacquisition gap; an expired gap, malformed time, basis conflict, or
+actual incoherent observation still clears the proof.
+
 A tracker row may remain visually valid while neither pose nor object depth
 contains a current floor contact. In that bounded case the detector silhouette
 may contribute one low-confidence `bbox_bottom` floor-ray hypothesis, but only
 for a sufficiently confident, tall/narrow person box with no seated or lying
 evidence. DeepStream detector confidence and NvDCF tracker confidence are
-alternate current observation signals: the detector field's documented
-`-0.1` tracker-frame sentinel is not treated as a low-confidence detection.
+alternate candidate-construction and continuity signals: the detector field's
+documented `-0.1` tracker-frame sentinel is not treated as a low-confidence
+detection. Before a lifecycle owns a queue-published metric point, however, a
+selected `floor_ray` requires current detector semantic confidence for final
+admission and ray-incidence sine of at least `0.20`; NvDCF confidence cannot
+establish that the box is a person, and neutral/unobserved PCF coverage cannot
+make shallow floor geometry authoritative.
 This hypothesis cannot establish learned height, bypass range or PCF evidence,
 or skip `PersonGroundState` physical admission. It is a continuity measurement
-candidate, not a dashboard-only fabricated dot.
+candidate, not a dashboard-only fabricated dot. Its minimum resolved height is
+expressed as a calibration-raster fraction (48/1080), not a camera-resolution-
+specific pixel constant. A pose floor contact materially below the detector
+silhouette is rejected before floor projection and cannot contaminate the
+upright reference.
+
+Pose torso evidence has two deliberately separate, non-floor roles. The
+image-only motion point requires both shoulders and both hips with bounded
+in-box geometry and corroborates detector-silhouette motion only. The metric
+range path samples one trimmed torso-core capsule through a bounded native
+statistic. Torso range may become a registered-depth hypothesis only for an
+already trusted lifecycle with exact-current depth, sufficient person
+confidence, and seated or active lower-body-occlusion context; lying and
+ordinary upright/dropout rows remain excluded. Torso range is never verified
+ground contact, cannot seed the weak floor-consensus path or learned height,
+and cannot suppress an independently eligible `bbox_bottom` floor ray. Floor
+support is a semantic authority tier, not a confidence-score hint: when any
+valid floor-supported hypothesis exists, it ranks ahead of non-floor body,
+seat, couch, or unknown support. Covariance intersection is allowed only among
+equal support states, and the hook independently requires every selected and
+contributing metric hypothesis to be floor-supported. A precise torso/body
+range therefore remains diagnostic even when it is spatially compatible with
+the selected floor point; it cannot pull the metric result, steer the bounded
+process posterior, or replace the accepted image origin.
+
+Hidden physical contact does not make a visible person unlocalizable. A typed
+`pose_scale` ground-footprint lane projects exact-current body observations
+through calibrated anatomical height planes. The upright solve uses nose,
+shoulders, and hips, estimates one common body height and X/Z footprint, and
+never uses the furniture-clipped detector bottom. One-frame strong proof
+requires five retained planes spanning head, shoulder, and hip bands; a
+four-plane/two-band solve remains weak even with a small residual because it can
+agree at the wrong range. Complete side profiles are valid despite apparent
+left/right width collapse, while a three-joint partial torso retains the width
+guard needed for safe midpoint inference. Valid moderate three/four-plane or
+noisier rows may advance the bounded same-basis reacquisition trajectory. One
+current five-plane strong proof may seed a cold lifecycle immediately; one
+three- or four-plane row cannot. As a cold-start-only exception, the second of
+two compatible exact-current four-plane/two-band solves may establish the first
+coordinate when both share the lifecycle/body-plane basis, have a positive gap
+no greater than `reacquire_max_gap_s`, and pass the ordinary physical-step
+bound. The first solve is retained corroboration only, and unavailable rows do
+not renew its timestamp. Three-plane, mixed, incompatible, expired, and
+basis-changing evidence cannot form this proof. Once a lifecycle owns
+queue-published metric truth, moderate body rows may accumulate relocation
+evidence, but only a current verified five-plane row can satisfy body
+reacquisition support and finalize the reanchor.
+When that gate quarantines a body solve, an independently valid queue-rooted
+image-motion continuation may keep the existing dot visible; the projective
+integrator preserves but never increments the pending metric consensus.
+
+The seated form projects an exact torso observation to the support footprint
+with broad height uncertainty. It is typed as seat support rather than visible
+foot contact, may use stationary hold when current geometry is temporarily
+absent, and does not disappear merely because ankles are hidden. Upright body
+projection and learned-height gravity reconstruction are alternative uses of
+the same current body evidence and are never co-fused on one row. Neither rule
+depends on camera or room identity.
+
+Exact-cohort evidence remains independent through resolution. A stale or
+cached depth branch is unavailable for metric authority, but in universal
+resolver mode it cannot clear an independently selected exact-current pose
+floor observation or that observation's same-basis reacquisition consensus.
+Only the final post-resolver absence or rejection may mark the current metric
+state unavailable.
 
 Revision-matched PCF contributes soft extent, authored-boundary,
 observed-confidence, and floor-height evidence. It never clamps or snaps a
@@ -622,9 +990,11 @@ uncertainty, and disagreement, but cannot affect the dot or trail.
 Every canonical spatial handoff preserves tracker lifecycle, target-frame
 revision, and source-to-world transform SHA-256. BEV fails closed on any
 mismatch. The global service refuses incomplete or mixed target revisions and
-uses full-matrix covariance intersection for compatible cameras; it never
+uses full-matrix covariance intersection for compatible fresh cameras. It never
 promotes `cv_prediction`, `image_motion_prediction`, or `anchor_hold` into a
-fresh global measurement.
+fresh global measurement. Strictly proven state-integrated continuations may
+replace a single-camera held canonical coordinate for exact downstream display
+parity, but cannot steer cross-camera fusion or its velocity baseline.
 
 The exact contract and practical tests are specified in
 [`universal_world_localization.md`](universal_world_localization.md).
@@ -701,3 +1071,34 @@ leveling was already correct. Rotating around the camera center corrects the
 ray-to-map relationship without moving the camera or floor, preserves the raw
 multi-camera/depth identities, and makes the correction reproducible rather
 than a presentation-only offset.
+
+## ADR-027 — A full static-camera PCF anchor may define a Scene Prior frame edge
+
+**Accepted:** 2026-08-31
+
+When a revision-matched static camera can be localized repeatedly against an
+accepted metric PCF walk, the Scene Prior builder may use that evidence as the
+complete camera-to-PCF pose. The anchor must retain metric scale and gravity,
+use independent early and late walk views, reject inconsistent per-view PnP
+poses, and verify a repeatable PCF floor. The resulting frame edge is derived
+as `camera_to_pcf @ camera_from_calibration`; it is consumed unchanged by the
+world estimator and BEV rather than being recreated as a dashboard offset.
+
+This is an optional evidence path, not a room-selected localization algorithm.
+Camera intrinsics remain sourced from the canonical calibration bundle. The
+anchor does not preserve an old measured mount height, add a camera-specific
+depth curve, or modify PCF geometry. A Scene Prior may use either the existing
+yaw-only map lock or a full PCF pose anchor, never both. Bindings without a
+full-pose anchor retain their existing behavior.
+
+The Living Room anchor uses 17 consistent views spanning both ends of its
+48-view walk and 1,799 PnP inliers. Its PCF floor fit has 759 independent cells,
+0.518 degrees residual tilt, and 0.032 m p90 residual. The resulting camera
+height over the PCF floor is 2.058 m; it replaces the incorrect 1.934 m
+low-envelope result without using physical room measurements.
+
+**Why:** A full camera pose and a metric PCF floor jointly determine where
+image rays meet the room. Preserving a known-bad legacy height or correcting
+only yaw can make the projected forward coordinate asymptote before the person
+reaches the foyer. The revision-bound SE(3) edge fixes that geometry at its
+source while remaining reproducible for future homes.

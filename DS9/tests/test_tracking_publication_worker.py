@@ -53,6 +53,57 @@ def _work(hooks, source: int, frame: int):
     )
 
 
+def test_paired_bev_drops_world_coordinate_rejected_by_canonical_service() -> None:
+    from noesis.pipelines import hooks
+
+    receipt = hooks.TrackingPublicationReceipt(
+        source_id=0,
+        frame_id=10,
+        observed_at_us=1_000_010,
+        tracking_publication_sequence=0,
+        outbound_submission_id=1,
+        outbound_message_count=2,
+        canonical_world_admission_bound=True,
+        canonical_world_track_keys=((7, 3, 10),),
+    )
+    accepted = hooks.Footpoint(
+        tracker_id=7,
+        tracker_lifecycle_generation=3,
+        frame_id=10,
+        world_x=1.0,
+        world_z=2.0,
+        anchor_source="pose_floor_only",
+        anchor_quality="good",
+        debug={"world": [1.0, 0.0, 2.0], "world_valid": True},
+    )
+    rejected = hooks.Footpoint(
+        tracker_id=8,
+        tracker_lifecycle_generation=4,
+        frame_id=10,
+        world_x=3.0,
+        world_z=4.0,
+        anchor_source="cv_prediction",
+        anchor_quality="held",
+        debug={"world": [3.0, 0.0, 4.0], "world_valid": True},
+    )
+
+    paired = hooks._bind_bev_footpoints_to_canonical_admission(
+        [accepted, rejected],
+        receipt,
+    )
+
+    assert paired[0] is accepted
+    assert paired[1].world_x is None
+    assert paired[1].world_z is None
+    assert paired[1].anchor_source is None
+    assert paired[1].anchor_quality == "invalid"
+    assert paired[1].anchor_reason == "canonical_world_service_rejected"
+    assert paired[1].trail_append_allowed is False
+    assert paired[1].trail_break_required is True
+    assert paired[1].debug["world"] is None
+    assert paired[1].debug["world_valid"] is False
+
+
 def _shadow_work(
     hooks,
     source: int,
@@ -210,6 +261,87 @@ def test_worker_preserves_per_source_fifo_and_fairly_rotates_sources() -> None:
     ]
     assert queue_wait["count"] == 4
     assert queue_wait["max_ns"] > 0
+
+
+def test_canonical_tracking_source_epoch_is_forwarded_to_paired_bev() -> None:
+    from noesis.pipelines import hooks
+    from noesis_core.runtime_publication import RuntimePublicationGate
+
+    tracking_epochs: list[int] = []
+    bev_epochs: list[int] = []
+
+    class Publisher:
+        sequence = 0
+
+        def publish(self, source_id, _tracks, *, frame_metadata=None):
+            metadata = dict(frame_metadata or {})
+            tracking_epochs.append(int(metadata["source_epoch"]))
+            receipt = hooks.TrackingPublicationReceipt(
+                source_id=int(source_id),
+                frame_id=int(metadata["frame_id"]),
+                observed_at_us=int(metadata["observed_at_us"]),
+                tracking_publication_sequence=self.sequence,
+                outbound_submission_id=(self.sequence * 2) + 1,
+                outbound_message_count=1,
+            )
+            self.sequence += 1
+            return receipt
+
+    class Renderer:
+        def render_and_publish(self, **kwargs):
+            bev_epochs.append(int(kwargs["source_epoch"]))
+            return _bev_receipt(hooks, kwargs)
+
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(config={}, ds_pipeline=None),
+        tracking_pub=Publisher(),
+        camera_labels={0: "camera-0"},
+        sensor_id_map={},
+        publication_gate=RuntimePublicationGate(),
+        bev_renderer=Renderer(),
+        bev_calibration=SimpleNamespace(
+            world_snapshot=lambda _source, camera: SimpleNamespace(
+                image_size=(1280, 720),
+                camera_id=camera,
+            )
+        ),
+    )
+
+    def publish(frame_id: int, observed_at_us: int) -> None:
+        epoch = processor._begin_source_frame_timeline(
+            sensor_id=0,
+            frame_id=frame_id,
+            observed_at_us=observed_at_us,
+        )
+        continuity = processor._prepare_tracking_cohort(
+            sensor_id=0,
+            camera_id="camera-0",
+            frame_id=frame_id,
+            observed_at_us=observed_at_us,
+            tracks=[],
+            footpoints=[],
+        )
+        assert int(continuity.source_epoch) == int(epoch)
+        assert processor._enqueue_tracking_publication(
+            sensor_id=0,
+            camera_id="camera-0",
+            frame_meta=SimpleNamespace(
+                frame_number=frame_id,
+                buf_pts=observed_at_us * 1_000,
+            ),
+            tracks=[],
+            footpoints=[],
+            now_ts=float(observed_at_us) / 1_000_000.0,
+            temporal_contract={"observed_at_us": observed_at_us},
+            continuity=continuity,
+            force=True,
+        )
+
+    publish(101, 101_000_000)
+    publish(1, 102_000_000)
+
+    assert tracking_epochs == [0, 1]
+    assert bev_epochs == tracking_epochs
 
 
 def test_worker_overflow_is_terminal_and_does_not_drop_silently() -> None:

@@ -10,6 +10,7 @@ export const bevCohort = (payload) => {
   if (!payload?.cohort || typeof payload.cohort !== 'object') return null;
   const cohort = payload.cohort;
   const sourceId = integer(payload?.sourceId, 0);
+  const sourceEpoch = integer(payload?.sourceEpoch, 0);
   const frameId = integer(payload?.frameId, 0);
   const observedAtUs = integer(payload?.observedAtUs, 1);
   const sequence = integer(
@@ -20,11 +21,12 @@ export const bevCohort = (payload) => {
     payload?.trackingOutboundSubmissionId,
     1,
   );
-  if ([sourceId, frameId, observedAtUs, sequence, outboundSubmissionId].some((value) => value === null)) {
+  if ([sourceId, sourceEpoch, frameId, observedAtUs, sequence, outboundSubmissionId].some((value) => value === null)) {
     return null;
   }
   const mirrored = [
     ['sourceId', 'source_id', sourceId],
+    ['sourceEpoch', 'source_epoch', sourceEpoch],
     ['frameId', 'frame_id', frameId],
     ['observedAtUs', 'observed_at_us', observedAtUs],
     ['trackingPublicationSequence', 'tracking_publication_sequence', sequence],
@@ -36,7 +38,7 @@ export const bevCohort = (payload) => {
   if (cohort.tracking_outbound_submission_id !== outboundSubmissionId) {
     return null;
   }
-  return { sourceId, frameId, observedAtUs, sequence, outboundSubmissionId };
+  return { sourceId, sourceEpoch, frameId, observedAtUs, sequence, outboundSubmissionId };
 };
 
 const hasCohortMetadata = (payload) => (
@@ -45,6 +47,7 @@ const hasCohortMetadata = (payload) => (
   && (
     Object.prototype.hasOwnProperty.call(payload, 'cohort')
     || Object.prototype.hasOwnProperty.call(payload, 'sourceId')
+    || Object.prototype.hasOwnProperty.call(payload, 'sourceEpoch')
     || Object.prototype.hasOwnProperty.call(payload, 'frameId')
     || Object.prototype.hasOwnProperty.call(payload, 'observedAtUs')
     || Object.prototype.hasOwnProperty.call(payload, 'trackingPublicationSequence')
@@ -80,15 +83,19 @@ export const admitBevFrame = (previous, incoming) => {
   if (!nextCohort) return { admitted: false, reason: 'cohort_invalid', payload: null };
 
   const previousCohort = previous ? bevCohort(previous) : null;
-  if (
-    previousCohort
-    && nextCohort.sourceId === previousCohort.sourceId
-    && (
-      nextCohort.observedAtUs <= previousCohort.observedAtUs
-      || nextCohort.outboundSubmissionId <= previousCohort.outboundSubmissionId
-    )
-  ) {
-    return { admitted: false, reason: 'cohort_not_newer', payload: null };
+  if (previousCohort && nextCohort.sourceId === previousCohort.sourceId) {
+    if (nextCohort.sourceEpoch < previousCohort.sourceEpoch) {
+      return { admitted: false, reason: 'source_epoch_stale', payload: null };
+    }
+    if (
+      nextCohort.sourceEpoch === previousCohort.sourceEpoch
+      && (
+        nextCohort.observedAtUs <= previousCohort.observedAtUs
+        || nextCohort.outboundSubmissionId <= previousCohort.outboundSubmissionId
+      )
+    ) {
+      return { admitted: false, reason: 'cohort_not_newer', payload: null };
+    }
   }
 
   return {
@@ -98,6 +105,7 @@ export const admitBevFrame = (previous, incoming) => {
       ...incoming,
       cameraId,
       sourceId: nextCohort.sourceId,
+      sourceEpoch: nextCohort.sourceEpoch,
       frameId: nextCohort.frameId,
       observedAtUs: nextCohort.observedAtUs,
       trackingPublicationSequence: nextCohort.sequence,
@@ -143,6 +151,16 @@ export const admitBevStatus = (previous, incoming) => {
   }
 
   if (previousCohort && nextCohort.sourceId === previousCohort.sourceId) {
+    if (nextCohort.sourceEpoch < previousCohort.sourceEpoch) {
+      return { admitted: false, reason: 'source_epoch_stale', payload: null };
+    }
+    if (nextCohort.sourceEpoch > previousCohort.sourceEpoch) {
+      return {
+        admitted: true,
+        reason: 'admitted',
+        payload: clearBevForStatus(previous, incoming),
+      };
+    }
     const sameCohort = (
       nextCohort.observedAtUs === previousCohort.observedAtUs
       && nextCohort.outboundSubmissionId === previousCohort.outboundSubmissionId

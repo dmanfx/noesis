@@ -146,6 +146,12 @@ finite asynchronous queue; its failure is surfaced as degraded persistence and
 cannot stall or partially mutate canonical tracking/world/BEV. Authority commit
 failure still aborts the complete cohort with no partial visibility.
 
+The nested world snapshot's `observed_start_us`/`observed_end_us` describe the
+evidence-time extent of its retained entities. They are not stream freshness
+clocks: `observed_end_us` may regress when the entity with the freshest retained
+evidence disappears. Snapshot `sequence` and `published_at_us` are the
+strictly advancing ordering/freshness fields for downstream consumers.
+
 ```json
 {
   "type": "tracking",
@@ -206,7 +212,9 @@ failure still aborts the complete cohort with no partial visibility.
       "world_resolver_disagreement_m": <float|null>,
       "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
       "world_prediction_image_foot": [<float u>, <float v>]|null,
-      "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
+      "world_prediction_provenance": { /* bounded non-authoritative process provenance */ }|null,
+      "world_inferred_raw_observation": [<float x>, <float y>, <float z>]|null,
+      "world_inferred_process_observation": [<float x>, <float y>, <float z>]|null,
       "world_measurement_accepted": <bool|null>,
       "world_rejection_reason": "<string|null>",
       "world_contact_basis": "<string|null>",
@@ -215,6 +223,7 @@ failure still aborts the complete cohort with no partial visibility.
       "world_state_continuity": "restored_short_ghost"|null,
       "world_reacquire_count": <int|null>,
       "world_reacquired": <bool|null>,
+      "world_post_occlusion_support_required": <bool|null>,
       "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
       "posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "trail_append_allowed": <bool|null>,
@@ -252,6 +261,16 @@ failure still aborts the complete cohort with no partial visibility.
 - `observations` is the canonical product surface. `tracks` is the compatible
   operator/diagnostic view, and every person row used by semantic acceptance
   must associate with one same-frame strict observation.
+- `world_valid=true` on a compatible track is stronger than producer
+  candidacy: it means the strict `CanonicalWorldService` admitted the exact
+  source/tracker/lifecycle/frame observation with a world coordinate in this
+  release-gated cohort. Before delivery, a rejected candidate is stripped of
+  `world`, `world_source`, filter/process provenance, and inferred-coordinate
+  fields, is restamped `world_quality="invalid"` with
+  `world_quality_reason="canonical_world_service_rejected"`, and cannot append
+  a trail. The publication receipt carries the admitted key set to BEV, so a
+  public valid track, BEV current head, nested world snapshot, standalone world
+  snapshot, and Menon projection cannot disagree about positional admission.
 - `embedding_sequence`, `embedding_model_sha256`, and `embedding_dimension`
   form an all-or-none persisted-provenance triad on both associated surfaces.
   They are stamped only after the exact private identity-evidence row is
@@ -288,23 +307,127 @@ failure still aborts the complete cohort with no partial visibility.
   seconds. A seated/lying lifecycle may hold for at most 2.0 seconds only while
   exact-frame bbox evidence remains stationary. A predicted point may extend a
   trail only while `trail_append_allowed=true`.
+  A standing lifecycle may also hold the exact last public point for at most
+  2.0 seconds when the current row has a strong pose-confirmed upright
+  silhouette, torso-motion contact, admitted/plausible floor support, admitted
+  observation range, sufficient detector/tracker confidence, and a floor
+  candidate within 0.75 m of that output. Because this is a gain-zero presence
+  hold, bbox stationarity and a resolved walk/idle label are not required. The
+  candidate itself remains rejected and the trail does not grow.
+  The producer's typed stationary proof is stamped from the public tracking
+  `posture`. The strict service consults `world_posture` only when `posture` is
+  absent, so a resolver-diagnostic posture cannot override, suppress, or
+  manufacture the longer sitting/lying hold.
   `image_motion_prediction` is the stricter projective continuation for a
   materially moving detector box when the current metric/depth anchor is
   missing or rejected. It transports the last physically accepted image foot
   through the current bbox affine change and projects that pixel through the
-  active corrected floor plane. It never updates the filter or prediction
-  origin; `world_prediction_image_foot` and
+  active corrected floor plane. It may advance the physically gated bounded
+  process posterior, but it never updates last-good metric state or its fixed
+  transport origin; `world_prediction_image_foot` and
   `world_prediction_provenance` expose its non-authoritative basis. If image,
   ray, metric-speed, or TTL gates fail, the producer fails closed instead of
   publishing a frozen point.
-- `cv_prediction`, `image_motion_prediction`, and `anchor_hold` are display
-  continuity only. They are never admitted as fresh observations by the
-  canonical global-world fusion service. That service also refuses to average
-  incomplete or mixed target-frame revisions and preserves full covariance
-  through conservative covariance intersection.
+- An established, confidently standing lifecycle with explicit lower-body
+  occlusion and a learned upright height may use the current gravity
+  reconstruction as non-authoritative process evidence. The first eligible
+  raw reconstruction is paired with the last exact queue-admitted **metric**
+  world output; later rows apply only a recent three-sample XZ medoid's raw
+  delta to those two immutable origins. Neither an inferred/held row nor a
+  hidden callback may rebase them. Each selected medoid sample and consensus
+  span remains within the 0.40-second window. Lifecycle, calibration revision,
+  trail segment, range, complete monotonic media time, posterior speed, and
+  visible-output gates all remain mandatory. A raw gap
+  beyond 0.40 seconds clears the short medoid window but does not rebase either
+  immutable origin. The same episode may restart only while the gap and latest
+  service output are no older than 1.25 seconds, the transition names an exact
+  recent service commit carrying the same service-owned inferred root, and all
+  lifecycle/segment/frame/transform/time bindings still match. Otherwise it
+  fails closed for that row without renewing the root; any later candidate must
+  independently satisfy the ordinary recent-evidence or exact-root restart
+  gates.
+  Producer root lifetime follows the ordered queue: only a committed metric or
+  unrelated projective successor may end it. A metric accepted solely on a
+  rate-suppressed callback cannot replace the root still owned by the strict
+  service; inferred rows and their bounded descendants retain that root until a
+  queue-visible successor, lifecycle/revision change, or expiry.
+  `world_inferred_raw_observation`,
+  `world_inferred_process_observation`, and
+  `world_prediction_provenance.transport="fixed_occlusion_origin_raw_world_delta"`
+  expose the exact algebra. This lane never updates accepted metric geometry,
+  body height, last-good metric state, or cross-camera measurement authority.
+- A proven `image_motion_prediction`, `cv_prediction`, or `anchor_hold` is
+  carried into the canonical snapshot as a high-uncertainty held observation
+  so tracking, BEV, and Menon receive the same Noesis-owned continuation.
+  Image transport, including learned-height occlusion transport, requires
+  complete fixed-origin provenance. For learned-height transport, the strict
+  service additionally proves `process_observation = trusted_world_origin +
+  (raw_consensus - raw_origin)`. The medoid-selected consensus retains its own
+  evidence timestamp when it is older than the current cohort. Independently,
+  `filter_transition` version 1 binds an exact queue-admitted source output,
+  media-time gate, physical filter base, gain, process observation, and
+  posterior. The strict service recomputes the innovation update and requires
+  that origin to equal either its latest point or one point in its bounded
+  same-segment history of exact service commits for that source/lifecycle.
+  This accommodates finite producer/consumer queue lag without trusting a
+  producer-invented origin; the proposed posterior must also satisfy the human
+  speed bound relative to the service's latest committed point. Exact output
+  origins are retained for at most the 1.25-second physical filter horizon;
+  this validation retention does not extend the 0.40-second CV bridge or make
+  a held output fresh metric evidence.
+  The producer queue and service each derive an immutable projective root only
+  from an admitted `image_motion_prediction`; CV/hold descendants may carry it
+  but cannot renew it with their own PTS or recreate it from a source label.
+  Service history is keyed by source, camera, tracker lifecycle, world-frame
+  revision, world-transform SHA-256, and active calibration-artifact SHA-256,
+  so a calibration artifact change invalidates roots and retained origins.
+  `world_filter_prediction` must exactly equal the recomputed emitted tracking
+  point; the filter may legitimately move less than its process input. CV and
+  hold rows require complete `bounded_cv_process` provenance, or a typed
+  `bounded_output_hold` from the last published coordinate when final output
+  admission rejects the proposed process step. A bounded CV row may bind a
+  slightly older exact service commit only while its retained metric anchor is
+  still identical to the latest commit and the result is physically bounded
+  from that latest point. A recent-projective bridge additionally requires the
+  matched commit itself to be an image-motion output inside 0.405 seconds, so
+  CV cannot chain. `bounded_output_hold` remains latest-output-only. Their
+  `filter_transition` binds the output and retained metric origin by exact
+  media PTS, trail segment, tracker lifecycle, and world-registration identity.
+  `process_observation` is the actual candidate presented to final output
+  admission; transition gain is exactly `1` for an admitted bounded CV step
+  and `0` for an output hold. The strict service recomputes that posterior,
+  enforces the canonical speed/time bound, and requires exact finite equality
+  between `world_filter_prediction` and the emitted `world` point. Rejected
+  pre-seeded/bbox3d observations use this same proof rather than a parallel
+  display-only hold path.
+  A gain-zero `bounded_output_hold` advances the latest visible PTS while
+  preserving a separate kinematic coordinate/PTS/segment. Only recovery after
+  that exact condition may reduce filter gain along the original transition
+  line to remain within 4 m/s of the latest displayed point while the older
+  kinematic clock supplies the real elapsed motion budget. The strict service
+  verifies both bounds; ordinary metric rows retain strict rejection or
+  evidence-backed reanchor behavior and are never generally slewed or clipped.
+  All three require `state_integrated=true`, remain non-authoritative, and
+  never become fresh metric or cross-camera fusion evidence. When a
+  contemporaneous fresh camera observation exists, global fusion uses it and
+  retains the held row as rejected source evidence; when only held rows exist,
+  it selects the newest one exactly instead of averaging process continuations.
+  Global fusion's default velocity cap is the same 4 m/s source/service
+  contract, including across identity continuity.
+  Snapshot entity lifecycle remains presence-time based. The service also
+  refuses incomplete or mixed target-frame revisions and preserves full
+  covariance through conservative covariance intersection for fresh evidence.
 - World/filter/lock state is discarded on the first exact processed frame that
   omits a tracker key. A later reuse of the same numeric tracker ID starts a new
   world lifecycle and cannot inherit the prior position or velocity.
+- Cold weak metric bootstrap normally requires three mutually consistent
+  same-family rows. Two consecutive exact current `pose:ankle_pair` contacts
+  may seed because both observed feet support the floor contact; single-ankle
+  or mixed runs still require three samples unless the independent strong
+  torso/silhouette motion proof is current. One intervening weaker
+  bbox/non-floor row may preserve the pending ankle-family run but cannot be
+  published or become its coordinate; a second intervening row or expired gap
+  clears the run.
 - `depth_used_m` is the current registered DAv2 anchor range admitted as a
   resolver candidate; `world_source` and compact `world_resolver_*` fields
   describe the normal decision, while request-gated BEV diagnostics expose
@@ -368,6 +491,20 @@ errors remain stable machine codes and never return a stale payload as success.
   "type": "bev-frame",
   "cameraId": "<camera>",
   "ts": <int microseconds>,
+  "sourceId": <int>,
+  "sourceEpoch": <int>,
+  "frameId": <int>,
+  "observedAtUs": <int epoch microseconds>,
+  "trackingPublicationSequence": <int>,
+  "trackingOutboundSubmissionId": <int>,
+  "cohort": {
+    "source_id": <int>,
+    "source_epoch": <int>,
+    "frame_id": <int>,
+    "observed_at_us": <int epoch microseconds>,
+    "tracking_publication_sequence": <int>,
+    "tracking_outbound_submission_id": <int>
+  },
   "w": <int>,
   "h": <int>,
   "mpp": <float meters_per_px>,
@@ -394,7 +531,8 @@ errors remain stable machine codes and never return a stale payload as success.
   "overlay": <bool>,
   "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "frameId": <int>, "anchorSource": "<string|null>", "displaySource": "world"|"world_to_camera_local"|"world_floor_fallback_to_camera_local"|"image_anchor"|"image_depth_anchor"|"registered_depth_anchor"|"floor_contact_ray", "canonicalWorld": <bool>, "worldAdmission": "accepted"|"predicted"|"held"|null, "worldFrame": "backend_world_m"|null, "worldFrameRevision": "<revision>"|null, "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null, "posture": "standing"|"sitting"|"lying"|"unknown"|null, "trailAppendAllowed": <bool|null>, "idleJitterM": <float|null>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ],
   "droppedFootpointCount": <int>,
-  "droppedFootpoints": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "trailSegmentId": <int|null>, "reason": "<canonical admission reason>", "canonicalWorld": true, "anchorSource": "<string|null>"} ],
+  "droppedFootpoints": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "trailSegmentId": <int|null>, "reason": "<admission reason>", "canonicalWorld": <bool>, "trailRetained": <bool|null>, "anchorSource": "<string|null>"} ],
+  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "canonicalWorld": <bool>, "trailSegmentId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} | {"t": <int ms>, "breakBefore": true} ]} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
@@ -410,6 +548,12 @@ errors remain stable machine codes and never return a stale payload as success.
 
 - BEV JPEG binary delivery is retired. BEV is metadata-only; `bev.jpeg_enabled`
   and `NOESIS_BEV_JPEG_ENABLED` are ignored by the DS9.1 runtime.
+- The top-level cohort fields exactly mirror `cohort`, including
+  `sourceEpoch == cohort.source_epoch`. For one `sourceId`, a higher epoch is a
+  new media timeline and remains admissible when media, observation, frame,
+  sequence, and outbound-submission clocks restart. Dashboard admission clears
+  all source-local heads, trails, smoothing, sampling phase, and source-time
+  state before consuming it. A lower epoch is stale and is rejected.
 - Footpoints use `stableId` when available; `trackerId` may be present as a debug/fallback identity key (not stable across restarts).
 - The primary inline floorplan BEV uses `frame=camera_local_ground_m`;
   `footpoints[].x` is local X and `footpoints[].y` is local Z in meters so
@@ -455,6 +599,16 @@ errors remain stable machine codes and never return a stale payload as success.
 - In world mode, BEV head points are the canonical backend `track.world` positions and are not low-pass filtered a second time inside `BevRenderer`.
 - `trail_smoothing_owner="backend"` with `bev_world_points_smoothed=false` is valid and expected in the baseline world-mode path: the backend owns trail history, while `PersonGroundState` (human CV filter + stationary lock) owns the only track-position filtering stage.
 - When `trailAppendAllowed` is false, producer trails do not grow new path samples (person is idle/sit/lie locked).
+- A trail point with `breakBefore=true` has no coordinates and terminates the
+  preceding polyline. A later finite point starts a disconnected segment. The
+  marker may be terminal while a recovered live head is not yet eligible for
+  trail sampling; consumers must then also suppress any old-tail-to-head
+  connector. Bounded earlier history remains visible through a missing-world
+  interval or reanchor without a false straight-line bridge. Completed and
+  current segments share the configured time and total per-track point bounds.
+- `trails[].trailSegmentId` identifies the current segment only. Retained
+  completed segments in the combined point list are visual history separated
+  by `breakBefore` and do not inherit that top-level identity.
 - World-mode BEV emits a canonical `anchor_hold` head with
   `worldAdmission="held"` so a visible track does not disappear during a brief
   occlusion or physical rejection; held points never append trail samples.
@@ -464,6 +618,18 @@ errors remain stable machine codes and never return a stale payload as success.
   through the bounded dropped-point fields rather than clamped to a raster
   edge; points just outside the PCF remain visible with their exact metric
   coordinates and `floorplanInside=false`.
+- `droppedFootpointCount` is the complete number of omitted footpoints across
+  active admission paths in the exact cohort. `droppedFootpoints` is only the
+  first 64 reason records for diagnosis; consumers remove any live head absent
+  from the exact current `footpoints` cohort and must not treat that bounded
+  list as an exhaustive lifecycle signal. Alignment-debug mode may additionally
+  count and sample legacy/noncanonical presentation rejects marked
+  `canonicalWorld=false`; those records are never live-head authority.
+- Dashboard current-head state is independent of trail state. Every finite
+  canonical `footpoints` member updates its lifecycle-keyed head even when
+  trails are disabled or unsampled; complete-cohort absence removes only that
+  head. Producer `trails` may remain visible across the gap, separated by
+  `breakBefore`, without recreating a live dot from the retained tail.
 - The post-tiler OSD trail path joins the canonical analytics row on the exact
   source/frame cohort, maps the declared source-image basis into the configured
   mosaic tile, and resets on tracker lifecycle or basis changes. It does not use

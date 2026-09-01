@@ -146,6 +146,19 @@ class UniversalWorldMeasurementResolver:
         excluded_reasons: dict[str, str] = {}
 
         for candidate in ranked[1:]:
+            # A ground-footprint resolver cannot treat body/seat geometry as
+            # equivalent to an observed floor contact.  In particular, a
+            # very precise torso range must not pull covariance intersection
+            # away from the selected foot point.  Keep mixed-support rows in
+            # diagnostics, but give them no metric influence.
+            if (
+                candidate.hypothesis.support_state
+                != selected.hypothesis.support_state
+            ):
+                excluded_reasons[candidate.hypothesis.candidate_id] = (
+                    "support_state_not_equivalent_to_selected"
+                )
+                continue
             pairwise = tuple(
                 (
                     contributor,
@@ -401,11 +414,21 @@ class UniversalWorldMeasurementResolver:
             return "estimated"
         return "weak"
 
-    def _ranking_key(self, scored: _ScoredHypothesis) -> tuple[float, float, str]:
-        # Candidate id is the deterministic final tie-breaker.  No room or
-        # camera name enters the ordering.
+    def _ranking_key(
+        self,
+        scored: _ScoredHypothesis,
+    ) -> tuple[int, float, float, str]:
+        # Explicit floor support is semantic authority for this resolver, not
+        # a probabilistic score hint. Candidate id is the deterministic final
+        # tie-breaker. No room or camera name enters the ordering.
         candidate = scored.hypothesis
-        return (-scored.score, -candidate.confidence, candidate.candidate_id)
+        floor_authority_rank = 0 if candidate.support_state == "floor" else 1
+        return (
+            floor_authority_rank,
+            -scored.score,
+            -candidate.confidence,
+            candidate.candidate_id,
+        )
 
     def _diagnostics(
         self,

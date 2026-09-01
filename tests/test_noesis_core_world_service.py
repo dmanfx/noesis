@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import statistics
 import threading
 import time
@@ -20,6 +21,7 @@ from noesis.telemetry.publishers import (
 from noesis_core.contracts.base import ArtifactFingerprint, ProducerRef
 from noesis_core.health import CapabilityMonitor, CapabilityPolicy
 from noesis_core.journal import AsyncContractJournal, ContractJournal
+from noesis_core.contracts.world import EntityLifecycle
 from noesis_core.world import GlobalWorldFusion, WorldFusionConfig
 from noesis_core.world_service import CanonicalWorldService, WorldArtifacts
 from noesis.server.websocket import WebSocketServer
@@ -105,6 +107,262 @@ def _service(
     )
 
 
+def _image_motion_filter_transition(
+    *,
+    process_observation: list[float],
+    position_base: list[float],
+    position_gain: float,
+    origin_media_pts_ns: int = 1_000_000_000,
+    current_media_pts_ns: int = 1_100_000_000,
+    trail_segment_id: int = 0,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "kind": "innovation_update",
+        "origin_kind": "queue_admitted_world_output",
+        "origin_world": [1.0, 0.0, 2.0],
+        "origin_media_pts_ns": origin_media_pts_ns,
+        "current_media_pts_ns": current_media_pts_ns,
+        "origin_trail_segment_id": trail_segment_id,
+        "gate_dt_s": 0.1,
+        "position_base": position_base,
+        "position_gain": position_gain,
+        "max_speed_mps": 4.0,
+        "max_jump_m": 0.75,
+        "reset_after_s": 1.25,
+    }
+
+
+def _set_image_motion_origin(
+    track: dict[str, Any],
+    *,
+    trail_segment_id: int = 0,
+) -> dict[str, Any]:
+    track["media_pts_ns"] = 1_000_000_000
+    track["tracker_lifecycle_generation"] = 1
+    track["trail_segment_id"] = trail_segment_id
+    track["world_measurement_accepted"] = True
+    return track
+
+
+def _bounded_process_track(
+    *,
+    continuity_source: str = "cv_prediction",
+    provenance_type: str = "bounded_cv_process",
+    provenance_origin: str = "last_metric_process",
+    trail_segment_id: int = 0,
+) -> dict[str, Any]:
+    output_hold = provenance_type == "bounded_output_hold"
+    world_x = 1.0 if output_hold else 1.2
+    process_x = 1.4 if output_hold else world_x
+    continuation = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_950_000,
+        x=world_x,
+    )
+    continuation.update(
+        {
+            "media_pts_ns": 1_100_000_000,
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": trail_segment_id,
+            "world_source": continuity_source,
+            "world_quality": "held",
+            "world_quality_reason": "physical_measurement_rejected",
+            "world_measurement_accepted": False,
+            "world_filter_prediction": [world_x, 0.0, 2.0],
+            "world_prediction_provenance": {
+                "type": provenance_type,
+                "non_authoritative": True,
+                "state_integrated": True,
+                "origin": provenance_origin,
+                "reason": "physical_measurement_rejected",
+                "process_observation": [process_x, 0.0, 2.0],
+                "filter_transition": {
+                    "version": 1,
+                    "kind": "output_hold" if output_hold else "bounded_process_step",
+                    "origin_kind": "queue_admitted_world_output",
+                    "origin_world": [1.0, 0.0, 2.0],
+                    "origin_media_pts_ns": 1_000_000_000,
+                    "current_media_pts_ns": 1_100_000_000,
+                    "origin_trail_segment_id": trail_segment_id,
+                    "metric_origin_kind": "queue_admitted_metric_world_output",
+                    "metric_origin_world": [1.0, 0.0, 2.0],
+                    "metric_origin_media_pts_ns": 1_000_000_000,
+                    "metric_origin_trail_segment_id": trail_segment_id,
+                    "tracker_lifecycle_generation": 1,
+                    "world_frame": "backend_world_m",
+                    "world_frame_revision": "world-rev",
+                    "world_transform_sha256": "d" * 64,
+                    "gate_dt_s": 0.1,
+                    "position_base": [1.0, 0.0, 2.0],
+                    "position_gain": 0.0 if output_hold else 1.0,
+                    "max_speed_mps": 4.0,
+                    "reset_after_s": 1.25,
+                },
+            },
+        }
+    )
+    return continuation
+
+
+def _stationary_output_hold(
+    *,
+    metric_age_ns: int,
+    include_evidence: bool = True,
+    stationary_supported: bool = True,
+    posture: str = "sitting",
+    reason: str = "physical_measurement_rejected",
+) -> dict[str, Any]:
+    hold = _bounded_process_track(
+        continuity_source="anchor_hold",
+        provenance_type="bounded_output_hold",
+        provenance_origin="last_published_output",
+    )
+    current_media_pts_ns = 1_000_000_000 + int(metric_age_ns)
+    hold["media_pts_ns"] = current_media_pts_ns
+    hold["posture"] = posture
+    hold["world_posture"] = posture
+    hold["world_bbox_stationary_supported"] = bool(stationary_supported)
+    hold["world_quality_reason"] = reason
+    provenance = hold["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["reason"] = reason
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["current_media_pts_ns"] = current_media_pts_ns
+    transition["gate_dt_s"] = min(
+        metric_age_ns / 1_000_000_000.0,
+        1.25,
+    )
+    if include_evidence:
+        provenance["stationary_evidence"] = {
+            "version": 1,
+            "kind": "bbox_stationary",
+            "frame_id": hold["frame_id"],
+            "media_pts_ns": current_media_pts_ns,
+            "posture": posture,
+        }
+    return hold
+
+
+def _upright_presence_output_hold(
+    *,
+    origin_media_pts_ns: int,
+    current_media_pts_ns: int,
+    floor_candidate_x: float = 1.2,
+    posture: str = "standing",
+    motion_mode: str = "walk",
+    bbox_stationary_supported: bool = True,
+) -> dict[str, Any]:
+    hold = _retimed_bounded_output_hold(
+        origin_x=1.0,
+        origin_media_pts_ns=origin_media_pts_ns,
+        current_media_pts_ns=current_media_pts_ns,
+    )
+    hold.update(
+        {
+            "frame_id": int(current_media_pts_ns // 100_000_000),
+            "observed_at_us": int(current_media_pts_ns // 1_000),
+            "pose_present": True,
+            "posture": posture,
+            "world_posture": posture,
+            "motion_mode": motion_mode,
+            "lower_body_occluded": False,
+            "world_bbox_stationary_supported": bbox_stationary_supported,
+            "world_contact_basis": "pose:torso_motion",
+            "world_floor_admitted": True,
+            "world_floor_contact_plausible": True,
+            "world_observation_range_admitted": True,
+            "world_support_state": "floor",
+            "world_floor_candidate": [floor_candidate_x, 0.0, 2.0],
+            "bbox": [736.0, 382.0, 75.0, 154.0],
+            "image_size": [1920, 1080],
+            "confidence": 0.90,
+            "tracker_confidence": 0.70,
+        }
+    )
+    distance_m = abs(float(floor_candidate_x) - 1.0)
+    provenance = hold["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["upright_presence_evidence"] = {
+        "version": 1,
+        "kind": "pose_confirmed_nonseated_floor_near_output",
+        "frame_id": hold["frame_id"],
+        "media_pts_ns": current_media_pts_ns,
+        "posture": posture,
+        "motion_mode": motion_mode,
+        "contact_basis": "pose:torso_motion",
+        "detector_confidence": 0.90,
+        "tracker_confidence": 0.70,
+        "floor_candidate": [floor_candidate_x, 0.0, 2.0],
+        "output_distance_m": distance_m,
+        "output_distance_limit_m": 1.25,
+    }
+    return hold
+
+
+def _current_presence_output_hold(
+    *,
+    visible_origin_media_pts_ns: int,
+    kinematic_origin_media_pts_ns: int,
+    current_media_pts_ns: int,
+) -> dict[str, Any]:
+    hold = _retimed_bounded_output_hold(
+        origin_x=1.0,
+        origin_media_pts_ns=visible_origin_media_pts_ns,
+        current_media_pts_ns=current_media_pts_ns,
+    )
+    root_bbox = [10.0, 20.0, 30.0, 40.0]
+    current_bbox = [11.0, 20.0, 31.0, 40.0]
+    root_center = [25.0, 40.0]
+    current_center = [26.5, 40.0]
+    bbox_scale = 0.5 * (
+        math.hypot(root_bbox[2], root_bbox[3])
+        + math.hypot(current_bbox[2], current_bbox[3])
+    )
+    size_ratio = max(
+        root_bbox[2] / current_bbox[2],
+        current_bbox[2] / root_bbox[2],
+        root_bbox[3] / current_bbox[3],
+        current_bbox[3] / root_bbox[3],
+    )
+    displacement_norm = math.hypot(
+        current_center[0] - root_center[0],
+        current_center[1] - root_center[1],
+    ) / bbox_scale
+    hold.update(
+        {
+            "class_id": 0,
+            "frame_id": int(current_media_pts_ns // 100_000_000),
+            "observed_at_us": int(current_media_pts_ns // 1_000),
+            "bbox": current_bbox,
+            "pose_present": True,
+            "confidence": 0.39,
+            "tracker_confidence": 0.71,
+        }
+    )
+    provenance = hold["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["current_presence_evidence"] = {
+        "version": 1,
+        "kind": "same_lifecycle_bbox_from_kinematic_output",
+        "frame_id": hold["frame_id"],
+        "media_pts_ns": current_media_pts_ns,
+        "kinematic_origin_media_pts_ns": kinematic_origin_media_pts_ns,
+        "kinematic_origin_trail_segment_id": 0,
+        "kinematic_origin_bbox": root_bbox,
+        "current_bbox": current_bbox,
+        "bbox_size_ratio": size_ratio,
+        "bbox_center_displacement_norm": displacement_norm,
+        "detector_confidence": 0.39,
+        "tracker_confidence": 0.71,
+        "pose_present": True,
+    }
+    return hold
+
+
 def test_resident_observations_across_cameras_fuse_into_one_entity() -> None:
     service = _service()
     first = service.publish(
@@ -125,6 +383,188 @@ def test_resident_observations_across_cameras_fuse_into_one_entity() -> None:
     assert entity.position is not None
     assert entity.position.x == pytest.approx(1.1)
     assert {source.camera_id for source in entity.sources} == {"kitchen", "hall"}
+
+
+def test_service_trail_break_resets_fusion_once_then_same_segment_teleport_is_gated() -> None:
+    service = _service()
+    origin = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_800_000,
+        x=0.0,
+    )
+    origin.update(
+        {
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": 9,
+            "trail_break_required": False,
+            "trail_append_allowed": True,
+        }
+    )
+    service.publish(0, [origin], metadata={})
+
+    reset_point = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_900_000,
+        x=10.0,
+    )
+    reset_point.update(
+        {
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": 10,
+            "trail_break_required": True,
+            "trail_append_allowed": False,
+        }
+    )
+    reset_publication = service.publish(0, [reset_point], metadata={})
+
+    reset_world = reset_publication.observations[0].payload.world
+    assert reset_world is not None
+    assert reset_world.position.x == pytest.approx(10.0)
+    reset_entity = reset_publication.snapshot.entities[0]
+    assert reset_entity.position is not None
+    assert reset_entity.position.x == pytest.approx(10.0)
+    assert reset_entity.velocity_mps is None
+    assert reset_entity.conflict is False
+
+    teleport = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=3,
+        observed_at_us=1_950_000,
+        x=20.0,
+    )
+    teleport.update(
+        {
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": 10,
+            "trail_break_required": False,
+            "trail_append_allowed": True,
+        }
+    )
+    rejected_publication = service.publish(0, [teleport], metadata={})
+
+    # The strict observation remains an exact record of the producer row;
+    # only global same-episode position admission is rejected.
+    rejected_world = rejected_publication.observations[0].payload.world
+    assert rejected_world is not None
+    assert rejected_world.position.x == pytest.approx(20.0)
+    retained_entity = rejected_publication.snapshot.entities[0]
+    assert retained_entity.position is not None
+    assert retained_entity.position.x == pytest.approx(10.0)
+    assert retained_entity.conflict is True
+    current = next(
+        source
+        for source in retained_entity.sources
+        if source.observation_id == rejected_publication.observations[0].observation_id
+    )
+    assert current.accepted is False
+    assert current.rejection_reason and current.rejection_reason.startswith(
+        "velocity_gate:"
+    )
+
+
+def test_service_passes_private_source_epoch_to_fusion_velocity_clock() -> None:
+    service = _service()
+
+    def epoch_track(
+        *,
+        frame_id: int,
+        observed_at_us: int,
+        media_pts_ns: int,
+        source_epoch: int,
+        x: float,
+    ) -> dict[str, Any]:
+        track = _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=frame_id,
+            observed_at_us=observed_at_us,
+            x=x,
+        )
+        track.update(
+            {
+                "media_pts_ns": media_pts_ns,
+                "source_epoch": source_epoch,
+                "tracker_lifecycle_generation": 1,
+                "trail_segment_id": 0,
+            }
+        )
+        return track
+
+    service.publish(
+        0,
+        [
+            epoch_track(
+                frame_id=1,
+                observed_at_us=1_800_000,
+                media_pts_ns=100_000_000_000,
+                source_epoch=0,
+                x=0.0,
+            )
+        ],
+        metadata={"camera_id": "kitchen"},
+    )
+    reset = service.publish(
+        0,
+        [
+            epoch_track(
+                frame_id=2,
+                observed_at_us=1_900_000,
+                media_pts_ns=1_000_000_000,
+                source_epoch=1,
+                x=10.0,
+            )
+        ],
+        metadata={"camera_id": "kitchen"},
+    ).snapshot.entities[0]
+
+    assert reset.position is not None
+    assert reset.position.x == pytest.approx(10.0)
+    assert reset.velocity_mps is None
+    assert reset.conflict is False
+
+    continued = service.publish(
+        0,
+        [
+            epoch_track(
+                frame_id=3,
+                observed_at_us=2_000_000,
+                media_pts_ns=1_100_000_000,
+                source_epoch=1,
+                x=10.2,
+            )
+        ],
+        metadata={"camera_id": "kitchen"},
+    ).snapshot.entities[0]
+
+    assert continued.position is not None
+    assert continued.position.x == pytest.approx(10.2)
+    assert continued.velocity_mps is not None
+    assert continued.velocity_mps.x == pytest.approx(2.0)
+    assert continued.conflict is False
+
+
+def test_world_observation_bounds_quality_reason_to_contract_limit() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_quality_reason"] = "diagnostic," * 40
+
+    publication = service.publish(0, [track], metadata={})
+
+    world = publication.observations[0].payload.world
+    assert world is not None
+    assert world.reason == str(track["world_quality_reason"])[:200]
+    assert len(world.reason) == 200
 
 
 def test_world_observation_preserves_resolver_anisotropic_covariance() -> None:
@@ -321,9 +761,9 @@ def test_canonical_world_observation_requires_registration_identity(
 
 @pytest.mark.parametrize(
     "continuity_source",
-    ("cv_prediction", "anchor_hold", "image_motion_prediction"),
+    ("cv_prediction", "anchor_hold", "relative_motion_prediction"),
 )
-def test_display_continuity_never_enters_authoritative_world_fusion(
+def test_unproven_display_continuity_never_enters_canonical_world(
     continuity_source: str,
 ) -> None:
     service = _service()
@@ -350,6 +790,3520 @@ def test_display_continuity_never_enters_authoritative_world_fusion(
     assert observation.payload.world is None
     assert observation.coordinate_frame == "image_px"
     assert publication.snapshot.entities[0].position is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    (
+        "continuity_source",
+        "provenance_type",
+        "provenance_origin",
+        "expected_x",
+    ),
+    (
+        ("cv_prediction", "bounded_cv_process", "last_metric_process", 1.2),
+        ("anchor_hold", "bounded_cv_process", "last_metric_process", 1.2),
+        ("anchor_hold", "bounded_output_hold", "last_published_output", 1.0),
+    ),
+)
+def test_bounded_process_continuity_updates_canonical_held_position(
+    continuity_source: str,
+    provenance_type: str,
+    provenance_origin: str,
+    expected_x: float,
+) -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    service.publish(0, [authoritative], metadata={})
+    continuation = _bounded_process_track(
+        continuity_source=continuity_source,
+        provenance_type=provenance_type,
+        provenance_origin=provenance_origin,
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is not None
+    assert observation.payload.world.source == continuity_source
+    assert observation.payload.world.quality == "held"
+    assert observation.payload.world.covariance.values[0] == pytest.approx(0.64)
+    assert observation.coordinate_frame == "backend_world_m"
+    assert (
+        observation.payload.world.position.x,
+        observation.payload.world.position.y,
+        observation.payload.world.position.z,
+    ) == pytest.approx((expected_x, 0.0, 2.0))
+    assert publication.snapshot.entities[0].position is not None
+    assert (
+        publication.snapshot.entities[0].position.x,
+        publication.snapshot.entities[0].position.y,
+        publication.snapshot.entities[0].position.z,
+    ) == pytest.approx((expected_x, 0.0, 2.0))
+    assert publication.snapshot.entities[0].lifecycle == EntityLifecycle.PRESENT
+
+
+@pytest.mark.parametrize(
+    ("reason_length", "accepted"),
+    (
+        (240, True),
+        (241, False),
+    ),
+)
+def test_bounded_process_reason_has_a_fixed_boundary_limit(
+    reason_length: int,
+    accepted: bool,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track()
+    reason = "r" * reason_length
+    continuation["world_quality_reason"] = reason
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["reason"] = reason
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert (publication.observations[0].payload.world is not None) is accepted
+
+
+def test_bounded_process_continuity_is_not_cross_camera_fusion_authority() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(
+        1,
+        [
+            _track(
+                camera_id="hall",
+                tracker_id=9,
+                frame_id=1,
+                observed_at_us=1_900_000,
+                x=1.1,
+            )
+        ],
+        metadata={},
+    )
+    image_publication = service.publish(
+        0,
+        [_bbox_affine_process_track()],
+        metadata={},
+    )
+    assert image_publication.observations[0].payload.world is not None
+    continuation = _recent_projective_bridge_track(
+        origin_x=1.2,
+        origin_media_pts_ns=1_100_000_000,
+        current_x=1.2,
+        current_media_pts_ns=1_200_000_000,
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    held_world = publication.observations[0].payload.world
+    assert held_world is not None
+    assert held_world.position.x == pytest.approx(1.2)
+    entity = publication.snapshot.entities[0]
+    assert entity.position is not None
+    assert entity.position.x == pytest.approx(1.1)
+    assert entity.conflict is False
+    by_camera = {source.camera_id: source for source in entity.sources}
+    assert by_camera["hall"].accepted is True
+    assert by_camera["kitchen"].accepted is False
+    assert by_camera["kitchen"].rejection_reason == (
+        "non_authoritative_held_continuation"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("world_measurement_accepted", True),
+        ("world_quality", "estimated"),
+        ("world_filter_prediction", [1.3, 0.0, 2.0]),
+        ("world_prediction_provenance", {"type": "bounded_cv_process"}),
+    ),
+)
+def test_unproven_bounded_process_continuity_remains_diagnostic_only(
+    field: str,
+    value: Any,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track(
+        provenance_origin="recent_projective_process"
+    )
+    continuation[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is None
+    assert observation.payload.world_diagnostics is not None
+    assert observation.payload.world_diagnostics.first_divergence_reason == (
+        "bounded_process_continuity_provenance_invalid"
+    )
+    assert publication.snapshot.entities[0].position is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    (
+        ("transition", "origin_world", [1.1, 0.0, 2.0]),
+        ("transition", "origin_media_pts_ns", 999_000_000),
+        ("transition", "current_media_pts_ns", 1_099_000_000),
+        ("transition", "origin_trail_segment_id", 1),
+        ("transition", "metric_origin_world", [1.1, 0.0, 2.0]),
+        ("transition", "metric_origin_media_pts_ns", 999_000_000),
+        ("transition", "metric_origin_trail_segment_id", 1),
+        ("transition", "tracker_lifecycle_generation", 2),
+        ("transition", "position_base", [1.1, 0.0, 2.0]),
+        ("transition", "position_gain", 0.5),
+        ("transition", "max_speed_mps", 40.0),
+        ("provenance", "reason", "different_reason"),
+        ("track", "media_pts_ns", None),
+        ("track", "trail_segment_id", 1),
+        ("track", "tracker_lifecycle_generation", 2),
+    ),
+)
+def test_bounded_process_rejects_mutated_origin_or_transition(
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    if scope == "transition":
+        transition = provenance["filter_transition"]
+        assert isinstance(transition, dict)
+        transition[field] = value
+    elif scope == "provenance":
+        provenance[field] = value
+    else:
+        continuation[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_bounded_process_rejects_jointly_forged_posterior_and_origins() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track()
+    continuation["world"] = [99.0, 0.0, 99.0]
+    continuation["world_filter_prediction"] = [99.0, 0.0, 99.0]
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["process_observation"] = [99.0, 0.0, 99.0]
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["origin_world"] = [98.9, 0.0, 99.0]
+    transition["metric_origin_world"] = [98.9, 0.0, 99.0]
+    transition["position_base"] = [98.9, 0.0, 99.0]
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("continuity_source", "provenance_type", "provenance_origin"),
+    (
+        ("cv_prediction", "bounded_cv_process", "last_metric_process"),
+        ("anchor_hold", "bounded_cv_process", "last_metric_process"),
+        ("anchor_hold", "bounded_output_hold", "last_published_output"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("metric_age_ns", "accepted"),
+    (
+        (405_000_000, True),
+        (405_000_001, False),
+    ),
+)
+def test_nonstationary_bounded_process_is_bound_to_metric_horizon(
+    continuity_source: str,
+    provenance_type: str,
+    provenance_origin: str,
+    metric_age_ns: int,
+    accepted: bool,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track(
+        continuity_source=continuity_source,
+        provenance_type=provenance_type,
+        provenance_origin=provenance_origin,
+    )
+    current_pts = 1_000_000_000 + metric_age_ns
+    continuation["media_pts_ns"] = current_pts
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["current_media_pts_ns"] = current_pts
+    transition["gate_dt_s"] = min(metric_age_ns / 1_000_000_000.0, 1.25)
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert (publication.observations[0].payload.world is not None) is accepted
+
+
+@pytest.mark.parametrize(
+    ("metric_age_ns", "accepted"),
+    (
+        (2_005_000_000, True),
+        (2_005_000_001, False),
+    ),
+)
+def test_typed_stationary_exact_hold_uses_one_fixed_metric_horizon(
+    metric_age_ns: int,
+    accepted: bool,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _stationary_output_hold(
+        metric_age_ns=metric_age_ns,
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert (publication.observations[0].payload.world is not None) is accepted
+
+
+def test_pose_confirmed_nonseated_hold_renews_from_each_current_person_row() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    origin_pts = 1_000_000_000
+    for current_pts in (
+        1_300_000_000,
+        1_600_000_000,
+        1_900_000_000,
+        2_200_000_000,
+        2_500_000_000,
+        2_800_000_000,
+        3_005_000_000,
+    ):
+        publication = service.publish(
+            0,
+            [
+                _upright_presence_output_hold(
+                    origin_media_pts_ns=origin_pts,
+                    current_media_pts_ns=current_pts,
+                )
+            ],
+            metadata={},
+        )
+        assert publication.observations[0].payload.world is not None
+        origin_pts = current_pts
+
+    expired = service.publish(
+        0,
+        [
+            _upright_presence_output_hold(
+                origin_media_pts_ns=origin_pts,
+                current_media_pts_ns=origin_pts + 2_005_000_001,
+            )
+        ],
+        metadata={},
+    )
+    assert expired.observations[0].payload.world is None
+
+
+def test_current_bbox_presence_hold_uses_one_fixed_kinematic_root() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first = service.publish(
+        0,
+        [
+            _current_presence_output_hold(
+                visible_origin_media_pts_ns=1_000_000_000,
+                kinematic_origin_media_pts_ns=1_000_000_000,
+                current_media_pts_ns=1_500_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert first.observations[0].payload.world is not None
+
+    boundary = service.publish(
+        0,
+        [
+            _current_presence_output_hold(
+                visible_origin_media_pts_ns=1_500_000_000,
+                kinematic_origin_media_pts_ns=1_000_000_000,
+                current_media_pts_ns=2_005_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert boundary.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.kinematic_media_pts_ns == 1_000_000_000
+    assert output.kinematic_bbox_geometry == (10.0, 20.0, 30.0, 40.0)
+
+    expired = service.publish(
+        0,
+        [
+            _current_presence_output_hold(
+                visible_origin_media_pts_ns=2_005_000_000,
+                kinematic_origin_media_pts_ns=1_000_000_000,
+                current_media_pts_ns=2_105_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert expired.observations[0].payload.world is None
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    (
+        ("track", "pose_present", False),
+        ("track", "world_contact_basis", "bbox:bottom_center"),
+        ("track", "world_floor_admitted", False),
+        ("track", "world_observation_range_admitted", False),
+        ("track", "lower_body_occluded", True),
+        ("track", "bbox", [736.0, 382.0, 20.0, 40.0]),
+        ("track", "world_floor_candidate", [1.2, 0.0, 2.0, 99.0]),
+        ("evidence", "detector_confidence", 0.60),
+        ("evidence", "floor_candidate", [1.2, 0.0]),
+    ),
+)
+def test_upright_presence_evidence_is_bound_to_current_person_row(
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_300_000_000,
+    )
+    assert service.publish(
+        0, [first], metadata={}
+    ).observations[0].payload.world is not None
+
+    continuation = _upright_presence_output_hold(
+        origin_media_pts_ns=1_300_000_000,
+        current_media_pts_ns=1_600_000_000,
+    )
+    if scope == "track":
+        continuation[field] = value
+    else:
+        provenance = continuation["world_prediction_provenance"]
+        assert isinstance(provenance, dict)
+        evidence = provenance["upright_presence_evidence"]
+        assert isinstance(evidence, dict)
+        evidence[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+    assert publication.observations[0].payload.world is None
+
+
+@pytest.mark.parametrize("motion_mode", ("sit", "lie"))
+def test_nonseated_presence_hold_rejects_seated_motion_mode(
+    motion_mode: str,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_600_000_000,
+        motion_mode=motion_mode,
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+
+
+@pytest.mark.parametrize(
+    ("track_field", "evidence_field"),
+    (
+        ("confidence", "detector_confidence"),
+        ("tracker_confidence", "tracker_confidence"),
+    ),
+)
+def test_upright_presence_confidence_must_remain_unit_bounded(
+    track_field: str,
+    evidence_field: str,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_600_000_000,
+    )
+    continuation[track_field] = 1.5
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    evidence = provenance["upright_presence_evidence"]
+    assert isinstance(evidence, dict)
+    evidence[evidence_field] = 1.5
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+
+
+def test_upright_presence_hold_does_not_require_stationary_motion_label() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_300_000_000,
+    )
+    assert service.publish(
+        0, [first], metadata={}
+    ).observations[0].payload.world is not None
+    continuation = _upright_presence_output_hold(
+        origin_media_pts_ns=1_300_000_000,
+        current_media_pts_ns=1_600_000_000,
+        motion_mode="unknown",
+        bbox_stationary_supported=False,
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_unknown_posture_presence_hold_survives_old_metric_origin() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_500_000_000,
+    )
+    assert service.publish(
+        0, [first], metadata={}
+    ).observations[0].payload.world is not None
+
+    # The metric root is now 2.066 s old, but the latest exact public output is
+    # only 1.566 s old and this row carries fresh pose/floor presence evidence.
+    continuation = _upright_presence_output_hold(
+        origin_media_pts_ns=1_500_000_000,
+        current_media_pts_ns=3_066_000_000,
+        posture="unknown",
+        motion_mode="unknown",
+        bbox_stationary_supported=False,
+    )
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_upright_presence_floor_candidate_cannot_be_far_from_output() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_000_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first = _upright_presence_output_hold(
+        origin_media_pts_ns=1_000_000_000,
+        current_media_pts_ns=1_300_000_000,
+    )
+    assert service.publish(
+        0, [first], metadata={}
+    ).observations[0].payload.world is not None
+    far = _upright_presence_output_hold(
+        origin_media_pts_ns=1_300_000_000,
+        current_media_pts_ns=1_600_000_000,
+        floor_candidate_x=2.30,
+    )
+
+    publication = service.publish(0, [far], metadata={})
+    assert publication.observations[0].payload.world is None
+
+
+def test_stationary_reason_token_alone_cannot_expand_metric_horizon() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _stationary_output_hold(
+        metric_age_ns=2_000_000_000,
+        include_evidence=False,
+        reason="physical_measurement_rejected,stationary_bbox_hold",
+    )
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_stationary_evidence_cannot_expand_moving_cv_horizon() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bounded_process_track(
+        continuity_source="anchor_hold",
+        provenance_type="bounded_cv_process",
+        provenance_origin="last_metric_process",
+    )
+    current_media_pts_ns = 3_000_000_000
+    continuation["media_pts_ns"] = current_media_pts_ns
+    continuation["world_posture"] = "sitting"
+    continuation["world_bbox_stationary_supported"] = True
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["stationary_evidence"] = {
+        "version": 1,
+        "kind": "bbox_stationary",
+        "frame_id": continuation["frame_id"],
+        "media_pts_ns": current_media_pts_ns,
+        "posture": "sitting",
+    }
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["current_media_pts_ns"] = current_media_pts_ns
+    transition["gate_dt_s"] = 1.25
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    (
+        ("evidence", "version", 2),
+        ("evidence", "kind", "reason_token_only"),
+        ("evidence", "frame_id", 99),
+        ("evidence", "media_pts_ns", 2_999_999_999),
+        ("evidence", "posture", "lying"),
+        ("track", "world_bbox_stationary_supported", False),
+        ("track", "posture", "standing"),
+    ),
+)
+def test_stationary_evidence_is_exactly_bound_to_current_track(
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _stationary_output_hold(
+        metric_age_ns=2_000_000_000,
+    )
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    evidence = provenance["stationary_evidence"]
+    assert isinstance(evidence, dict)
+    if scope == "evidence":
+        evidence[field] = value
+    else:
+        continuation[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+
+
+def test_stationary_evidence_uses_tracking_posture_not_resolver_diagnostic() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _stationary_output_hold(
+        metric_age_ns=2_000_000_000,
+    )
+    continuation["world_posture"] = "unknown"
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is not None
+
+    # A resolver diagnostic cannot grant stationary authority when tracking
+    # posture disagrees with the typed evidence.
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    forged = _stationary_output_hold(
+        metric_age_ns=2_000_000_000,
+    )
+    forged["posture"] = "standing"
+    forged["world_posture"] = "sitting"
+    rejected = service.publish(0, [forged], metadata={})
+
+    assert rejected.observations[0].payload.world is None
+
+
+def test_bounded_cv_chain_cannot_renew_its_metric_horizon() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+
+    prior_x = 1.0
+    prior_pts = 1_000_000_000
+    for step in range(1, 7):
+        current_x = 1.0 + 0.05 * step
+        current_pts = 1_000_000_000 + 100_000_000 * step
+        continuation = _bounded_process_track()
+        continuation["frame_id"] = step + 1
+        continuation["observed_at_us"] = 1_900_000 + 100_000 * step
+        continuation["media_pts_ns"] = current_pts
+        continuation["world"] = [current_x, 0.0, 2.0]
+        continuation["world_filter_prediction"] = [current_x, 0.0, 2.0]
+        provenance = continuation["world_prediction_provenance"]
+        assert isinstance(provenance, dict)
+        provenance["process_observation"] = [current_x, 0.0, 2.0]
+        transition = provenance["filter_transition"]
+        assert isinstance(transition, dict)
+        transition["origin_world"] = [prior_x, 0.0, 2.0]
+        transition["origin_media_pts_ns"] = prior_pts
+        transition["current_media_pts_ns"] = current_pts
+        transition["position_base"] = [prior_x, 0.0, 2.0]
+        transition["gate_dt_s"] = 0.1
+
+        publication = service.publish(0, [continuation], metadata={})
+        admitted = publication.observations[0].payload.world is not None
+        assert admitted is (step <= 4)
+        if admitted:
+            prior_x = current_x
+            prior_pts = current_pts
+
+
+def test_canonical_track_output_cache_replaces_superseded_bindings() -> None:
+    service = _service()
+
+    first = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    service.publish(0, [first], metadata={})
+
+    next_lifecycle = dict(first)
+    next_lifecycle["frame_id"] = 2
+    next_lifecycle["media_pts_ns"] = 1_100_000_000
+    next_lifecycle["tracker_lifecycle_generation"] = 2
+    service.publish(0, [next_lifecycle], metadata={})
+
+    assert len(service._canonical_track_outputs) == 1
+    lifecycle_key = next(iter(service._canonical_track_outputs))
+    assert lifecycle_key[2:4] == (7, 2)
+
+    next_revision = dict(next_lifecycle)
+    next_revision["frame_id"] = 3
+    next_revision["media_pts_ns"] = 1_200_000_000
+    next_revision["world_frame_revision"] = "world-rev-2"
+    next_revision["world_transform_sha256"] = "e" * 64
+    service.publish(0, [next_revision], metadata={})
+
+    assert len(service._canonical_track_outputs) == 1
+    revision_key = next(iter(service._canonical_track_outputs))
+    assert revision_key[3:] == (
+        2,
+        "world-rev-2",
+        "e" * 64,
+        "a" * 64,
+        0,
+    )
+
+
+def test_canonical_continuation_never_crosses_source_epoch() -> None:
+    service = _service()
+    metric = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    metric["source_epoch"] = 0
+    service.publish(0, [metric], metadata={})
+    image = _bbox_affine_process_track()
+    image["source_epoch"] = 0
+    assert service.publish(
+        0, [image], metadata={}
+    ).observations[0].payload.world is not None
+
+    stale_after_reconnect = _recent_projective_bridge_track(
+        origin_x=1.2,
+        origin_media_pts_ns=1_100_000_000,
+        current_x=1.25,
+        current_media_pts_ns=1_200_000_000,
+    )
+    stale_after_reconnect["source_epoch"] = 1
+    publication = service.publish(
+        0,
+        [stale_after_reconnect],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+    assert service._canonical_track_outputs == {}
+
+
+def test_canonical_track_output_never_crosses_calibration_artifact_revision() -> None:
+    calibration_sha256 = {"value": "a" * 64}
+
+    def artifacts(_source_id: int, _metadata: object) -> WorldArtifacts:
+        baseline = _artifacts()
+        return WorldArtifacts(
+            calibration=ArtifactFingerprint(
+                role="camera_calibration",
+                sha256=calibration_sha256["value"],
+            ),
+            model=baseline.model,
+            config=baseline.config,
+        )
+
+    producer = _producer()
+    service = CanonicalWorldService(
+        producer=producer,
+        artifacts=artifacts,
+        fusion=GlobalWorldFusion(producer),
+        clock_us=lambda: 2_000_000,
+    )
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    initial_key = next(iter(service._canonical_track_outputs))
+    assert initial_key[-2:] == ("a" * 64, 0)
+
+    calibration_sha256["value"] = "f" * 64
+    publication = service.publish(
+        0,
+        [_bounded_process_track()],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+    assert service._canonical_track_outputs == {}
+
+
+def test_world_observation_requires_exact_raw_camera_calibration_digest() -> None:
+    baseline = _artifacts()
+    current_digest = "b" * 64
+    service = CanonicalWorldService(
+        producer=_producer(),
+        artifacts=WorldArtifacts(
+            calibration=ArtifactFingerprint(
+                role="camera_calibration",
+                sha256="e" * 64,
+            ),
+            model=baseline.model,
+            config=baseline.config,
+            camera_calibration_sha256=current_digest,
+        ),
+        clock_us=lambda: 2_000_000,
+    )
+    stale = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    stale["world_calibration_sha256"] = "a" * 64
+    stale["world_floor_candidate"] = [99.0, 0.0, 99.0]
+
+    publication = service.publish(0, [stale], metadata={})
+
+    assert publication.observations[0].calibration.sha256 == "e" * 64
+    assert publication.observations[0].payload.world is None
+    diagnostics = publication.observations[0].payload.world_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.first_divergence_reason == (
+        "camera_calibration_sha256_mismatch"
+    )
+    assert diagnostics.floor_candidate_m is None
+    assert publication.snapshot.entities == ()
+    assert service._canonical_track_outputs == {}
+
+
+def test_prepared_world_commit_rejects_camera_calibration_provider_switch() -> None:
+    calibration_sha256 = {"value": "a" * 64}
+
+    def artifacts(_source_id: int, _metadata: object) -> WorldArtifacts:
+        baseline = _artifacts()
+        digest = calibration_sha256["value"]
+        return WorldArtifacts(
+            calibration=ArtifactFingerprint(
+                role="camera_calibration",
+                sha256=digest,
+            ),
+            model=baseline.model,
+            config=baseline.config,
+            camera_calibration_sha256=digest,
+        )
+
+    service = CanonicalWorldService(
+        producer=_producer(),
+        artifacts=artifacts,
+        clock_us=lambda: 2_000_000,
+    )
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_calibration_sha256"] = "a" * 64
+    prepared = service.prepare(
+        0,
+        [track],
+        metadata={"camera_id": "kitchen"},
+    )
+    assert prepared.publication.observations[0].payload.world is not None
+
+    calibration_sha256["value"] = "b" * 64
+    with pytest.raises(
+        RuntimeError,
+        match="camera calibration authority changed before commit",
+    ):
+        service.commit(prepared)
+
+    assert service.current_snapshot() is None
+    assert service._revision == 0
+    assert service._canonical_track_outputs == {}
+    service.discard(prepared)
+
+
+def test_empty_source_publication_preserves_short_gap_origins() -> None:
+    service = _service()
+    kitchen = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    hall = _set_image_motion_origin(
+        _track(
+            camera_id="hall",
+            tracker_id=8,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    service.publish(0, [kitchen], metadata={})
+    service.publish(1, [hall], metadata={})
+
+    service.publish(
+        0,
+        [],
+        metadata={"camera_id": "kitchen", "media_pts_ns": 1_200_000_000},
+    )
+
+    assert {key[0] for key in service._canonical_track_outputs} == {0, 1}
+    kitchen_continuation = _bounded_process_track()
+    kitchen_continuation["media_pts_ns"] = 1_300_000_000
+    kitchen_provenance = kitchen_continuation["world_prediction_provenance"]
+    assert isinstance(kitchen_provenance, dict)
+    kitchen_transition = kitchen_provenance["filter_transition"]
+    assert isinstance(kitchen_transition, dict)
+    kitchen_transition["current_media_pts_ns"] = 1_300_000_000
+    kitchen_transition["gate_dt_s"] = 0.3
+    publication = service.publish(0, [kitchen_continuation], metadata={})
+    assert publication.observations[0].payload.world is not None
+
+    continuation = _bounded_process_track()
+    continuation["camera_id"] = "hall"
+    continuation["tracker_id"] = 8
+    publication = service.publish(1, [continuation], metadata={})
+    assert publication.observations[0].payload.world is not None
+
+
+def test_canonical_track_output_cache_is_hard_bounded_and_keeps_live_origin() -> None:
+    service = _service()
+    service.MAX_CANONICAL_TRACK_OUTPUTS = 3
+    for tracker_id in range(1, 4):
+        track = _set_image_motion_origin(
+            _track(
+                camera_id="kitchen",
+                tracker_id=tracker_id,
+                frame_id=tracker_id,
+                observed_at_us=1_900_000 + tracker_id,
+                x=1.0,
+            )
+        )
+        service.publish(0, [track], metadata={})
+
+    # Refresh the oldest key before introducing more churn. Plain dict
+    # replacement alone would leave it first in eviction order.
+    hot = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=1,
+            frame_id=4,
+            observed_at_us=1_900_100,
+            x=1.0,
+        )
+    )
+    service.publish(0, [hot], metadata={})
+    fourth = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=4,
+            frame_id=5,
+            observed_at_us=1_900_200,
+            x=1.0,
+        )
+    )
+    service.publish(0, [fourth], metadata={})
+
+    assert len(service._canonical_track_outputs) == 3
+    assert {key[2] for key in service._canonical_track_outputs} == {1, 3, 4}
+
+    continuation = _bounded_process_track()
+    continuation["tracker_id"] = 1
+    publication = service.publish(0, [continuation], metadata={})
+    assert publication.observations[0].payload.world is not None
+
+
+def test_canonical_track_output_cache_prunes_when_all_horizons_expire() -> None:
+    service = _service()
+    origin = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    service.publish(0, [origin], metadata={})
+
+    service.publish(
+        0,
+        [],
+        metadata={
+            "camera_id": "kitchen",
+            "media_pts_ns": 3_005_000_001,
+        },
+    )
+
+    assert service._canonical_track_outputs == {}
+
+
+def _bbox_affine_process_track() -> dict[str, Any]:
+    continuation = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_950_000,
+        x=1.2,
+    )
+    continuation.update(
+        {
+            "media_pts_ns": 1_100_000_000,
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": 0,
+            "world_source": "image_motion_prediction",
+            "world_quality": "held",
+            "world_measurement_accepted": False,
+            "world_filter_prediction": [1.2, 0.0, 2.0],
+            "world_prediction_provenance": {
+                "type": "bbox_affine_floor_projection",
+                "non_authoritative": True,
+                "state_integrated": True,
+                "origin": "last_accepted_pose_projective_origin",
+                "transport": "pose_torso_translation",
+                "image_foot": [640.0, 500.0],
+                "age_s": 0.1,
+                "projective_origin_world": [1.05, 0.0, 2.0],
+                "process_observation": [1.25, 0.0, 2.0],
+                "world_delta_m": 0.2,
+                "world_delta_limit_m": 0.75,
+                "filter_transition": _image_motion_filter_transition(
+                    process_observation=[1.25, 0.0, 2.0],
+                    position_base=[1.0, 0.0, 2.0],
+                    position_gain=0.8,
+                ),
+            },
+        }
+    )
+    return continuation
+
+
+def _recent_projective_bridge_track(
+    *,
+    origin_x: float,
+    origin_media_pts_ns: int,
+    current_x: float,
+    current_media_pts_ns: int,
+) -> dict[str, Any]:
+    continuation = _bounded_process_track(
+        provenance_origin="recent_projective_process"
+    )
+    continuation["media_pts_ns"] = current_media_pts_ns
+    continuation["world"] = [current_x, 0.0, 2.0]
+    continuation["world_filter_prediction"] = [current_x, 0.0, 2.0]
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["process_observation"] = [current_x, 0.0, 2.0]
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["origin_world"] = [origin_x, 0.0, 2.0]
+    transition["origin_media_pts_ns"] = origin_media_pts_ns
+    transition["current_media_pts_ns"] = current_media_pts_ns
+    transition["position_base"] = [origin_x, 0.0, 2.0]
+    transition["gate_dt_s"] = min(
+        (current_media_pts_ns - origin_media_pts_ns) / 1_000_000_000.0,
+        1.25,
+    )
+    return continuation
+
+
+def _retimed_bounded_output_hold(
+    *,
+    origin_x: float,
+    origin_media_pts_ns: int,
+    current_media_pts_ns: int,
+    trail_segment_id: int = 0,
+    active_inferred_occlusion: bool = False,
+) -> dict[str, Any]:
+    hold = _bounded_process_track(
+        continuity_source="anchor_hold",
+        provenance_type="bounded_output_hold",
+        provenance_origin="last_published_output",
+        trail_segment_id=trail_segment_id,
+    )
+    hold["media_pts_ns"] = current_media_pts_ns
+    hold["world"] = [origin_x, 0.0, 2.0]
+    hold["world_filter_prediction"] = [origin_x, 0.0, 2.0]
+    if active_inferred_occlusion:
+        hold.update(
+            {
+                "posture": "standing",
+                "motion_mode": "walk",
+                "lower_body_occluded": True,
+                "lower_body_occlusion_level": "knees",
+            }
+        )
+    provenance = hold["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.update(
+        {
+            "origin_world": [origin_x, 0.0, 2.0],
+            "origin_media_pts_ns": origin_media_pts_ns,
+            "current_media_pts_ns": current_media_pts_ns,
+            "gate_dt_s": min(
+                (current_media_pts_ns - origin_media_pts_ns)
+                / 1_000_000_000.0,
+                1.25,
+            ),
+            "position_base": [origin_x, 0.0, 2.0],
+        }
+    )
+    return hold
+
+
+@pytest.mark.parametrize(
+    ("output_age_ns", "accepted"),
+    (
+        (1_655_000_000, True),
+        (1_655_000_001, False),
+    ),
+)
+def test_recent_projective_bridge_is_bound_to_image_output_age(
+    output_age_ns: int,
+    accepted: bool,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    image_publication = service.publish(
+        0,
+        [_bbox_affine_process_track()],
+        metadata={},
+    )
+    assert image_publication.observations[0].payload.world is not None
+
+    publication = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_100_000_000 + output_age_ns,
+            )
+        ],
+        metadata={},
+    )
+
+    assert (publication.observations[0].payload.world is not None) is accepted
+
+
+def test_delayed_projective_proof_can_name_root_after_newer_descendant() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    assert service.publish(
+        0, [_bbox_affine_process_track()], metadata={}
+    ).observations[0].payload.world is not None
+
+    newer_descendant = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=2_400_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert newer_descendant.observations[0].payload.world is not None
+
+    delayed_root_proof = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.30,
+                current_media_pts_ns=2_500_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert delayed_root_proof.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+
+def test_recent_projective_bridge_chain_keeps_one_nonrenewing_image_root() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    first = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert first.observations[0].payload.world is not None
+    first_output = next(iter(service._canonical_track_outputs.values()))
+    assert first_output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+    second = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.25,
+                origin_media_pts_ns=1_200_000_000,
+                current_x=1.30,
+                current_media_pts_ns=1_300_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert second.observations[0].payload.world is not None
+    second_output = next(iter(service._canonical_track_outputs.values()))
+    assert second_output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+    boundary = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.30,
+                origin_media_pts_ns=1_300_000_000,
+                current_x=1.35,
+                current_media_pts_ns=2_755_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert boundary.observations[0].payload.world is not None
+    boundary_output = next(iter(service._canonical_track_outputs.values()))
+    assert boundary_output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+    expired = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.35,
+                origin_media_pts_ns=2_755_000_000,
+                current_x=1.35,
+                current_media_pts_ns=2_755_000_001,
+            )
+        ],
+        metadata={},
+    )
+    assert expired.observations[0].payload.world is None
+    assert expired.snapshot.entities[0].position.x == pytest.approx(1.35)
+
+
+def test_queued_older_projective_origin_inherits_latest_service_image_root() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    newer_image = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert newer_image.observations[0].payload.world is not None
+
+    first_bridge = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_300_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert first_bridge.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.projective_bridge_root_media_pts_ns == 1_200_000_000
+
+    older_origin_again = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.30,
+                current_media_pts_ns=1_400_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert older_origin_again.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.projective_bridge_root_media_pts_ns == 1_200_000_000
+
+    expired = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.30,
+                origin_media_pts_ns=1_400_000_000,
+                current_x=1.30,
+                current_media_pts_ns=2_855_000_001,
+            )
+        ],
+        metadata={},
+    )
+    assert expired.observations[0].payload.world is None
+    assert expired.snapshot.entities[0].position.x == pytest.approx(1.30)
+
+
+def test_output_hold_inherits_recent_projective_bridge_episode() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    bridge = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert bridge.observations[0].payload.world is not None
+
+    hold = service.publish(
+        0,
+        [
+            _retimed_bounded_output_hold(
+                origin_x=1.25,
+                origin_media_pts_ns=1_200_000_000,
+                current_media_pts_ns=1_300_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert hold.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+    continued = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.25,
+                origin_media_pts_ns=1_300_000_000,
+                current_x=1.30,
+                current_media_pts_ns=1_350_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert continued.observations[0].payload.world is not None
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.projective_bridge_root_media_pts_ns == 1_100_000_000
+
+
+def test_recent_projective_bridge_accepts_older_committed_image_origin() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    first_image = service.publish(
+        0,
+        [_bbox_affine_process_track()],
+        metadata={},
+    )
+    assert first_image.observations[0].payload.world is not None
+    second_image = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert second_image.observations[0].payload.world is not None
+
+    publication = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_300_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.observations[0].payload.world.position.x == pytest.approx(1.25)
+
+
+def test_recent_projective_history_rejects_after_metric_reanchor() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    metric_reanchor = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=3,
+            observed_at_us=2_100_000,
+            x=1.3,
+        )
+    )
+    metric_reanchor["media_pts_ns"] = 1_200_000_000
+    service.publish(0, [metric_reanchor], metadata={})
+
+    publication = service.publish(
+        0,
+        [
+            _recent_projective_bridge_track(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_x=1.25,
+                current_media_pts_ns=1_300_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.3)
+
+
+def test_bounded_output_hold_remains_latest_origin_only() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    hold = _bounded_process_track(
+        continuity_source="anchor_hold",
+        provenance_type="bounded_output_hold",
+        provenance_origin="last_published_output",
+    )
+    hold["media_pts_ns"] = 1_300_000_000
+    hold["world"] = [1.2, 0.0, 2.0]
+    hold["world_filter_prediction"] = [1.2, 0.0, 2.0]
+    provenance = hold["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.update(
+        {
+            "origin_world": [1.2, 0.0, 2.0],
+            "origin_media_pts_ns": 1_100_000_000,
+            "current_media_pts_ns": 1_300_000_000,
+            "gate_dt_s": 0.2,
+            "position_base": [1.2, 0.0, 2.0],
+        }
+    )
+
+    publication = service.publish(0, [hold], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.3)
+
+
+def test_latest_projective_image_allows_multiple_holds_under_one_root() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    image = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.2,
+                process_x=1.2,
+                current_media_pts_ns=1_400_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert image.observations[0].payload.world is not None
+
+    def _hold(*, origin_media_pts_ns: int, current_media_pts_ns: int) -> dict[str, Any]:
+        track = _bounded_process_track(
+            continuity_source="anchor_hold",
+            provenance_type="bounded_output_hold",
+            provenance_origin="last_published_output",
+        )
+        track["media_pts_ns"] = current_media_pts_ns
+        track["world"] = [1.2, 0.0, 2.0]
+        track["world_filter_prediction"] = [1.2, 0.0, 2.0]
+        provenance = track["world_prediction_provenance"]
+        assert isinstance(provenance, dict)
+        transition = provenance["filter_transition"]
+        assert isinstance(transition, dict)
+        transition.update(
+            {
+                "origin_world": [1.2, 0.0, 2.0],
+                    "origin_media_pts_ns": origin_media_pts_ns,
+                    "current_media_pts_ns": current_media_pts_ns,
+                    "gate_dt_s": min(
+                        (current_media_pts_ns - origin_media_pts_ns)
+                        / 1_000_000_000.0,
+                        1.25,
+                    ),
+                "position_base": [1.2, 0.0, 2.0],
+            }
+        )
+        return track
+
+    first_hold = service.publish(
+        0,
+        [
+            _hold(
+                origin_media_pts_ns=1_400_000_000,
+                current_media_pts_ns=1_500_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert first_hold.observations[0].payload.world is not None
+    held_output = next(iter(service._canonical_track_outputs.values()))
+    assert held_output.committed_world_source == "anchor_hold"
+    assert held_output.projective_bridge_root_media_pts_ns == 1_400_000_000
+
+    second_hold = service.publish(
+        0,
+        [
+            _hold(
+                # The media worker formed this proof before the first hold's
+                # admission receipt arrived. Both service-owned origins have
+                # the exact same gain-zero coordinate and trail segment.
+                origin_media_pts_ns=1_400_000_000,
+                current_media_pts_ns=1_600_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert second_hold.observations[0].payload.world is not None
+    held_output = next(iter(service._canonical_track_outputs.values()))
+    assert held_output.projective_bridge_root_media_pts_ns == 1_400_000_000
+
+    boundary_hold = service.publish(
+        0,
+        [
+            _hold(
+                origin_media_pts_ns=1_600_000_000,
+                current_media_pts_ns=3_055_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert boundary_hold.observations[0].payload.world is not None
+    held_output = next(iter(service._canonical_track_outputs.values()))
+    assert held_output.projective_bridge_root_media_pts_ns == 1_400_000_000
+
+    expired_hold = service.publish(
+        0,
+        [
+            _hold(
+                origin_media_pts_ns=3_055_000_000,
+                current_media_pts_ns=3_055_000_001,
+            )
+        ],
+        metadata={},
+    )
+    assert expired_hold.observations[0].payload.world is None
+    assert expired_hold.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_gain_zero_hold_preserves_motion_bearing_kinematic_origin() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    image = service.publish(
+        0,
+        [_bbox_affine_process_track()],
+        metadata={},
+    )
+    assert image.observations[0].payload.world is not None
+
+    hold = service.publish(
+        0,
+        [
+            _retimed_bounded_output_hold(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+    assert hold.observations[0].payload.world is not None
+    held_output = next(iter(service._canonical_track_outputs.values()))
+    assert held_output.kinematic_position == pytest.approx((1.2, 0.0, 2.0))
+    assert held_output.kinematic_media_pts_ns == 1_100_000_000
+
+    # The held row did not observe the person at a new physical coordinate.
+    # A later process step therefore receives its filter budget from the image
+    # posterior at 1.1s. Its emitted coordinate is nevertheless limited by the
+    # latest visible 1.2s row, preventing that retained budget from becoming a
+    # one-frame display teleport.
+    continuation = _recent_projective_bridge_track(
+        origin_x=1.2,
+        origin_media_pts_ns=1_100_000_000,
+        current_x=2.0,
+        current_media_pts_ns=1_400_000_000,
+    )
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.observations[0].payload.world.position.x == pytest.approx(2.0)
+
+
+def test_gain_zero_hold_rejects_kinematically_valid_visible_teleport() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    service.publish(
+        0,
+        [
+            _retimed_bounded_output_hold(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    teleport = _recent_projective_bridge_track(
+        origin_x=1.2,
+        origin_media_pts_ns=1_100_000_000,
+        current_x=2.2,
+        current_media_pts_ns=1_400_000_000,
+    )
+    publication = service.publish(0, [teleport], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_calibrated_image_motion_updates_canonical_held_position() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(_track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    ))
+    service.publish(0, [authoritative], metadata={})
+    continuation = _bbox_affine_process_track()
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is not None
+    assert observation.payload.world.source == "image_motion_prediction"
+    assert observation.payload.world.quality == "held"
+    assert observation.payload.world.covariance.values[0] == pytest.approx(0.64)
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def _retimed_bbox_affine_process_track(
+    *,
+    origin_x: float,
+    origin_media_pts_ns: int,
+    current_x: float,
+    process_x: float,
+    current_media_pts_ns: int,
+) -> dict[str, Any]:
+    continuation = _bbox_affine_process_track()
+    continuation["media_pts_ns"] = current_media_pts_ns
+    continuation["world"] = [current_x, 0.0, 2.0]
+    continuation["world_filter_prediction"] = [current_x, 0.0, 2.0]
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["process_observation"] = [process_x, 0.0, 2.0]
+    provenance["world_delta_m"] = abs(process_x - 1.05)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.update(
+        {
+            "origin_world": [origin_x, 0.0, 2.0],
+            "origin_media_pts_ns": origin_media_pts_ns,
+            "current_media_pts_ns": current_media_pts_ns,
+            "gate_dt_s": min(
+                (current_media_pts_ns - origin_media_pts_ns)
+                / 1_000_000_000.0,
+                1.25,
+            ),
+            "position_base": [origin_x, 0.0, 2.0],
+            "position_gain": 1.0,
+        }
+    )
+    return continuation
+
+
+def test_calibrated_image_motion_accepts_bounded_older_committed_origin() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    latest = service.publish(0, [_bbox_affine_process_track()], metadata={})
+    assert latest.observations[0].payload.world is not None
+    assert latest.observations[0].payload.world.position.x == pytest.approx(1.2)
+
+    publication = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.observations[0].payload.world.position.x == pytest.approx(1.3)
+
+
+def test_calibrated_image_motion_rejects_uncommitted_older_origin() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+
+    publication = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.1,
+                origin_media_pts_ns=1_050_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_calibrated_image_motion_rejects_old_origin_jump_from_latest() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+
+    publication = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.7,
+                process_x=1.7,
+                current_media_pts_ns=1_200_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    ("origin_age_ns", "accepted"),
+    ((1_250_000_000, True), (1_250_000_001, False)),
+)
+def test_calibrated_image_motion_committed_history_has_time_horizon(
+    origin_age_ns: int,
+    accepted: bool,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_bbox_affine_process_track()], metadata={})
+    current_media_pts_ns = 1_000_000_000 + origin_age_ns
+
+    publication = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.3,
+                process_x=1.3,
+                current_media_pts_ns=current_media_pts_ns,
+            )
+        ],
+        metadata={},
+    )
+
+    if accepted:
+        assert publication.observations[0].payload.world is not None
+        assert publication.observations[0].payload.world.position.x == pytest.approx(1.3)
+    else:
+        assert publication.observations[0].payload.world is None
+        assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_calibrated_image_motion_prunes_expired_latest_before_validation() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+
+    publication = service.publish(
+        0,
+        [
+            _retimed_bbox_affine_process_track(
+                origin_x=1.0,
+                origin_media_pts_ns=1_000_000_000,
+                current_x=1.2,
+                process_x=1.2,
+                current_media_pts_ns=4_000_000_000,
+            )
+        ],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is None
+
+
+def test_calibrated_image_motion_accepts_epoch_float_gate_clock_roundoff() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+    service.publish(0, [authoritative], metadata={})
+    continuation = _bbox_affine_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["gate_dt_s"] = 1_780_000_000.1 - 1_780_000_000.0
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is not None
+    assert observation.payload.world.position.x == pytest.approx(1.2)
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    "posterior",
+    (None, [1.3, 0.0, 2.0], [float("nan"), 0.0, 2.0]),
+)
+def test_calibrated_image_motion_requires_exact_integrated_posterior(
+    posterior: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(_track(
+                camera_id="kitchen",
+                tracker_id=7,
+                frame_id=1,
+                observed_at_us=1_900_000,
+                x=1.0,
+            ))
+        ],
+        metadata={},
+    )
+    continuation = _bbox_affine_process_track()
+    continuation["world_filter_prediction"] = posterior
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("origin_world", [1.1, 0.0, 2.0]),
+        ("origin_media_pts_ns", 999_000_000),
+        ("current_media_pts_ns", 1_099_000_000),
+        ("origin_trail_segment_id", 1),
+        ("gate_dt_s", 0.2),
+        ("position_base", [1.1, 0.0, 2.0]),
+        ("position_gain", 0.9),
+        ("max_speed_mps", 40.0),
+        ("max_jump_m", 7.5),
+        ("reset_after_s", 12.5),
+    ),
+)
+def test_calibrated_image_motion_rejects_mutated_filter_transition(
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bbox_affine_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_calibrated_image_motion_rejects_jointly_forged_posterior() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                )
+            )
+        ],
+        metadata={},
+    )
+    continuation = _bbox_affine_process_track()
+    continuation["world"] = [99.0, 0.0, 99.0]
+    continuation["world_filter_prediction"] = [99.0, 0.0, 99.0]
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def _inferred_ground_process_track() -> dict[str, object]:
+    continuation = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_950_000,
+        x=1.2,
+    )
+    continuation.update(
+        {
+            "world_source": "image_motion_prediction",
+            "world_quality": "held",
+            "world_quality_reason": (
+                "world_resolver_non_floor_diagnostic_only,"
+                "guided_by_inferred_body_geometry"
+            ),
+            "world_measurement_accepted": False,
+            "world_filter_prediction": [1.2, 0.0, 2.0],
+            "media_pts_ns": 1_100_000_000,
+            "world_observation_range_admitted": True,
+            "tracker_lifecycle_generation": 1,
+            "trail_segment_id": 4,
+            "posture": "standing",
+            "motion_mode": "walk",
+            "lower_body_occluded": True,
+            "lower_body_occlusion_level": "knees",
+            "lower_body_occlusion_confidence": 0.89,
+            "world_inferred_raw_observation": [10.5, 0.0, 19.5],
+            "world_inferred_process_observation": [1.25, 0.0, 2.05],
+            "world_prediction_provenance": {
+                "type": "inferred_ground_process_observation",
+                "non_authoritative": True,
+                "state_integrated": True,
+                "origin": "learned_body_height",
+                "transport": "fixed_occlusion_origin_raw_world_delta",
+                "support_kind": "lower_body_occlusion",
+                "image_motion_supported": False,
+                "image_motion_streak": 0,
+                "image_motion_contact_basis": "",
+                "detector_confidence": 0.91,
+                "trusted_origin_kind": "queue_admitted_metric_world_output",
+                "age_s": 0.05,
+                "raw_origin_ts_s": 1.9,
+                "raw_consensus_ts_s": 1.95,
+                "current_ts_s": 1.95,
+                "trusted_origin_filter_ts_s": 1.89,
+                "origin_observed_at_us": 1_900_000,
+                "raw_consensus_observed_at_us": 1_950_000,
+                "observed_at_us": 1_950_000,
+                "raw_origin_media_pts_ns": 1_050_000_000,
+                "raw_consensus_media_pts_ns": 1_100_000_000,
+                "trusted_origin_media_pts_ns": 1_000_000_000,
+                "current_media_pts_ns": 1_100_000_000,
+                "raw_consensus_method": "xz_medoid",
+                "raw_consensus_count": 2,
+                "raw_consensus_span_s": 0.05,
+                "raw_evidence_gap_s": 0.05,
+                "tracker_lifecycle_generation": 1,
+                "origin_trail_segment_id": 4,
+                "world_frame": "backend_world_m",
+                "world_frame_revision": "world-rev",
+                "world_transform_sha256": "d" * 64,
+                "resolver_candidate_id": "gravity_reconstruction",
+                "raw_sample": [10.5, 0.0, 19.5],
+                "raw_consensus": [10.5, 0.0, 19.5],
+                "raw_origin": [10.25, 0.0, 19.45],
+                "raw_delta": [0.25, 0.0, 0.05],
+                "trusted_world_origin": [1.0, 0.0, 2.0],
+                "process_observation": [1.25, 0.0, 2.05],
+                "filter_transition": _image_motion_filter_transition(
+                    process_observation=[1.25, 0.0, 2.05],
+                    position_base=[1.0, 0.0, 1.8],
+                    position_gain=0.8,
+                    trail_segment_id=4,
+                ),
+                "height_ref_scene": 1.78,
+                "occlusion_level": "knees",
+                "occlusion_confidence": 0.89,
+            },
+        }
+    )
+    return continuation
+
+
+def _coherent_torso_inferred_ground_process_track() -> dict[str, object]:
+    continuation = _inferred_ground_process_track()
+    continuation.update(
+        {
+            "lower_body_occluded": False,
+            "lower_body_occlusion_level": "none",
+            "lower_body_occlusion_confidence": 0.0,
+            "world_image_motion_supported": True,
+            "world_image_motion_streak": 3,
+            "world_contact_basis": "pose:torso_motion",
+        }
+    )
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance.update(
+        {
+            "transport": "fixed_torso_origin_raw_world_delta",
+            "support_kind": "coherent_torso_motion",
+            "image_motion_supported": True,
+            "image_motion_streak": 3,
+            "image_motion_contact_basis": "pose:torso_motion",
+            "detector_confidence": 0.91,
+            "occlusion_level": "none",
+            "occlusion_confidence": 0.0,
+        }
+    )
+    return continuation
+
+
+def _robust_innovation_inferred_ground_process_track() -> dict[str, object]:
+    continuation = _inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    raw_consensus = [12.25, 0.0, 19.45]
+    raw_delta = [2.0, 0.0, 0.0]
+    raw_process = [3.0, 0.0, 2.0]
+    filter_observation = [2.15, 0.0, 2.0]
+    posterior = [1.345, 0.0, 2.0]
+    continuation.update(
+        {
+            "world": posterior,
+            "world_filter_prediction": posterior,
+            "world_inferred_raw_observation": raw_consensus,
+            "world_inferred_process_observation": raw_process,
+        }
+    )
+    provenance.update(
+        {
+            "raw_sample": raw_consensus,
+            "raw_consensus": raw_consensus,
+            "raw_delta": raw_delta,
+            "process_observation": raw_process,
+        }
+    )
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.update(
+        {
+            "position_base": [1.0, 0.0, 2.0],
+            "position_gain": 0.3,
+            "innovation_limit_applied": True,
+            "raw_position_target": raw_process,
+            "filter_observation": filter_observation,
+            "raw_innovation_m": 2.0,
+            "innovation_limit_m": 1.15,
+            "innovation_scale": 0.575,
+        }
+    )
+    return continuation
+
+
+def _retimed_inferred_ground_process_track(
+    *,
+    origin_world: tuple[float, float, float] = (1.2, 0.0, 2.0),
+    origin_media_pts_ns: int = 1_100_000_000,
+    current_media_pts_ns: int = 1_833_000_000,
+    current_ts_s: float = 2.683,
+    raw_evidence_gap_s: float = 0.733,
+) -> dict[str, object]:
+    continuation = _inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    raw_origin = provenance["raw_origin"]
+    trusted_origin = provenance["trusted_world_origin"]
+    assert isinstance(raw_origin, list)
+    assert isinstance(trusted_origin, list)
+    raw_consensus = [10.5, 0.0, 19.5]
+    raw_delta = [
+        raw_consensus[index] - float(raw_origin[index])
+        for index in range(3)
+    ]
+    process_observation = [
+        float(trusted_origin[index]) + raw_delta[index]
+        for index in range(3)
+    ]
+    position_gain = 0.8
+    posterior = [
+        float(origin_world[index])
+        + position_gain
+        * (process_observation[index] - float(origin_world[index]))
+        for index in range(3)
+    ]
+    observed_at_us = int(round(current_ts_s * 1_000_000.0))
+    continuation.update(
+        {
+            "observed_at_us": observed_at_us,
+            "media_pts_ns": current_media_pts_ns,
+            "world": posterior,
+            "world_filter_prediction": posterior,
+            "world_inferred_raw_observation": raw_consensus,
+            "world_inferred_process_observation": process_observation,
+        }
+    )
+    provenance.update(
+        {
+            "age_s": current_ts_s - float(provenance["raw_origin_ts_s"]),
+            "raw_consensus_ts_s": current_ts_s,
+            "current_ts_s": current_ts_s,
+            "raw_consensus_observed_at_us": observed_at_us,
+            "observed_at_us": observed_at_us,
+            "raw_consensus_media_pts_ns": current_media_pts_ns,
+            "current_media_pts_ns": current_media_pts_ns,
+            "raw_consensus_count": 1,
+            "raw_consensus_span_s": 0.0,
+            "raw_evidence_gap_s": raw_evidence_gap_s,
+            "raw_sample": raw_consensus,
+            "raw_consensus": raw_consensus,
+            "raw_delta": raw_delta,
+            "process_observation": process_observation,
+        }
+    )
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.update(
+        {
+            "origin_world": list(origin_world),
+            "origin_media_pts_ns": origin_media_pts_ns,
+            "current_media_pts_ns": current_media_pts_ns,
+            "gate_dt_s": min(
+                (current_media_pts_ns - origin_media_pts_ns)
+                / 1_000_000_000.0,
+                1.25,
+            ),
+            "position_base": list(origin_world),
+            "position_gain": position_gain,
+        }
+    )
+    return continuation
+
+
+def test_inferred_ground_process_updates_exact_canonical_held_position() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(_track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    ), trail_segment_id=4)
+    service.publish(0, [authoritative], metadata={})
+
+    publication = service.publish(
+        0,
+        [_inferred_ground_process_track()],
+        metadata={},
+    )
+
+    observation = publication.observations[0]
+    assert observation.payload.world is not None
+    assert observation.payload.world.source == "image_motion_prediction"
+    assert observation.payload.world.quality == "held"
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_coherent_torso_inferred_process_closes_established_contact_gap() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        ),
+        trail_segment_id=4,
+    )
+    service.publish(0, [authoritative], metadata={})
+
+    publication = service.publish(
+        0,
+        [_coherent_torso_inferred_ground_process_track()],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.observations[0].payload.world.source == (
+        "image_motion_prediction"
+    )
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    (
+        ("provenance", "support_kind", "lower_body_occlusion"),
+        (
+            "provenance",
+            "transport",
+            "fixed_occlusion_origin_raw_world_delta",
+        ),
+        ("provenance", "image_motion_supported", False),
+        ("provenance", "image_motion_streak", 2),
+        ("provenance", "image_motion_contact_basis", "bbox_bottom"),
+        ("provenance", "detector_confidence", 0.64),
+        ("track", "lower_body_occluded", True),
+        ("track", "world_image_motion_supported", False),
+        ("track", "world_image_motion_streak", 2),
+        ("track", "world_contact_basis", "bbox_bottom"),
+    ),
+)
+def test_coherent_torso_inferred_process_rejects_incomplete_current_proof(
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    continuation = _coherent_torso_inferred_ground_process_track()
+    if scope == "provenance":
+        provenance = continuation["world_prediction_provenance"]
+        assert isinstance(provenance, dict)
+        provenance[field] = value
+    else:
+        continuation[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_inferred_ground_robust_innovation_proof_is_canonical() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        ),
+        trail_segment_id=4,
+    )
+    service.publish(0, [authoritative], metadata={})
+
+    publication = service.publish(
+        0,
+        [_robust_innovation_inferred_ground_process_track()],
+        metadata={},
+    )
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.345)
+
+
+def test_inferred_ground_robust_innovation_rejects_tampered_scale() -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        ),
+        trail_segment_id=4,
+    )
+    service.publish(0, [authoritative], metadata={})
+    continuation = _robust_innovation_inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition["innovation_scale"] = 0.6
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("innovation_limit_applied", False),
+        ("raw_position_target", [3.01, 0.0, 2.0]),
+        ("filter_observation", [2.14, 0.0, 2.0]),
+        ("raw_innovation_m", 1.99),
+        ("innovation_limit_m", 1.14),
+        ("innovation_scale", 0.574),
+    ),
+)
+def test_inferred_ground_robust_innovation_rejects_each_mutated_proof_member(
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    continuation = _robust_innovation_inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "raw_position_target",
+        "filter_observation",
+        "raw_innovation_m",
+        "innovation_limit_m",
+        "innovation_scale",
+    ),
+)
+def test_inferred_ground_robust_innovation_rejects_partial_proof(
+    field: str,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    continuation = _robust_innovation_inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition.pop(field)
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def _service_with_inferred_ground_root_and_hold() -> CanonicalWorldService:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    first = service.publish(
+        0,
+        [_inferred_ground_process_track()],
+        metadata={},
+    )
+    assert first.observations[0].payload.world is not None
+    hold = service.publish(
+        0,
+        [
+            _retimed_bounded_output_hold(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_media_pts_ns=1_200_000_000,
+                trail_segment_id=4,
+                active_inferred_occlusion=True,
+            )
+        ],
+        metadata={},
+    )
+    assert hold.observations[0].payload.world is not None
+    return service
+
+
+def test_inferred_ground_root_ends_when_current_occlusion_episode_ends() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    first = service.publish(
+        0,
+        [_inferred_ground_process_track()],
+        metadata={},
+    )
+    assert first.observations[0].payload.world is not None
+    assert next(
+        iter(service._canonical_track_outputs.values())
+    ).inferred_ground_episode_root is not None
+
+    ended = service.publish(
+        0,
+        [
+            _retimed_bounded_output_hold(
+                origin_x=1.2,
+                origin_media_pts_ns=1_100_000_000,
+                current_media_pts_ns=1_200_000_000,
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+
+    assert ended.observations[0].payload.world is not None
+    assert next(
+        iter(service._canonical_track_outputs.values())
+    ).inferred_ground_episode_root is None
+
+
+def test_long_gap_inferred_ground_restart_keeps_exact_service_episode_root() -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    held_output = next(iter(service._canonical_track_outputs.values()))
+    episode_root = held_output.inferred_ground_episode_root
+    assert episode_root is not None
+    assert held_output.prior_outputs[0].inferred_ground_episode_root is episode_root
+
+    restart = _retimed_inferred_ground_process_track()
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is not None
+    assert publication.observations[0].payload.world.position.x == pytest.approx(
+        1.24
+    )
+    restarted_output = next(iter(service._canonical_track_outputs.values()))
+    assert restarted_output.inferred_ground_episode_root is episode_root
+
+    following = _retimed_inferred_ground_process_track(
+        origin_world=(1.24, 0.0, 2.04),
+        origin_media_pts_ns=1_833_000_000,
+        current_media_pts_ns=1_933_000_000,
+        current_ts_s=2.783,
+        raw_evidence_gap_s=0.1,
+    )
+    following_publication = service.publish(0, [following], metadata={})
+
+    assert following_publication.observations[0].payload.world is not None
+    following_output = next(iter(service._canonical_track_outputs.values()))
+    assert following_output.inferred_ground_episode_root is episode_root
+
+
+def test_long_gap_inferred_ground_restart_requires_service_owned_root() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    restart = _retimed_inferred_ground_process_track(
+        origin_world=(1.0, 0.0, 2.0),
+        origin_media_pts_ns=1_000_000_000,
+    )
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("raw_origin_media_pts_ns", 1_049_000_000),
+        ("origin_observed_at_us", 1_899_000),
+        ("trusted_origin_media_pts_ns", 999_000_000),
+        ("trusted_origin_filter_ts_s", 1.88),
+        ("height_ref_scene", 1.79),
+    ),
+)
+def test_long_gap_inferred_ground_restart_rejects_changed_root_scalar(
+    field: str,
+    value: object,
+) -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track()
+    provenance = restart["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance[field] = value
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_long_gap_inferred_ground_restart_rejects_changed_raw_origin_time() -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track()
+    provenance = restart["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["raw_origin_ts_s"] = 1.89
+    provenance["age_s"] = float(provenance["current_ts_s"]) - 1.89
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_long_gap_inferred_ground_restart_rejects_changed_raw_root_with_valid_algebra() -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track()
+    provenance = restart["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["raw_origin"] = [10.2, 0.0, 19.45]
+    raw_consensus = provenance["raw_consensus"]
+    trusted_origin = provenance["trusted_world_origin"]
+    assert isinstance(raw_consensus, list)
+    assert isinstance(trusted_origin, list)
+    raw_delta = [
+        float(raw_consensus[index])
+        - float(provenance["raw_origin"][index])
+        for index in range(3)
+    ]
+    process = [
+        float(trusted_origin[index]) + raw_delta[index]
+        for index in range(3)
+    ]
+    posterior = [
+        1.2 + 0.8 * (process[0] - 1.2),
+        0.0,
+        2.0 + 0.8 * (process[2] - 2.0),
+    ]
+    provenance["raw_delta"] = raw_delta
+    provenance["process_observation"] = process
+    restart["world_inferred_process_observation"] = process
+    restart["world"] = posterior
+    restart["world_filter_prediction"] = posterior
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_long_gap_inferred_ground_restart_rejects_changed_trusted_root_with_valid_algebra() -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track()
+    provenance = restart["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    provenance["trusted_world_origin"] = [1.01, 0.0, 2.0]
+    raw_delta = provenance["raw_delta"]
+    assert isinstance(raw_delta, list)
+    process = [
+        float(provenance["trusted_world_origin"][index])
+        + float(raw_delta[index])
+        for index in range(3)
+    ]
+    posterior = [
+        1.2 + 0.8 * (process[0] - 1.2),
+        0.0,
+        2.0 + 0.8 * (process[2] - 2.0),
+    ]
+    provenance["process_observation"] = process
+    restart["world_inferred_process_observation"] = process
+    restart["world"] = posterior
+    restart["world_filter_prediction"] = posterior
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("lifecycle", "world_frame", "revision", "transform", "segment"),
+)
+def test_long_gap_inferred_ground_restart_rejects_changed_episode_boundary(
+    boundary: str,
+) -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track()
+    provenance = restart["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    if boundary == "lifecycle":
+        restart["tracker_lifecycle_generation"] = 2
+        provenance["tracker_lifecycle_generation"] = 2
+    elif boundary == "world_frame":
+        restart["world_frame"] = "other_world_m"
+        provenance["world_frame"] = "other_world_m"
+    elif boundary == "revision":
+        restart["world_frame_revision"] = "other-revision"
+        provenance["world_frame_revision"] = "other-revision"
+    elif boundary == "transform":
+        restart["world_transform_sha256"] = "e" * 64
+        provenance["world_transform_sha256"] = "e" * 64
+    else:
+        restart["trail_segment_id"] = 5
+        provenance["origin_trail_segment_id"] = 5
+        transition["origin_trail_segment_id"] = 5
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_long_gap_inferred_ground_restart_rejects_excessive_output_age() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    service.publish(0, [_inferred_ground_process_track()], metadata={})
+    restart = _retimed_inferred_ground_process_track(
+        current_media_pts_ns=2_350_000_001,
+    )
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+def test_long_gap_inferred_ground_restart_rejects_gap_beyond_reset_age() -> None:
+    service = _service_with_inferred_ground_root_and_hold()
+    restart = _retimed_inferred_ground_process_track(
+        current_ts_s=3.150002,
+        raw_evidence_gap_s=1.250002,
+    )
+
+    publication = service.publish(0, [restart], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    (
+        ("provenance", "origin", "last_accepted_image_foot"),
+        ("provenance", "transport", "current_reference_plane_projection"),
+        ("provenance", "trusted_origin_kind", "filter_state"),
+        ("provenance", "tracker_lifecycle_generation", 99),
+        ("provenance", "observed_at_us", 1_949_999),
+        ("provenance", "raw_delta", [0.6, 0.0, -0.5]),
+        ("provenance", "raw_consensus", [10.6, 0.0, 19.5]),
+        ("provenance", "raw_consensus_ts_s", 1.96),
+        ("provenance", "raw_consensus_observed_at_us", 1_950_001),
+        ("provenance", "raw_consensus_media_pts_ns", 2_001),
+        ("provenance", "raw_consensus_method", "mean"),
+        ("provenance", "raw_consensus_count", 6),
+        ("provenance", "raw_consensus_span_s", -0.1),
+        ("provenance", "raw_evidence_gap_s", 0.41),
+        ("provenance", "trusted_world_origin", [0.8, 0.0, 2.55]),
+        ("provenance", "process_observation", [1.3, 0.0, 2.05]),
+        ("provenance", "age_s", 0.06),
+        ("provenance", "current_ts_s", 1.96),
+        ("provenance", "current_media_pts_ns", 1_999),
+        ("provenance", "origin_trail_segment_id", 3),
+        ("provenance", "world_frame_revision", "other-world"),
+        ("track", "lower_body_occluded", False),
+        ("track", "world_observation_range_admitted", False),
+        ("track", "world_inferred_raw_observation", [10.6, 0.0, 19.5]),
+        ("track", "world_inferred_process_observation", [1.3, 0.0, 2.05]),
+        ("track", "trail_segment_id", 3),
+        ("track", "world_filter_prediction", [1.3, 0.0, 2.0]),
+    ),
+)
+def test_malformed_inferred_ground_process_remains_diagnostic_only(
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    authoritative = _set_image_motion_origin(_track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    ), trail_segment_id=4)
+    service.publish(0, [authoritative], metadata={})
+    continuation = _inferred_ground_process_track()
+    if scope == "provenance":
+        provenance = continuation["world_prediction_provenance"]
+        assert isinstance(provenance, dict)
+        provenance[field] = value
+    else:
+        continuation[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is None
+    assert observation.payload.world_diagnostics is not None
+    assert observation.payload.world_diagnostics.first_divergence_reason == (
+        "image_motion_continuity_provenance_invalid"
+    )
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("origin_world", [1.1, 0.0, 2.0]),
+        ("origin_media_pts_ns", 999_000_000),
+        ("gate_dt_s", 0.2),
+        ("position_base", [1.0, 0.0, 1.9]),
+        ("position_gain", 0.9),
+    ),
+)
+def test_inferred_ground_process_rejects_mutated_filter_transition(
+    field: str,
+    value: object,
+) -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    continuation = _inferred_ground_process_track()
+    provenance = continuation["world_prediction_provenance"]
+    assert isinstance(provenance, dict)
+    transition = provenance["filter_transition"]
+    assert isinstance(transition, dict)
+    transition[field] = value
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_inferred_ground_process_rejects_jointly_forged_posterior() -> None:
+    service = _service()
+    service.publish(
+        0,
+        [
+            _set_image_motion_origin(
+                _track(
+                    camera_id="kitchen",
+                    tracker_id=7,
+                    frame_id=1,
+                    observed_at_us=1_900_000,
+                    x=1.0,
+                ),
+                trail_segment_id=4,
+            )
+        ],
+        metadata={},
+    )
+    continuation = _inferred_ground_process_track()
+    continuation["world"] = [99.0, 0.0, 99.0]
+    continuation["world_filter_prediction"] = [99.0, 0.0, 99.0]
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
+
+
+def test_unproven_image_motion_remains_diagnostic_only() -> None:
+    service = _service()
+    authoritative = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    service.publish(0, [authoritative], metadata={})
+    continuation = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=2,
+        observed_at_us=1_950_000,
+        x=99.0,
+    )
+    continuation["world_source"] = "image_motion_prediction"
+    continuation["world_quality"] = "held"
+    continuation["world_measurement_accepted"] = False
+    continuation["world_prediction_provenance"] = {
+        "type": "bbox_affine_floor_projection",
+        "non_authoritative": True,
+        "state_integrated": False,
+        "origin": "last_accepted_image_foot",
+        "transport": "bbox_affine",
+        "image_foot": [640.0, 500.0],
+        "age_s": 0.1,
+        "world_delta_m": 0.2,
+        "world_delta_limit_m": 0.75,
+    }
+
+    publication = service.publish(0, [continuation], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is None
+    assert observation.payload.world_diagnostics is not None
+    assert (
+        observation.payload.world_diagnostics.first_divergence_reason
+        == "image_motion_continuity_provenance_invalid"
+    )
     assert publication.snapshot.entities[0].position.x == pytest.approx(1.0)
 
 
@@ -426,6 +4380,41 @@ def test_image_only_observation_is_published_but_not_fused() -> None:
 
     assert len(publication.observations) == 1
     assert publication.observations[0].coordinate_frame == "image_px"
+    assert publication.snapshot.entities == ()
+
+
+def test_explicitly_rejected_ordinary_measurement_is_not_fused() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_measurement_accepted"] = False
+    track["world_quality_reason"] = "physical_innovation_exceeded"
+
+    publication = service.publish(0, [track], metadata={})
+
+    assert publication.observations[0].payload.world is None
+    assert publication.snapshot.entities == ()
+
+
+def test_ordinary_source_cannot_masquerade_as_held_process_output() -> None:
+    service = _service()
+    track = _track(
+        camera_id="kitchen",
+        tracker_id=7,
+        frame_id=1,
+        observed_at_us=1_900_000,
+        x=1.0,
+    )
+    track["world_quality"] = "held"
+
+    publication = service.publish(0, [track], metadata={})
+
+    assert publication.observations[0].payload.world is None
     assert publication.snapshot.entities == ()
 
 
@@ -1115,6 +5104,138 @@ def test_tracking_publisher_emits_observations_and_separate_world_snapshot() -> 
     assert tracking["observations"][0]["contract_version"] == 1
     assert tracking["world_snapshot"]["contract"] == "noesis.world.snapshot"
     assert tracking["world_events"][0]["event_type"] == "appeared"
+
+
+def test_tracking_publisher_clears_world_row_rejected_by_canonical_service() -> None:
+    websocket = _WebSocketRecorder()
+    publisher = TrackingTelemetryPublisher(
+        websocket,
+        metadata_getter=lambda _source_id, _tracks: {"camera_id": "kitchen"},
+        world_service=_service(),
+    )
+    proposed = _bounded_process_track()
+
+    receipt = publisher.publish(0, [proposed])
+
+    tracking = websocket.messages[0]
+    public_track = tracking["tracks"][0]
+    assert proposed["world_valid"] is True
+    assert public_track["world_valid"] is False
+    assert public_track["world_quality"] == "invalid"
+    assert public_track["world_quality_reason"] == (
+        "canonical_world_service_rejected"
+    )
+    assert public_track["trail_append_allowed"] is False
+    assert public_track["trail_break_required"] is True
+    assert "world" not in public_track
+    assert "world_source" not in public_track
+    assert "world_filter_prediction" not in public_track
+    assert "world_prediction_provenance" not in public_track
+    assert tracking["observations"][0]["payload"]["world"] is None
+    assert tracking["world_snapshot"]["entities"] == []
+    assert receipt.canonical_world_admission_bound is True
+    assert receipt.canonical_world_track_keys == ()
+
+
+def test_tracking_publisher_receipt_binds_exact_admitted_world_row() -> None:
+    websocket = _WebSocketRecorder()
+    publisher = TrackingTelemetryPublisher(
+        websocket,
+        metadata_getter=lambda _source_id, _tracks: {"camera_id": "kitchen"},
+        world_service=_service(),
+    )
+    track = _set_image_motion_origin(
+        _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=1,
+            observed_at_us=1_900_000,
+            x=1.0,
+        )
+    )
+
+    receipt = publisher.publish(0, [track])
+
+    assert websocket.messages[0]["tracks"][0]["world_valid"] is True
+    assert receipt.canonical_world_admission_bound is True
+    assert receipt.canonical_world_track_keys == ((7, 1, 1),)
+
+
+def test_velocity_rejection_clears_tracking_authority_and_process_origin() -> None:
+    websocket = _WebSocketRecorder()
+    service = _service()
+    publisher = TrackingTelemetryPublisher(
+        websocket,
+        metadata_getter=lambda _source_id, _tracks: {"camera_id": "kitchen"},
+        world_service=service,
+    )
+
+    def point(*, frame_id: int, media_pts_ns: int, x: float) -> dict[str, Any]:
+        track = _track(
+            camera_id="kitchen",
+            tracker_id=7,
+            frame_id=frame_id,
+            observed_at_us=1_800_000 + (frame_id - 1) * 100_000,
+            x=x,
+        )
+        track.update(
+            {
+                "media_pts_ns": media_pts_ns,
+                "tracker_lifecycle_generation": 1,
+                "trail_segment_id": 0,
+                "trail_break_required": False,
+                "trail_append_allowed": True,
+            }
+        )
+        return track
+
+    publisher.publish(
+        0,
+        [point(frame_id=1, media_pts_ns=1_000_000_000, x=0.0)],
+    )
+    rejected = point(frame_id=2, media_pts_ns=1_100_000_000, x=2.0)
+    receipt = publisher.publish(0, [rejected])
+
+    tracking_messages = [
+        message
+        for message in websocket.messages
+        if message["type"] == "tracking"
+    ]
+    tracking = tracking_messages[1]
+    public_track = tracking["tracks"][0]
+    assert public_track["world_valid"] is False
+    assert "world" not in public_track
+    assert public_track["world_quality_reason"] == (
+        "canonical_world_service_rejected"
+    )
+    assert receipt.canonical_world_track_keys == ()
+
+    entity = tracking["world_snapshot"]["entities"][0]
+    assert entity["position"]["x"] == pytest.approx(0.0)
+    current_source = next(
+        source
+        for source in entity["sources"]
+        if source["observation_id"].endswith(":1:7")
+    )
+    assert current_source["accepted"] is False
+    assert current_source["rejection_reason"].startswith("velocity_gate:")
+
+    output = next(iter(service._canonical_track_outputs.values()))
+    assert output.position[0] == pytest.approx(0.0)
+    assert output.media_pts_ns == 1_000_000_000
+
+    process = _recent_projective_bridge_track(
+        origin_x=2.0,
+        origin_media_pts_ns=1_100_000_000,
+        current_x=2.0,
+        current_media_pts_ns=1_200_000_000,
+    )
+    process["frame_id"] = 3
+    process["observed_at_us"] = 2_000_000
+    later = service.publish(0, [process], metadata={})
+
+    assert later.observations[0].payload.world is None
+    assert later.snapshot.entities[0].position.x == pytest.approx(0.0)
 
 
 def test_tracking_publisher_emits_advancing_empty_frame_and_clears_world() -> None:

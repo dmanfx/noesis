@@ -49,6 +49,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--camera-pose-anchor",
+        type=Path,
+        help=(
+            "Optional admitted full 6DoF static-camera pose localized directly "
+            "inside the metric PCF."
+        ),
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=REPO_ROOT / "data" / "scene_priors",
@@ -86,6 +94,7 @@ def main() -> int:
         world_to_scene=args.world_to_scene,
         output_root=args.output_root,
         camera_map_lock=args.camera_map_lock,
+        camera_pose_anchor=args.camera_pose_anchor,
         camera_ids=tuple(args.camera_ids),
         grid_resolution_m=args.grid_resolution_m,
         floor_support_band_m=args.floor_support_band_m,

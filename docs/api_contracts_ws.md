@@ -402,12 +402,14 @@ Emitted by `BevRenderer`:
   "cameraId": "<camera>",
   "ts": <int microseconds>,
   "sourceId": <int>,
+  "sourceEpoch": <int>,
   "frameId": <int>,
   "observedAtUs": <int epoch microseconds>,
   "trackingPublicationSequence": <int>,
   "trackingOutboundSubmissionId": <int>,
   "cohort": {
     "source_id": <int>,
+    "source_epoch": <int>,
     "frame_id": <int>,
     "observed_at_us": <int epoch microseconds>,
     "tracking_publication_sequence": <int>,
@@ -500,12 +502,13 @@ Emitted by `BevRenderer`:
       "trackerId": <int|null>,
       "trackerLifecycleGeneration": <int|null>,
       "trailSegmentId": <int|null>,
-      "reason": "canonical_world_missing"|"canonical_world_nonfinite"|"canonical_world_outside_admission_surface"|"canonical_world_outside_max_distance"|"canonical_world_outside_display_guard"|"<other canonical admission reason>",
-      "canonicalWorld": true,
+      "reason": "canonical_world_missing"|"canonical_world_nonfinite"|"canonical_world_outside_admission_surface"|"canonical_world_outside_max_distance"|"canonical_world_outside_display_guard"|"<other admission reason>",
+      "canonicalWorld": <bool>,
+      "trailRetained": <bool|null>,
       "anchorSource": "<string|null>"
     }
   ],
-  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "canonicalWorld": <bool>, "trailSegmentId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} ]} ],
+  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "trackerLifecycleGeneration": <int|null>, "canonicalWorld": <bool>, "trailSegmentId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>, "floorplanInside": <bool>, "coverageInside": <bool>, "coverageRegion": "<semantic-region>"|null} | {"t": <int ms>, "breakBefore": true} ]} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
@@ -523,7 +526,7 @@ Emitted by `BevRenderer`:
 ```
 
 - `footpoints[].method` is an image-anchor/render provenance string emitted by the backend (`image_base`, `image_foot`, `bbox`, etc.), not the canonical track world estimator source.
-- `sourceId`, `frameId`, `observedAtUs`, and
+- `sourceId`, `sourceEpoch`, `frameId`, `observedAtUs`, and
   `trackingPublicationSequence` identify the exact tracking
   publication cohort that produced the BEV frame. Every current footpoint
   repeats that `frameId`. Validators join by camera/source/frame and require
@@ -532,7 +535,13 @@ Emitted by `BevRenderer`:
 - The top-level cohort fields, nested `cohort`, and
   `trackingOutboundSubmissionId` are all required. Dashboard ingestion rejects
   partial, contradictory, duplicate, or older cohorts, including frames that
-  arrive after a status/error message.
+  arrive after a status/error message. Top-level `sourceEpoch` must exactly
+  equal `cohort.source_epoch`. For the same `sourceId`, a higher epoch starts a
+  new media timeline and is admitted even when `ts`, `frameId`,
+  `observedAtUs`, sequence, and outbound-submission clocks rewind; before that
+  cohort is rendered, the dashboard clears every source-local live head,
+  retained trail, smoothing state, trail-sampling phase, and source-time
+  clock. A lower epoch is stale and cannot roll the display back.
 - When the BEV renderer is active, tracking and BEV share one publication gate.
   Its effective interval is
   `max(selected tracking interval, configured BEV interval)`, where the
@@ -592,8 +601,21 @@ Emitted by `BevRenderer`:
   boxes prove stationary continuity; that exception remains
   `world_measurement_accepted=false` and trail-disabled. A genuinely
   unplaceable canonical track is omitted and accounted for by
-  `droppedFootpointCount` plus a bounded `droppedFootpoints` reason list; normal
-  operation never hides that omission behind alignment-debug mode.
+  `droppedFootpointCount` plus a bounded `droppedFootpoints` reason list.
+  `droppedFootpointCount` is the complete exact-cohort omission count across
+  the active admission paths;
+  `droppedFootpoints` retains at most the first 64 diagnostic reason records.
+  The dashboard therefore removes every live head absent from the exact
+  canonical `footpoints` cohort instead of depending on that bounded reason
+  sample. Normal operation never hides an omission behind alignment-debug
+  mode. In alignment-debug mode only, the same bounded list may also include
+  legacy/noncanonical presentation rejects marked `canonicalWorld=false`; they
+  never participate in canonical live-head authority.
+- Dashboard current heads are lifecycle-keyed state independent of trail
+  samples. Each finite canonical `footpoints` member updates its head even when
+  trails are disabled or unsampled; complete-cohort absence removes only that
+  head. A producer trail retained across the gap may remain visible but cannot
+  recreate a dot from its last sample.
 - `floorplanBounds` and the other `floorplan*` fields bind the MapAnything raster
   to the active floorplan registry's metric bounds, grid, resolution, exact
   snapshot identity, and capture timestamps. The registry accepts only
@@ -647,6 +669,16 @@ Emitted by `BevRenderer`:
   `person_ground_state.py` already own the only track-position filtering stage
   (human CV filter + stationary lock).
 - When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in the declared BEV `frame` with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
+- `trails[].points[].breakBefore=true` is a producer-owned discontinuity
+  marker with no `x` or `y`. Consumers end the preceding polyline and, if a
+  later finite point exists, start a new one there. The marker may be terminal
+  while a recovered live head is deliberately not yet sampled into history;
+  in that form it also forbids a connector from the retained trail tail to the
+  current head. A missing canonical head, lifecycle-safe reanchor, or explicit
+  segment break therefore leaves the bounded earlier path visible without
+  drawing a physically false connector across the gap.
+  Both completed and current segments remain subject to the configured trail
+  time window and total per-track point bound.
 - `trails[].canonicalWorld` is the producer-owned authority marker for the
   retained trail, including frames where the current `footpoints` cohort is
   empty. A `true` marker permits a finite trail sample with
@@ -654,6 +686,10 @@ Emitted by `BevRenderer`:
   that canonical world trail. Consumers must fail closed for an unmarked
   retained trail with no current canonical footpoint; during the transition,
   legacy payloads may infer authority only from a matching current footpoint.
+- `trails[].trailSegmentId` names only the current producer segment. Earlier
+  disconnected segments retained in the combined `points` history are visual
+  history separated by `breakBefore`; consumers must not reinterpret the
+  top-level ID as the identity of every retained segment.
 - The post-tiler OSD trail consumer joins a canonical track only on the exact
   `(source_id, frame_id)` analytics cohort and maps the track's declared
   source-image basis into that source's configured mosaic tile. It must not use
@@ -666,6 +702,18 @@ Emitted by `BevRenderer`:
   `worldAdmission=predicted` and may extend history only while
   `trailAppendAllowed=true`. Legacy/non-canonical held anchors remain
   inadmissible.
+- The strict observation and nested `world_snapshot` admit a process head only
+  when it carries complete non-authoritative, state-integrated provenance. This
+  is either `bounded_cv_process`, a typed `bounded_output_hold` proving final
+  admission retained the last published coordinate, or
+  `inferred_ground_process_observation` with the immutable raw/world origin
+  algebra and exact cohort/lifecycle/revision proof described below. Its finite
+  `world_filter_prediction` exactly equals the emitted `world` point. This makes the single-camera held
+  snapshot numerically identical to tracking/BEV for Menon. A held observation
+  never participates in cross-camera covariance intersection: fresh metric
+  evidence wins when present, while an all-held cohort selects the newest exact
+  continuation without averaging it. A fresh held row keeps entity lifecycle
+  `present`; lifecycle still describes observation age, not measurement class.
 - Backend world-BEV trail history is keyed by tracker-local identity plus
   `trackerLifecycleGeneration` when available (`stableId` is fallback display
   metadata only). A reused numeric tracker ID removes its older generation
@@ -741,7 +789,7 @@ direct-write or `memory://` publication fallback.
 
 Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` is internal and never exposed.
 
-Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry and disappearance emits an exact tombstone. A same-camera numeric tracker ID may reuse its lifecycle generation only when it returns within 350 ms and strict bbox position/scale compatibility proves a short metadata gap. A moved, size-incompatible, expired, evicted, unknown, or post-reconnect return receives a new positive generation. Downstream clients can therefore distinguish rate-limited camera-frame gaps from absence and numeric tracker-ID reuse. On every exact processed frame, the canonical world service removes absent filter state from active authority. Scalar-only quarantine may restore it only across that same compatible 350 ms lifecycle grace; otherwise position, velocity, lock, rejection, and hold state start cold. The exact tombstone still breaks BEV/OSD trail history even when the compatible generation is reused. Tracker shadow age remains the owner of brief detector occlusion.
+Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry and disappearance emits an exact tombstone. A same-camera numeric tracker ID may reuse its lifecycle generation only when it returns within 750 ms and strict bbox position/scale compatibility proves a short metadata gap. A moved, size-incompatible, expired, evicted, unknown, or post-reconnect return receives a new positive generation. Downstream clients can therefore distinguish rate-limited camera-frame gaps from absence and numeric tracker-ID reuse. On every exact processed frame, the canonical world service removes absent filter state from active authority. Scalar-only quarantine may restore it only across that same compatible 750 ms lifecycle grace; otherwise position, velocity, lock, rejection, and hold state start cold. The exact tombstone still breaks BEV/OSD trail history even when the compatible generation is reused. Tracker shadow age remains the owner of brief detector occlusion.
 
 ```json
 {
@@ -836,7 +884,9 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "world_floor_rejection_reason": "floor_ray_range_exceeded"|"floor_ray_geometry_invalid"|null,
       "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
       "world_prediction_image_foot": [<float u>, <float v>]|null,
-      "world_prediction_provenance": { /* bounded non-authoritative image-motion provenance */ }|null,
+      "world_prediction_provenance": { /* bounded non-authoritative process provenance */ }|null,
+      "world_inferred_raw_observation": [<float x>, <float y>, <float z>]|null,
+      "world_inferred_process_observation": [<float x>, <float y>, <float z>]|null,
       "world_measurement_accepted": <bool|null>,
       "world_rejection_reason": "<string|null>",
       "world_contact_basis": "<string|null>",
@@ -845,6 +895,7 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "world_state_continuity": "restored_short_ghost"|null,
       "world_reacquire_count": <int|null>,
       "world_reacquired": <bool|null>,
+      "world_post_occlusion_support_required": <bool|null>,
       "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
       "posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "trail_append_allowed": <bool|null>,
@@ -954,15 +1005,91 @@ Tracking telemetry has two world-source scopes:
   continuation used when the current bbox moved but its metric/depth anchor was
   missing or rejected.  It transports the last physically accepted image foot
   through the current bbox affine change and projects that pixel through the
-  active corrected floor plane.  It is non-authoritative, never updates the
-  filter or last-good origin, is bounded by image-motion, ray, metric-speed,
-  and short-TTL gates, and exposes `world_prediction_image_foot` plus
+  active corrected floor plane. It is non-authoritative, may advance only the
+  physically gated bounded process posterior, never updates last-good metric
+  state or the fixed transport origin, is bounded by image-motion, ray,
+  metric-speed, and short-TTL gates, and exposes `world_prediction_image_foot` plus
   `world_prediction_provenance`.  If those gates fail after material bbox
   motion, the track is omitted for that frame rather than frozen at an old
   position.
-- `cv_prediction`, `image_motion_prediction`, and `anchor_hold` remain
-  tracking/BEV continuity and are never submitted as fresh global-world
-  observations. Canonical global observations require a complete
+- `cv_prediction` and `anchor_hold` remain tracking/BEV continuity only. A
+  proven, state-integrated `image_motion_prediction` may update the canonical
+  snapshot as a high-uncertainty held coordinate so the exact tracking/BEV
+  point reaches Menon; it remains ineligible as fresh metric or cross-camera
+  fusion evidence. For an established confidently standing lifecycle with
+  explicit lower-body occlusion, `image_motion_prediction` may instead be
+  guided by an exact-current learned-height floor reconstruction. Its first raw
+  reconstruction and the last queue-admitted **metric** world output form two
+  immutable origins; subsequent rows use a recent three-sample XZ medoid and
+  apply only `raw_consensus - raw_origin` to the trusted world origin. A medoid
+  selected from an earlier in-window row retains that row's timestamp, observed
+  time, and media PTS instead of being relabeled exact-current. The selected
+  sample and consensus span remain inside the 0.40-second horizon. A longer raw
+  gap resets that short medoid window without rebasing either immutable origin.
+  The same inferred episode may restart only while both the gap and latest
+  public output are no older than 1.25 seconds, the transition names an exact
+  recent service commit carrying the identical service-owned inferred root,
+  and lifecycle/segment/frame/transform/time bindings still match. Otherwise
+  that row fails closed without renewing the root; any later row must
+  independently satisfy the ordinary recent-evidence or exact-root restart
+  gates. It may not rebase from inferred/held output or hidden callback state.
+  The inferred root is retired only by an ordered queue-visible metric or
+  unrelated projective successor. A metric accepted on a rate-suppressed
+  callback cannot erase the root while the strict service still owns it;
+  inferred-image and bounded CV/hold descendants retain the same root until a
+  public successor, lifecycle/revision change, or expiry.
+  The strict snapshot boundary accepts it only when lifecycle, revision,
+  segment, range, media-time, occlusion, and process provenance are complete.
+  It independently proves `process_observation = trusted_world_origin +
+  raw_delta`. For both learned-height and bbox-affine image motion,
+  `filter_transition` version 1 binds an exact committed source output,
+  media-time gate, physical prediction/hold base, filter gain, and process
+  observation. The world service recomputes the posterior, requires that
+  origin to match its latest point or bounded same-segment history of exact
+  commits for that camera/source/tracker/lifecycle, gates the result again
+  from its latest committed point, and then requires
+  `world_filter_prediction = world`; the physically filtered posterior may
+  move less than its process observation. The history exists only to absorb
+  finite ordered-worker lag, is capped by the 1.25-second physical filter
+  horizon, and cannot be populated by producer claims. Retaining an origin for
+  validation does not extend the separately bounded 0.40-second CV bridge.
+  The ordered queue and strict service each establish their immutable
+  projective root only from an admitted `image_motion_prediction`. CV/hold
+  descendants may inherit it but cannot renew it with their own PTS, and a
+  producer source label cannot create or resurrect it. Service continuity is
+  keyed by source, camera, tracker lifecycle, world-frame revision,
+  world-transform SHA-256, and active calibration-artifact SHA-256; changing
+  the artifact invalidates the old roots and history even if a textual revision
+  is reused.
+  For `bounded_cv_process` and `bounded_output_hold`, the same transition also
+  binds the retained queue-admitted metric origin, exact media PTS, visible
+  trail segment, lifecycle generation, and world-registration identity. A
+  bounded CV proof may name a bounded earlier exact commit only when that
+  commit retains the same latest metric anchor and the posterior passes a new
+  latest-output speed gate. A recent-projective bridge must still name an
+  image-motion commit within 0.405 seconds and cannot chain from CV;
+  `bounded_output_hold` must name the latest commit. Its
+  gain is `1` for an admitted bounded process step and `0` when final output
+  admission holds the previous public coordinate. A rejected bbox3d/pre-seeded
+  measurement uses this shared path; it cannot publish a separate unproven
+  tracking/BEV-only continuation.
+  A gain-zero `bounded_output_hold` advances the visible publication clock but
+  preserves an independent kinematic coordinate/PTS/segment. Only a recovery
+  after that exact hold may reduce the normal filter gain along its original
+  transition line so the emitted point stays within 4 m/s of the latest
+  displayed point while the kinematic clock retains the real elapsed motion
+  budget. The service verifies both limits. Ordinary adjacent observations are
+  not generally slewed or clipped; they retain strict quarantine or a proven
+  reanchor/segment break.
+  A pose-confirmed standing row may extend that exact last-output hold to a
+  fixed two-second metric horizon only with strong detector/tracker confidence,
+  a tall/narrow silhouette, torso-motion contact, admitted and plausible floor
+  support, admitted range, and a floor candidate within 0.75 m of the public
+  output. The service revalidates the typed current-row evidence. The hold has
+  zero gain, so it does not require bbox stationarity or an already classified
+  walk/idle label, does not promote the candidate, and cannot append a trail.
+  It never becomes body-height, last-good metric, or fusion authority.
+  Canonical global observations require a complete
   `world_frame_revision` plus `world_transform_sha256`; mixed target-frame
   revisions are retained as conflict evidence instead of being averaged.
 
@@ -970,7 +1097,18 @@ The producer applies the human-speed limit to the proposed published filter
 state, not only to its stored velocity. An observation inside the measurement
 innovation allowance is quarantined when it would create an unreachable
 same-segment step. A coherent relocation must instead be published as a new
-`trail_segment_id` with `trail_break_required=true`.
+`trail_segment_id` with `trail_break_required=true`. Only a physically accepted
+current metric observation may spend that segment break; predictions and holds
+must satisfy continuity against the last visible output and cannot hide a jump
+behind an internal reacquisition segment change. That comparison uses the
+last lifecycle/revision point admitted to the ordered canonical tracking/BEV
+queue, not an internal point from a rate-suppressed callback. A rejected
+alternate source holds the prior coordinate and segment and advances only the
+output media timestamp, so hidden callbacks and repeated rejection cannot bank
+extra speed allowance.
+Canonical global fusion defaults to that same 4 m/s cap, preventing fused
+identity continuity from reintroducing a faster velocity after source-local
+admission.
 
 `tracks[].scene_prior` is optional, additive shadow evidence for cameras bound
 by the configured site catalog. It evaluates only a valid
@@ -1094,6 +1232,18 @@ Consumers reject unsupported major versions. Contradictory simultaneous camera
 positions are retained as rejected evidence with `conflict=true`; they are
 never averaged. Empty snapshots are authoritative absence/lifecycle evidence,
 not a transport failure. See `contracts/schema/world_snapshot.schema.json`.
+`observed_start_us` and `observed_end_us` are the evidence-time extent of the
+entities retained in that snapshot, not a stream watermark. In particular,
+`observed_end_us` may decrease when the entity carrying the freshest retained
+evidence disappears. Consumers use the strictly advancing snapshot `sequence`
+and `published_at_us` for stream freshness and ordering; they must not reject a
+newer snapshot solely because its retained observation extent regressed.
+State-integrated held observations are retained with high uncertainty but are
+not contradictory metric evidence. They do not enter covariance intersection
+or update the global velocity baseline. With fresh contemporaneous evidence,
+the held source is marked `accepted=false` with
+`rejection_reason="non_authoritative_held_continuation"` without setting an
+entity conflict; with held-only evidence, the newest exact row is selected.
 
 Every `entities[].sources[]` row preserves the exact strict `observation_id`,
 its source `zone`, and that label's `zone_source`/`zone_authoritative`
@@ -1160,11 +1310,10 @@ The exact design is in
   depth hypotheses both mathematically contributed on a frame without usable
   pose.
 - `person_anchor_floor_only`: the person mask/depth anchor updated the world-state filter without a usable DAv2 observation on that frame.
-- `gravity_drop`: a stored upright height reference allowed a floor-consistent
-  gravity drop. This is both the degraded path when no current person anchor is
-  available and the authoritative path while lower-body occlusion is active.
-  In the latter case, a syntactically valid bbox/depth bottom at a counter or
-  table edge is deliberately demoted before fusion.
+- `gravity_drop`: legacy/non-resolver source label for a stored upright-height
+  floor reconstruction. In the canonical universal resolver, gravity/body-
+  height reconstruction has unknown floor support and remains diagnostic; it
+  cannot update metric or bounded CV state as an absolute position.
 - `anchor_hold`: no current valid observation; the estimator is briefly holding the last reliable world state.
 - `image_motion_prediction`: the current metric/depth observation was missing
   or rejected, so a last-accepted image foot was transported by the current
@@ -1187,6 +1336,11 @@ Human pathing fields (producer-owned):
 
 - `motion_mode`: locomotion class from the stationary lock (`walk` / `idle` / `sit` / `lie` / `unknown`).
 - `posture`: geometric posture guess (`standing` / `sitting` / `lying` / `unknown`).
+- Typed stationary hold evidence is stamped from that public tracking
+  `posture`. Strict ingestion falls back to resolver-diagnostic
+  `world_posture` only when `posture` is absent; `world_posture` cannot
+  contradict, suppress, or independently grant the 2.0-second sitting/lying
+  hold.
 - `trail_append_allowed`: when false, BEV and OSD trail history must not grow (person is locked stationary).
 - `idle_jitter_m`: residual magnitude while locked; useful for tuning deadzones.
 - `sticky_world_source` / `source_switch_count`: hysteresis diagnostics for source thrash.
@@ -1195,12 +1349,26 @@ Human pathing fields (producer-owned):
   occluder edge rather than the person's floor contact.
 - `lower_body_occlusion_level`: deepest hidden support region:
   `feet_ankles`, `knees`, or `waist_hips`. The producer retains this state until
-  direct lower-body evidence is clear for three consecutive updates.
+  exit evidence persists for at least three consecutive rows and 0.20 seconds
+  of monotonic media time. A moving false sit/lie transition must satisfy the
+  same budget; one callback with missing image motion cannot consume it or
+  clear an already-pending transition.
 - `lower_body_occlusion_confidence` / `lower_body_occlusion_reason`: bounded
   operator diagnostics explaining the keypoint-loss and scale-collapse evidence.
+- `world_post_occlusion_support_required`: true after a standing lower-body
+  occlusion until an observed ankle contact, registered lower-body depth
+  contact, or a floor ray paired with a high-confidence exact-current detector
+  pose on that track returns. Ordinary in-gate bbox continuity remains available,
+  but a distant bbox-only floor ray cannot establish a new world origin while
+  this guard is set.
 - During authoritative occlusion gravity-drop, `image_foot` and `image_base`
   both carry the calibrated reconstructed floor-contact pixel. Consumers must
   not reselect bbox bottom or the visible counter/table edge.
+- When that gravity reconstruction is used only as learned-height process
+  continuity, `world_inferred_raw_observation` is diagnostic raw geometry and
+  `world_inferred_process_observation` is its bias-aligned, physically admitted
+  posterior input. Only the latter may equal the displayed held point, and only
+  under complete `fixed_occlusion_origin_raw_world_delta` provenance.
 
 Depth exposure:
 
@@ -1234,6 +1402,26 @@ Depth exposure:
   `depth_median_m`, or attachment attempts independently.
 
 When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS9.1 leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
+
+`world_valid=true` is finalized only after strict world-service admission for
+the exact source/tracker/lifecycle/frame key. Before the cohort is released, a
+producer candidate rejected by that service is restamped
+`world_quality_reason="canonical_world_service_rejected"`, its coordinate and
+process/inferred provenance are removed, and trail append is disabled. The
+tracking receipt carries the exact admitted-key set to the associated BEV
+render, while the producer's visible-output watermark advances only for the
+committed keys. Thus tracking, BEV, the nested and standalone world snapshots,
+and Menon share one positional admission result rather than merely sharing a
+transform.
+
+Weak cold bootstrap normally requires three mutually consistent observations
+on one contact-basis family. Two consecutive exact current
+`pose:ankle_pair` floor contacts may seed without the separate torso-motion
+proof; single-ankle and mixed runs retain the normal three-sample rule unless
+that strong proof is current. One intervening lower-authority bbox/non-floor
+row may preserve but cannot replace or publish the pending ankle candidate; a
+second intervening row or expired gap clears it. Successful bootstrap always
+publishes the current ankle-derived coordinate.
 
 Validation diagnostics:
 

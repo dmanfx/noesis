@@ -1157,6 +1157,44 @@ class DepthRegistrationEntry:
             return None
         return float(np.interp(value, self.knots_raw_m, self.knots_registered_m))
 
+    def has_observable_local_slope(self, raw_depth_m: float) -> bool:
+        """Return whether the local mapping retains metric range information.
+
+        A flat piecewise interval maps multiple physical ranges to one output,
+        so it cannot localize a person along the camera ray.  Treat that
+        interval as unavailable evidence instead of publishing a plausible but
+        fixed depth.  This is deliberately local: valid sloped portions of the
+        same registration remain usable.
+        """
+
+        value = float(raw_depth_m)
+        if not math.isfinite(value):
+            return False
+        raw_knots = np.asarray(self.knots_raw_m, dtype=np.float64)
+        registered_knots = np.asarray(
+            self.knots_registered_m,
+            dtype=np.float64,
+        )
+        if raw_knots.size < 2 or registered_knots.size != raw_knots.size:
+            return False
+        interval = int(np.searchsorted(raw_knots, value, side="right") - 1)
+        interval = max(0, min(interval, int(raw_knots.size) - 2))
+        raw_span = float(raw_knots[interval + 1] - raw_knots[interval])
+        registered_span = float(
+            registered_knots[interval + 1] - registered_knots[interval]
+        )
+        if not math.isfinite(raw_span) or raw_span <= 0.0:
+            return False
+        tolerance = 1.0e-9 * max(
+            1.0,
+            abs(float(registered_knots[interval])),
+            abs(float(registered_knots[interval + 1])),
+        )
+        return bool(
+            math.isfinite(registered_span)
+            and abs(registered_span) > tolerance
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "camera_id": self.camera_id,
@@ -1936,6 +1974,8 @@ class DepthRegistrationManager:
         corrected = entry.apply(float(raw_depth_m))
         if corrected is None:
             return None, "out_of_domain_or_invalid", entry.registration_id
+        if not entry.has_observable_local_slope(float(raw_depth_m)):
+            return None, "unobservable_plateau", entry.registration_id
         return corrected, "ok", entry.registration_id
 
 

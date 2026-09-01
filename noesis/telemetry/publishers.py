@@ -13,6 +13,8 @@ from noesis_core.tracking_continuity import (
 
 logger = logging.getLogger(__name__)
 
+CanonicalWorldTrackKey = tuple[int, Optional[int], int]
+
 _TRACKING_FRAME_FIELDS = (
     "frame_id",
     "captured_at_us",
@@ -126,6 +128,124 @@ def _record_response_model_error(
         recorder(route=route, message_type=message_type, error=error)
 
 
+def _tracking_world_key(track: Mapping[str, Any]) -> CanonicalWorldTrackKey | None:
+    """Return the exact source-local row identity used for BEV admission."""
+
+    try:
+        tracker_id = int(track.get("tracker_id", track.get("track_id")))
+        frame_id = int(track.get("frame_id"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if tracker_id < 0 or frame_id < 0:
+        return None
+    generation_raw = track.get("tracker_lifecycle_generation")
+    if generation_raw is None:
+        generation = None
+    else:
+        try:
+            generation = int(generation_raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if generation <= 0:
+            return None
+    return tracker_id, generation, frame_id
+
+
+def _canonicalize_tracking_world_rows(
+    tracks: Sequence[Mapping[str, Any]],
+    publication: Any,
+) -> tuple[list[Mapping[str, Any]], tuple[CanonicalWorldTrackKey, ...]]:
+    """Make tracking coordinates equal the canonical service's admitted set.
+
+    The estimator is allowed to propose a coordinate which the independently
+    stateful world service rejects (for example, after an earlier queued origin
+    failed its physical gate).  Such a proposal must not remain ``world_valid``
+    in the tracking message or be rendered by the paired BEV while Menon sees no
+    observation.  Normalize only the public copy; estimator diagnostics and
+    state remain private to the producer.
+    """
+
+    snapshot = getattr(publication, "snapshot", None)
+    accepted_observation_ids = {
+        source.observation_id
+        for entity in getattr(snapshot, "entities", ())
+        for source in getattr(entity, "sources", ())
+        if getattr(source, "accepted", False) is True
+    }
+    admitted_base_keys: set[tuple[int, int]] = set()
+    seen_base_keys: set[tuple[int, int]] = set()
+    for observation in getattr(publication, "observations", ()):
+        payload = getattr(observation, "payload", None)
+        tracklet = getattr(payload, "tracklet", None)
+        if (
+            payload is None
+            or tracklet is None
+            or getattr(payload, "world", None) is None
+        ):
+            continue
+        try:
+            base_key = (int(tracklet.tracker_id), int(tracklet.frame_id))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if base_key in seen_base_keys:
+            raise RuntimeError(
+                "canonical world publication contains duplicate track rows"
+            )
+        seen_base_keys.add(base_key)
+        if getattr(observation, "observation_id", None) in accepted_observation_ids:
+            admitted_base_keys.add(base_key)
+
+    normalized: list[Mapping[str, Any]] = []
+    admitted_keys: list[CanonicalWorldTrackKey] = []
+    matched_admitted_base_keys: set[tuple[int, int]] = set()
+    for source_track in tracks:
+        track = dict(source_track)
+        row_key = _tracking_world_key(track)
+        base_key = (
+            (int(row_key[0]), int(row_key[2]))
+            if row_key is not None
+            else None
+        )
+        admitted = bool(base_key is not None and base_key in admitted_base_keys)
+        if admitted:
+            if row_key is None or track.get("world_valid") is not True:
+                raise RuntimeError(
+                    "canonical world admitted a coordinate without an exact "
+                    "world-valid tracking row"
+                )
+            admitted_keys.append(row_key)
+            matched_admitted_base_keys.add(base_key)
+        elif track.get("world_valid") is True:
+            # Remove every coordinate-bearing continuation field, not merely
+            # the display flag.  This keeps downstream clients from treating a
+            # rejected candidate or its algebra as a second position authority.
+            for field in (
+                "world",
+                "world_source",
+                "world_filter_prediction",
+                "world_prediction_image_foot",
+                "world_prediction_provenance",
+                "world_inferred_raw_sample",
+                "world_inferred_raw_observation",
+                "world_inferred_process_observation",
+                "world_inferred_process_image_foot",
+            ):
+                track.pop(field, None)
+            track["world_valid"] = False
+            track["world_quality"] = "invalid"
+            track["world_quality_reason"] = "canonical_world_service_rejected"
+            track["world_measurement_accepted"] = False
+            track["trail_append_allowed"] = False
+            track["trail_break_required"] = True
+        normalized.append(track)
+
+    if matched_admitted_base_keys != admitted_base_keys:
+        raise RuntimeError(
+            "canonical world publication is not bijective with tracking rows"
+        )
+    return normalized, tuple(admitted_keys)
+
+
 class DepthTelemetryPublisher:
     """Bridge depth bursts to websocket clients."""
 
@@ -183,6 +303,8 @@ class TrackingPublicationReceipt(NamedTuple):
     tracking_publication_sequence: int
     outbound_submission_id: int
     outbound_message_count: int
+    canonical_world_admission_bound: bool = False
+    canonical_world_track_keys: tuple[CanonicalWorldTrackKey, ...] = ()
 
 
 class TrackingPublicationPoisoned(RuntimeError):
@@ -290,11 +412,25 @@ class TrackingTelemetryPublisher:
                             "canonical world preparation omitted publication"
                         )
 
+                outbound_track_list: list[Mapping[str, Any]] = list(track_list)
+                canonical_world_track_keys: tuple[
+                    CanonicalWorldTrackKey, ...
+                ] = ()
+                canonical_world_admission_bound = publication is not None
+                if publication is not None:
+                    (
+                        outbound_track_list,
+                        canonical_world_track_keys,
+                    ) = _canonicalize_tracking_world_rows(
+                        track_list,
+                        publication,
+                    )
+
                 payload: dict[str, Any] = {
                     "type": "tracking",
                     "source_id": source,
-                    "track_count": len(track_list),
-                    "tracks": track_list,
+                    "track_count": len(outbound_track_list),
+                    "tracks": outbound_track_list,
                     **dict(extra),
                     **frame_fields,
                     "tracking_continuity_contract": (
@@ -420,6 +556,12 @@ class TrackingTelemetryPublisher:
                         ),
                         outbound_message_count=int(
                             outbound_receipt.message_count
+                        ),
+                        canonical_world_admission_bound=(
+                            canonical_world_admission_bound
+                        ),
+                        canonical_world_track_keys=(
+                            canonical_world_track_keys
                         ),
                     )
                 except Exception as exc:

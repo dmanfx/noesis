@@ -737,6 +737,10 @@ def test_family_active_world_view_intersects_revision_floor_at_reported_scale(
     assert active.world_frame_revision == binding.target_frame.revision
     assert active.floor_y == pytest.approx(0.0)
     assert tuple(active.extrinsics_col_major) != tuple(raw.extrinsics_col_major)
+    assert active.target_from_calibration_col_major == tuple(
+        binding.target_from_source_col_major
+    )
+    assert active.image_localization_basis == "revision_target_floor"
 
     raw_matrix = np.asarray(raw.extrinsics_col_major).reshape((4, 4), order="F")
     active_matrix = np.asarray(active.extrinsics_col_major).reshape((4, 4), order="F")

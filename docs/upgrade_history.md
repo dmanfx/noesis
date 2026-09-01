@@ -3,6 +3,235 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-31 — Living Room BEV uses its full PCF-derived camera pose
+
+- Added an opt-in full-pose mode to the static-camera PCF localizer and bound
+  the Living Room Scene Prior to its admitted result. The estimate uses 17
+  consistent early/late phone-walk views and 1,799 PnP inliers; no measured
+  mount height, room-specific depth curve, or dashboard correction is used.
+- Replaced the incorrect 1.934 m low-envelope camera result with the PCF pose
+  and a 2.058 m camera-to-floor distance. The fused PCF floor fit has 0.518
+  degrees residual tilt and 0.032 m p90 residual across 759 spatial cells.
+- Activated `sceneprior_living-room_20260802T202254Z_9380ed8099bb`. Direct
+  replay of the recorded Living trace places all 337 sampled track points
+  inside the PCF extent and restores continuous forward motion through both
+  former plateau intervals; the deepest sample reaches 7.82 m camera-forward
+  at PCF world `[7.48, 0.00, 8.48]`.
+- Kitchen and Family Room bindings are unchanged, and this work changes only
+  Noesis BEV/world localization; Menon presentation was not modified.
+
+## 2026-08-30 — Published-cadence ground continuity and lifecycle-correct BEV trails
+
+- Added typed seated and upright body-to-floor projection so a detected person
+  remains localizable when furniture hides every ankle/floor contact. The
+  upright solver jointly estimates height and footprint from calibrated head,
+  shoulder, and hip planes without using detector-box bottom; the seated lane
+  carries broad uncertainty and stationary hold instead of suppressing the dot.
+- Made strong upright proof require five retained planes spanning three
+  anatomical height bands, while preserving complete side profiles whose
+  apparent left/right width collapses under perspective. One three- or
+  four-plane solve remains nonpublishing, while two compatible exact-current
+  four-plane/two-band solves may establish a cold lifecycle within the bounded
+  reacquisition interval; only the second current row supplies the coordinate.
+  Three-plane, mixed, incompatible, expired, and basis-changing evidence cannot
+  form that proof. Established relocations still require a current verified
+  five-plane finalizer, preventing a low-residual wrong-range solve from
+  breaking a trusted lifecycle. Current body-plane and learned-height gravity
+  estimates are no longer co-fused from the same body evidence.
+- Kept independently proven, queue-rooted image-motion continuity visible
+  while a divergent body-plane solve remains in the physical reacquisition
+  gate. The projective transition preserves but cannot advance the pending
+  metric consensus, avoiding a display hole without loosening relocation.
+- Made motion and stationarity follow exact published cohorts instead of raw
+  adjacent frame numbers, and admitted only typed weak floor evidence through
+  bounded same-basis consensus. A separate strong, short-lived torso/silhouette
+  motion proof may shorten cold observed-ankle bootstrap without renewing
+  itself or promoting the torso point to metric authority.
+- Made two consecutive, mutually consistent current ankle-pair floor contacts
+  sufficient for cold bootstrap while keeping single-ankle and mixed runs on
+  the normal three-sample/motion-corroborated path. One intervening weaker
+  bbox/non-floor row now consumes a bounded unavailable-row allowance instead
+  of replacing the stronger pending ankle candidate; a second row or expired
+  gap still clears it.
+- Prevented a cold mirrored ankle sequence from overriding a strong
+  revision-bound Scene Prior contradiction by repetition alone. A bounded
+  two-sample exact-ankle exception requires tight plausible contact, adequate
+  incidence, current detector semantic confidence, and one immutable binding on
+  every sample. Independent current registered person-floor depth may still
+  establish the lifecycle, and an already metric-established person may
+  override an imperfect prior through the unchanged physical filter.
+- Required current detector semantic confidence before a cold selected
+  `floor_ray` can establish metric output and rejected shallow incidence below
+  `0.20` before first metric authority; NvDCF confidence cannot turn static
+  furniture into a person, and neutral PCF coverage cannot admit an unstable
+  mirror ray. When any lifecycle earns its first accepted metric point, its
+  exact tracking/world/BEV cohort now publishes immediately instead of losing
+  the proof-bearing callback to normal cadence.
+- Added separate torso image-motion and torso-range roles. Accepted confident
+  non-lying rows, including standing rows, may arm and later consume a fixed
+  translation-only torso-to-foot origin when current floor evidence is missing,
+  under silhouette, ground-edge articulation, direction, magnitude, lifecycle,
+  TTL, ray, and physical gates. The complete pose-compatible bundle is retained
+  independently, so later bbox-only exact rows cannot erase or mismatch it. A
+  missing anatomy row preserves only recent real motion observations inside the
+  existing bounded gap. Stale depth cannot erase independent exact-current pose
+  consensus.
+- Added a camera-agnostic learned-height continuity lane for an established
+  standing lifecycle with explicit lower-body occlusion. It bias-aligns the
+  current gravity reconstruction by applying a recent three-sample raw XZ
+  medoid's displacement between immutable raw and queue-visible metric world
+  origins,
+  preserving the selected sample's own evidence time when the medoid chooses
+  an older in-window row,
+  then subjects that process-only point to range, media-time, lifecycle,
+  revision, segment, and physical-output gates. Strict world ingestion replays
+  the origin/delta algebra before carrying the exact tracking/BEV coordinate to
+  Menon as held evidence; it cannot train metric state or cross-camera fusion.
+  A raw gap beyond 0.40 seconds now clears only the short medoid window. A
+  restart row with that longer gap is eligible through 1.25 seconds only when
+  an exact recent service commit carries the same service-owned immutable root
+  and every lifecycle/segment/frame/transform/time binding still matches; a
+  rejected restart cannot renew the root.
+- Bound both learned-height and bbox-affine image motion to one versioned
+  filter-transition proof. The strict world service now verifies the exact last
+  committed source/lifecycle origin, complete media cadence, fixed human
+  speed/jump limits, prediction/hold base, filter gain, process input, and
+  recomputed posterior. Missing media PTS fails the producer lane closed, held
+  rows cannot replace the retained metric origin, and a longer raw gap cannot
+  renew that origin or bypass the service-owned restart gate.
+- Made projective lineage structural instead of label-authorized. Only an
+  admitted image-motion output establishes the immutable queue/service root;
+  bounded CV/hold descendants can inherit but never renew it. Strict-service
+  continuity keys now include the active calibration-artifact SHA-256 in
+  addition to lifecycle, frame revision, and transform digest, so a changed
+  artifact retires old service roots and history. Global fusion now defaults to
+  the same 4 m/s velocity cap enforced by the producer and strict service.
+- Made occlusion exit require both three consecutive evidence rows and 0.20
+  seconds of source media time. A pending moving false sit/lie transition now
+  survives a single image-motion dropout, so callback wall time cannot consume
+  physical evidence budget or cause a one-frame continuity collapse.
+- Bound typed stationary-hold evidence to `PersonGroundState`'s public tracking
+  posture. Strict service admission now gives `posture` precedence and treats
+  `world_posture` only as a fallback diagnostic when the public field is absent,
+  preventing resolver `unknown` from suppressing a proven seated/lying hold or
+  a resolver-only label from granting one.
+- Prevented a post-occlusion bbox-only floor ray from relocating an established
+  track. It may still provide physically in-gate pose-dropout continuity, but a
+  distant same-lifecycle reanchor now requires observed ankle support,
+  registered lower-body depth contact, or a floor ray with high-confidence
+  exact-current detector-pose support, and begins a new trail segment
+  only after the normal bounded consensus.
+- Made observed floor support an explicit resolver authority tier. Non-floor
+  torso, gravity, seat, couch, and unknown-support hypotheses remain
+  diagnostic, cannot participate in mixed-support covariance intersection,
+  and cannot steer either metric or bounded process state.
+- Allowed an established lifecycle to reanchor after three tight same-family
+  observed ankle-floor samples even when current image-motion evidence is
+  absent. Cold, bbox, gravity, leg-extension, and other inferred bases remain
+  motion-gated; one unavailable row is tolerated, while a second or an expired
+  gap clears the candidate.
+- Kept accepted-foot projective continuation non-renewing, preserved pending
+  metric reacquisition consensus across it, and limited a recent projective
+  posterior to one explicitly budgeted, non-chainable visible CV bridge row.
+  Rate-suppressed callbacks can advance its bounded process but cannot consume
+  its token, which is independent of mutable rejection diagnostics. Proven image
+  transport now updates the high-uncertainty held canonical snapshot as the
+  exact same coordinate shown by tracking/BEV and consumed by Menon; it remains
+  ineligible as fresh metric or cross-camera fusion evidence.
+- Carried strictly proven state-integrated CV predictions and anchor holds into
+  that same held snapshot boundary only when the bounded process posterior
+  exactly equals the tracking coordinate and its versioned transition binds
+  the prior queue-visible output, retained metric origin, media PTS, visible
+  segment, lifecycle, and registration. Rejected bbox3d/pre-seeded observations
+  now use that same output gate and proof instead of emitting an unprovable
+  tracking/BEV-only hold. Fresh camera evidence excludes held rows from
+  covariance intersection; held-only cohorts select the newest exact point and
+  do not train the global velocity baseline.
+- Restamped a final output-speed rejection as an exact
+  `bounded_output_hold` at the last published coordinate, so its strict
+  observation no longer describes the rejected process candidate while the
+  tracking row and snapshot display the held point. Gain-zero holds now advance
+  only the visible clock while preserving a separate motion-bearing kinematic
+  clock. On the first recovery after that exact condition, projective and
+  metric filters may reduce gain along the original transition line to respect
+  the 4 m/s latest-visible bound; ordinary observations retain strict
+  quarantine rather than receiving a general slew or coordinate clip. The
+  world service independently verifies both visible and kinematic limits.
+- Rejected pose contacts materially below their detector silhouette, normalized
+  the guarded bbox-floor minimum height across calibration resolutions, and
+  prevented predictions or holds from consuming a hidden metric segment break
+  by admitting them against the last ordered tracking/BEV queue watermark;
+  rate-suppressed internal rows cannot become visible continuity authority, and
+  public trail fields cannot leak an uncommitted internal segment break.
+- Restored lifecycle-keyed BEV heads and trails: a missing canonical point
+  removes the live head while retaining prior history during the gap, return
+  starts a fresh visible segment, and current heads no longer depend on trail
+  enablement or a second trail sample. Dashboard head state is now separate
+  from trail state and reconciled against the complete exact `footpoints`
+  cohort, so the capped dropped-reason sample cannot leave stale heads and a
+  retained producer trail cannot recreate one.
+- Bound dashboard BEV admission and visual history to exact
+  `(sourceId, sourceEpoch)` timelines. A higher same-source epoch now admits a
+  replay/reconnect clock rewind only after clearing local heads, trails,
+  smoothing, sampling phase, and source-time state; an older epoch is rejected,
+  and top-level/nested epoch disagreement fails closed.
+- Corrected world-snapshot consumer freshness semantics: retained-entity
+  `observed_end_us` may regress when the freshest entity disappears, while
+  snapshot `sequence` and `published_at_us` remain the monotonic stream
+  ordering authority.
+- Matched tracker-lifecycle reappearance to the existing 0.75-second ground
+  quarantine. A same-camera numeric tracker ID now retains its generation
+  across a sub-750 ms dropout only when normalized bbox position and scale
+  remain compatible; incompatible, expired, evicted, and source-epoch returns
+  still start cold. This preserves learned height and image-motion authority
+  across real short metadata gaps without keying kinematics by StableID or
+  carrying state across an unproven reuse.
+- Bound public tracking and BEV position validity to the exact world rows
+  admitted by `CanonicalWorldService`. A service-rejected producer candidate
+  is cleared before transport with
+  `world_quality_reason=canonical_world_service_rejected`; the paired BEV head
+  is removed through the typed receipt, and the producer's visible world
+  watermark advances only after the service commit. This closes the prior case
+  where tracking/BEV could draw a candidate that Menon correctly refused.
+- Deferred service proof/output-cache advancement until global fusion exposes
+  exact source evidence. Position, registration, and velocity-gated candidates
+  now leave the prior source root unchanged and cannot authorize a later
+  process row; only the existing non-authoritative held-continuation exception
+  remains usable as a private source-local root. Both publisher mirrors admit
+  public tracking/BEV coordinates only from `source.accepted=true` evidence.
+- Kept one immutable learned-height episode root across exact coherent-torso
+  process rows as well as explicit lower-body occlusion. A transient change in
+  the occlusion label no longer re-roots every standing row and creates a dot
+  hole; loss of both current proof forms, a non-upright transition, lifecycle
+  change, segment change, or expiry still ends the episode.
+- Made the ordered queue the authority that ends that inferred root. A metric
+  accepted only on a rate-suppressed callback can no longer erase producer
+  lineage that the strict service has not seen; inferred rows and bounded
+  descendants retain the root until a queue-visible successor or expiry.
+- Added a typed two-second, gain-zero upright-presence hold for a strong current
+  standing row with pose, torso contact, admitted/plausible floor geometry,
+  admitted range, human silhouette, confidence, and a floor candidate within
+  0.75 m of the exact public output. It intentionally does not require bbox
+  stationarity or a preclassified motion mode, because neither proves a
+  non-moving output; the candidate stays rejected and the trail stays fixed.
+- Retained a hard-capped, same-segment history of exact service-committed
+  outputs for bbox-affine image-motion validation. An ordered worker may now
+  accept a proof formed from a slightly older real commit while independently
+  speed-gating its posterior from the latest commit. This restores valid dots
+  lost to producer/consumer queue lag without admitting invented origins,
+  cross-segment continuity, or stale-origin teleports.
+- Separated exact-origin validation retention from permission to generate a
+  continuation. Any real service commit remains matchable for at most the
+  1.25-second physical-filter horizon, including a recent CV output, while the
+  CV bridge itself remains non-chainable and limited to 0.40 seconds. Origins
+  are expired before validating the next cohort, closing the previous one-row
+  stale-cache admission at a long media gap.
+- Applied the same lag tolerance narrowly to bounded CV proofs: an earlier
+  exact commit is eligible only with the unchanged latest metric anchor, a
+  latest-output speed gate, and the original 0.405-second bridge horizon.
+  Recent-projective CV still requires an image-motion origin and cannot chain;
+  output holds remain latest-only so a delayed hold cannot move a dot backward.
+
 ## 2026-08-28 — Guarded missing-contact continuity and target-frame dashboard projection
 
 - Added one camera-agnostic detector-bottom hypothesis for tracked person rows
@@ -92,7 +321,7 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
 - Removed canonical filter/lock/velocity state from active authority on the
   first exact tracker-row absence. A scalar-only quarantine restores it and
   reuses the lifecycle generation only for a same-camera/tracker return within
-  350 ms whose bbox position and scale remain compatible; all other reused IDs
+  750 ms whose bbox position and scale remain compatible; all other reused IDs
   start cold with a new generation. The exact tombstone still breaks BEV/OSD
   trails across either case. Bounded
   reject-driven prediction to a fixed last-good anchor for 0.40 seconds

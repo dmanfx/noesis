@@ -80,6 +80,10 @@ from noesis_core.world.resolver import (
     UniversalWorldMeasurementResolver,
     WorldMeasurementResolverConfig,
 )
+from noesis_core.world_service import (
+    CanonicalWorldService,
+    _CanonicalTrackOutput,
+)
 from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
     TrackingContinuityUpdate,
@@ -97,20 +101,26 @@ from noesis.telemetry.person_ground_state import (
     PersonGroundState,
     PoseAnchorCandidate,
     admit_human_ground_output,
+    align_inferred_ground_observation,
     assess_lower_body_occlusion,
     advance_human_cv_prediction,
     bind_world_frame,
     begin_source_admission,
     classify_posture,
+    clear_first_output_ankle_proof,
+    clear_inferred_ground_continuity_anchor,
     commit_image_path_point,
     complete_source_admission,
+    mark_image_motion_observation_unavailable,
     mark_world_measurement_unavailable,
     observe_bbox_stationarity,
     observe_coherent_image_motion,
+    observe_first_output_ankle_proof,
     record_accepted_image_geometry,
     resolve_pose_floor_anchor,
     source_score,
     transport_accepted_image_foot,
+    transport_accepted_image_foot_from_pose,
     integrate_projective_ground_observation,
     update_human_cv_filter,
     update_motion_mode,
@@ -139,6 +149,85 @@ def _require_tracking_publication_receipt(
     ):
         raise RuntimeError("tracking publication receipt cohort mismatch")
     return value
+
+
+def _bev_world_admission_key(
+    footpoint: Footpoint,
+) -> tuple[int, Optional[int], int] | None:
+    """Resolve the exact track row represented by one paired BEV footpoint."""
+
+    if footpoint.tracker_id is None or footpoint.frame_id is None:
+        return None
+    try:
+        tracker_id = int(footpoint.tracker_id)
+        frame_id = int(footpoint.frame_id)
+        generation = (
+            int(footpoint.tracker_lifecycle_generation)
+            if footpoint.tracker_lifecycle_generation is not None
+            else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if tracker_id < 0 or frame_id < 0 or (
+        generation is not None and generation <= 0
+    ):
+        return None
+    return tracker_id, generation, frame_id
+
+
+def _bind_bev_footpoints_to_canonical_admission(
+    footpoints: Sequence[Footpoint],
+    receipt: TrackingPublicationReceipt,
+) -> List[Footpoint]:
+    """Remove current BEV heads not admitted by the same world transaction."""
+
+    if receipt.canonical_world_admission_bound is not True:
+        return list(footpoints)
+    admitted = set(receipt.canonical_world_track_keys)
+    matched: set[tuple[int, Optional[int], int]] = set()
+    paired: List[Footpoint] = []
+    for footpoint in footpoints:
+        key = _bev_world_admission_key(footpoint)
+        has_world = bool(
+            footpoint.world_x is not None and footpoint.world_z is not None
+        )
+        if key in admitted:
+            if not has_world:
+                raise RuntimeError(
+                    "canonical world admitted a track without a paired BEV coordinate"
+                )
+            matched.add(key)
+            paired.append(footpoint)
+            continue
+        if not has_world:
+            paired.append(footpoint)
+            continue
+
+        debug = dict(footpoint.debug)
+        debug["world"] = None
+        debug["world_valid"] = False
+        debug["world_quality"] = "invalid"
+        debug["world_quality_reason"] = "canonical_world_service_rejected"
+        paired.append(
+            replace(
+                footpoint,
+                world_x=None,
+                world_z=None,
+                anchor_source=None,
+                anchor_quality="invalid",
+                anchor_reason="canonical_world_service_rejected",
+                trail_append_allowed=False,
+                trail_break_required=True,
+                debug=debug,
+            )
+        )
+    if matched != admitted:
+        missing = sorted(admitted - matched, key=repr)
+        raise RuntimeError(
+            "canonical world admission is missing paired BEV footpoints: "
+            f"{missing[:8]}"
+        )
+    return paired
 
 try:  # DeepStream imports are optional during unit tests
     from pyservicemaker import (  # type: ignore
@@ -3768,6 +3857,26 @@ class _WorldOutputWatermark:
     media_pts_ns: Optional[int]
     filter_ts: float
     trail_segment_id: int
+    committed_world_source: str = ""
+    committed_provenance_type: Optional[str] = None
+    projective_bridge_root_media_pts_ns: Optional[int] = None
+    metric_world_x: Optional[float] = None
+    metric_world_z: Optional[float] = None
+    metric_media_pts_ns: Optional[int] = None
+    metric_filter_ts: Optional[float] = None
+    metric_trail_segment_id: Optional[int] = None
+    kinematic_world_x: Optional[float] = None
+    kinematic_world_z: Optional[float] = None
+    kinematic_media_pts_ns: Optional[int] = None
+    kinematic_filter_ts: Optional[float] = None
+    kinematic_trail_segment_id: Optional[int] = None
+    bbox_geometry: Optional[Tuple[float, float, float, float]] = None
+    kinematic_bbox_geometry: Optional[
+        Tuple[float, float, float, float]
+    ] = None
+
+
+_WorldOutputWatermarkKey = Tuple[int, int, int, str, str, str, str]
 
 
 # Product-owned person-ground state and scoring stay single-source. DS9 only
@@ -7094,6 +7203,182 @@ class _ObjectDepthFusionProcessor:
             contact_capsules,
         )
 
+    def _pose_torso_capsule_geometry(
+        self,
+        keypoints: np.ndarray,
+        *,
+        bbox: Tuple[float, float, float, float],
+    ) -> Tuple[
+        Optional[Tuple[float, float, float, float, float, float]],
+        Optional[List[float]],
+    ]:
+        """Return one compact, pose-bounded torso depth sampler.
+
+        This is range evidence, never a floor-contact construction. Requiring
+        both shoulders and both hips keeps the sample on observed person
+        anatomy and out of the detector rectangle's furniture/background.
+        The native depth API already accepts a generic compound capsule, so
+        this remains one bounded GPU statistic with no image-sized host copy.
+        """
+
+        if not isinstance(keypoints, np.ndarray) or keypoints.shape[0] < 17:
+            return None, None
+        try:
+            left, top, width, height = (float(value) for value in bbox[:4])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None, None
+        if (
+            not all(math.isfinite(value) for value in (left, top, width, height))
+            or width <= 1.0
+            or height <= 1.0
+        ):
+            return None, None
+
+        threshold = _read_env_float(
+            "NOESIS_OBJECT_DEPTH_POSE_KPT_THRESHOLD",
+            0.35,
+            min_value=0.0,
+        )
+
+        def _point(index: int) -> Optional[Tuple[float, float]]:
+            try:
+                px = float(keypoints[index, 0])
+                py = float(keypoints[index, 1])
+                confidence = float(keypoints[index, 2])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            if (
+                confidence < threshold
+                or not math.isfinite(px)
+                or not math.isfinite(py)
+            ):
+                return None
+            margin_x = 0.15 * width
+            margin_y = 0.15 * height
+            if not (
+                left - margin_x <= px <= left + width + margin_x
+                and top - margin_y <= py <= top + height + margin_y
+            ):
+                return None
+            return px, py
+
+        left_shoulder = _point(5)
+        right_shoulder = _point(6)
+        left_hip = _point(11)
+        right_hip = _point(12)
+        if None in (left_shoulder, right_shoulder, left_hip, right_hip):
+            return None, None
+        assert left_shoulder is not None
+        assert right_shoulder is not None
+        assert left_hip is not None
+        assert right_hip is not None
+
+        shoulder_mid = (
+            0.5 * (left_shoulder[0] + right_shoulder[0]),
+            0.5 * (left_shoulder[1] + right_shoulder[1]),
+        )
+        hip_mid = (
+            0.5 * (left_hip[0] + right_hip[0]),
+            0.5 * (left_hip[1] + right_hip[1]),
+        )
+        shoulder_width = math.hypot(
+            right_shoulder[0] - left_shoulder[0],
+            right_shoulder[1] - left_shoulder[1],
+        )
+        hip_width = math.hypot(
+            right_hip[0] - left_hip[0],
+            right_hip[1] - left_hip[1],
+        )
+        torso_dx = hip_mid[0] - shoulder_mid[0]
+        torso_dy = hip_mid[1] - shoulder_mid[1]
+        torso_length = math.hypot(torso_dx, torso_dy)
+        min_side_width = max(5.0, 0.08 * width)
+        if (
+            shoulder_width < min_side_width
+            or hip_width < min_side_width
+            or torso_length < max(8.0, 0.08 * height)
+            or abs(torso_dy) < 0.45 * torso_length
+        ):
+            return None, None
+
+        # Trim the end joints so the statistic stays in the torso core. The
+        # radius is tied to observed anatomy, not the detector rectangle.
+        ax = shoulder_mid[0] + 0.18 * torso_dx
+        ay = shoulder_mid[1] + 0.18 * torso_dy
+        bx = shoulder_mid[0] + 0.78 * torso_dx
+        by = shoulder_mid[1] + 0.78 * torso_dy
+        radius = max(
+            2.5,
+            min(18.0, 0.16 * min(shoulder_width, hip_width)),
+        )
+        capsule = (
+            float(ax),
+            float(ay),
+            float(bx),
+            float(by),
+            float(radius),
+            float(radius),
+        )
+        anchor_uv = [0.5 * (ax + bx), 0.5 * (ay + by)]
+        return capsule, [float(anchor_uv[0]), float(anchor_uv[1])]
+
+    @staticmethod
+    def _pose_capsule_host_mask(
+        capsule: Optional[Sequence[float]],
+        *,
+        crop_origin: Tuple[int, int],
+        crop_shape: Tuple[int, int],
+    ) -> Optional[np.ndarray]:
+        """Rasterize the native capsule predicate over one copied host ROI."""
+
+        if capsule is None or len(capsule) < 6:
+            return None
+        try:
+            ax, ay, bx, by, line_radius, endpoint_radius = (
+                float(value) for value in capsule[:6]
+            )
+            height, width = (int(crop_shape[0]), int(crop_shape[1]))
+            x0, y0 = (int(crop_origin[0]), int(crop_origin[1]))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            height <= 0
+            or width <= 0
+            or line_radius <= 0.0
+            or endpoint_radius <= 0.0
+            or not all(
+                math.isfinite(value)
+                for value in (ax, ay, bx, by, line_radius, endpoint_radius)
+            )
+        ):
+            return None
+
+        grid_y, grid_x = np.ogrid[y0 : y0 + height, x0 : x0 + width]
+        point_x = np.asarray(grid_x, dtype=np.float32) + 0.5
+        point_y = np.asarray(grid_y, dtype=np.float32) + 0.5
+        dx = float(bx) - float(ax)
+        dy = float(by) - float(ay)
+        length_sq = dx * dx + dy * dy
+        if length_sq > 1.0e-6:
+            t = ((point_x - ax) * dx + (point_y - ay) * dy) / length_sq
+            t = np.clip(t, 0.0, 1.0)
+        else:
+            t = np.zeros((height, width), dtype=np.float32)
+        nearest_x = ax + t * dx
+        nearest_y = ay + t * dy
+        segment = (
+            np.square(point_x - nearest_x) + np.square(point_y - nearest_y)
+            <= line_radius * line_radius
+        )
+        endpoints = (
+            np.square(point_x - ax) + np.square(point_y - ay)
+            <= endpoint_radius * endpoint_radius
+        ) | (
+            np.square(point_x - bx) + np.square(point_y - by)
+            <= endpoint_radius * endpoint_radius
+        )
+        return np.asarray(segment | endpoints, dtype=bool)
+
     def _extract_instance_mask_payload(self, obj_meta: Any) -> Optional[Mapping[str, Any]]:
         if noesis_depth_meta_ext is None:
             return None
@@ -7250,6 +7535,9 @@ class _ObjectDepthFusionProcessor:
         contact_mask: np.ndarray,
         contact_uv: Optional[Sequence[float]],
         visible_ankles: int,
+        torso_capsule: Optional[Sequence[float]],
+        torso_uv: Optional[Sequence[float]],
+        crop_origin: Tuple[int, int],
         depth_center: Optional[float],
     ) -> ObjectDepthResult:
         body_valid = np.logical_and(np.asarray(body_mask, dtype=bool), np.isfinite(depth_crop))
@@ -7308,10 +7596,66 @@ class _ObjectDepthFusionProcessor:
                 status = "ok"
             else:
                 status = "ambiguous_depth"
+        elif torso_uv is not None and torso_capsule is not None:
+            # Host-only fallback for systems without the native compact
+            # sampler. Rasterize the same torso-only capsule used by the
+            # native path; the whole skeleton mask includes legs and must not
+            # supply range for the torso UV.
+            torso_mask = self._pose_capsule_host_mask(
+                torso_capsule,
+                crop_origin=crop_origin,
+                crop_shape=(int(depth_crop.shape[0]), int(depth_crop.shape[1])),
+            )
+            if torso_mask is None:
+                torso_mask = np.zeros_like(depth_crop, dtype=bool)
+            torso_area = int(np.count_nonzero(torso_mask))
+            torso_valid = np.logical_and(torso_mask, np.isfinite(depth_crop))
+            torso_values_full = np.asarray(depth_crop[torso_valid], dtype=np.float32)
+            torso_values = _bounded_depth_stat_values(
+                torso_values_full,
+                env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+            )
+            torso_count = int(torso_values_full.size)
+            torso_fraction = float(torso_count) / float(torso_area or 1)
+            torso_median = (
+                float(np.median(torso_values)) if torso_values.size > 0 else None
+            )
+            torso_spread = _depth_spread_from_bounds(
+                float(np.percentile(torso_values, 10.0)) if torso_values.size > 0 else None,
+                float(np.percentile(torso_values, 90.0)) if torso_values.size > 0 else None,
+            )
+            min_torso_count = max(24, min(48, int(math.ceil(torso_area * 0.20))))
+            evidence_reason = _depth_evidence_rejection_reason(
+                sample_count=torso_count,
+                valid_fraction=torso_fraction,
+                depth_m=torso_median,
+                depth_spread_m=torso_spread,
+                min_sample_count=min_torso_count,
+                min_valid_fraction=0.55,
+                strict_spread=False,
+            )
+            anchor_depth_spread_m = torso_spread
+            if evidence_reason is None:
+                anchor_source = "pose_torso_support"
+                anchor_depth_m = torso_median
+                anchor_sample_count = int(torso_count)
+                anchor_valid_fraction = float(torso_fraction)
+                evidence_quality = "estimated"
+                status = "ok"
+            else:
+                status = "ambiguous_depth" if torso_count > 0 else "no_valid_depth"
 
         anchor_fields: Dict[str, Any] = {
             "spatial_class": "person",
-            "anchor_uv": list(contact_uv) if anchor_source is not None and contact_uv is not None else None,
+            "anchor_uv": (
+                list(contact_uv)
+                if anchor_source == "pose_ankle_support" and contact_uv is not None
+                else (
+                    list(torso_uv)
+                    if anchor_source == "pose_torso_support" and torso_uv is not None
+                    else None
+                )
+            ),
             "anchor_source": anchor_source,
             "anchor_depth_m": anchor_depth_m,
             "anchor_sample_count": anchor_sample_count,
@@ -7495,6 +7839,8 @@ class _ObjectDepthFusionProcessor:
         contact_uv: Optional[Sequence[float]],
         visible_ankles: int,
         contact_capsules: Optional[Sequence[Sequence[float]]] = None,
+        torso_capsule: Optional[Sequence[float]] = None,
+        torso_uv: Optional[Sequence[float]] = None,
     ) -> Optional[ObjectDepthResult]:
         depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
         if depth_device_frame is None:
@@ -7504,14 +7850,27 @@ class _ObjectDepthFusionProcessor:
         if body_area <= 0:
             return None
 
-        # Position authority needs only compact ankle/contact support.  The
-        # native method receives at most two scalar [ax, ay, bx, by, radius]
-        # capsules, samples their union from the GPU-resident depth tensor,
-        # and returns one compact statistic.  No image-sized host mask is
-        # uploaded. With no observed ankle contact, fail closed without
-        # touching the GPU at all.
+        # Position authority needs only compact anatomy support. Prefer ankle
+        # contact; when lower-body contact is not observed, one strict torso
+        # capsule may provide current person range without claiming a floor
+        # contact. The native method returns one compact statistic from the
+        # GPU-resident tensor and never uploads an image-sized host mask.
+        ankle_sampling = bool(
+            contact_uv is not None
+            and visible_ankles > 0
+            and contact_area > 0
+            and contact_capsules
+        )
+        torso_sampling = bool(
+            not ankle_sampling and torso_capsule is not None and torso_uv is not None
+        )
+        selected_capsules: Sequence[Sequence[float]] = (
+            list(contact_capsules or ())[:2]
+            if ankle_sampling
+            else ([list(torso_capsule)] if torso_sampling and torso_capsule is not None else [])
+        )
         body_stats: Mapping[str, Any] = {}
-        if contact_uv is not None and visible_ankles > 0 and contact_area > 0 and contact_capsules:
+        if selected_capsules:
             sample_capsule_stats = getattr(
                 depth_device_frame,
                 "sample_pose_capsule_stats",
@@ -7522,7 +7881,7 @@ class _ObjectDepthFusionProcessor:
             try:
                 start_ns = time.perf_counter_ns()
                 stats_raw = sample_capsule_stats(
-                    [list(capsule) for capsule in contact_capsules[:2]],
+                    [list(capsule) for capsule in selected_capsules],
                     _read_env_int(
                         "NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
                         4096,
@@ -7530,9 +7889,13 @@ class _ObjectDepthFusionProcessor:
                     ),
                 )
                 _record_core_stage_timing(
-                    "object_depth.native_pose_contact_capsule_stats",
+                    (
+                        "object_depth.native_pose_contact_capsule_stats"
+                        if ankle_sampling
+                        else "object_depth.native_pose_torso_capsule_stats"
+                    ),
                     start_ns,
-                    item_count=int(contact_area),
+                    item_count=int(contact_area if ankle_sampling else body_area),
                 )
             except Exception:
                 logger.debug(
@@ -7567,7 +7930,7 @@ class _ObjectDepthFusionProcessor:
         evidence_reason: Optional[str] = "pose_ankles_unavailable"
         status = "no_ground_contact"
 
-        if contact_uv is not None and visible_ankles > 0 and contact_area > 0 and contact_capsules:
+        if ankle_sampling:
             contact_stats = body_stats
             if contact_stats is not None:
                 try:
@@ -7600,6 +7963,40 @@ class _ObjectDepthFusionProcessor:
                     status = "ok"
                 else:
                     status = "ambiguous_depth"
+        elif torso_sampling:
+            try:
+                torso_count = int(body_stats.get("sample_count", 0) or 0)
+            except Exception:
+                torso_count = 0
+            torso_fraction = self._stats_float(body_stats, "valid_fraction") or 0.0
+            torso_median = self._stats_float(body_stats, "depth_median")
+            torso_spread = _depth_spread_from_bounds(
+                self._stats_float(body_stats, "depth_p10"),
+                self._stats_float(body_stats, "depth_p90"),
+            )
+            torso_area = int(
+                body_stats.get("sampled_capsule_area_px", body_area) or body_area
+            )
+            min_torso_count = max(24, min(48, int(math.ceil(torso_area * 0.20))))
+            evidence_reason = _depth_evidence_rejection_reason(
+                sample_count=torso_count,
+                valid_fraction=torso_fraction,
+                depth_m=torso_median,
+                depth_spread_m=torso_spread,
+                min_sample_count=min_torso_count,
+                min_valid_fraction=0.55,
+                strict_spread=False,
+            )
+            anchor_depth_spread_m = torso_spread
+            if evidence_reason is None:
+                anchor_source = "pose_torso_support"
+                anchor_depth_m = torso_median
+                anchor_sample_count = int(torso_count)
+                anchor_valid_fraction = float(torso_fraction)
+                evidence_quality = "estimated"
+                status = "ok"
+            else:
+                status = "ambiguous_depth" if torso_count > 0 else "no_valid_depth"
 
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
@@ -7640,7 +8037,15 @@ class _ObjectDepthFusionProcessor:
             "model": self.depth_model_name,
             "ts_us": ts_us,
             "spatial_class": "person",
-            "anchor_uv": list(contact_uv) if anchor_source is not None and contact_uv is not None else None,
+            "anchor_uv": (
+                list(contact_uv)
+                if anchor_source == "pose_ankle_support" and contact_uv is not None
+                else (
+                    list(torso_uv)
+                    if anchor_source == "pose_torso_support" and torso_uv is not None
+                    else None
+                )
+            ),
             "anchor_source": anchor_source,
             "anchor_depth_m": anchor_depth_m,
             "anchor_sample_count": anchor_sample_count,
@@ -8042,6 +8447,10 @@ class _ObjectDepthFusionProcessor:
         pose_contact_capsules: List[
             Tuple[float, float, float, float, float, float]
         ] = []
+        pose_torso_capsule: Optional[
+            Tuple[float, float, float, float, float, float]
+        ] = None
+        pose_torso_uv: Optional[List[float]] = None
         if not mask_payload:
             pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox)
             if pose_keypoints is not None:
@@ -8054,6 +8463,10 @@ class _ObjectDepthFusionProcessor:
                 ) = self._pose_capsule_masks(
                     pose_keypoints,
                     crop_rect=(x0, y0, x1, y1),
+                    bbox=bbox,
+                )
+                pose_torso_capsule, pose_torso_uv = self._pose_torso_capsule_geometry(
+                    pose_keypoints,
                     bbox=bbox,
                 )
                 if int(np.count_nonzero(pose_body_mask)) <= 0:
@@ -8075,6 +8488,8 @@ class _ObjectDepthFusionProcessor:
                 contact_uv=pose_contact_uv,
                 visible_ankles=pose_visible_ankles,
                 contact_capsules=pose_contact_capsules,
+                torso_capsule=pose_torso_capsule,
+                torso_uv=pose_torso_uv,
             )
             if native_pose_result is not None:
                 return native_pose_result
@@ -8137,6 +8552,9 @@ class _ObjectDepthFusionProcessor:
                 contact_mask=pose_contact_mask,
                 contact_uv=pose_contact_uv,
                 visible_ankles=pose_visible_ankles,
+                torso_capsule=pose_torso_capsule,
+                torso_uv=pose_torso_uv,
+                crop_origin=(crop_x0, crop_y0),
                 depth_center=center_value,
             )
 
@@ -8586,6 +9004,7 @@ class _TrackingPublicationWork:
     tracks: List[Dict[str, Any]]
     footpoints: List[Footpoint]
     temporal_contract: Dict[str, Any]
+    world_filter_ts: Optional[float] = None
     # Lifecycle stamping is performed in the media callback before its rows
     # are exposed to OSD.  The worker carries that exact continuity receipt;
     # it must never derive a second generation from a later snapshot.
@@ -9094,7 +9513,7 @@ class _AnalyticsTelemetryProcessor:
     _world_state_ghost_by_track: Dict[
         Tuple[int, int], Tuple[_WorldAnchorState, float]
     ] = field(default_factory=dict, init=False, repr=False)
-    _world_output_watermarks: "OrderedDict[Tuple[int, int, int, str, str, str], _WorldOutputWatermark]" = field(
+    _world_output_watermarks: "OrderedDict[_WorldOutputWatermarkKey, _WorldOutputWatermark]" = field(
         default_factory=OrderedDict,
         init=False,
         repr=False,
@@ -9680,6 +10099,7 @@ class _AnalyticsTelemetryProcessor:
         camera_id: str,
         frame_id: int,
         observed_at_us: int,
+        media_pts_ns: Any = None,
         tracks: Sequence[MutableMapping[str, Any]],
         footpoints: Sequence[Footpoint],
     ) -> TrackingContinuityUpdate:
@@ -9733,6 +10153,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=str(camera_id),
                 frame_id=frame,
                 observed_at_us=observed,
+                media_pts_ns=media_pts_ns,
                 tracks=tracks,
             )
             self._source_epoch_by_sensor[source] = int(continuity.source_epoch)
@@ -9961,6 +10382,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=str(work.camera_id),
                 frame_id=int(work.frame_id),
                 observed_at_us=int(work.observed_at_us),
+                media_pts_ns=work.temporal_contract.get("media_pts_ns"),
                 tracks=work.tracks,
             )
         if (
@@ -9996,6 +10418,29 @@ class _AnalyticsTelemetryProcessor:
                 source_id=int(work.source_id),
                 frame_id=int(work.frame_id),
                 observed_at_us=int(work.observed_at_us),
+            )
+            # Advance the estimator's public-output watermark only after the
+            # canonical world transaction has admitted the exact coordinate.
+            # Enqueue alone is insufficient: a rejected queued point must not
+            # become the origin for later image-motion/CV rows.
+            admitted_world_keys = (
+                set(tracking_receipt.canonical_world_track_keys)
+                if tracking_receipt.canonical_world_admission_bound is True
+                else None
+            )
+            self._commit_enqueued_world_output_watermarks(
+                int(work.source_id),
+                work.tracks,
+                filter_ts=(
+                    float(work.world_filter_ts)
+                    if work.world_filter_ts is not None
+                    else float(work.now_ts)
+                ),
+                admitted_world_track_keys=admitted_world_keys,
+            )
+            paired_footpoints = _bind_bev_footpoints_to_canonical_admission(
+                work.footpoints,
+                tracking_receipt,
             )
             # Tracking/world authority is committed immediately after its
             # typed admission receipt, matching the existing publisher
@@ -10043,13 +10488,14 @@ class _AnalyticsTelemetryProcessor:
                     buf_pts=int(work.timestamp_us) * 1000,
                     source_id=int(work.source_id),
                 ),
-                work.footpoints,
+                paired_footpoints,
                 now_ts=float(work.now_ts),
                 track_count=len(work.tracks),
                 paired_with_tracking=True,
                 tracking_receipt=tracking_receipt,
                 observed_at_us=int(work.observed_at_us),
                 timestamp_us=int(work.timestamp_us),
+                source_epoch=int(work.source_epoch),
                 tracker_lifecycle_tombstones=continuity.tombstones,
             )
             if bev_receipt.status == "failed":
@@ -10076,6 +10522,7 @@ class _AnalyticsTelemetryProcessor:
         continuity: TrackingContinuityUpdate,
         force: bool,
         identity_v2_primitives: Optional[Sequence[IdentityFramePrimitive]] = None,
+        world_now_ts: Optional[float] = None,
     ) -> bool:
         frame_id = int(
             _meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0
@@ -10116,7 +10563,11 @@ class _AnalyticsTelemetryProcessor:
             public_track = {
                 key: value
                 for key, value in track.items()
-                if key != "world_resolver"
+                if key
+                not in {
+                    "world_resolver",
+                    "_world_force_first_metric_publication",
+                }
             }
             copied = _copy_public_scalar(public_track)
             if isinstance(copied, Mapping):
@@ -10139,6 +10590,11 @@ class _AnalyticsTelemetryProcessor:
             tracks=copied_tracks,
             footpoints=list(footpoints),
             temporal_contract=dict(_copy_public_scalar(dict(temporal_contract)) or {}),
+            world_filter_ts=(
+                float(world_now_ts)
+                if world_now_ts is not None
+                else float(now_ts)
+            ),
             continuity=continuity,
             source_epoch=int(continuity.source_epoch),
         )
@@ -10767,6 +11223,7 @@ class _AnalyticsTelemetryProcessor:
             present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
             identity_v2_primitives: List[IdentityFramePrimitive] = []
+            first_metric_publication_due = False
             frame_dims = self._track_image_size(sensor_id, frame_meta)
 
             reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
@@ -10974,6 +11431,7 @@ class _AnalyticsTelemetryProcessor:
                         int(tracker_id_int),
                         frame_id=int(frame_id),
                         observed_at_us=int(temporal_contract["observed_at_us"]),
+                        media_pts_ns=temporal_contract.get("media_pts_ns"),
                         bbox=raw.get("bbox"),
                     ),
                     "camera_id": camera_id,
@@ -11033,6 +11491,11 @@ class _AnalyticsTelemetryProcessor:
                     depth_result=depth_result,
                     world_now_ts=float(world_now_ts),
                 )
+                if public_track.pop(
+                    "_world_force_first_metric_publication",
+                    False,
+                ):
+                    first_metric_publication_due = True
                 _record_core_stage_timing(
                     "analytics.world_augment",
                     world_augment_start_ns,
@@ -11245,6 +11708,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=str(camera_id),
                 frame_id=int(frame_id),
                 observed_at_us=int(temporal_contract["observed_at_us"]),
+                media_pts_ns=temporal_contract.get("media_pts_ns"),
                 tracks=tracks,
                 footpoints=footpoints,
             )
@@ -11314,10 +11778,13 @@ class _AnalyticsTelemetryProcessor:
                 now_ts=float(now_ts),
                 temporal_contract=temporal_contract,
                 continuity=continuity,
-                force=tracker_keys_changed,
+                force=bool(
+                    tracker_keys_changed or first_metric_publication_due
+                ),
                 identity_v2_primitives=(
                     identity_v2_primitives if identity_v2_shadow else None
                 ),
+                world_now_ts=float(world_now_ts),
             )
             _record_core_stage_timing(
                 "analytics.post_frame",
@@ -11368,6 +11835,7 @@ class _AnalyticsTelemetryProcessor:
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
+            first_metric_publication_due = False
             frame_dims = self._track_image_size(sensor_id, frame_meta)
 
             for obj_meta in self._iter_object_meta(frame_meta):
@@ -11454,6 +11922,7 @@ class _AnalyticsTelemetryProcessor:
                         int(tracker_id_int),
                         frame_id=int(frame_id),
                         observed_at_us=int(temporal_contract["observed_at_us"]),
+                        media_pts_ns=temporal_contract.get("media_pts_ns"),
                         bbox=raw.get("bbox"),
                     ),
                     "camera_id": camera_id,
@@ -11509,6 +11978,11 @@ class _AnalyticsTelemetryProcessor:
                     depth_result=depth_result,
                     world_now_ts=float(world_now_ts),
                 )
+                if public_track.pop(
+                    "_world_force_first_metric_publication",
+                    False,
+                ):
+                    first_metric_publication_due = True
                 self._apply_scene_prior_shadow(camera_id, public_track)
                 self._apply_public_depth_fields(public_track, depth_result)
                 try:
@@ -11589,6 +12063,7 @@ class _AnalyticsTelemetryProcessor:
                 camera_id=str(camera_id),
                 frame_id=int(frame_id),
                 observed_at_us=int(temporal_contract["observed_at_us"]),
+                media_pts_ns=temporal_contract.get("media_pts_ns"),
                 tracks=tracks,
                 footpoints=footpoints,
             )
@@ -11639,7 +12114,10 @@ class _AnalyticsTelemetryProcessor:
                 now_ts=float(now_ts),
                 temporal_contract=temporal_contract,
                 continuity=continuity,
-                force=tracker_keys_changed,
+                force=bool(
+                    tracker_keys_changed or first_metric_publication_due
+                ),
+                world_now_ts=float(world_now_ts),
             )
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame")
@@ -12321,8 +12799,9 @@ class _AnalyticsTelemetryProcessor:
         world_frame_id: Optional[str],
         world_frame_revision: Optional[str],
         world_transform_sha256: Optional[str],
-    ) -> Optional[Tuple[int, int, int, str, str, str]]:
-        """Return the exact public lifecycle/revision continuity key."""
+        camera_calibration_sha256: Optional[str] = None,
+    ) -> Optional[_WorldOutputWatermarkKey]:
+        """Return the exact lifecycle, frame, and calibration continuity key."""
 
         track_key = self._world_track_key(sensor_id, track)
         if track_key is None:
@@ -12334,7 +12813,19 @@ class _AnalyticsTelemetryProcessor:
         frame_id = str(world_frame_id or "").strip()
         revision = str(world_frame_revision or "").strip()
         transform = str(world_transform_sha256 or "").strip()
-        if generation < 0 or not frame_id or not revision or not transform:
+        raw_calibration = (
+            camera_calibration_sha256
+            if camera_calibration_sha256 is not None
+            else track.get("world_calibration_sha256")
+        )
+        calibration = str(raw_calibration or "").strip().lower()
+        if (
+            generation <= 0
+            or not frame_id
+            or not revision
+            or not transform
+            or re.fullmatch(r"[0-9a-f]{64}", calibration) is None
+        ):
             return None
         return (
             int(track_key[0]),
@@ -12343,12 +12834,13 @@ class _AnalyticsTelemetryProcessor:
             frame_id,
             revision,
             transform,
+            calibration,
         )
 
     def _restore_world_output_watermark(
         self,
         state: _WorldAnchorState,
-        key: Optional[Tuple[int, int, int, str, str, str]],
+        key: Optional[_WorldOutputWatermarkKey],
     ) -> bool:
         """Bind a recreated measurement state to its last public output."""
 
@@ -12382,10 +12874,954 @@ class _AnalyticsTelemetryProcessor:
         state.last_output_trail_segment_id = int(watermark.trail_segment_id)
         return True
 
+    def _world_output_reference(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+        *,
+        metric_only: bool = False,
+        kinematic_only: bool = False,
+    ) -> Optional[Tuple[float, float, Optional[int], float, int]]:
+        """Return the last canonical queue-admitted point for one lifecycle.
+
+        ``metric_only`` selects the last accepted metric point retained inside
+        the watermark. Held/projective publications advance the ordinary
+        output reference but never overwrite this authority anchor.
+        """
+
+        if key is None:
+            return None
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return None
+        watermark = store.get(key)
+        if watermark is None:
+            return None
+        store.move_to_end(key)
+        if metric_only and kinematic_only:
+            return None
+        if metric_only:
+            if (
+                watermark.metric_world_x is None
+                or watermark.metric_world_z is None
+                or watermark.metric_filter_ts is None
+                or watermark.metric_trail_segment_id is None
+            ):
+                return None
+            return (
+                float(watermark.metric_world_x),
+                float(watermark.metric_world_z),
+                watermark.metric_media_pts_ns,
+                float(watermark.metric_filter_ts),
+                int(watermark.metric_trail_segment_id),
+            )
+        if kinematic_only:
+            if (
+                watermark.kinematic_world_x is None
+                or watermark.kinematic_world_z is None
+                or watermark.kinematic_filter_ts is None
+                or watermark.kinematic_trail_segment_id is None
+            ):
+                return None
+            return (
+                float(watermark.kinematic_world_x),
+                float(watermark.kinematic_world_z),
+                watermark.kinematic_media_pts_ns,
+                float(watermark.kinematic_filter_ts),
+                int(watermark.kinematic_trail_segment_id),
+            )
+        return (
+            float(watermark.world_x),
+            float(watermark.world_z),
+            watermark.media_pts_ns,
+            float(watermark.filter_ts),
+            int(watermark.trail_segment_id),
+        )
+
+    def _world_output_kinematic_bbox_reference(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Return the bbox attached to the fixed motion-bearing output root."""
+
+        if key is None:
+            return None
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return None
+        watermark = store.get(key)
+        if watermark is None:
+            return None
+        geometry = (
+            watermark.kinematic_bbox_geometry
+            if watermark.kinematic_bbox_geometry is not None
+            else watermark.bbox_geometry
+        )
+        if geometry is None:
+            return None
+        try:
+            parsed = tuple(float(value) for value in geometry)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            len(parsed) != 4
+            or not all(math.isfinite(value) for value in parsed)
+            or parsed[2] <= 0.0
+            or parsed[3] <= 0.0
+        ):
+            return None
+        store.move_to_end(key)
+        return parsed
+
+    @staticmethod
+    def _world_output_recovery_display_reference(
+        visible_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ],
+        kinematic_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ],
+    ) -> Optional[Tuple[float, float, Optional[int], float, int]]:
+        """Return a visible slew constraint only after gain-zero holds.
+
+        Ordinary adjacent metric observations retain the filter's existing
+        reject/quarantine behavior. A reduced-gain recovery is needed only
+        when exact published holds advanced the visible clock while the
+        watermark deliberately preserved an older motion-bearing origin.
+        """
+
+        if visible_output is None or kinematic_output is None:
+            return None
+        try:
+            visible_pts = int(visible_output[2])
+            kinematic_pts = int(kinematic_output[2])
+            visible_segment = int(visible_output[4])
+            kinematic_segment = int(kinematic_output[4])
+            values = (
+                float(visible_output[0]),
+                float(visible_output[1]),
+                float(visible_output[3]),
+                float(kinematic_output[0]),
+                float(kinematic_output[1]),
+                float(kinematic_output[3]),
+            )
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            not all(math.isfinite(value) for value in values)
+            or visible_pts <= kinematic_pts
+            or visible_segment != kinematic_segment
+        ):
+            return None
+        return visible_output
+
+    def _world_output_commit_provenance(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Return service-confirmed source lineage for the visible output."""
+
+        if key is None:
+            return None
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return None
+        watermark = store.get(key)
+        if watermark is None:
+            return None
+        store.move_to_end(key)
+        source = str(watermark.committed_world_source or "").strip().lower()
+        if not source:
+            return None
+        provenance_type = str(
+            watermark.committed_provenance_type or ""
+        ).strip()
+        return source, provenance_type or None
+
+    @staticmethod
+    def _reconcile_inferred_ground_with_committed_output(
+        state: _WorldAnchorState,
+        committed_output: Optional[Tuple[str, Optional[str]]],
+        *,
+        committed_media_pts_ns: Optional[int],
+    ) -> None:
+        """End an inferred episode only after the queue exposes its successor.
+
+        World estimation also runs on callbacks suppressed by the publication
+        gate. A metric candidate accepted only on one of those callbacks is
+        not visible to CanonicalWorldService and therefore cannot silently
+        replace the immutable inferred root that service still owns. The
+        committed output watermark is the shared producer/consumer boundary:
+        metric or unrelated projective output ends the episode; inferred and
+        bounded descendants retain it.
+        """
+
+        if committed_output is None:
+            return
+        anchor = state.inferred_ground_continuity_anchor
+        try:
+            committed_pts = int(committed_media_pts_ns)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if anchor is not None:
+            try:
+                root_pts = int(anchor.raw_origin_media_pts_ns)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if committed_pts < root_pts:
+                # The queue watermark still predates the locally constructed
+                # root. It cannot decide the fate of that newer episode.
+                return
+        elif state.inferred_ground_continuity_blocked:
+            try:
+                blocked_after_pts = int(
+                    state.inferred_ground_blocked_after_media_pts_ns
+                )
+            except (TypeError, ValueError, OverflowError):
+                return
+            if committed_pts <= blocked_after_pts:
+                return
+        else:
+            return
+        source, provenance_type = committed_output
+        source_name = str(source or "").strip().lower()
+        provenance_name = str(provenance_type or "").strip()
+        retains_inferred_episode = bool(
+            (
+                source_name == "image_motion_prediction"
+                and provenance_name
+                == "inferred_ground_process_observation"
+            )
+            or (
+                source_name in {"cv_prediction", "anchor_hold"}
+                and provenance_name
+                in {"bounded_cv_process", "bounded_output_hold"}
+            )
+        )
+        if not retains_inferred_episode:
+            clear_inferred_ground_continuity_anchor(
+                state,
+                block_rearm=False,
+            )
+
+    def _world_output_projective_root(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+        *,
+        current_media_pts_ns: Any,
+    ) -> Optional[int]:
+        """Return the immutable live image-process root for one output.
+
+        Producer state can remember that some earlier callback used image
+        motion even after the canonical queue has committed a metric-derived
+        CV row.  Only the queue watermark may authorize another projective
+        descendant, and its fixed root may never be renewed by CV or holds.
+        """
+
+        if key is None:
+            return None
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return None
+        watermark = store.get(key)
+        if watermark is None:
+            return None
+        try:
+            current_pts = int(current_media_pts_ns)
+            root_pts = int(watermark.projective_bridge_root_media_pts_ns)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        horizon_ns = int(
+            round(
+                (
+                    CanonicalWorldService.PROJECTIVE_PROCESS_BRIDGE_HORIZON_S
+                    + CanonicalWorldService.BOUNDED_PROCESS_HORIZON_EPSILON_S
+                )
+                * 1_000_000_000.0
+            )
+        )
+        if not (
+            0 < root_pts < current_pts
+            and current_pts - root_pts <= horizon_ns
+        ):
+            return None
+        store.move_to_end(key)
+        return root_pts
+
+    def _clear_world_output_projective_root(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+    ) -> None:
+        """End image-process authority across an exact tracker-row absence."""
+
+        if key is None:
+            return
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            return
+        watermark = store.get(key)
+        if watermark is None or watermark.projective_bridge_root_media_pts_ns is None:
+            return
+        store[key] = replace(
+            watermark,
+            projective_bridge_root_media_pts_ns=None,
+        )
+        store.move_to_end(key)
+
+    def _bounded_process_output_provenance(
+        self,
+        track: Mapping[str, Any],
+        *,
+        provenance_type: str,
+        provenance_origin: str,
+        reason: str,
+        prior_output: Optional[Tuple[float, float, Optional[int], float, int]],
+        metric_output: Optional[Tuple[float, float, Optional[int], float, int]],
+        process_observation: Sequence[float],
+        emitted_point: Sequence[float],
+        output_continuous: bool,
+        emitted_trail_segment_id: int,
+        world_frame_id: str,
+        world_frame_revision: Optional[str],
+        world_transform_sha256: Optional[str],
+        stationary_hold_posture: Optional[str] = None,
+        upright_presence_evidence: Optional[Mapping[str, Any]] = None,
+        current_presence_evidence: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Describe the exact queue-origin -> bounded process output transition.
+
+        A CV posterior is process state, not a new metric observation.  The
+        strict world service can nevertheless carry that exact point when the
+        proof binds both the last queue-visible output and the retained metric
+        origin.  A final output-gate rejection uses the same contract with zero
+        gain, proving that the emitted coordinate is the previous public point
+        rather than the rejected process candidate.
+        """
+
+        if prior_output is None or metric_output is None:
+            return None
+        try:
+            prior_x, prior_z, prior_pts_raw, _prior_filter_ts, prior_segment = (
+                prior_output
+            )
+            metric_x, metric_z, metric_pts_raw, _metric_filter_ts, metric_segment = (
+                metric_output
+            )
+            prior_pts = int(prior_pts_raw) if prior_pts_raw is not None else 0
+            metric_pts = int(metric_pts_raw) if metric_pts_raw is not None else 0
+            current_pts = int(self._valid_world_media_pts_ns(track.get("media_pts_ns")) or 0)
+            lifecycle_generation = int(track.get("tracker_lifecycle_generation"))
+            process = np.asarray(process_observation, dtype=np.float64).reshape(-1)
+            emitted = np.asarray(emitted_point, dtype=np.float64).reshape(-1)
+            floor_y = float(emitted[1])
+            prior_world = [float(prior_x), floor_y, float(prior_z)]
+            metric_world = [float(metric_x), floor_y, float(metric_z)]
+            process_world = [
+                float(process[0]),
+                floor_y,
+                float(process[2]),
+            ]
+            emitted_world = [
+                float(emitted[0]),
+                floor_y,
+                float(emitted[2]),
+            ]
+            prior_segment = int(prior_segment)
+            metric_segment = int(metric_segment)
+            emitted_segment = int(emitted_trail_segment_id)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            prior_pts <= 0
+            or metric_pts <= 0
+            or current_pts <= prior_pts
+            or lifecycle_generation <= 0
+            or prior_segment < 0
+            or metric_segment < 0
+            or emitted_segment < 0
+            or not world_frame_id
+            or not world_frame_revision
+            or not world_transform_sha256
+            or not all(
+                math.isfinite(value)
+                for point in (prior_world, metric_world, process_world, emitted_world)
+                for value in point
+            )
+        ):
+            return None
+
+        output_kind = (
+            "bounded_process_step" if bool(output_continuous) else "output_hold"
+        )
+        position_gain = 1.0 if bool(output_continuous) else 0.0
+        media_dt_s = (current_pts - prior_pts) / 1_000_000_000.0
+        gate_dt_s = min(
+            float(media_dt_s),
+            float(self._human_ground_cfg.reset_after_s),
+        )
+        result: Dict[str, Any] = {
+            "type": str(provenance_type),
+            "non_authoritative": True,
+            "state_integrated": True,
+            "origin": str(provenance_origin),
+            "reason": str(reason),
+            "process_observation": process_world,
+            "filter_transition": {
+                "version": 1,
+                "kind": output_kind,
+                "origin_kind": "queue_admitted_world_output",
+                "origin_world": prior_world,
+                "origin_media_pts_ns": int(prior_pts),
+                "current_media_pts_ns": int(current_pts),
+                "origin_trail_segment_id": int(prior_segment),
+                "metric_origin_kind": "queue_admitted_metric_world_output",
+                "metric_origin_world": metric_world,
+                "metric_origin_media_pts_ns": int(metric_pts),
+                "metric_origin_trail_segment_id": int(metric_segment),
+                "tracker_lifecycle_generation": int(lifecycle_generation),
+                "world_frame": str(world_frame_id),
+                "world_frame_revision": str(world_frame_revision),
+                "world_transform_sha256": str(world_transform_sha256),
+                "gate_dt_s": float(gate_dt_s),
+                "position_base": prior_world,
+                "position_gain": float(position_gain),
+                "max_speed_mps": float(self._human_ground_cfg.max_speed_mps),
+                "reset_after_s": float(self._human_ground_cfg.reset_after_s),
+            },
+        }
+        if stationary_hold_posture is not None:
+            try:
+                evidence_frame_id = int(track.get("frame_id"))
+                evidence_posture = str(stationary_hold_posture).strip().lower()
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if evidence_posture not in {"sitting", "lying"}:
+                return None
+            result["stationary_evidence"] = {
+                "version": 1,
+                "kind": "bbox_stationary",
+                "frame_id": evidence_frame_id,
+                "media_pts_ns": int(current_pts),
+                "posture": evidence_posture,
+            }
+        if upright_presence_evidence is not None:
+            if not isinstance(upright_presence_evidence, Mapping):
+                return None
+            result["upright_presence_evidence"] = dict(
+                upright_presence_evidence
+            )
+        if current_presence_evidence is not None:
+            if not isinstance(current_presence_evidence, Mapping):
+                return None
+            result["current_presence_evidence"] = dict(
+                current_presence_evidence
+            )
+        return result
+
+    @staticmethod
+    def _upright_presence_output_hold_evidence(
+        track: Mapping[str, Any],
+        *,
+        state: _WorldAnchorState,
+        prior_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ],
+        floor_y: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Bind a gain-zero hold to one exact, current non-seated person row.
+
+        This evidence does not make the rejected floor candidate canonical.
+        It permits the strict service to retain the latest public coordinate
+        for a little longer when independent current image and floor geometry
+        prove that the established upright person is still present nearby.
+        """
+
+        posture = str(state.posture or "").strip().lower()
+        motion_mode = str(state.motion_mode or "").strip().lower()
+        if (
+            prior_output is None
+            or track.get("pose_present") is not True
+            or posture not in {"standing", "unknown"}
+            or motion_mode in {"sit", "lie"}
+            or state.lower_body_occluded
+            or str(state.image_motion_contact_basis or "")
+            != "pose:torso_motion"
+            or str(track.get("world_contact_basis") or "")
+            != "pose:torso_motion"
+            or track.get("lower_body_occluded") is not False
+            or track.get("world_floor_admitted") is not True
+            or track.get("world_floor_contact_plausible") is not True
+            or track.get("world_observation_range_admitted") is not True
+            or str(track.get("world_support_state") or "") != "floor"
+        ):
+            return None
+        candidate = track.get("world_floor_candidate")
+        bbox = track.get("bbox")
+        image_size = track.get("image_size")
+        if (
+            not isinstance(candidate, (list, tuple))
+            or len(candidate) != 3
+            or not isinstance(bbox, (list, tuple))
+            or len(bbox) < 4
+            or not isinstance(image_size, (list, tuple))
+            or len(image_size) < 2
+        ):
+            return None
+        try:
+            frame_id = int(track.get("frame_id"))
+            media_pts_ns = int(track.get("media_pts_ns"))
+            prior_media_pts_ns = int(prior_output[2])
+            detector_confidence = float(track.get("confidence"))
+            tracker_confidence = float(track.get("tracker_confidence"))
+            candidate_world = [
+                float(candidate[0]),
+                float(candidate[1]),
+                float(candidate[2]),
+            ]
+            bbox_width = float(bbox[2])
+            bbox_height = float(bbox[3])
+            image_height = float(image_size[1])
+            prior_x = float(prior_output[0])
+            prior_z = float(prior_output[1])
+            output_distance_m = math.hypot(
+                candidate_world[0] - prior_x,
+                candidate_world[2] - prior_z,
+            )
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        max_distance_m = float(
+            CanonicalWorldService.UPRIGHT_PRESENCE_MAX_OUTPUT_DISTANCE_M
+        )
+        hold_horizon_ns = int(
+            round(
+                (
+                    CanonicalWorldService.UPRIGHT_PRESENCE_HOLD_HORIZON_S
+                    + CanonicalWorldService.BOUNDED_PROCESS_HORIZON_EPSILON_S
+                )
+                * 1_000_000_000.0
+            )
+        )
+        if (
+            frame_id < 0
+            or media_pts_ns <= 0
+            or prior_media_pts_ns <= 0
+            or media_pts_ns <= prior_media_pts_ns
+            or media_pts_ns - prior_media_pts_ns > hold_horizon_ns
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    detector_confidence,
+                    tracker_confidence,
+                    *candidate_world,
+                    bbox_width,
+                    bbox_height,
+                    image_height,
+                    prior_x,
+                    prior_z,
+                    output_distance_m,
+                )
+            )
+            or detector_confidence
+            < float(
+                CanonicalWorldService.UPRIGHT_PRESENCE_MIN_DETECTOR_CONFIDENCE
+            )
+            or detector_confidence > 1.0
+            or tracker_confidence
+            < float(
+                CanonicalWorldService.UPRIGHT_PRESENCE_MIN_TRACKER_CONFIDENCE
+            )
+            or tracker_confidence > 1.0
+            or bbox_width <= 0.0
+            or bbox_height <= 0.0
+            or image_height <= 0.0
+            or bbox_height / image_height
+            < float(
+                CanonicalWorldService.UPRIGHT_PRESENCE_MIN_BBOX_HEIGHT_FRACTION
+            )
+            or bbox_width / bbox_height
+            > float(CanonicalWorldService.UPRIGHT_PRESENCE_MAX_BBOX_ASPECT)
+            or not math.isclose(
+                candidate_world[1],
+                float(floor_y),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            or output_distance_m > max_distance_m
+        ):
+            return None
+        return {
+            "version": 1,
+            "kind": "pose_confirmed_nonseated_floor_near_output",
+            "frame_id": int(frame_id),
+            "media_pts_ns": int(media_pts_ns),
+            "posture": posture,
+            "motion_mode": motion_mode,
+            "contact_basis": "pose:torso_motion",
+            "detector_confidence": float(detector_confidence),
+            "tracker_confidence": float(tracker_confidence),
+            "floor_candidate": list(candidate_world),
+            "output_distance_m": float(output_distance_m),
+            "output_distance_limit_m": float(max_distance_m),
+        }
+
+    @staticmethod
+    def _current_presence_output_hold_evidence(
+        track: Mapping[str, Any],
+        *,
+        kinematic_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ],
+        kinematic_bbox_geometry: Optional[
+            Tuple[float, float, float, float]
+        ],
+    ) -> Optional[Dict[str, Any]]:
+        """Prove a short non-renewing hold from current bbox presence.
+
+        This does not estimate a new position. It only retains the exact
+        queue-visible coordinate while the same tracker lifecycle still has a
+        credible person box compatible with the last motion-bearing output.
+        The fixed kinematic timestamp and bbox survive gain-zero holds, so the
+        one-second window cannot slide forward from hold to hold.
+        """
+
+        bbox = track.get("bbox")
+        if (
+            kinematic_output is None
+            or kinematic_bbox_geometry is None
+            or not isinstance(bbox, (list, tuple))
+            or len(bbox) < 4
+        ):
+            return None
+        try:
+            class_id = int(track.get("class_id"))
+            frame_id = int(track.get("frame_id"))
+            current_media_pts_ns = int(track.get("media_pts_ns"))
+            root_media_pts_ns = int(kinematic_output[2])
+            root_trail_segment_id = int(kinematic_output[4])
+            detector_confidence = float(track.get("confidence"))
+            tracker_confidence = float(track.get("tracker_confidence"))
+            current_bbox = tuple(float(value) for value in bbox[:4])
+            root_bbox = tuple(
+                float(value) for value in kinematic_bbox_geometry
+            )
+            current_left, current_top, current_width, current_height = (
+                current_bbox
+            )
+            root_left, root_top, root_width, root_height = root_bbox
+            size_ratio = max(
+                root_width / current_width,
+                current_width / root_width,
+                root_height / current_height,
+                current_height / root_height,
+            )
+            root_center = (
+                root_left + 0.5 * root_width,
+                root_top + 0.5 * root_height,
+            )
+            current_center = (
+                current_left + 0.5 * current_width,
+                current_top + 0.5 * current_height,
+            )
+            center_displacement_px = math.hypot(
+                current_center[0] - root_center[0],
+                current_center[1] - root_center[1],
+            )
+            bbox_scale_px = 0.5 * (
+                math.hypot(root_width, root_height)
+                + math.hypot(current_width, current_height)
+            )
+            center_displacement_norm = (
+                center_displacement_px / bbox_scale_px
+            )
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+            ZeroDivisionError,
+            OverflowError,
+        ):
+            return None
+        horizon_ns = int(
+            round(
+                (
+                    CanonicalWorldService.CURRENT_PRESENCE_HOLD_HORIZON_S
+                    + CanonicalWorldService.BOUNDED_PROCESS_HORIZON_EPSILON_S
+                )
+                * 1_000_000_000.0
+            )
+        )
+        pose_present = track.get("pose_present") is True
+        if (
+            class_id != 0
+            or frame_id < 0
+            or root_trail_segment_id < 0
+            or current_media_pts_ns <= root_media_pts_ns
+            or current_media_pts_ns - root_media_pts_ns > horizon_ns
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    detector_confidence,
+                    tracker_confidence,
+                    *current_bbox,
+                    *root_bbox,
+                    size_ratio,
+                    center_displacement_px,
+                    bbox_scale_px,
+                    center_displacement_norm,
+                )
+            )
+            or not 0.0 <= detector_confidence <= 1.0
+            or detector_confidence
+            < CanonicalWorldService.CURRENT_PRESENCE_MIN_DETECTOR_CONFIDENCE
+            or tracker_confidence
+            < CanonicalWorldService.CURRENT_PRESENCE_MIN_TRACKER_CONFIDENCE
+            or (
+                not pose_present
+                and detector_confidence
+                < CanonicalWorldService.CURRENT_PRESENCE_STRONG_DETECTOR_CONFIDENCE
+            )
+            or current_width <= 0.0
+            or current_height <= 0.0
+            or root_width <= 0.0
+            or root_height <= 0.0
+            or bbox_scale_px <= 0.0
+            or size_ratio
+            > CanonicalWorldService.CURRENT_PRESENCE_MAX_BBOX_SIZE_RATIO
+            or center_displacement_norm
+            > CanonicalWorldService.CURRENT_PRESENCE_MAX_CENTER_DISPLACEMENT_NORM
+        ):
+            return None
+        return {
+            "version": 1,
+            "kind": "same_lifecycle_bbox_from_kinematic_output",
+            "frame_id": int(frame_id),
+            "media_pts_ns": int(current_media_pts_ns),
+            "kinematic_origin_media_pts_ns": int(root_media_pts_ns),
+            "kinematic_origin_trail_segment_id": int(
+                root_trail_segment_id
+            ),
+            "kinematic_origin_bbox": list(root_bbox),
+            "current_bbox": list(current_bbox),
+            "bbox_size_ratio": float(size_ratio),
+            "bbox_center_displacement_norm": float(
+                center_displacement_norm
+            ),
+            "detector_confidence": float(detector_confidence),
+            "tracker_confidence": float(tracker_confidence),
+            "pose_present": bool(pose_present),
+        }
+
+    def _set_world_output_watermark(
+        self,
+        key: Optional[_WorldOutputWatermarkKey],
+        *,
+        world_x: Any,
+        world_z: Any,
+        media_pts_ns: Any,
+        filter_ts: Any,
+        trail_segment_id: Any,
+        metric_authoritative: bool = False,
+        committed_world_source: Any = None,
+        committed_provenance_type: Any = None,
+        bbox_geometry: Any = None,
+    ) -> None:
+        """Store one bounded canonical queue-admission watermark."""
+
+        if key is None:
+            return
+        try:
+            parsed_x = float(world_x)
+            parsed_z = float(world_z)
+            parsed_filter_ts = float(filter_ts)
+            parsed_segment = int(trail_segment_id)
+            parsed_media_pts = (
+                int(media_pts_ns) if media_pts_ns is not None else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not all(
+            math.isfinite(value)
+            for value in (parsed_x, parsed_z, parsed_filter_ts)
+        ):
+            return
+        parsed_bbox: Optional[Tuple[float, float, float, float]] = None
+        if isinstance(bbox_geometry, (list, tuple)) and len(bbox_geometry) >= 4:
+            try:
+                candidate_bbox = tuple(
+                    float(value) for value in bbox_geometry[:4]
+                )
+            except (TypeError, ValueError, OverflowError):
+                candidate_bbox = ()
+            if (
+                len(candidate_bbox) == 4
+                and all(math.isfinite(value) for value in candidate_bbox)
+                and candidate_bbox[2] > 0.0
+                and candidate_bbox[3] > 0.0
+            ):
+                parsed_bbox = candidate_bbox
+        store = getattr(self, "_world_output_watermarks", None)
+        if not isinstance(store, OrderedDict):
+            store = OrderedDict()
+            self._world_output_watermarks = store
+        previous = store.get(key)
+        normalized_world_source = str(
+            committed_world_source or ""
+        ).strip().lower()
+        normalized_provenance_type = str(
+            committed_provenance_type or ""
+        ).strip()
+        if not normalized_world_source:
+            if previous is not None:
+                normalized_world_source = previous.committed_world_source
+                if not normalized_provenance_type:
+                    normalized_provenance_type = str(
+                        previous.committed_provenance_type or ""
+                    ).strip()
+            elif bool(metric_authoritative):
+                # Runtime queue commits always pass the exact producer source;
+                # retain compatibility with direct metric state primers in
+                # focused tests that predate source retention.
+                normalized_world_source = "metric_world_output"
+        if bool(metric_authoritative):
+            metric_world_x: Optional[float] = parsed_x
+            metric_world_z: Optional[float] = parsed_z
+            metric_media_pts_ns: Optional[int] = parsed_media_pts
+            metric_filter_ts: Optional[float] = parsed_filter_ts
+            metric_trail_segment_id: Optional[int] = parsed_segment
+        elif previous is not None:
+            metric_world_x = previous.metric_world_x
+            metric_world_z = previous.metric_world_z
+            metric_media_pts_ns = previous.metric_media_pts_ns
+            metric_filter_ts = previous.metric_filter_ts
+            metric_trail_segment_id = previous.metric_trail_segment_id
+        else:
+            metric_world_x = None
+            metric_world_z = None
+            metric_media_pts_ns = None
+            metric_filter_ts = None
+            metric_trail_segment_id = None
+        gain_zero_output_hold = bool(
+            normalized_world_source == "anchor_hold"
+            and normalized_provenance_type == "bounded_output_hold"
+        )
+        image_process_root = bool(
+            normalized_world_source == "image_motion_prediction"
+            and normalized_provenance_type
+            in {
+                "bbox_affine_floor_projection",
+                "inferred_ground_process_observation",
+            }
+        )
+        bounded_projective_descendant = bool(
+            normalized_world_source in {"cv_prediction", "anchor_hold"}
+            and normalized_provenance_type
+            in {"bounded_cv_process", "bounded_output_hold"}
+        )
+        if image_process_root and parsed_media_pts is not None:
+            projective_bridge_root_media_pts_ns: Optional[int] = (
+                int(parsed_media_pts)
+            )
+        elif (
+            bounded_projective_descendant
+            and parsed_media_pts is not None
+            and previous is not None
+            and previous.projective_bridge_root_media_pts_ns is not None
+            and self._hold_age_is_current(
+                (
+                    int(parsed_media_pts)
+                    - int(previous.projective_bridge_root_media_pts_ns)
+                )
+                / 1_000_000_000.0,
+                ttl_s=float(self._world_anchor_hold_ttl_s),
+            )
+        ):
+            projective_bridge_root_media_pts_ns = int(
+                previous.projective_bridge_root_media_pts_ns
+            )
+        else:
+            projective_bridge_root_media_pts_ns = None
+        if gain_zero_output_hold and previous is not None:
+            kinematic_world_x = (
+                previous.kinematic_world_x
+                if previous.kinematic_world_x is not None
+                else previous.world_x
+            )
+            kinematic_world_z = (
+                previous.kinematic_world_z
+                if previous.kinematic_world_z is not None
+                else previous.world_z
+            )
+            kinematic_media_pts_ns = (
+                previous.kinematic_media_pts_ns
+                if previous.kinematic_media_pts_ns is not None
+                else previous.media_pts_ns
+            )
+            kinematic_filter_ts = (
+                previous.kinematic_filter_ts
+                if previous.kinematic_filter_ts is not None
+                else previous.filter_ts
+            )
+            kinematic_trail_segment_id = (
+                previous.kinematic_trail_segment_id
+                if previous.kinematic_trail_segment_id is not None
+                else previous.trail_segment_id
+            )
+            kinematic_bbox_geometry = (
+                previous.kinematic_bbox_geometry
+                if previous.kinematic_bbox_geometry is not None
+                else previous.bbox_geometry
+            )
+        elif gain_zero_output_hold:
+            kinematic_world_x = None
+            kinematic_world_z = None
+            kinematic_media_pts_ns = None
+            kinematic_filter_ts = None
+            kinematic_trail_segment_id = None
+            kinematic_bbox_geometry = None
+        else:
+            kinematic_world_x = parsed_x
+            kinematic_world_z = parsed_z
+            kinematic_media_pts_ns = parsed_media_pts
+            kinematic_filter_ts = parsed_filter_ts
+            kinematic_trail_segment_id = parsed_segment
+            kinematic_bbox_geometry = parsed_bbox
+        store[key] = _WorldOutputWatermark(
+            world_x=parsed_x,
+            world_z=parsed_z,
+            media_pts_ns=parsed_media_pts,
+            filter_ts=parsed_filter_ts,
+            trail_segment_id=parsed_segment,
+            committed_world_source=normalized_world_source,
+            committed_provenance_type=(
+                normalized_provenance_type or None
+            ),
+            projective_bridge_root_media_pts_ns=(
+                projective_bridge_root_media_pts_ns
+            ),
+            metric_world_x=metric_world_x,
+            metric_world_z=metric_world_z,
+            metric_media_pts_ns=metric_media_pts_ns,
+            metric_filter_ts=metric_filter_ts,
+            metric_trail_segment_id=metric_trail_segment_id,
+            kinematic_world_x=kinematic_world_x,
+            kinematic_world_z=kinematic_world_z,
+            kinematic_media_pts_ns=kinematic_media_pts_ns,
+            kinematic_filter_ts=kinematic_filter_ts,
+            kinematic_trail_segment_id=kinematic_trail_segment_id,
+            bbox_geometry=parsed_bbox,
+            kinematic_bbox_geometry=kinematic_bbox_geometry,
+        )
+        store.move_to_end(key)
+        capacity = max(
+            1,
+            int(getattr(self, "_world_output_watermark_capacity", 4096) or 4096),
+        )
+        while len(store) > capacity:
+            store.popitem(last=False)
+
     def _save_world_output_watermark(
         self,
         state: _WorldAnchorState,
-        key: Optional[Tuple[int, int, int, str, str, str]],
+        key: Optional[_WorldOutputWatermarkKey],
     ) -> None:
         """Persist the final admission watermark with an explicit hard cap."""
 
@@ -12395,38 +13831,405 @@ class _AnalyticsTelemetryProcessor:
         z = state.last_output_world_z
         if x is None or z is None:
             return
+        self._set_world_output_watermark(
+            key,
+            world_x=x,
+            world_z=z,
+            media_pts_ns=state.last_output_media_pts_ns,
+            filter_ts=state.last_output_filter_ts,
+            trail_segment_id=state.last_output_trail_segment_id,
+        )
+
+    def _clear_uncommitted_world_output_state(
+        self,
+        state: _WorldAnchorState,
+        key: Optional[_WorldOutputWatermarkKey],
+    ) -> None:
+        """Discard a filter-local output that never crossed the public queue."""
+
+        if self._world_output_reference(key) is not None:
+            return
+        state.last_output_world_x = None
+        state.last_output_world_z = None
+        state.last_output_media_pts_ns = None
+        state.last_output_filter_ts = -1.0
+        state.last_output_trail_segment_id = int(state.trail_segment_id)
+
+    def _world_state_matches_output_authority(
+        self,
+        sensor_id: int,
+        track: Mapping[str, Any],
+        state: _WorldAnchorState,
+        key: Optional[_WorldOutputWatermarkKey],
+        *,
+        calibration_authority_cache: MutableMapping[
+            str,
+            Optional[Tuple[str, str, str, str]],
+        ],
+    ) -> bool:
+        """Bind a delayed queue commit to the current filter authority.
+
+        The canonical worker can drain an admitted A cohort after the media
+        callback has already reset this tracker state under calibration/source
+        epoch B. The old A-keyed immutable watermark remains valid history for
+        A, but it must not overwrite B's live process state. Match every
+        authority component that can change independently, not only the
+        tracker lifecycle generation.
+        """
+
+        if key is None:
+            return False
         try:
-            world_x = float(x)
-            world_z = float(z)
-            filter_ts = float(state.last_output_filter_ts)
-            segment = int(state.last_output_trail_segment_id)
-            media_pts = (
-                int(state.last_output_media_pts_ns)
-                if state.last_output_media_pts_ns is not None
-                else None
-            )
+            if int(getattr(state, "tracker_lifecycle_generation", -1)) != int(
+                key[2]
+            ):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        state_frame_authority = (
+            str(getattr(state, "world_frame_id", None) or "").strip(),
+            str(getattr(state, "world_frame_revision", None) or "").strip(),
+            str(getattr(state, "world_transform_sha256", None) or "").strip(),
+        )
+        if any(state_frame_authority) and state_frame_authority != tuple(key[3:6]):
+            return False
+
+        source_epochs = getattr(self, "_source_epoch_by_sensor", None)
+        if isinstance(source_epochs, Mapping) and int(sensor_id) in source_epochs:
+            try:
+                if int(track.get("source_epoch")) != int(
+                    source_epochs[int(sensor_id)]
+                ):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        provider = getattr(self, "bev_calibration", None)
+        if provider is None:
+            return True
+        camera_id = str(track.get("camera_id") or "").strip()
+        if not camera_id:
+            return False
+        if camera_id not in calibration_authority_cache:
+            try:
+                calibration = self._world_calibration_snapshot(
+                    int(sensor_id),
+                    camera_id,
+                )
+                frame_id, frame_revision, transform_sha256 = (
+                    world_frame_binding_from_calibration(
+                        calibration,
+                        default_frame_id=self._world_frame,
+                    )
+                )
+                calibration_sha256 = str(
+                    getattr(
+                        calibration,
+                        "camera_calibration_sha256",
+                        None,
+                    )
+                    or ""
+                ).strip().lower()
+                authority = (
+                    str(frame_id or "").strip(),
+                    str(frame_revision or "").strip(),
+                    str(transform_sha256 or "").strip(),
+                    calibration_sha256,
+                )
+                if (
+                    not all(authority)
+                    or re.fullmatch(r"[0-9a-f]{64}", calibration_sha256)
+                    is None
+                ):
+                    authority = None
+            except Exception:
+                authority = None
+            calibration_authority_cache[camera_id] = authority
+        return calibration_authority_cache[camera_id] == tuple(key[3:7])
+
+    def _commit_enqueued_world_output_watermarks(
+        self,
+        sensor_id: int,
+        tracks: Sequence[Mapping[str, Any]],
+        *,
+        filter_ts: float,
+        admitted_world_track_keys: Optional[
+            set[tuple[int, Optional[int], int]]
+        ] = None,
+    ) -> None:
+        """Commit only points admitted to the ordered tracking/BEV queue.
+
+        World augmentation also runs on rate-suppressed callbacks. Those rows
+        may update the internal CV/filter state, but they are not visible and
+        cannot become the continuity reference or spend a one-visible-row
+        projective bridge. The canonical publication queue is ordered and
+        non-dropping, so successful enqueue is the exact display boundary.
+        """
+
+        try:
+            published_filter_ts = float(filter_ts)
         except (TypeError, ValueError, OverflowError):
             return
-        if not all(math.isfinite(value) for value in (world_x, world_z, filter_ts)):
+        if not math.isfinite(published_filter_ts):
             return
-        store = getattr(self, "_world_output_watermarks", None)
-        if not isinstance(store, OrderedDict):
-            store = OrderedDict()
-            self._world_output_watermarks = store
-        store[key] = _WorldOutputWatermark(
-            world_x=world_x,
-            world_z=world_z,
-            media_pts_ns=media_pts,
-            filter_ts=filter_ts,
-            trail_segment_id=segment,
-        )
-        store.move_to_end(key)
-        capacity = max(
-            1,
-            int(getattr(self, "_world_output_watermark_capacity", 4096) or 4096),
-        )
-        while len(store) > capacity:
-            store.popitem(last=False)
+        calibration_authority_cache: Dict[
+            str,
+            Optional[Tuple[str, str, str, str]],
+        ] = {}
+        for track in tracks:
+            if not isinstance(track, Mapping) or track.get("world_valid") is not True:
+                continue
+            if admitted_world_track_keys is not None:
+                try:
+                    admission_key = (
+                        int(track.get("tracker_id", track.get("track_id"))),
+                        (
+                            int(track.get("tracker_lifecycle_generation"))
+                            if track.get("tracker_lifecycle_generation") is not None
+                            else None
+                        ),
+                        int(track.get("frame_id")),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if admission_key not in admitted_world_track_keys:
+                    continue
+            world = track.get("world")
+            if not isinstance(world, (list, tuple)) or len(world) < 3:
+                continue
+            try:
+                world_x = float(world[0])
+                world_z = float(world[2])
+                segment = int(track.get("trail_segment_id", 0) or 0)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if not all(math.isfinite(value) for value in (world_x, world_z)):
+                continue
+            key = self._world_output_watermark_key(
+                int(sensor_id),
+                track,
+                world_frame_id=(
+                    str(track.get("world_frame"))
+                    if track.get("world_frame") is not None
+                    else None
+                ),
+                world_frame_revision=(
+                    str(track.get("world_frame_revision"))
+                    if track.get("world_frame_revision") is not None
+                    else None
+                ),
+                world_transform_sha256=(
+                    str(track.get("world_transform_sha256"))
+                    if track.get("world_transform_sha256") is not None
+                    else None
+                ),
+                camera_calibration_sha256=(
+                    str(track.get("world_calibration_sha256"))
+                    if track.get("world_calibration_sha256") is not None
+                    else None
+                ),
+            )
+            world_source = str(track.get("world_source") or "").strip().lower()
+            if world_source in {
+                "anchor_hold",
+                "cv_prediction",
+                "image_motion_prediction",
+            } and admitted_world_track_keys is None:
+                # Direct/focused callers without a canonical admission receipt
+                # still need a local fail-closed proof check. Native runtime
+                # publication supplies the exact service-owned admitted set;
+                # revalidating that set against this producer's latest-only
+                # watermark would incorrectly reject service-approved history
+                # origins and leave the producer behind the visible output.
+                store = getattr(self, "_world_output_watermarks", None)
+                prior = (
+                    store.get(key)
+                    if isinstance(store, OrderedDict) and key is not None
+                    else None
+                )
+                try:
+                    if prior is None or prior.media_pts_ns is None:
+                        raise ValueError("missing committed output watermark")
+                    floor_y = float(world[1])
+                    metric_position = (
+                        (
+                            float(prior.metric_world_x),
+                            floor_y,
+                            float(prior.metric_world_z),
+                        )
+                        if prior.metric_world_x is not None
+                        and prior.metric_world_z is not None
+                        else None
+                    )
+                    expected_origin = _CanonicalTrackOutput(
+                        position=(
+                            float(prior.world_x),
+                            floor_y,
+                            float(prior.world_z),
+                        ),
+                        media_pts_ns=int(prior.media_pts_ns),
+                        trail_segment_id=int(prior.trail_segment_id),
+                        committed_world_source=str(
+                            prior.committed_world_source
+                        ),
+                        committed_provenance_type=(
+                            str(prior.committed_provenance_type)
+                            if prior.committed_provenance_type is not None
+                            else None
+                        ),
+                        metric_position=metric_position,
+                        metric_media_pts_ns=(
+                            int(prior.metric_media_pts_ns)
+                            if prior.metric_media_pts_ns is not None
+                            else None
+                        ),
+                        metric_trail_segment_id=(
+                            int(prior.metric_trail_segment_id)
+                            if prior.metric_trail_segment_id is not None
+                            else None
+                        ),
+                        kinematic_position=(
+                            (
+                                float(prior.kinematic_world_x),
+                                floor_y,
+                                float(prior.kinematic_world_z),
+                            )
+                            if prior.kinematic_world_x is not None
+                            and prior.kinematic_world_z is not None
+                            else None
+                        ),
+                        kinematic_media_pts_ns=(
+                            int(prior.kinematic_media_pts_ns)
+                            if prior.kinematic_media_pts_ns is not None
+                            else None
+                        ),
+                        kinematic_trail_segment_id=(
+                            int(prior.kinematic_trail_segment_id)
+                            if prior.kinematic_trail_segment_id is not None
+                            else None
+                        ),
+                        bbox_geometry=prior.bbox_geometry,
+                        kinematic_bbox_geometry=(
+                            prior.kinematic_bbox_geometry
+                        ),
+                        projective_bridge_root_media_pts_ns=(
+                            int(prior.projective_bridge_root_media_pts_ns)
+                            if prior.projective_bridge_root_media_pts_ns
+                            is not None
+                            else None
+                        ),
+                    )
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if world_source == "image_motion_prediction":
+                    continuation_is_canonical = (
+                        CanonicalWorldService._image_motion_observation_is_canonical(
+                            track,
+                            expected_origin=expected_origin,
+                        )
+                    )
+                else:
+                    continuation_is_canonical = (
+                        CanonicalWorldService._bounded_process_observation_is_canonical(
+                            track,
+                            expected_origin=expected_origin,
+                        )
+                    )
+                # Reuse the consumer's exact proof validator before advancing
+                # the producer watermark. A partial, forged, or stale process
+                # row can still be published as a fail-closed diagnostic, but
+                # it can never become the next image-motion origin.
+                if not continuation_is_canonical:
+                    continue
+            media_pts = self._valid_world_media_pts_ns(track.get("media_pts_ns"))
+            world_key = self._world_track_key(int(sensor_id), track)
+            state = (
+                self._world_state_by_track.get(world_key)
+                if world_key is not None
+                else None
+            )
+            state_matches_authority = False
+            if state is not None:
+                state_matches_authority = (
+                    self._world_state_matches_output_authority(
+                        int(sensor_id),
+                        track,
+                        state,
+                        key,
+                        calibration_authority_cache=(
+                            calibration_authority_cache
+                        ),
+                    )
+                )
+            output_segment = segment
+            if state_matches_authority and state is not None:
+                try:
+                    state_output_x = float(state.last_output_world_x)
+                    state_output_z = float(state.last_output_world_z)
+                    state_output_segment = int(
+                        state.last_output_trail_segment_id
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if (
+                        math.hypot(
+                            state_output_x - world_x,
+                            state_output_z - world_z,
+                        )
+                        <= 1e-6
+                    ):
+                        # A non-metric alternate can expose a newer internal
+                        # filter segment while the output gate holds the prior
+                        # visible coordinate. Preserve the segment attached to
+                        # the emitted point so a later metric row can still
+                        # spend the real visible break.
+                        output_segment = state_output_segment
+            metric_authoritative = bool(
+                track.get("world_measurement_accepted") is True
+                and world_source
+                not in {
+                    "anchor_hold",
+                    "cv_prediction",
+                    "image_motion_prediction",
+                }
+            )
+            committed_provenance = track.get("world_prediction_provenance")
+            self._set_world_output_watermark(
+                key,
+                world_x=world_x,
+                world_z=world_z,
+                media_pts_ns=media_pts,
+                filter_ts=published_filter_ts,
+                trail_segment_id=output_segment,
+                metric_authoritative=metric_authoritative,
+                committed_world_source=world_source,
+                committed_provenance_type=(
+                    str(committed_provenance.get("type") or "").strip()
+                    if not metric_authoritative
+                    and isinstance(committed_provenance, Mapping)
+                    else None
+                ),
+                bbox_geometry=track.get("bbox"),
+            )
+
+            if not state_matches_authority or state is None:
+                continue
+            state.last_output_world_x = world_x
+            state.last_output_world_z = world_z
+            state.last_output_media_pts_ns = media_pts
+            state.last_output_filter_ts = published_filter_ts
+            state.last_output_trail_segment_id = output_segment
+            if metric_authoritative:
+                clear_first_output_ankle_proof(state)
+            provenance = track.get("world_prediction_provenance")
+            if (
+                isinstance(provenance, Mapping)
+                and str(provenance.get("origin") or "")
+                == "recent_projective_process"
+            ):
+                state.projective_bridge_rows_remaining = 0
 
     def _maybe_prune_world_state(self, now_ts: float) -> None:
         if not self._world_state_by_track and not self._world_state_ghost_by_track:
@@ -12792,6 +14595,332 @@ class _AnalyticsTelemetryProcessor:
             config=self._human_ground_cfg,
         )
 
+    def _resolve_pose_torso_motion_anchor(
+        self,
+        kpts_abs: np.ndarray,
+        *,
+        bbox: Sequence[float],
+    ) -> Optional[_PoseAnchorCandidate]:
+        """Return a current torso point used only to corroborate image motion.
+
+        The point deliberately has no metric range and is never projected to
+        the floor. Three of the four shoulder/hip joints are sufficient when
+        they include both anatomical bands: the complete band supplies the
+        missing side offset for the partial band. This keeps a seated or
+        furniture-occluded person localized through a one-joint dropout without
+        accepting an arbitrary pelvis pixel. ``observe_coherent_image_motion``
+        still requires the detector silhouette to move coherently with this
+        point, so pose jitter alone cannot authorize bootstrap or reacquisition.
+        """
+
+        if not isinstance(kpts_abs, np.ndarray) or kpts_abs.shape[0] < 17:
+            return None
+        try:
+            left, top, width, height = (float(value) for value in bbox[:4])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            not all(math.isfinite(value) for value in (left, top, width, height))
+            or width <= 1.0
+            or height <= 1.0
+        ):
+            return None
+
+        points = {
+            name: self._pose_point(kpts_abs, name)
+            for name in ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+        }
+        shoulder_points = {
+            name: points[name]
+            for name in ("left_shoulder", "right_shoulder")
+            if points[name] is not None
+        }
+        hip_points = {
+            name: points[name]
+            for name in ("left_hip", "right_hip")
+            if points[name] is not None
+        }
+        if (
+            len(shoulder_points) < 1
+            or len(hip_points) < 1
+            or len(shoulder_points) + len(hip_points) < 3
+        ):
+            return None
+
+        margin_x = 0.15 * width
+        margin_y = 0.15 * height
+        if any(
+            not (
+                left - margin_x <= float(point[0]) <= left + width + margin_x
+                and top - margin_y <= float(point[1]) <= top + height + margin_y
+            )
+            for point in points.values()
+            if point is not None
+        ):
+            return None
+
+        def _band_center(
+            band: Mapping[str, Optional[Tuple[float, float]]],
+            complete_reference: Mapping[str, Optional[Tuple[float, float]]],
+            *,
+            left_name: str,
+            right_name: str,
+            reference_left_name: str,
+            reference_right_name: str,
+        ) -> Optional[Tuple[float, float]]:
+            left_point = band.get(left_name)
+            right_point = band.get(right_name)
+            if left_point is not None and right_point is not None:
+                return (
+                    0.5 * (float(left_point[0]) + float(right_point[0])),
+                    0.5 * (float(left_point[1]) + float(right_point[1])),
+                )
+            reference_left = complete_reference.get(reference_left_name)
+            reference_right = complete_reference.get(reference_right_name)
+            if reference_left is None or reference_right is None:
+                return None
+            reference_dx = float(reference_right[0]) - float(reference_left[0])
+            reference_dy = float(reference_right[1]) - float(reference_left[1])
+            if left_point is not None:
+                return (
+                    float(left_point[0]) + 0.5 * reference_dx,
+                    float(left_point[1]) + 0.5 * reference_dy,
+                )
+            if right_point is not None:
+                return (
+                    float(right_point[0]) - 0.5 * reference_dx,
+                    float(right_point[1]) - 0.5 * reference_dy,
+                )
+            return None
+
+        shoulder_mid = _band_center(
+            points,
+            points,
+            left_name="left_shoulder",
+            right_name="right_shoulder",
+            reference_left_name="left_hip",
+            reference_right_name="right_hip",
+        )
+        hip_mid = _band_center(
+            points,
+            points,
+            left_name="left_hip",
+            right_name="right_hip",
+            reference_left_name="left_shoulder",
+            reference_right_name="right_shoulder",
+        )
+        if shoulder_mid is None or hip_mid is None:
+            return None
+
+        pair_widths: List[float] = []
+        for left_name, right_name in (
+            ("left_shoulder", "right_shoulder"),
+            ("left_hip", "right_hip"),
+        ):
+            left_point = points.get(left_name)
+            right_point = points.get(right_name)
+            if left_point is not None and right_point is not None:
+                pair_widths.append(
+                    math.hypot(
+                        float(right_point[0]) - float(left_point[0]),
+                        float(right_point[1]) - float(left_point[1]),
+                    )
+                )
+        torso_dx = float(hip_mid[0]) - float(shoulder_mid[0])
+        torso_dy = float(hip_mid[1]) - float(shoulder_mid[1])
+        torso_length = math.hypot(torso_dx, torso_dy)
+        partial_torso = bool(
+            len(shoulder_points) < 2 or len(hip_points) < 2
+        )
+        if (
+            (
+                partial_torso
+                and (
+                    not pair_widths
+                    or min(pair_widths) < max(5.0, 0.08 * width)
+                )
+            )
+            or torso_length < max(8.0, 0.08 * height)
+            or abs(torso_dy) < 0.45 * torso_length
+        ):
+            return None
+
+        # The midpoint of the trimmed torso core is less sensitive to joint
+        # swaps than either shoulder or hip pair alone.
+        return _PoseAnchorCandidate(
+            u=float(shoulder_mid[0] + 0.48 * torso_dx),
+            v=float(shoulder_mid[1] + 0.48 * torso_dy),
+            source="pose_torso_motion",
+            contact_basis="pose:torso_motion",
+            quality="estimated",
+            quality_reason="current_pose_torso_motion_only",
+            height_lock_eligible=False,
+            score=0.0,
+        )
+
+    def _moving_upright_lateral_truncation(
+        self,
+        *,
+        state: Optional[_WorldAnchorState],
+        classified_posture: str,
+        previous_posture: str,
+        previous_motion: str,
+        bbox: Sequence[float],
+        image_size: Optional[Sequence[int]],
+        now_ts: float,
+        queue_metric_root_available: bool,
+    ) -> Tuple[bool, bool, bool, Optional[float]]:
+        """Keep a moving upright lifecycle upright at a lateral image edge.
+
+        Dewarped silhouettes can be clipped to a compact upper-body fragment
+        while the person walks through a raster boundary.  A 2-D pose model
+        can then label the fragment ``sitting`` even though the established
+        person is still upright.  Use only scale-free image geometry, recent
+        upright lifecycle evidence, and the queue-admitted metric root; no
+        camera or room constants participate.
+
+        The relative one-box-width edge envelope catches progressive clipping
+        before the detector box is hard-clamped, but proximity alone is not
+        truncation evidence: a person can genuinely sit near an image edge.
+        Soft-edge cases therefore also require the accepted silhouette to have
+        moved outward while its normalized edge gap shrank.  A hard one-percent
+        envelope remains valid even when the clipped box height has collapsed.
+        """
+
+        if (
+            state is None
+            or str(classified_posture) not in ("sitting", "lying")
+            or str(previous_motion) != "walk"
+            or state.height_ref_scene is None
+            or not bool(queue_metric_root_available)
+            or image_size is None
+            or len(image_size) < 2
+            or len(bbox) < 4
+        ):
+            return False, False, False, None
+        try:
+            image_width = float(image_size[0])
+            image_height = float(image_size[1])
+            left, _top, width, height = (float(value) for value in bbox[:4])
+            current_ts = float(now_ts)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False, False, False, None
+        if (
+            image_width <= 1.0
+            or image_height <= 1.0
+            or width <= 1.0
+            or height <= 1.0
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    image_width,
+                    image_height,
+                    left,
+                    width,
+                    height,
+                    current_ts,
+                )
+            )
+        ):
+            return False, False, False, None
+
+        left_margin = float(left)
+        right_margin = float(image_width) - (float(left) + float(width))
+        lateral_gap = max(0.0, min(left_margin, right_margin))
+        near_lateral_edge = bool(lateral_gap <= float(width))
+        hard_lateral_clip = bool(
+            lateral_gap <= max(8.0, 0.01 * float(image_width))
+        )
+
+        progressive_outward_clip = False
+        previous_bbox = state.last_accepted_bbox_geometry
+        if previous_bbox is not None and len(previous_bbox) >= 4:
+            try:
+                previous_left, _previous_top, previous_width, previous_height = (
+                    float(value) for value in previous_bbox[:4]
+                )
+                previous_left_margin = float(previous_left)
+                previous_right_margin = float(image_width) - (
+                    float(previous_left) + float(previous_width)
+                )
+                current_nearest_left = bool(left_margin <= right_margin)
+                previous_nearest_left = bool(
+                    previous_left_margin <= previous_right_margin
+                )
+                current_gap_ratio = float(lateral_gap) / float(width)
+                previous_gap = max(
+                    0.0,
+                    min(previous_left_margin, previous_right_margin),
+                )
+                previous_gap_ratio = previous_gap / float(previous_width)
+                current_center = float(left) + 0.5 * float(width)
+                previous_center = (
+                    float(previous_left) + 0.5 * float(previous_width)
+                )
+                outward_delta = (
+                    float(previous_center) - float(current_center)
+                    if current_nearest_left
+                    else float(current_center) - float(previous_center)
+                )
+                minimum_outward_delta = 0.05 * min(
+                    float(previous_width),
+                    float(width),
+                )
+                progressive_outward_clip = bool(
+                    previous_width > 1.0
+                    and previous_height > 1.0
+                    and current_nearest_left == previous_nearest_left
+                    and previous_gap_ratio - current_gap_ratio >= 0.08
+                    and outward_delta >= minimum_outward_delta
+                )
+            except (TypeError, ValueError, IndexError, OverflowError):
+                progressive_outward_clip = False
+
+        upright_height_ratio: Optional[float] = None
+        if (
+            state.upright_bbox_height_px is not None
+            and math.isfinite(float(state.upright_bbox_height_px))
+            and float(state.upright_bbox_height_px) > 1.0
+        ):
+            upright_height_ratio = float(height) / float(
+                state.upright_bbox_height_px
+            )
+        upright_not_collapsed = bool(
+            upright_height_ratio is None
+            or upright_height_ratio
+            >= float(self._human_ground_cfg.occlusion_bbox_height_ratio)
+        )
+
+        previous_effective_upright = str(previous_posture) in (
+            "standing",
+            "unknown",
+        )
+        recent_full_body_upright = bool(
+            float(state.last_full_body_ts) >= 0.0
+            and float(state.last_full_body_ts)
+            >= float(state.last_non_upright_ts)
+            and current_ts >= float(state.last_full_body_ts)
+            and (
+                float(self._human_ground_cfg.occlusion_upright_memory_s)
+                <= 0.0
+                or current_ts - float(state.last_full_body_ts)
+                <= float(self._human_ground_cfg.occlusion_upright_memory_s)
+            )
+        )
+        supported = bool(
+            previous_effective_upright
+            and (recent_full_body_upright or str(previous_posture) == "standing")
+            and near_lateral_edge
+            and (hard_lateral_clip or progressive_outward_clip)
+            and (upright_not_collapsed or hard_lateral_clip)
+        )
+        return (
+            supported,
+            near_lateral_edge,
+            hard_lateral_clip,
+            upright_height_ratio,
+        )
+
     def _resolve_person_depth_anchor(self, depth_result: Optional[ObjectDepthResult]) -> Optional[_PoseAnchorCandidate]:
         if depth_result is None or str(depth_result.status) != "ok":
             return None
@@ -12802,7 +14931,12 @@ class _AnalyticsTelemetryProcessor:
         if evidence_quality == "rejected":
             return None
         anchor_band = str(depth_result.anchor_source or "")
-        if anchor_band not in ("lower_body_band", "torso_core", "pose_ankle_support"):
+        if anchor_band not in (
+            "lower_body_band",
+            "torso_core",
+            "pose_ankle_support",
+            "pose_torso_support",
+        ):
             return None
         anchor_depth_m = depth_result.anchor_depth_m
         if (
@@ -12824,10 +14958,18 @@ class _AnalyticsTelemetryProcessor:
             f"depth_anchor={anchor_band},sampling={sampling_mode or 'unknown'},"
             f"evidence={evidence_quality or 'legacy'}"
         )
+        torso_projection = anchor_band in (
+            "torso_core",
+            "pose_torso_support",
+        )
         return _PoseAnchorCandidate(
             u=float(anchor_uv[0]),
             v=float(anchor_uv[1]),
-            source="person_mask_floor",
+            source=(
+                "person_body_projection"
+                if torso_projection
+                else "person_mask_floor"
+            ),
             contact_basis=f"depth:{anchor_band}",
             quality=quality,
             quality_reason=quality_reason,
@@ -12869,21 +15011,30 @@ class _AnalyticsTelemetryProcessor:
         )
 
     @staticmethod
-    def _person_admission_confidence(track: Mapping[str, Any]) -> float:
-        """Return the best current DeepStream person-observation confidence.
+    def _person_admission_confidence(
+        track: Mapping[str, Any],
+        *,
+        trusted_lifecycle: bool = False,
+    ) -> float:
+        """Return semantic confidence, with tracker continuity only when trusted.
 
         DeepStream may set ``NvDsObjectMeta.confidence`` to its ``-0.1``
         sentinel for tracker-generated rows even though NvDCF still publishes
-        a valid ``tracker_confidence`` for the visible box.  Treating that
-        sentinel as a detector rejection makes an otherwise continuous track
-        lose its bbox-floor hypothesis between detector observations.  Use
-        the strongest finite non-negative detector/tracker signal and clamp
-        only at this admission boundary; neither value changes estimator
-        weighting or bypasses the geometric/PCF/physical gates.
+        a high ``tracker_confidence`` for the visible box. Tracker confidence
+        describes association quality, not whether a cold box is semantically
+        a person: static portraits can score highly there. Cold admission is
+        therefore detector-only. Once the lifecycle already owns a trusted
+        metric point, tracker confidence may preserve continuity between
+        detector rows.
         """
 
         best = 0.0
-        for field_name in ("confidence", "tracker_confidence"):
+        field_names = (
+            ("confidence", "tracker_confidence")
+            if trusted_lifecycle
+            else ("confidence",)
+        )
+        for field_name in field_names:
             try:
                 value = float(track.get(field_name, 0.0) or 0.0)
             except (TypeError, ValueError, OverflowError):
@@ -12924,6 +15075,47 @@ class _AnalyticsTelemetryProcessor:
             "depth:lower_body_band",
             "depth:pose_ankle_support",
         }
+
+    @classmethod
+    def _accepted_image_foot_for_recording(
+        cls,
+        track: Mapping[str, Any],
+        *,
+        world_source: Optional[str],
+        anchor: Optional[_PoseAnchorCandidate],
+    ) -> Optional[Tuple[float, float]]:
+        """Choose the image foot corresponding to the accepted world point.
+
+        The temporary anchor UV is an exact ground contact only for a
+        floor-ray-only result. Registered-depth and fused results may use a
+        torso/lower-body range sample, so their accepted image origin is the
+        final metric point reprojected into the calibration raster. This keeps
+        a body-range UV from being transported and floor-projected as a foot
+        on the next occluded frame.
+        """
+
+        candidate: Any = track.get("image_base")
+        if (
+            str(world_source or "")
+            in {"pose_floor_only", "person_anchor_floor_only"}
+            and cls._anchor_is_verified_ground_contact(anchor)
+        ):
+            raw_ground_contact = track.get("_world_current_image_foot_calib")
+            if (
+                isinstance(raw_ground_contact, (list, tuple))
+                and len(raw_ground_contact) >= 2
+            ):
+                candidate = raw_ground_contact
+        if not isinstance(candidate, (list, tuple)) or len(candidate) < 2:
+            return None
+        try:
+            u = float(candidate[0])
+            v = float(candidate[1])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not (math.isfinite(u) and math.isfinite(v)):
+            return None
+        return float(u), float(v)
 
     @staticmethod
     def _depth_measurement_is_current(
@@ -13108,6 +15300,7 @@ class _AnalyticsTelemetryProcessor:
         bbox: Sequence[float],
         foot_world: Sequence[float],
         *,
+        foot_uv: Optional[Sequence[float]] = None,
         flip_u: bool,
         flip_v: bool,
         pose_kpts_abs: Optional[np.ndarray] = None,
@@ -13122,14 +15315,26 @@ class _AnalyticsTelemetryProcessor:
             return
         u_top = float(left) + float(width) * 0.5
         v_top = float(top)
+        source_foot = None
+        if foot_uv is not None and len(foot_uv) >= 2:
+            source_foot = self._project_pixel_to_localization_observation(
+                calib,
+                float(foot_uv[0]),
+                float(foot_uv[1]),
+                depth_m=None,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+        if source_foot is None:
+            source_foot = np.asarray(foot_world, dtype=np.float64)
         try:
             est_height = estimate_upright_height_from_top_and_foot(
                 u_top,
                 v_top,
-                foot_world,
+                source_foot,
                 calib.intrinsics,
-                calib.extrinsics_col_major,
-                float(calib.floor_y),
+                self._localization_projection_extrinsics(calib),
+                self._localization_projection_floor_y(calib),
                 tuple(int(x) for x in calib.image_size),
                 unit_scale=1.0,
                 flip_u=bool(flip_u),
@@ -13154,7 +15359,7 @@ class _AnalyticsTelemetryProcessor:
             state,
             calib,
             pose_kpts_abs,
-            foot_world,
+            source_foot,
             flip_u=flip_u,
             flip_v=flip_v,
         )
@@ -13210,11 +15415,13 @@ class _AnalyticsTelemetryProcessor:
         )
         try:
             width_src, height_src = calib.image_size
-            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            R_wc, C_world = parse_extrinsics(
+                self._localization_projection_extrinsics(calib)
+            )
             C_world = C_world * self._scene_per_meter(calib)
             foot_x = float(foot_world[0])
             foot_z = float(foot_world[2])
-            floor_y = float(calib.floor_y)
+            floor_y = self._localization_projection_floor_y(calib)
             height_ref = float(state.height_ref_scene)
         except Exception:
             return
@@ -13287,7 +15494,9 @@ class _AnalyticsTelemetryProcessor:
                 bool(flip_u),
                 bool(flip_v),
             )
-            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            R_wc, C_world = parse_extrinsics(
+                self._localization_projection_extrinsics(calib)
+            )
             C_world = C_world * self._scene_per_meter(calib)
             origin, direction = ray_from_pixel(
                 u_ray,
@@ -13299,18 +15508,23 @@ class _AnalyticsTelemetryProcessor:
             denom = float(direction[1])
             if abs(denom) < 1e-9:
                 return None
-            plane_y = float(calib.floor_y) + float(plane_height_scene)
+            source_floor_y = self._localization_projection_floor_y(calib)
+            plane_y = source_floor_y + float(plane_height_scene)
             ray_t = (plane_y - float(origin[1])) / denom
             if not math.isfinite(ray_t) or ray_t <= 0.0:
                 return None
             reference_point = origin + (direction * ray_t)
-            return np.array(
+            source_footprint = np.array(
                 [
                     float(reference_point[0]),
-                    float(calib.floor_y),
+                    float(source_floor_y),
                     float(reference_point[2]),
                 ],
                 dtype=np.float64,
+            )
+            return self._target_ground_from_localization_point(
+                calib,
+                source_footprint,
             )
         except Exception:
             return None
@@ -13459,8 +15673,186 @@ class _AnalyticsTelemetryProcessor:
             return "world_anchor_projection_failed"
         return ",".join(dict.fromkeys(str(reason) for reason in reasons if reason))
 
+    @staticmethod
+    def _bounded_world_quality_reason(
+        *parts: Any,
+        maximum: int = 200,
+    ) -> Optional[str]:
+        """Compose stable de-duplicated reason tokens within the wire contract."""
+
+        tokens: List[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            if part in (None, ""):
+                continue
+            for raw_token in str(part).split(","):
+                token = raw_token.strip()
+                if not token or token in seen:
+                    continue
+                candidate = ",".join((*tokens, token))
+                if len(candidate) > max(1, int(maximum)):
+                    continue
+                tokens.append(token)
+                seen.add(token)
+        return ",".join(tokens) or None
+
     def _extract_object_depth_result(self, obj_meta: Any) -> Optional[ObjectDepthResult]:
         return _extract_object_depth_result_from_meta(obj_meta)
+
+    @staticmethod
+    def _localization_projection_extrinsics(calib: Any) -> Sequence[float]:
+        """Return the independently height-checked localization camera pose."""
+
+        if (
+            str(getattr(calib, "image_localization_basis", ""))
+            == "revision_target_floor"
+        ):
+            return calib.extrinsics_col_major
+        values = getattr(calib, "calibration_extrinsics_col_major", None)
+        if isinstance(values, Sequence) and len(values) == 16:
+            return values
+        return calib.extrinsics_col_major
+
+    @staticmethod
+    def _localization_projection_floor_y(calib: Any) -> float:
+        if (
+            str(getattr(calib, "image_localization_basis", ""))
+            == "revision_target_floor"
+        ):
+            return float(calib.floor_y)
+        value = getattr(calib, "calibration_floor_y", None)
+        if value is None:
+            value = getattr(calib, "floor_y", 0.0)
+        return float(value)
+
+    @staticmethod
+    def _target_from_localization_matrix(calib: Any) -> np.ndarray:
+        if (
+            str(getattr(calib, "image_localization_basis", ""))
+            == "revision_target_floor"
+        ):
+            return np.eye(4, dtype=np.float64)
+        values = getattr(calib, "target_from_calibration_col_major", None)
+        if not isinstance(values, Sequence) or len(values) != 16:
+            return np.eye(4, dtype=np.float64)
+        matrix = np.asarray(values, dtype=np.float64).reshape((4, 4), order="F")
+        if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+            raise ValueError("target-from-calibration transform is invalid")
+        return matrix
+
+    def _target_ground_from_localization_point(
+        self,
+        calib: Any,
+        source_point: Sequence[float],
+    ) -> Optional[np.ndarray]:
+        """Carry a physical source point into target X/Z and ground it."""
+
+        try:
+            point = np.asarray(source_point, dtype=np.float64).reshape(-1)
+            if point.size < 3 or not np.all(np.isfinite(point[:3])):
+                return None
+            transform = self._target_from_localization_matrix(calib)
+            target_point = (transform[:3, :3] @ point[:3]) + transform[:3, 3]
+            if target_point.shape != (3,) or not np.all(np.isfinite(target_point)):
+                return None
+            target_point[1] = float(calib.floor_y)
+            return np.asarray(target_point, dtype=np.float64)
+        except Exception:
+            return None
+
+    def _localization_floor_from_target_ground_point(
+        self,
+        calib: Any,
+        target_point: Sequence[float],
+    ) -> Optional[np.ndarray]:
+        """Recover the physical calibration-floor point for target X/Z.
+
+        Canonical ground footprints intentionally replace the transformed
+        point's Y with the target floor elevation.  Inverting that flattened
+        3-D point would therefore move it off the physical source floor.  The
+        two horizontal target equations plus the known calibration floor give
+        the exact planar inverse needed for image reprojection and continuity.
+        """
+
+        try:
+            point = np.asarray(target_point, dtype=np.float64).reshape(-1)
+            if point.size < 3 or not np.all(np.isfinite(point[:3])):
+                return None
+            transform = self._target_from_localization_matrix(calib)
+            source_floor_y = self._localization_projection_floor_y(calib)
+            rotation = transform[:3, :3]
+            translation = transform[:3, 3]
+            horizontal = np.asarray(
+                [
+                    [float(rotation[0, 0]), float(rotation[0, 2])],
+                    [float(rotation[2, 0]), float(rotation[2, 2])],
+                ],
+                dtype=np.float64,
+            )
+            rhs = np.asarray(
+                [
+                    float(point[0])
+                    - float(translation[0])
+                    - float(rotation[0, 1]) * source_floor_y,
+                    float(point[2])
+                    - float(translation[2])
+                    - float(rotation[2, 1]) * source_floor_y,
+                ],
+                dtype=np.float64,
+            )
+            source_xz = np.linalg.solve(horizontal, rhs)
+            source_point = np.asarray(
+                [float(source_xz[0]), source_floor_y, float(source_xz[1])],
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(source_point)):
+                return None
+            return source_point
+        except Exception:
+            return None
+
+    def _project_pixel_to_localization_observation(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        *,
+        depth_m: Optional[float],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        """Project in the calibration-owned physical camera/floor frame."""
+
+        try:
+            width_src, height_src = calib.image_size
+            u_ray, v_ray = self._apply_image_flip(
+                float(u),
+                float(v),
+                int(width_src),
+                int(height_src),
+                bool(flip_u),
+                bool(flip_v),
+            )
+            result = pixel_to_world(
+                calib.intrinsics,
+                self._localization_projection_extrinsics(calib),
+                self._localization_projection_floor_y(calib),
+                float(getattr(calib, "unit_scale", 1.0) or 1.0),
+                float(u_ray),
+                float(v_ray),
+                depth_m=float(depth_m) if depth_m is not None else None,
+            )
+            if not bool(getattr(result, "ok", False)):
+                return None
+            point = getattr(result, "world_point", None)
+            if not isinstance(point, Sequence) or len(point) < 3:
+                return None
+            projected = np.asarray(point[:3], dtype=np.float64)
+            if projected.shape != (3,) or not np.all(np.isfinite(projected)):
+                return None
+            return projected
+        except Exception:
+            return None
 
     def _project_pixel_to_world_observation(
         self,
@@ -13472,24 +15864,39 @@ class _AnalyticsTelemetryProcessor:
         flip_u: bool,
         flip_v: bool,
     ) -> Optional[np.ndarray]:
+        """Project physically first, then carry the point into canonical world.
+
+        The Scene Prior target transform may level a reconstructed point cloud
+        whose inferred source floor is tilted.  It must not redefine the
+        physical camera height/pitch used to intersect an image ray.  Ground
+        footprints are therefore localized against the calibration floor,
+        transformed through the revision-bound edge, and finally grounded on
+        the target floor for the canonical ground-footprint contract.
+        """
+
         try:
-            width_src, height_src = calib.image_size
-            u_ray, v_ray = self._apply_image_flip(float(u), float(v), int(width_src), int(height_src), bool(flip_u), bool(flip_v))
-            result = pixel_to_world(
-                calib.intrinsics,
-                calib.extrinsics_col_major,
-                float(calib.floor_y),
-                float(getattr(calib, "unit_scale", 1.0) or 1.0),
-                float(u_ray),
-                float(v_ray),
-                depth_m=float(depth_m) if depth_m is not None else None,
+            source_point = self._project_pixel_to_localization_observation(
+                calib,
+                u,
+                v,
+                depth_m=depth_m,
+                flip_u=flip_u,
+                flip_v=flip_v,
             )
-            if not bool(getattr(result, "ok", False)):
+            if source_point is None:
                 return None
-            point = getattr(result, "world_point", None)
-            if not isinstance(point, Sequence) or len(point) < 3:
+            if depth_m is None:
+                return self._target_ground_from_localization_point(
+                    calib,
+                    source_point,
+                )
+            transform = self._target_from_localization_matrix(calib)
+            target_point = (
+                transform[:3, :3] @ np.asarray(source_point, dtype=np.float64)
+            ) + transform[:3, 3]
+            if target_point.shape != (3,) or not np.all(np.isfinite(target_point)):
                 return None
-            return np.array([float(point[0]), float(point[1]), float(point[2])], dtype=np.float64)
+            return np.asarray(target_point, dtype=np.float64)
         except Exception:
             return None
 
@@ -13510,6 +15917,261 @@ class _AnalyticsTelemetryProcessor:
             flip_u=flip_u,
             flip_v=flip_v,
         )
+
+    def _torso_depth_corroborates_floor_contact(
+        self,
+        *,
+        calib: Any,
+        track: Dict[str, Any],
+        state: Optional[_WorldAnchorState],
+        depth_result: Optional[ObjectDepthResult],
+        torso_uv: Optional[Sequence[float]],
+        floor_candidate: Optional[np.ndarray],
+        floor_anchor_source: str,
+        floor_contact_basis: str,
+        posture: str,
+        bbox: Optional[Sequence[float]],
+        image_size: Optional[Sequence[int]],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> bool:
+        """Corroborate a truncated pose contact with bounded torso range.
+
+        The detector silhouette is not a physical visibility mask: counters,
+        doorways, and partial detector boxes can end above a person's hidden
+        feet.  A pose floor ray below that box is therefore admitted only when
+        strong current pose geometry and a recent, lifecycle-bound registered
+        torso range independently land at the same X/Z footprint.
+
+        Cached depth never becomes a measurement here.  It may only
+        corroborate the current pose ray after an uncached sample from this
+        exact lifecycle established the immutable cache root, and only while
+        the detector box remains stationary within a short fixed horizon.
+        """
+
+        track["world_floor_depth_corroborated"] = False
+        for key in (
+            "world_floor_depth_corroboration_disagreement_m",
+            "world_floor_depth_corroboration_limit_m",
+            "world_floor_depth_corroboration_measurement_age_us",
+            "world_floor_depth_corroboration_tensor_age_us",
+            "world_floor_depth_corroboration_source",
+        ):
+            track.pop(key, None)
+        if (
+            state is None
+            or depth_result is None
+            or torso_uv is None
+            or len(torso_uv) < 2
+            or floor_candidate is None
+            or str(floor_anchor_source) != "pose_leg_floor"
+            or str(floor_contact_basis) != "pose:leg_pair_extension"
+            or str(posture) != "standing"
+            or str(depth_result.status or "") != "ok"
+            or not bool(depth_result.is_metric)
+            or str(depth_result.unit or "") != "m"
+            or str(depth_result.anchor_source or "")
+            != "pose_torso_support"
+        ):
+            return False
+        try:
+            lifecycle_generation = int(
+                track.get("tracker_lifecycle_generation")
+            )
+            source_id = int(track.get("source_id"))
+            tracker_id = int(track.get("tracker_id", track.get("track_id")))
+            current_frame_id = int(track.get("frame_id"))
+            current_ts_us = int(track.get("media_pts_ns")) // 1_000
+            measurement_frame_id = int(depth_result.measurement_frame_id)
+            measurement_ts_us = int(depth_result.measurement_ts_us)
+            measurement_age_us = int(depth_result.measurement_age_us or 0)
+            tensor_frame_id = int(depth_result.depth_tensor_frame_id)
+            tensor_ts_us = int(depth_result.depth_tensor_ts_us)
+            tensor_age_frames = int(depth_result.depth_tensor_age_frames or 0)
+            tensor_age_us = int(depth_result.depth_tensor_age_us or 0)
+            raw_depth_m = float(depth_result.anchor_depth_m)
+            support_count = int(
+                depth_result.anchor_sample_count
+                if depth_result.anchor_sample_count is not None
+                else depth_result.sample_count
+            )
+            support_fraction = float(
+                depth_result.anchor_valid_fraction
+                if depth_result.anchor_valid_fraction is not None
+                else depth_result.valid_fraction
+            )
+            spread_m = float(depth_result.anchor_depth_spread_m or 0.0)
+            detector_confidence = float(track.get("confidence"))
+            tracker_confidence = float(track.get("tracker_confidence"))
+            torso_u = float(torso_uv[0])
+            torso_v = float(torso_uv[1])
+            floor = np.asarray(floor_candidate, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+        if not (
+            lifecycle_generation > 0
+            and int(depth_result.source_id) == source_id
+            and int(depth_result.object_id) == tracker_id
+            and int(depth_result.frame_id) == current_frame_id
+            and int(depth_result.ts_us or 0) == current_ts_us
+            and current_ts_us > 0
+            and measurement_frame_id > 0
+            and measurement_ts_us > 0
+            and 0 <= measurement_age_us <= 250_000
+            and 0 <= tensor_age_frames <= 1
+            and 0 <= tensor_age_us <= 100_000
+            and tensor_frame_id <= measurement_frame_id
+            and tensor_ts_us <= measurement_ts_us <= current_ts_us
+            and current_ts_us - tensor_ts_us <= 250_000
+            and raw_depth_m > 0.0
+            and support_count >= 24
+            and support_fraction >= 0.55
+            and math.isfinite(spread_m)
+            and _depth_spread_is_supported(
+                raw_depth_m,
+                spread_m,
+                strict=False,
+            )
+            and detector_confidence >= 0.60
+            and tracker_confidence >= 0.50
+            and detector_confidence <= 1.0
+            and tracker_confidence <= 1.0
+            and math.isfinite(torso_u)
+            and math.isfinite(torso_v)
+            and floor.size >= 3
+            and np.all(np.isfinite(floor[:3]))
+        ):
+            return False
+
+        uncached_root = bool(
+            depth_result.measurement_cached is False
+            and measurement_age_us == 0
+            and measurement_frame_id == current_frame_id
+            and measurement_ts_us == current_ts_us
+        )
+        if not uncached_root:
+            if not (
+                depth_result.measurement_cached is True
+                and state.bbox_stationary_supported
+                and int(state.depth_corroboration_measurement_frame_id)
+                == measurement_frame_id
+                and int(state.depth_corroboration_measurement_ts_us)
+                == measurement_ts_us
+                and state.depth_corroboration_lifecycle_generation is not None
+                and int(state.depth_corroboration_lifecycle_generation)
+                == lifecycle_generation
+            ):
+                return False
+
+        try:
+            bbox_width_px = float(bbox[2]) if bbox is not None else 0.0
+            bbox_height_px = float(bbox[3]) if bbox is not None else 0.0
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+        if not self._bbox_floor_candidate_has_resolved_silhouette(
+            bbox_width_px=bbox_width_px,
+            bbox_height_px=bbox_height_px,
+            image_size=image_size,
+        ):
+            return False
+        if self.depth_registration is None:
+            return False
+        corrected_depth_m, registration_status, _registration_id = (
+            self.depth_registration.apply(
+                camera_id=str(getattr(calib, "camera_id", "") or ""),
+                raw_depth_m=raw_depth_m,
+            )
+        )
+        if corrected_depth_m is None or str(registration_status) != "ok":
+            return False
+        depth_point = self._project_pixel_to_world_observation(
+            calib,
+            torso_u,
+            torso_v,
+            depth_m=float(corrected_depth_m),
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+        if depth_point is None:
+            return False
+        disagreement_m = math.hypot(
+            float(depth_point[0]) - float(floor[0]),
+            float(depth_point[2]) - float(floor[2]),
+        )
+        resolver_uncertainty_m = min(
+            1.25,
+            max(0.25, float(self._world_resolver_max_disagreement_m)),
+        )
+        registration_uncertainty_m = 0.0
+        registration_bundle = getattr(
+            self.depth_registration,
+            "bundle",
+            None,
+        )
+        registration_entries = getattr(
+            registration_bundle,
+            "entries",
+            {},
+        )
+        registration_entry = (
+            registration_entries.get(str(getattr(calib, "camera_id", "") or ""))
+            if isinstance(registration_entries, Mapping)
+            else None
+        )
+        occupied_validation = getattr(
+            registration_entry,
+            "occupied_anchor_validation",
+            {},
+        )
+        try:
+            measured_max_error_m = float(
+                occupied_validation.get("max_abs_error_m", 0.0)
+                if isinstance(occupied_validation, Mapping)
+                else 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            measured_max_error_m = 0.0
+        if math.isfinite(measured_max_error_m) and measured_max_error_m > 0.0:
+            registration_uncertainty_m = measured_max_error_m
+        disagreement_limit_m = math.hypot(
+            float(resolver_uncertainty_m),
+            float(registration_uncertainty_m),
+        )
+        track["world_floor_depth_corroboration_disagreement_m"] = float(
+            disagreement_m
+        )
+        track["world_floor_depth_corroboration_limit_m"] = float(
+            disagreement_limit_m
+        )
+        if not (
+            math.isfinite(disagreement_m)
+            and disagreement_m <= disagreement_limit_m
+        ):
+            return False
+        if uncached_root:
+            # Establish the reusable cache root only after registration and
+            # X/Z agreement both succeed. A failed sample cannot authorize a
+            # later cached corroboration row.
+            state.depth_corroboration_measurement_frame_id = int(
+                measurement_frame_id
+            )
+            state.depth_corroboration_measurement_ts_us = int(
+                measurement_ts_us
+            )
+            state.depth_corroboration_lifecycle_generation = int(
+                lifecycle_generation
+            )
+        track["world_floor_depth_corroborated"] = True
+        track["world_floor_depth_corroboration_measurement_age_us"] = int(
+            measurement_age_us
+        )
+        track["world_floor_depth_corroboration_tensor_age_us"] = int(
+            current_ts_us - tensor_ts_us
+        )
+        track["world_floor_depth_corroboration_source"] = (
+            "registered_torso_range"
+        )
+        return True
 
     def _depth_observation_from_anchor(
         self,
@@ -13561,6 +16223,11 @@ class _AnalyticsTelemetryProcessor:
             min_support_fraction = 0.45
             support_scale_denom = 128.0
             anchor_source_weight = 0.50
+        elif anchor_source == "pose_torso_support":
+            min_support_count = 24
+            min_support_fraction = 0.55
+            support_scale_denom = 128.0
+            anchor_source_weight = 0.40
         else:
             return _DepthObservationResult(None, 0.0, "depth_anchor_source_invalid")
         if anchor_depth_m is None or not math.isfinite(float(anchor_depth_m)) or float(anchor_depth_m) <= 0.0:
@@ -13852,6 +16519,440 @@ class _AnalyticsTelemetryProcessor:
             floor_y_variance=0.02 + 0.08 * (1.0 - max(0.0, min(1.0, support_fraction))),
         )
 
+    def _seated_pose_ground_projection(
+        self,
+        calib: Any,
+        *,
+        torso_uv: Sequence[float],
+        state: Optional[_WorldAnchorState],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Tuple[np.ndarray, Matrix3, float]]:
+        """Project an exact seated torso observation to its floor footprint.
+
+        A seated person's feet are commonly hidden by furniture, but gravity
+        still constrains the person's horizontal location. Intersect the
+        current torso ray with a bounded human seated-torso plane and then
+        drop that point vertically to the calibrated floor. This is not a
+        claimed foot contact: callers publish it with ``support_state=seat``.
+
+        The prior is camera- and room-independent. A lifecycle-specific
+        standing height refines the plane when available; otherwise the broad
+        adult prior is deliberately paired with conservative height/UV
+        covariance and the ordinary multi-sample physical bootstrap.
+        """
+
+        try:
+            u = float(torso_uv[0])
+            v = float(torso_uv[1])
+            scene_per_meter = float(self._scene_per_meter(calib))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            not all(math.isfinite(value) for value in (u, v, scene_per_meter))
+            or scene_per_meter <= 1e-9
+        ):
+            return None
+
+        seated_torso_height_m = 0.82
+        if state is not None and state.height_ref_scene is not None:
+            try:
+                standing_height_m = (
+                    float(state.height_ref_scene) / scene_per_meter
+                )
+            except (TypeError, ValueError, OverflowError):
+                standing_height_m = math.nan
+            if math.isfinite(standing_height_m) and standing_height_m > 0.0:
+                seated_torso_height_m = 0.44 * standing_height_m
+        seated_torso_height_m = max(
+            0.68,
+            min(0.96, float(seated_torso_height_m)),
+        )
+        plane_height_scene = seated_torso_height_m * scene_per_meter
+        candidate = self._reference_plane_floor_world(
+            calib,
+            u,
+            v,
+            plane_height_scene,
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+        if candidate is None:
+            return None
+
+        image_size = self._normalize_image_size(
+            getattr(calib, "image_size", None)
+        )
+        if image_size is None:
+            return None
+        width, height = image_size
+        sigma_px = max(2.0, min(8.0, 0.003 * float(max(width, height))))
+        sigma_height_m = 0.18
+        sigma_height_scene = sigma_height_m * scene_per_meter
+
+        def _project(
+            du: float,
+            dv: float,
+            height_delta_scene: float = 0.0,
+        ) -> Optional[np.ndarray]:
+            pu = min(float(width - 1), max(0.0, u + float(du)))
+            pv = min(float(height - 1), max(0.0, v + float(dv)))
+            return self._reference_plane_floor_world(
+                calib,
+                pu,
+                pv,
+                max(0.01, plane_height_scene + float(height_delta_scene)),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+
+        covariance = self._covariance_matrix_from_projection(
+            candidate,
+            (
+                (sigma_px, _project(sigma_px, 0.0)),
+                (sigma_px, _project(0.0, sigma_px)),
+                (
+                    sigma_height_scene,
+                    _project(0.0, 0.0, sigma_height_scene),
+                ),
+            ),
+            floor_y_variance=0.09,
+        )
+        if covariance is None:
+            return None
+        return (
+            np.asarray(candidate, dtype=np.float64),
+            covariance,
+            float(seated_torso_height_m),
+        )
+
+    def _upright_pose_ground_projection(
+        self,
+        calib: Any,
+        *,
+        kpts_abs: np.ndarray,
+        bbox: Sequence[float],
+        state: Optional[_WorldAnchorState],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Tuple[np.ndarray, Matrix3, float, float, int, bool]]:
+        """Infer an upright ground footprint from convergent body planes.
+
+        Furniture can hide every physical floor contact while shoulders, hips,
+        and the head remain exact-current pose observations.  For each visible
+        anatomical point, intersect its camera ray with that point's expected
+        fraction of an unknown standing height.  The intersections are affine
+        in height, so one bounded least-squares solve finds the height at which
+        the independent body rays agree on one X/Z footprint.
+
+        This is typed body-to-floor geometry, not observed foot contact.  It is
+        therefore returned with broad covariance and is admitted separately
+        from floor rays.  The detector bottom never participates in the solve.
+        """
+
+        if (
+            not isinstance(kpts_abs, np.ndarray)
+            or kpts_abs.shape[0] < 17
+            or len(bbox) < 4
+            or self._resolve_pose_torso_motion_anchor(kpts_abs, bbox=bbox) is None
+        ):
+            return None
+        try:
+            left, top, width, height = (float(value) for value in bbox[:4])
+            scene_per_meter = float(self._scene_per_meter(calib))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (left, top, width, height, scene_per_meter)
+            )
+            or width <= 1.0
+            or height <= 1.0
+            or scene_per_meter <= 1e-9
+        ):
+            return None
+
+        learned_fractions = (
+            state.body_plane_height_fractions if state is not None else {}
+        )
+        definitions = (
+            ("nose", "nose", float(learned_fractions.get("nose", 0.94)), 0.75),
+            (
+                "left_shoulder",
+                "shoulders",
+                float(learned_fractions.get("shoulders", 0.82)),
+                0.675,
+            ),
+            (
+                "right_shoulder",
+                "shoulders",
+                float(learned_fractions.get("shoulders", 0.82)),
+                0.675,
+            ),
+            (
+                "left_hip",
+                "hips",
+                float(learned_fractions.get("hips", 0.55)),
+                0.35,
+            ),
+            (
+                "right_hip",
+                "hips",
+                float(learned_fractions.get("hips", 0.55)),
+                0.35,
+            ),
+        )
+        rows: List[Dict[str, Any]] = []
+        margin_x = 0.15 * float(width)
+        margin_y = 0.15 * float(height)
+        for point_name, band_name, height_fraction, weight in definitions:
+            point = self._pose_point(kpts_abs, point_name)
+            if point is None:
+                continue
+            u, v = float(point[0]), float(point[1])
+            if not (
+                left - margin_x <= u <= left + width + margin_x
+                and top - margin_y <= v <= top + height + margin_y
+                and math.isfinite(height_fraction)
+                and 0.30 <= height_fraction <= 1.05
+            ):
+                continue
+            at_floor = self._reference_plane_floor_world(
+                calib,
+                u,
+                v,
+                0.0,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            at_unit_height = self._reference_plane_floor_world(
+                calib,
+                u,
+                v,
+                float(height_fraction),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if at_floor is None or at_unit_height is None:
+                continue
+            a = np.asarray(
+                [float(at_floor[0]), float(at_floor[2])],
+                dtype=np.float64,
+            )
+            b = np.asarray(
+                [
+                    float(at_unit_height[0]) - float(at_floor[0]),
+                    float(at_unit_height[2]) - float(at_floor[2]),
+                ],
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+                continue
+            rows.append(
+                {
+                    "point_name": point_name,
+                    "band_name": band_name,
+                    "weight": float(weight),
+                    "a": a,
+                    "b": b,
+                }
+            )
+
+        def _solve(
+            active_rows: Sequence[Mapping[str, Any]],
+        ) -> Optional[
+            Tuple[
+                float,
+                np.ndarray,
+                List[np.ndarray],
+                float,
+                bool,
+                np.ndarray,
+                List[float],
+            ]
+        ]:
+            if len(active_rows) < 3:
+                return None
+            bands = {str(row["band_name"]) for row in active_rows}
+            if "shoulders" not in bands or "hips" not in bands:
+                return None
+            weights = np.asarray(
+                [float(row["weight"]) for row in active_rows],
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(weights)) or float(np.sum(weights)) <= 1e-9:
+                return None
+            a_values = np.stack(
+                [np.asarray(row["a"], dtype=np.float64) for row in active_rows]
+            )
+            b_values = np.stack(
+                [np.asarray(row["b"], dtype=np.float64) for row in active_rows]
+            )
+            weight_sum = float(np.sum(weights))
+            a_mean = np.sum(a_values * weights[:, None], axis=0) / weight_sum
+            b_mean = np.sum(b_values * weights[:, None], axis=0) / weight_sum
+            centered_a = a_values - a_mean
+            centered_b = b_values - b_mean
+            denominator = float(
+                np.sum(weights[:, None] * centered_b * centered_b)
+            )
+            if not math.isfinite(denominator) or denominator <= 1e-8:
+                return None
+            numerator = float(
+                np.sum(weights[:, None] * centered_b * centered_a)
+            )
+            solved_height = -numerator / denominator
+            min_height, max_height = self._human_height_scene_bounds(calib)
+            if (
+                not math.isfinite(solved_height)
+                or solved_height < 0.85 * float(min_height)
+                or solved_height > 1.15 * float(max_height)
+            ):
+                return None
+            height_was_clamped = bool(
+                solved_height < float(min_height)
+                or solved_height > float(max_height)
+            )
+            solved_height = min(
+                float(max_height),
+                max(float(min_height), float(solved_height)),
+            )
+            points = [
+                np.asarray(row["a"], dtype=np.float64)
+                + np.asarray(row["b"], dtype=np.float64) * solved_height
+                for row in active_rows
+            ]
+            center = np.sum(
+                np.stack(points) * weights[:, None],
+                axis=0,
+            ) / weight_sum
+            residuals = [
+                float(np.linalg.norm(point - center)) for point in points
+            ]
+            scatter = math.sqrt(
+                sum(
+                    float(weight) * float(residual) * float(residual)
+                    for weight, residual in zip(weights, residuals)
+                )
+                / weight_sum
+            )
+            return (
+                float(solved_height),
+                np.asarray(center, dtype=np.float64),
+                points,
+                float(scatter),
+                bool(height_was_clamped),
+                np.asarray(b_mean, dtype=np.float64),
+                residuals,
+            )
+
+        active_rows: List[Mapping[str, Any]] = list(rows)
+        solved = _solve(active_rows)
+        if solved is None:
+            return None
+        # A five-point solve can reject one isolated pose swap while retaining
+        # both anatomical bands. Three/four-point partial torsos fail closed.
+        residuals = solved[6]
+        if len(active_rows) >= 5 and residuals:
+            worst_index = int(np.argmax(np.asarray(residuals, dtype=np.float64)))
+            median_residual = float(np.median(np.asarray(residuals, dtype=np.float64)))
+            if residuals[worst_index] > max(
+                0.45 * scene_per_meter,
+                2.5 * max(0.05 * scene_per_meter, median_residual),
+            ):
+                reduced_rows = [
+                    row for index, row in enumerate(active_rows) if index != worst_index
+                ]
+                reduced = _solve(reduced_rows)
+                if reduced is not None:
+                    active_rows = reduced_rows
+                    solved = reduced
+
+        (
+            height_scene,
+            center_xz,
+            points_xz,
+            scatter_scene,
+            height_was_clamped,
+            mean_height_derivative,
+            _residuals,
+        ) = solved
+        if (
+            scatter_scene > 0.55 * scene_per_meter
+            or not np.all(np.isfinite(center_xz))
+        ):
+            return None
+
+        weights = np.asarray(
+            [float(row["weight"]) for row in active_rows],
+            dtype=np.float64,
+        )
+        weight_sum = float(np.sum(weights))
+        centered_points = np.stack(points_xz) - center_xz
+        scatter_covariance = (
+            centered_points.T @ (centered_points * weights[:, None])
+        ) / max(1e-9, weight_sum)
+        height_sigma_scene = (
+            0.12 if state is not None and state.height_ref_scene is not None else 0.22
+        ) * scene_per_meter
+        height_vector = (
+            np.asarray(mean_height_derivative, dtype=np.float64)
+            * float(height_sigma_scene)
+        )
+        covariance_xz = (
+            scatter_covariance
+            + np.outer(height_vector, height_vector)
+            + np.eye(2, dtype=np.float64) * (0.20 * scene_per_meter) ** 2
+        )
+        covariance = Matrix3(
+            values=(
+                float(covariance_xz[0, 0]),
+                0.0,
+                float(covariance_xz[0, 1]),
+                0.0,
+                float((0.20 * scene_per_meter) ** 2),
+                0.0,
+                float(covariance_xz[1, 0]),
+                0.0,
+                float(covariance_xz[1, 1]),
+            )
+        )
+        # A fifth independent plane adds redundancy but also exposes one more
+        # articulated/profile residual. Keep approximately the same bound on
+        # centroid uncertainty as the four-plane solve instead of applying the
+        # four-plane RMS cutoff verbatim to both sample counts.
+        strong_scatter_limit_m = 0.34 if len(active_rows) >= 5 else 0.30
+        strong_internal_proof = bool(
+            # Shoulders and hips provide only two anatomical height bands;
+            # four low-residual rays can therefore agree on a wrong range.
+            # The fifth (head) plane is the independent vertical baseline
+            # required for a one-callback cold seed. Four-plane and noisier
+            # five-plane solves remain available as weak typed evidence.
+            len(active_rows) >= 5
+            and not height_was_clamped
+            and scatter_scene
+            <= float(strong_scatter_limit_m) * scene_per_meter
+            and 1.0
+            <= float(height_scene) / scene_per_meter
+            <= 2.25
+        )
+        return (
+            np.asarray(
+                [
+                    float(center_xz[0]),
+                    float(calib.floor_y),
+                    float(center_xz[1]),
+                ],
+                dtype=np.float64,
+            ),
+            covariance,
+            float(height_scene) / scene_per_meter,
+            float(scatter_scene) / scene_per_meter,
+            int(len(active_rows)),
+            bool(strong_internal_proof),
+        )
+
     def _append_universal_world_candidates(
         self,
         candidates: List[Dict[str, Any]],
@@ -13904,8 +17005,16 @@ class _AnalyticsTelemetryProcessor:
                 flip_v=flip_v,
             )
             if floor_covariance is not None:
+                observed_ankle_contact = str(floor_anchor.source) in {
+                    "pose_ankle_floor",
+                    "pose_single_ankle_floor",
+                    "pose_ankle_support",
+                }
                 floor_support_state = (
-                    "unknown" if str(posture) in ("sitting", "lying") else "floor"
+                    "floor"
+                    if observed_ankle_contact
+                    or str(posture) not in ("sitting", "lying")
+                    else "unknown"
                 )
                 candidates.append(
                     {
@@ -13961,14 +17070,34 @@ class _AnalyticsTelemetryProcessor:
                 else (depth_result.valid_fraction if depth_result is not None else 0.0)
             )
             depth_support_fraction = max(0.0, min(1.0, depth_support_fraction))
-            depth_support_state = (
-                "floor"
-                if str(posture) in ("standing", "unknown")
-                and str(depth_observation.registration_status or "") in ("ok", "raw_passthrough")
-                and str(depth_result.anchor_source if depth_result is not None else "")
-                in ("lower_body_band", "pose_ankle_support")
-                else "unknown"
+            depth_anchor_source = str(
+                depth_result.anchor_source
+                if depth_result is not None
+                else ""
             )
+            depth_registration_supported = str(
+                depth_observation.registration_status or ""
+            ) in ("ok", "raw_passthrough")
+            depth_support_state = "unknown"
+            if (
+                str(posture) in ("standing", "unknown")
+                and depth_registration_supported
+                and depth_anchor_source
+                in ("lower_body_band", "pose_ankle_support")
+            ):
+                depth_support_state = "floor"
+            elif (
+                str(posture) == "sitting"
+                and depth_registration_supported
+                and depth_anchor_source
+                in ("torso_core", "pose_torso_support")
+                and str(person_anchor.source)
+                == "person_body_projection"
+            ):
+                # The exact metric body point has been projected vertically
+                # to the calibrated floor. It localizes the seated person's
+                # floor footprint without claiming visible foot contact.
+                depth_support_state = "seat"
             candidates.append(
                 {
                     "candidate_id": "registered_depth",
@@ -14335,6 +17464,8 @@ class _AnalyticsTelemetryProcessor:
         self,
         track: Dict[str, Any],
         measurement_set: WorldMeasurementSet,
+        *,
+        contact_basis_by_candidate: Optional[Mapping[str, str]] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[ResolvedGroundMeasurement]]:
         """Resolve one exact cohort and publish bounded diagnostics."""
 
@@ -14384,6 +17515,11 @@ class _AnalyticsTelemetryProcessor:
             candidate.candidate_id: candidate
             for candidate in measurement_set.hypotheses
         }.get(result.selected_candidate_id or "")
+        anatomical_basis_by_id = {
+            str(candidate_id): str(basis).strip()
+            for candidate_id, basis in (contact_basis_by_candidate or {}).items()
+            if str(candidate_id).strip() and str(basis).strip()
+        }
         candidates: List[Dict[str, Any]] = []
         diagnostic_by_id = {
             item.candidate_id: item for item in result.diagnostics
@@ -14400,7 +17536,10 @@ class _AnalyticsTelemetryProcessor:
                 "position": self._world_vector_payload(candidate.position),
                 "covariance": self._world_covariance_payload(candidate.covariance),
                 "anchor": str(candidate.anchor),
-                "contact_basis": str(candidate.anchor),
+                "contact_basis": anatomical_basis_by_id.get(
+                    str(candidate.candidate_id),
+                    str(candidate.anchor),
+                ),
                 "support_state": str(candidate.support_state),
                 "posture": str(candidate.posture),
                 "confidence": float(candidate.confidence),
@@ -14527,8 +17666,27 @@ class _AnalyticsTelemetryProcessor:
             float(result.disagreement_m) if result.disagreement_m is not None else None
         )
         if selected_hypothesis is not None:
-            track["world_resolver_contact_basis"] = str(selected_hypothesis.anchor)
+            track["world_resolver_contact_basis"] = anatomical_basis_by_id.get(
+                str(selected_hypothesis.candidate_id),
+                str(selected_hypothesis.anchor),
+            )
         return point, result
+
+    @staticmethod
+    def _person_ground_consensus_contact_basis(contact_basis: Optional[str]) -> Optional[str]:
+        """Keep ankle-pair strength while collapsing left/right visibility."""
+
+        basis = str(contact_basis or "").strip()
+        if not basis:
+            return None
+        if basis == "pose:ankle_pair":
+            return "pose_ankle_floor"
+        if basis in {"pose:left_ankle", "pose:right_ankle"}:
+            # PersonGroundState collapses this label and the pair label into one
+            # temporal family, but retains the exact label internally so only
+            # two consecutive pair observations earn the shorter cold seed.
+            return "pose_single_ankle_floor"
+        return basis
 
     def _predict_world_state(
         self,
@@ -14609,6 +17767,13 @@ class _AnalyticsTelemetryProcessor:
         force_accept: bool = False,
         contact_basis: Optional[str] = None,
         image_motion_supported: bool = False,
+        verified_reacquire_support: bool = False,
+        verified_first_output_pose_floor_seed: bool = False,
+        defer_weak_seed: bool = False,
+        media_pts_ns: Optional[int] = None,
+        display_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ] = None,
     ) -> np.ndarray:
         mx = float(measurement[0])
         mz = float(measurement[2])
@@ -14616,16 +17781,34 @@ class _AnalyticsTelemetryProcessor:
             return np.array([mx, float(floor_y), mz], dtype=np.float64)
 
         _ = (alpha, beta)
+        ground_config = self._human_ground_cfg
+        if defer_weak_seed:
+            # Preserve the same-basis candidate run without permitting a cold
+            # semantic seed on this row. A later detector-confirmed row uses
+            # the normal threshold and can finalize the accumulated run.
+            ground_config = replace(
+                ground_config,
+                reacquire_samples=max(
+                    1_000_000,
+                    int(ground_config.reacquire_samples),
+                ),
+            )
         return update_human_cv_filter(
             state,
             measurement=measurement,
             floor_y=float(floor_y),
             now_ts=float(now_ts),
             quality=str(quality or "good"),
-            config=self._human_ground_cfg,
+            config=ground_config,
             force_accept=bool(force_accept),
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
+            verified_reacquire_support=bool(verified_reacquire_support),
+            verified_first_output_pose_floor_seed=bool(
+                verified_first_output_pose_floor_seed
+            ),
+            media_pts_ns=media_pts_ns,
+            display_output=display_output,
         )
 
     def _update_track_world_state(
@@ -14642,6 +17825,13 @@ class _AnalyticsTelemetryProcessor:
         force_accept: bool = False,
         contact_basis: Optional[str] = None,
         image_motion_supported: bool = False,
+        verified_reacquire_support: bool = False,
+        verified_first_output_pose_floor_seed: bool = False,
+        defer_weak_seed: bool = False,
+        media_pts_ns: Optional[int] = None,
+        display_output: Optional[
+            Tuple[float, float, Optional[int], float, int]
+        ] = None,
     ) -> np.ndarray:
         """Record pre-filter evidence and apply the shared physical filter."""
         track["world_prefilter_measurement"] = [
@@ -14667,6 +17857,13 @@ class _AnalyticsTelemetryProcessor:
             force_accept=bool(force_accept),
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
+            verified_reacquire_support=bool(verified_reacquire_support),
+            verified_first_output_pose_floor_seed=bool(
+                verified_first_output_pose_floor_seed
+            ),
+            defer_weak_seed=bool(defer_weak_seed),
+            media_pts_ns=media_pts_ns,
+            display_output=display_output,
         )
         if state is not None:
             # A physical reject advances only the bounded process model.  The
@@ -14679,6 +17876,14 @@ class _AnalyticsTelemetryProcessor:
                     float(floor_y),
                     float(result[2]),
                 ]
+            else:
+                # Do not clear the inferred root merely because this callback
+                # found a metric point. World estimation runs faster than the
+                # ordered publication boundary, so CanonicalWorldService may
+                # never observe this row. The next queue-admitted output is
+                # reconciled at callback entry and is the sole authority that
+                # can end or retain the shared episode.
+                pass
             complete_source_admission(
                 state,
                 measurement_accepted=bool(state.measurement_accepted),
@@ -14743,6 +17948,246 @@ class _AnalyticsTelemetryProcessor:
         if isinstance(diagnostics, MutableMapping):
             diagnostics["source_continuity_match"] = bool(continuity_match)
         return bool(continuity_match)
+
+    @staticmethod
+    def _resolver_candidate_is_ground_footprint_supported(
+        candidate: Any,
+    ) -> bool:
+        """Return whether a typed hypothesis localizes a floor footprint.
+
+        ``floor`` means observed/registered ground support. ``seat`` and the
+        exact ``upright_body_plane`` pose-scale type are different semantic
+        proofs: current body observations projected along calibrated gravity
+        to the person's ground footprint. Keeping these typed alternatives
+        explicit prevents a torso or pelvis point from masquerading as visible
+        foot contact.
+        """
+
+        support_state = str(getattr(candidate, "support_state", "") or "")
+        if support_state == "floor":
+            return True
+        kind = str(getattr(candidate, "kind", "") or "")
+        anchor = str(getattr(candidate, "anchor", "") or "")
+        if (
+            support_state == "unknown"
+            and str(getattr(candidate, "posture", "") or "") == "standing"
+            and kind == "pose_scale"
+            and anchor == "upright_body_plane"
+        ):
+            return True
+        if (
+            support_state != "seat"
+            or str(getattr(candidate, "posture", "") or "") != "sitting"
+        ):
+            return False
+        return bool(
+            (kind == "pose_scale" and anchor == "seated_torso_plane")
+            or (
+                kind == "registered_depth"
+                and anchor == "person_body_projection"
+            )
+        )
+
+    def _weak_resolver_measurement_is_ground_supported(
+        self,
+        resolved: ResolvedGroundMeasurement,
+        measurement_set: WorldMeasurementSet,
+        *,
+        state: Optional[_WorldAnchorState] = None,
+        image_motion_supported: bool = False,
+        depth_corroborated: bool = False,
+        verified_first_output_contact: bool = False,
+    ) -> bool:
+        """Return whether weak current evidence may enter temporal consensus.
+
+        Weak describes resolver confidence, not malformed geometry. A current
+        floor/depth ground-footprint hypothesis can be weak because a sparse
+        Scene Prior disagrees with it or because only one evidence branch is
+        present. A typed seated body-to-floor projection is likewise allowed
+        only through the same temporal/physical consensus. Untyped gravity or
+        body-height reconstructions remain diagnostic-only.
+        """
+
+        if str(resolved.quality) != "weak" or resolved.status != "measured":
+            return False
+        selected = next(
+            (
+                candidate
+                for candidate in measurement_set.hypotheses
+                if candidate.candidate_id == resolved.selected_candidate_id
+            ),
+            None,
+        )
+        if selected is None:
+            return False
+        kind = str(selected.kind)
+        anchor = str(selected.anchor or "").strip().lower()
+        seated_projection = bool(
+            self._resolver_candidate_is_ground_footprint_supported(selected)
+            and str(selected.support_state) == "seat"
+        )
+        if not self._resolver_candidate_is_ground_footprint_supported(selected):
+            return False
+        if (
+            kind not in ("floor_ray", "registered_depth", "pose_scale")
+            or float(selected.confidence)
+            < (0.60 if seated_projection else 0.70)
+            or float(selected.support_score) < 0.60
+            or float(selected.source_reliability)
+            < (0.78 if seated_projection else 0.80)
+            or not anchor
+        ):
+            return False
+
+        if seated_projection:
+            return bool(
+                str(selected.posture) == "sitting"
+                and (
+                    (
+                        kind == "pose_scale"
+                        and anchor == "seated_torso_plane"
+                    )
+                    or (
+                        kind == "registered_depth"
+                        and anchor == "person_body_projection"
+                    )
+                )
+            )
+
+        upright_body_projection = bool(
+            kind == "pose_scale"
+            and anchor == "upright_body_plane"
+            and str(selected.support_state) == "unknown"
+            and str(selected.posture) == "standing"
+        )
+        if upright_body_projection:
+            return bool(
+                str(resolved.reason)
+                != "selected_hypothesis_strongly_conflicts_with_pcf"
+                and float(selected.confidence) >= 0.68
+                and float(selected.support_score) >= 0.74
+                and float(selected.source_reliability) >= 0.82
+            )
+
+        trusted_lifecycle = bool(
+            state is not None and state.last_good_world is not None
+        )
+        trusted_metric_output = bool(
+            trusted_lifecycle
+            and state is not None
+            and state.last_output_world_x is not None
+            and state.last_output_world_z is not None
+        )
+        strong_pcf_conflict = bool(
+            str(resolved.reason)
+            == "selected_hypothesis_strongly_conflicts_with_pcf"
+        )
+        observed_ankle_contact = anchor in {
+            "pose_ankle_floor",
+            "pose_single_ankle_floor",
+            "pose_ankle_support",
+        }
+        registered_ground_depth = bool(
+            kind == "registered_depth" and anchor == "person_mask_floor"
+        )
+        if observed_ankle_contact or registered_ground_depth:
+            # A mirror can supply a persistent, anatomically plausible ankle
+            # ray even though no person occupies the corresponding floor.  A
+            # strongly contradictory, revision-bound Scene Prior therefore
+            # blocks only a *cold* ankle-ray bootstrap.  Independent current
+            # registered depth can still establish the lifecycle, and a real
+            # lifecycle with prior metric truth may subsequently override a
+            # sparse or stale prior through the normal physical filter.
+            return bool(
+                registered_ground_depth
+                or trusted_metric_output
+                or bool(verified_first_output_contact)
+                or not strong_pcf_conflict
+            )
+
+        corroborated_leg_floor = bool(
+            kind == "floor_ray"
+            and anchor == "pose_leg_floor"
+            and depth_corroborated
+        )
+
+        # A weak bbox/leg-extension ray can be geometrically consistent while
+        # belonging to a static photo or reflection. Admit it only when the
+        # same physical lifecycle already owns a trusted world point, or when
+        # exact-cohort image motion independently corroborates the candidate.
+        return bool(
+            str(selected.posture) not in ("sitting", "lying")
+            and (
+                trusted_lifecycle
+                or bool(image_motion_supported)
+                or corroborated_leg_floor
+            )
+        )
+
+    @staticmethod
+    def _first_output_ankle_contact_is_tight(
+        track: Mapping[str, Any],
+    ) -> bool:
+        """Corroborate one cold ankle sample against the detector ground edge.
+
+        A mirror can sustain two plausible ankle rays, so temporal agreement
+        alone may not override a strong revision-bound Scene Prior conflict.
+        Every sample in the exceptional proof must agree tightly with the
+        independently detected silhouette bottom and have enough vertical ray
+        incidence to avoid the ill-conditioned near-horizon regime. This
+        remains camera agnostic and does not turn the bbox into a second
+        position authority; it only corroborates the pose-derived floor ray.
+        """
+
+        try:
+            contact_gap_ratio = abs(
+                float(track.get("world_floor_contact_gap_ratio"))
+            )
+            contact_range_delta_m = abs(
+                float(track.get("world_floor_contact_range_delta_m"))
+            )
+            floor_incidence_sin = float(
+                track.get("world_floor_incidence_sin")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            track.get("pose_present") is True
+            and track.get("world_floor_admitted") is True
+            and track.get("world_floor_contact_plausible") is True
+            and math.isfinite(contact_gap_ratio)
+            and contact_gap_ratio <= 0.05
+            and math.isfinite(contact_range_delta_m)
+            and contact_range_delta_m <= 0.50
+            and math.isfinite(floor_incidence_sin)
+            and floor_incidence_sin >= 0.20
+        )
+
+    @staticmethod
+    def _cold_floor_ray_incidence_is_adequate(
+        track: Mapping[str, Any],
+    ) -> bool:
+        """Reject ill-conditioned floor rays before first metric authority.
+
+        PCF is deliberately neutral outside observed/authored coverage, so it
+        cannot always identify a mirror ray as contradictory. A shallow ray is
+        also intrinsically unstable: a few pixels of ankle error become meters
+        on the floor. Require the same camera-agnostic incidence floor used by
+        the exceptional exact-ankle proof before any cold ``floor_ray`` can
+        create the lifecycle's first queue-visible metric coordinate.
+        """
+
+        try:
+            floor_incidence_sin = float(
+                track.get("world_floor_incidence_sin")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            track.get("world_floor_admitted") is True
+            and math.isfinite(floor_incidence_sin)
+            and floor_incidence_sin >= 0.20
+        )
 
     def _world_fusion_weights(
         self,
@@ -14816,8 +18261,9 @@ class _AnalyticsTelemetryProcessor:
         track: Dict[str, Any],
         anchor_range_m: Optional[float] = None,
         bbox_bottom_range_m: Optional[float] = None,
+        below_silhouette_corroborated: bool = False,
     ) -> bool:
-        """Reject a near-horizon pose contact above its detector silhouette.
+        """Reject a floor contact that conflicts with its detector silhouette.
 
         A floor ray from a low-incidence pixel is extremely sensitive to a
         small vertical anchor error.  At the far edge of the Family Room
@@ -14827,10 +18273,12 @@ class _AnalyticsTelemetryProcessor:
         estimator-side plausibility gate: it does not clamp or consult the
         presentation floorplan.
 
-        Missing image geometry is left to the existing ray/range checks.  A
-        bbox gap is only rejected when the ray is also near the horizon, so
-        modest detector padding or lower-body occlusion is not turned into a
-        blanket loss of metric observations.
+        Missing image geometry is left to the existing ray/range checks. A
+        contact materially *below* the detector silhouette is geometrically
+        inconsistent at any incidence and is rejected directly. A contact
+        above the bottom is rejected only when the ray is also near the
+        horizon, so modest detector padding or lower-body occlusion is not
+        turned into a blanket loss of metric observations.
         """
 
         track["world_floor_contact_plausible"] = True
@@ -14899,14 +18347,27 @@ class _AnalyticsTelemetryProcessor:
             and float(range_delta_m)
             > float(track.get("world_floor_contact_range_tolerance_m", math.inf))
         )
-        plausible = not (near_horizon and (implausible_gap or implausible_range))
+        below_silhouette_tolerance_px = max(8.0, 0.12 * float(height))
+        contact_below_silhouette = bool(
+            float(gap_px) < -float(below_silhouette_tolerance_px)
+            and not bool(below_silhouette_corroborated)
+        )
+        plausible = bool(
+            not contact_below_silhouette
+            and not (near_horizon and (implausible_gap or implausible_range))
+        )
         track["world_floor_contact_plausible"] = bool(plausible)
         if not plausible:
-            track["world_floor_contact_rejection_reason"] = (
-                "bbox_contact_range_disagreement_near_horizon"
-                if implausible_range and not implausible_gap
-                else "bbox_contact_gap_near_horizon"
-            )
+            if contact_below_silhouette:
+                track["world_floor_contact_rejection_reason"] = (
+                    "floor_contact_below_detector_silhouette"
+                )
+            else:
+                track["world_floor_contact_rejection_reason"] = (
+                    "bbox_contact_range_disagreement_near_horizon"
+                    if implausible_range and not implausible_gap
+                    else "bbox_contact_gap_near_horizon"
+                )
         return bool(plausible)
 
     def _admit_floor_ray_range(
@@ -14920,6 +18381,7 @@ class _AnalyticsTelemetryProcessor:
         bbox: Optional[Sequence[float]] = None,
         flip_u: bool = False,
         flip_v: bool = False,
+        below_silhouette_corroborated: bool = False,
     ) -> bool:
         policy = self.world_fusion_policy
         if bool(getattr(self, "_world_resolver_enabled", False)):
@@ -14933,12 +18395,39 @@ class _AnalyticsTelemetryProcessor:
         admitted = False
         rejection_reason = "floor_ray_geometry_invalid"
         try:
-            _rotation, camera_world = parse_extrinsics(calib.extrinsics_col_major)
             unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
             if not math.isfinite(unit_scale) or unit_scale <= 0.0:
                 unit_scale = 1.0
-            camera_world = np.asarray(camera_world, dtype=np.float64) * unit_scale
+            projection_extrinsics = calib.extrinsics_col_major
             candidate = np.asarray(floor_candidate, dtype=np.float64)
+            if (
+                anchor_uv is not None
+                and len(anchor_uv) >= 2
+                and getattr(
+                    calib,
+                    "calibration_extrinsics_col_major",
+                    None,
+                )
+                is not None
+            ):
+                physical_candidate = self._project_pixel_to_localization_observation(
+                    calib,
+                    float(anchor_uv[0]),
+                    float(anchor_uv[1]),
+                    depth_m=None,
+                    flip_u=bool(flip_u),
+                    flip_v=bool(flip_v),
+                )
+                if physical_candidate is not None:
+                    candidate = np.asarray(
+                        physical_candidate,
+                        dtype=np.float64,
+                    )
+                    projection_extrinsics = (
+                        self._localization_projection_extrinsics(calib)
+                    )
+            _rotation, camera_world = parse_extrinsics(projection_extrinsics)
+            camera_world = np.asarray(camera_world, dtype=np.float64) * unit_scale
             delta = candidate - camera_world
             horizontal_range_m = float(math.hypot(float(delta[0]), float(delta[2])))
             ray_range_m = float(np.linalg.norm(delta))
@@ -14955,10 +18444,11 @@ class _AnalyticsTelemetryProcessor:
                     bbox_left, bbox_top, bbox_width, bbox_height = (
                         float(value) for value in bbox[:4]
                     )
-                    bbox_bottom_hit = self._project_pixel_to_floor_world(
+                    bbox_bottom_hit = self._project_pixel_to_localization_observation(
                         calib,
                         bbox_left + 0.5 * bbox_width,
                         bbox_top + bbox_height,
+                        depth_m=None,
                         flip_u=bool(flip_u),
                         flip_v=bool(flip_v),
                     )
@@ -14993,6 +18483,9 @@ class _AnalyticsTelemetryProcessor:
                 track=track,
                 anchor_range_m=horizontal_range_m,
                 bbox_bottom_range_m=bbox_bottom_range_m,
+                below_silhouette_corroborated=bool(
+                    below_silhouette_corroborated
+                ),
             )
             admitted = bool(range_admitted and contact_admitted)
             if not range_admitted:
@@ -15089,10 +18582,24 @@ class _AnalyticsTelemetryProcessor:
         flip_v: bool,
     ) -> None:
         try:
+            projection_point = np.asarray(world_point, dtype=np.float64)
+            projection_extrinsics = calib.extrinsics_col_major
+            if getattr(calib, "target_from_calibration_col_major", None) is not None:
+                source_floor_point = (
+                    self._localization_floor_from_target_ground_point(
+                        calib,
+                        projection_point,
+                    )
+                )
+                if source_floor_point is not None:
+                    projection_point = source_floor_point
+                    projection_extrinsics = (
+                        self._localization_projection_extrinsics(calib)
+                    )
             uv = project_world_to_image(
-                world_point,
+                projection_point,
                 calib.intrinsics,
-                calib.extrinsics_col_major,
+                projection_extrinsics,
                 tuple(int(x) for x in calib.image_size),
                 unit_scale=1.0,
                 flip_u=bool(flip_u),
@@ -15119,6 +18626,8 @@ class _AnalyticsTelemetryProcessor:
         flip_u: bool,
         flip_v: bool,
         track: Dict[str, Any],
+        motion_anchor_uv: Optional[Tuple[float, float]] = None,
+        motion_basis: Optional[str] = None,
     ) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
         """Project one bounded bbox-transported foot as weak observation.
 
@@ -15132,17 +18641,35 @@ class _AnalyticsTelemetryProcessor:
 
         if state is None or state.last_good_world is None:
             return None
-        transported = transport_accepted_image_foot(
+        pose_transport_diagnostics: Dict[str, Any] = {}
+        transported = transport_accepted_image_foot_from_pose(
             state,
+            motion_anchor_uv=motion_anchor_uv,
+            motion_basis=motion_basis,
             bbox=bbox_project,
             now_ts=float(now_ts),
             lifecycle_generation=lifecycle_generation,
-            ttl_s=float(self._world_anchor_hold_ttl_s),
             config=self._human_ground_cfg,
+            rejection_diagnostics=pose_transport_diagnostics,
         )
         if transported is None:
+            hard_rejection = str(
+                pose_transport_diagnostics.get("hard_rejection") or ""
+            ).strip()
+            if hard_rejection:
+                track["world_projective_rejection_reason"] = hard_rejection
+                return None
+            transported = transport_accepted_image_foot(
+                state,
+                bbox=bbox_project,
+                now_ts=float(now_ts),
+                lifecycle_generation=lifecycle_generation,
+                ttl_s=float(self._world_anchor_hold_ttl_s),
+                config=self._human_ground_cfg,
+            )
+        if transported is None:
             return None
-        u, v, age_s, center_step_px, scale_ratio, transport_name = transported
+        u, v, age_s, reference_step_px, scale_ratio, transport_name = transported
         try:
             width, height = (int(calib.image_size[0]), int(calib.image_size[1]))
         except Exception:
@@ -15175,7 +18702,19 @@ class _AnalyticsTelemetryProcessor:
         ):
             return None
         try:
-            prior = np.asarray(state.last_good_world, dtype=np.float64)
+            pose_origin = state.last_accepted_pose_projective_origin
+            using_pose_origin = bool(
+                str(transport_name) == "pose_torso_translation"
+                and pose_origin is not None
+            )
+            matched_image_world = (
+                pose_origin.world
+                if using_pose_origin and pose_origin is not None
+                else state.last_accepted_image_world
+            )
+            if matched_image_world is None:
+                return None
+            prior = np.asarray(matched_image_world, dtype=np.float64)
             world_delta_m = math.hypot(
                 float(candidate[0]) - float(prior[0]),
                 float(candidate[2]) - float(prior[2]),
@@ -15191,16 +18730,142 @@ class _AnalyticsTelemetryProcessor:
         provenance = {
             "type": "bbox_affine_floor_projection",
             "non_authoritative": True,
-            "origin": "last_accepted_image_foot",
+            "origin": (
+                "last_accepted_pose_projective_origin"
+                if using_pose_origin
+                else "last_accepted_image_foot"
+            ),
             "transport": str(transport_name),
             "age_s": float(age_s),
-            "bbox_center_step_px": float(center_step_px),
+            "bbox_reference_step_px": float(reference_step_px),
             "bbox_scale_ratio": float(scale_ratio),
             "image_foot": [float(u), float(v)],
+            "projective_origin_world": [
+                float(prior[0]),
+                float(prior[1]),
+                float(prior[2]),
+            ],
+            "process_observation": [
+                float(candidate[0]),
+                float(candidate[1]),
+                float(candidate[2]),
+            ],
             "world_delta_m": float(world_delta_m),
             "world_delta_limit_m": float(allowed_world_delta_m),
         }
         return candidate, provenance
+
+    @staticmethod
+    def _recent_process_bridge_is_current(
+        state: Optional[_WorldAnchorState],
+        *,
+        now_ts: float,
+        ttl_s: float,
+    ) -> bool:
+        """Keep one immutable short projective episode current.
+
+        Projective integration stamps a fixed origin while leaving
+        ``last_good_ts`` at the last metric observation. Bounded CV descendants
+        and exact output holds may advance only the process timestamp; neither
+        may renew the origin. Canonical service admission remains authoritative
+        and independently enforces the same fixed 405 ms root deadline.
+        """
+
+        if state is None:
+            return False
+        try:
+            current_ts = float(now_ts)
+            filtered_ts = float(state.filtered_ts)
+            projective_origin_ts = float(state.projective_bridge_origin_ts)
+            projective_process_ts = float(state.projective_bridge_process_ts)
+            last_good_ts = float(state.last_good_ts)
+            max_age_s = max(0.0, float(ttl_s))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not all(
+            math.isfinite(value)
+            for value in (
+                current_ts,
+                filtered_ts,
+                projective_origin_ts,
+                projective_process_ts,
+                last_good_ts,
+            )
+        ):
+            return False
+        process_age_s = current_ts - filtered_ts
+        origin_age_s = current_ts - projective_origin_ts
+        return bool(
+            filtered_ts > last_good_ts
+            and abs(filtered_ts - projective_process_ts) <= 1e-6
+            and process_age_s > 0.0
+            and origin_age_s > 0.0
+            and _AnalyticsTelemetryProcessor._hold_age_is_current(
+                process_age_s,
+                ttl_s=max_age_s,
+            )
+            and _AnalyticsTelemetryProcessor._hold_age_is_current(
+                origin_age_s,
+                ttl_s=max_age_s,
+            )
+        )
+
+    @staticmethod
+    def _hold_age_is_current(hold_age_s: float, *, ttl_s: float) -> bool:
+        """Apply one source-frame cadence tolerance to a fixed metric TTL."""
+
+        try:
+            age_s = float(hold_age_s)
+            limit_s = max(0.0, float(ttl_s))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not (math.isfinite(age_s) and math.isfinite(limit_s)):
+            return False
+        # Decimal replay/media-clock conversion can put a nominal 0.40s row
+        # past the boundary by one or two milliseconds. A fixed 5ms numeric
+        # tolerance covers that clock jitter without assuming camera cadence,
+        # renewing ``last_good_ts``, or admitting the following source row.
+        cadence_epsilon_s = 0.005
+        return bool(0.0 <= age_s <= limit_s + cadence_epsilon_s)
+
+    @staticmethod
+    def _bbox_floor_candidate_has_resolved_silhouette(
+        *,
+        bbox_width_px: float,
+        bbox_height_px: float,
+        image_size: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Gate a bbox floor hypothesis by resolution-normalized geometry.
+
+        The former 48-pixel cutoff encoded the 1080p calibration raster and
+        became either too permissive or too strict at another resolution. Use
+        the same 48/1080 silhouette fraction on every calibrated raster while
+        retaining the upright-person aspect gate. Missing raster identity
+        falls back to the historical 1080p scale instead of guessing a new
+        camera-specific threshold.
+        """
+
+        try:
+            width_px = float(bbox_width_px)
+            height_px = float(bbox_height_px)
+            image_height_px = (
+                float(image_size[1])
+                if image_size is not None and len(image_size) >= 2
+                else 1080.0
+            )
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+        if not all(
+            math.isfinite(value)
+            for value in (width_px, height_px, image_height_px)
+        ):
+            return False
+        if width_px <= 0.0 or height_px <= 0.0 or image_height_px <= 0.0:
+            return False
+        return bool(
+            height_px / image_height_px >= 48.0 / 1080.0
+            and width_px / height_px <= 0.85
+        )
 
     def _refine_seeded_world_with_ground_state(
         self,
@@ -15229,6 +18894,10 @@ class _AnalyticsTelemetryProcessor:
         if not (math.isfinite(mx) and math.isfinite(my) and math.isfinite(mz)):
             self._invalidate_world_track(track, "seeded_world_nonfinite")
             return
+        # A pre-seeded producer does not own Noesis process provenance. Rebuild
+        # any continuation proof only after the shared filter and final output
+        # gate have selected the exact emitted coordinate below.
+        track.pop("world_prediction_provenance", None)
 
         try:
             calib = self._world_calibration_snapshot(sensor_id, camera_id)
@@ -15259,6 +18928,34 @@ class _AnalyticsTelemetryProcessor:
                 self._invalidate_world_track(track, "world_frame_mismatch")
                 return
 
+            output_watermark_key = self._world_output_watermark_key(
+                sensor_id,
+                track,
+                world_frame_id=world_frame_id,
+                world_frame_revision=world_frame_revision,
+                world_transform_sha256=world_transform_sha256,
+                camera_calibration_sha256=getattr(
+                    calib,
+                    "camera_calibration_sha256",
+                    None,
+                ),
+            )
+            output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            metric_output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            kinematic_output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            kinematic_bbox_reference_at_entry: Optional[
+                Tuple[float, float, float, float]
+            ] = None
+            display_recovery_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+
             now_ts = (
                 float(world_now_ts)
                 if world_now_ts is not None
@@ -15284,6 +18981,13 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if restored:
                     track["world_state_continuity"] = "restored_short_ghost"
+                    state.post_ghost_position_support_required = True
+                    state.projective_bridge_origin_ts = -1.0
+                    state.projective_bridge_process_ts = -1.0
+                    state.projective_bridge_rows_remaining = 0
+                    self._clear_world_output_projective_root(
+                        output_watermark_key
+                    )
                 state.ts = now_ts
                 if bind_world_frame(
                     state,
@@ -15296,6 +19000,41 @@ class _AnalyticsTelemetryProcessor:
                     # seeded observation inherit the prior world's hold.
                     track["world_state_continuity"] = "reset_world_frame"
                     state.ts = now_ts
+                if self._restore_world_output_watermark(
+                    state,
+                    output_watermark_key,
+                ):
+                    track.setdefault(
+                        "world_state_continuity",
+                        "restored_lifecycle_output",
+                    )
+                output_reference_at_entry = self._world_output_reference(
+                    output_watermark_key
+                )
+                metric_output_reference_at_entry = self._world_output_reference(
+                    output_watermark_key,
+                    metric_only=True,
+                )
+                kinematic_output_reference_at_entry = self._world_output_reference(
+                    output_watermark_key,
+                    kinematic_only=True,
+                )
+                if output_reference_at_entry is None:
+                    # Seeded SDK rows share the same ordered-output authority
+                    # as the universal resolver path. A rate-suppressed
+                    # callback may have populated the process-local mirrors,
+                    # but it did not create a tracking/BEV coordinate.
+                    self._clear_uncommitted_world_output_state(
+                        state,
+                        output_watermark_key,
+                    )
+
+            display_recovery_reference_at_entry = (
+                self._world_output_recovery_display_reference(
+                    output_reference_at_entry,
+                    kinematic_output_reference_at_entry,
+                )
+            )
 
             metric_candidate = np.array([mx, float(calib.floor_y), mz], dtype=np.float64)
             if not self._admit_world_observation_range(
@@ -15315,14 +19054,22 @@ class _AnalyticsTelemetryProcessor:
                     track.pop("world", None)
                     track.pop("world_source", None)
                     return
-                mark_world_measurement_unavailable(state, reason=rejection_reason)
-                hit = advance_human_cv_prediction(
+                mark_world_measurement_unavailable(
                     state,
-                    floor_y=float(calib.floor_y),
+                    reason=rejection_reason,
                     now_ts=now_ts,
                     config=self._human_ground_cfg,
-                    reason=rejection_reason,
                 )
+                if state.post_ghost_position_support_required:
+                    hit = None
+                else:
+                    hit = advance_human_cv_prediction(
+                        state,
+                        floor_y=float(calib.floor_y),
+                        now_ts=now_ts,
+                        config=self._human_ground_cfg,
+                        reason=rejection_reason,
+                    )
             else:
                 hit = self._update_track_world_state(
                     track,
@@ -15333,9 +19080,33 @@ class _AnalyticsTelemetryProcessor:
                     alpha=float(self._world_smooth_alpha_good),
                     beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
                     quality="good",
+                    media_pts_ns=self._valid_world_media_pts_ns(
+                        track.get("media_pts_ns")
+                    ),
+                    display_output=display_recovery_reference_at_entry,
                 )
+                if state.measurement_accepted:
+                    state.post_ghost_position_support_required = False
 
+            bounded_process_origin: Optional[str] = None
             if state is not None and not state.measurement_accepted:
+                if state.post_ghost_position_support_required:
+                    reason = (
+                        "restored_short_ghost_requires_current_position_evidence"
+                    )
+                    mark_world_measurement_unavailable(
+                        state,
+                        reason=reason,
+                        now_ts=now_ts,
+                        config=self._human_ground_cfg,
+                    )
+                    state.trail_append_allowed = False
+                    track["world_estimator_evaluated"] = True
+                    self._invalidate_world_track(track, reason)
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
+                    return
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
                 if (
                     state.last_good_world is not None
@@ -15364,10 +19135,12 @@ class _AnalyticsTelemetryProcessor:
                             float(pred_z),
                         ]
                         world_source_label = "cv_prediction"
+                        bounded_process_origin = "last_metric_process"
                     else:
                         hit = np.asarray(state.last_good_world, dtype=np.float64)
                         world_source_label = "anchor_hold"
-                    track["world_quality"] = "estimated"
+                        bounded_process_origin = "last_metric_process"
+                    track["world_quality"] = "held"
                     track["world_quality_reason"] = str(
                         state.measurement_rejection_reason or "physical_measurement_rejected"
                     )
@@ -15434,6 +19207,8 @@ class _AnalyticsTelemetryProcessor:
                     mark_world_measurement_unavailable(
                         state,
                         reason=rejection_reason,
+                        now_ts=now_ts,
+                        config=self._human_ground_cfg,
                     )
                     state.trail_append_allowed = False
                 track["world_estimator_evaluated"] = True
@@ -15443,6 +19218,113 @@ class _AnalyticsTelemetryProcessor:
                         if value is not None:
                             track[key] = value
                 return
+
+            if state is not None:
+                output_candidate = np.asarray(hit, dtype=np.float64).copy()
+                hit, output_continuous = admit_human_ground_output(
+                    state,
+                    candidate=output_candidate,
+                    floor_y=float(calib.floor_y),
+                    now_ts=float(now_ts),
+                    media_pts_ns=track.get("media_pts_ns", 0),
+                    config=self._human_ground_cfg,
+                    allow_segment_break=bool(
+                        world_source_label not in ("anchor_hold", "cv_prediction")
+                        and state.measurement_accepted
+                    ),
+                    prior_output=output_reference_at_entry,
+                    ignore_uncommitted_state_output=bool(
+                        output_reference_at_entry is None
+                    ),
+                )
+                if not output_continuous:
+                    world_source_label = "anchor_hold"
+                    track["world_quality"] = "held"
+                    track["world_quality_reason"] = str(
+                        state.measurement_rejection_reason
+                        or "physical_output_continuity_exceeded"
+                    )
+                    track["world_filter_prediction"] = [
+                        float(hit[0]),
+                        float(calib.floor_y),
+                        float(hit[2]),
+                    ]
+                    bounded_provenance = (
+                        self._bounded_process_output_provenance(
+                            track,
+                            provenance_type="bounded_output_hold",
+                            provenance_origin="last_published_output",
+                            reason=str(track["world_quality_reason"]),
+                            prior_output=output_reference_at_entry,
+                            metric_output=metric_output_reference_at_entry,
+                            process_observation=output_candidate,
+                            emitted_point=np.asarray(hit, dtype=np.float64),
+                            output_continuous=False,
+                            emitted_trail_segment_id=int(
+                                state.last_output_trail_segment_id
+                            ),
+                            world_frame_id=str(
+                                world_frame_id or self._world_frame
+                            ),
+                            world_frame_revision=world_frame_revision,
+                            world_transform_sha256=world_transform_sha256,
+                        )
+                    )
+                elif world_source_label in ("anchor_hold", "cv_prediction"):
+                    track["world_quality"] = "held"
+                    track["world_filter_prediction"] = [
+                        float(hit[0]),
+                        float(calib.floor_y),
+                        float(hit[2]),
+                    ]
+                    bounded_provenance = (
+                        self._bounded_process_output_provenance(
+                            track,
+                            provenance_type="bounded_cv_process",
+                            provenance_origin=str(
+                                bounded_process_origin or "last_metric_process"
+                            ),
+                            reason=str(
+                                track.get("world_quality_reason")
+                                or state.measurement_rejection_reason
+                                or "physical_measurement_rejected"
+                            ),
+                            prior_output=output_reference_at_entry,
+                            metric_output=metric_output_reference_at_entry,
+                            process_observation=output_candidate,
+                            emitted_point=np.asarray(hit, dtype=np.float64),
+                            output_continuous=True,
+                            emitted_trail_segment_id=int(
+                                state.last_output_trail_segment_id
+                            ),
+                            world_frame_id=str(
+                                world_frame_id or self._world_frame
+                            ),
+                            world_frame_revision=world_frame_revision,
+                            world_transform_sha256=world_transform_sha256,
+                        )
+                    )
+                else:
+                    bounded_provenance = None
+                if bounded_provenance is not None:
+                    track["world_prediction_provenance"] = bounded_provenance
+                elif world_source_label in ("anchor_hold", "cv_prediction"):
+                    state.trail_append_allowed = False
+                    self._clear_uncommitted_world_output_state(
+                        state,
+                        output_watermark_key,
+                    )
+                    track["world_estimator_evaluated"] = True
+                    self._invalidate_world_track(
+                        track,
+                        "canonical_continuity_provenance_unavailable",
+                    )
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
+                    return
+                else:
+                    track.pop("world_prediction_provenance", None)
 
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
             # V3DT already publishes ``image_base`` from the opposite cuboid
@@ -15469,15 +19351,39 @@ class _AnalyticsTelemetryProcessor:
                 track["world_transform_sha256"] = str(world_transform_sha256)
             else:
                 track.pop("world_transform_sha256", None)
+            camera_calibration_sha256 = str(
+                getattr(calib, "camera_calibration_sha256", None) or ""
+            ).strip()
+            if camera_calibration_sha256:
+                track["world_calibration_sha256"] = camera_calibration_sha256
+            else:
+                track.pop("world_calibration_sha256", None)
             track["world_source"] = str(world_source_label)
             if state is not None:
                 for key, value in state.as_public_fields().items():
                     if value is not None:
                         track[key] = value
+                if world_source_label in ("anchor_hold", "cv_prediction"):
+                    track["trail_segment_id"] = int(
+                        state.last_output_trail_segment_id
+                    )
+                    track["trail_break_required"] = False
                 if world_source_label not in ("anchor_hold", "cv_prediction"):
                     state.last_good_world = (wx, wy, wz)
                     state.last_good_ts = now_ts
                     state.ts = now_ts
+            if (
+                metric_output_reference_at_entry is None
+                and track.get("world_valid") is True
+                and world_source_label
+                not in (
+                    "anchor_hold",
+                    "cv_prediction",
+                    "image_motion_prediction",
+                )
+                and (state is None or bool(state.measurement_accepted))
+            ):
+                track["_world_force_first_metric_publication"] = True
         except Exception:
             logger.debug("Seeded world refinement failed", exc_info=True)
             self._invalidate_world_track(track, "world_refinement_failed")
@@ -15676,9 +19582,33 @@ class _AnalyticsTelemetryProcessor:
                 world_frame_id=world_frame_id,
                 world_frame_revision=world_frame_revision,
                 world_transform_sha256=world_transform_sha256,
+                camera_calibration_sha256=getattr(
+                    calib,
+                    "camera_calibration_sha256",
+                    None,
+                ),
             )
             self._maybe_prune_world_state(now_ts)
             state: Optional[_WorldAnchorState] = None
+            output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            metric_output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            kinematic_output_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            kinematic_bbox_reference_at_entry: Optional[
+                Tuple[float, float, float, float]
+            ] = None
+            display_recovery_reference_at_entry: Optional[
+                Tuple[float, float, Optional[int], float, int]
+            ] = None
+            output_reference_committed_at_entry = False
+            output_commit_provenance_at_entry: Optional[
+                Tuple[str, Optional[str]]
+            ] = None
             if world_key is not None:
                 state, restored = self._world_state_for_observation(
                     world_key,
@@ -15692,6 +19622,13 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if restored:
                     track["world_state_continuity"] = "restored_short_ghost"
+                    state.post_ghost_position_support_required = True
+                    state.projective_bridge_origin_ts = -1.0
+                    state.projective_bridge_process_ts = -1.0
+                    state.projective_bridge_rows_remaining = 0
+                    self._clear_world_output_projective_root(
+                        output_watermark_key
+                    )
                 state.ts = float(now_ts)
                 if bind_world_frame(
                     state,
@@ -15712,16 +19649,119 @@ class _AnalyticsTelemetryProcessor:
                         "world_state_continuity",
                         "restored_lifecycle_output",
                     )
+                published_output_reference = self._world_output_reference(
+                    output_watermark_key
+                )
+                if published_output_reference is not None:
+                    output_reference_at_entry = published_output_reference
+                    output_reference_committed_at_entry = True
+                    output_commit_provenance_at_entry = (
+                        self._world_output_commit_provenance(
+                            output_watermark_key
+                        )
+                    )
+                    self._reconcile_inferred_ground_with_committed_output(
+                        state,
+                        output_commit_provenance_at_entry,
+                        committed_media_pts_ns=(
+                            output_reference_at_entry[2]
+                            if output_reference_at_entry is not None
+                            else None
+                        ),
+                    )
+                    metric_output_reference_at_entry = (
+                        self._world_output_reference(
+                            output_watermark_key,
+                            metric_only=True,
+                        )
+                    )
+                    kinematic_output_reference_at_entry = (
+                        self._world_output_reference(
+                            output_watermark_key,
+                            kinematic_only=True,
+                        )
+                    )
+                    kinematic_bbox_reference_at_entry = (
+                        self._world_output_kinematic_bbox_reference(
+                            output_watermark_key
+                        )
+                    )
+                else:
+                    # Final admission on a rate-suppressed callback may have
+                    # populated the process-local ``last_output_*`` mirrors,
+                    # but only the ordered queue watermark is display/world
+                    # authority. Discard that unpublished mirror instead of
+                    # using it as the first point's speed/provenance origin.
+                    self._clear_uncommitted_world_output_state(
+                        state,
+                        output_watermark_key,
+                    )
 
+            display_recovery_reference_at_entry = (
+                self._world_output_recovery_display_reference(
+                    output_reference_at_entry,
+                    kinematic_output_reference_at_entry,
+                )
+            )
+
+            valid_media_pts_ns = self._valid_world_media_pts_ns(
+                track.get("media_pts_ns")
+            )
+            committed_projective_root_at_entry = (
+                self._world_output_projective_root(
+                    output_watermark_key,
+                    current_media_pts_ns=valid_media_pts_ns,
+                )
+            )
+            # Snapshot the queue-proven projective bridge before any current
+            # metric attempt can advance ``filtered_ts`` or replace rejection
+            # diagnostics. A rate-suppressed callback may advance producer
+            # process state, but only an immutable live watermark root may
+            # authorize the next visible projective descendant.
+            recent_process_bridge_allowed_at_entry = (
+                self._recent_process_bridge_is_current(
+                    state,
+                    now_ts=float(now_ts),
+                    ttl_s=float(self._world_anchor_hold_ttl_s),
+                )
+                and committed_projective_root_at_entry is not None
+                and output_commit_provenance_at_entry is not None
+                and (
+                    (
+                        output_commit_provenance_at_entry[0]
+                        == "image_motion_prediction"
+                        and output_commit_provenance_at_entry[1]
+                        in {
+                            "bbox_affine_floor_projection",
+                            "inferred_ground_process_observation",
+                        }
+                    )
+                    or (
+                        output_commit_provenance_at_entry[0]
+                        in {"cv_prediction", "anchor_hold"}
+                        and output_commit_provenance_at_entry[1]
+                        in {
+                            "bounded_cv_process",
+                            "bounded_output_hold",
+                        }
+                    )
+                )
+            )
             try:
                 current_frame_id = int(track.get("frame_id", -1))
             except Exception:
                 current_frame_id = -1
+            observation_ts = (
+                float(valid_media_pts_ns) / 1_000_000_000.0
+                if valid_media_pts_ns is not None
+                else float(now_ts)
+            )
             bbox_stationary_supported = bool(
                 state is not None
                 and observe_bbox_stationarity(
                     state,
                     frame_id=current_frame_id,
+                    observation_ts=float(observation_ts),
                     bbox=bbox,
                     config=self._human_ground_cfg,
                 )
@@ -15751,6 +19791,30 @@ class _AnalyticsTelemetryProcessor:
                 height_ref_scene=state.height_ref_scene if state is not None else None,
                 config=self._human_ground_cfg,
             )
+            raw_classified_posture = str(posture)
+            # A seated person can look horizontally compressed to pose while
+            # leaning, but a real transition from seated to lying also changes
+            # the detector silhouette.  Preserve the established seated
+            # support when pose alone says ``lying`` inside a non-lying box;
+            # this prevents hallucinated knee/ankle contacts from moving the
+            # BEV point off the chair or sofa.
+            if (
+                posture == "lying"
+                and previous_posture == "sitting"
+                and len(bbox) >= 4
+            ):
+                try:
+                    bbox_aspect = float(bbox[2]) / max(1.0, float(bbox[3]))
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    bbox_aspect = math.inf
+                if (
+                    math.isfinite(bbox_aspect)
+                    and bbox_aspect < float(self._human_ground_cfg.lie_bbox_aspect)
+                ):
+                    posture = "sitting"
+                    track["world_posture_transition_guard"] = (
+                        "seated_pose_only_lying_rejected"
+                    )
             # Pose can briefly lose its compact seated geometry while the
             # tracker remains on the same person.  Do not let that one-frame
             # ``unknown`` state reopen the standing leg-extension heuristic:
@@ -15766,6 +19830,37 @@ class _AnalyticsTelemetryProcessor:
                     posture = "sitting"
                 elif previous_motion == "lie":
                     posture = "lying"
+            (
+                provisional_upright_edge,
+                near_lateral_edge,
+                hard_lateral_clip,
+                upright_height_ratio,
+            ) = self._moving_upright_lateral_truncation(
+                state=state,
+                classified_posture=str(posture),
+                previous_posture=previous_posture,
+                previous_motion=previous_motion,
+                bbox=bbox_project,
+                image_size=calib_image_size,
+                now_ts=float(now_ts),
+                queue_metric_root_available=(
+                    metric_output_reference_at_entry is not None
+                ),
+            )
+            track["world_posture_classified_raw"] = raw_classified_posture
+            track["world_lateral_edge_near"] = bool(near_lateral_edge)
+            track["world_lateral_edge_hard_clip"] = bool(hard_lateral_clip)
+            if upright_height_ratio is not None:
+                track["world_upright_bbox_height_ratio"] = float(
+                    upright_height_ratio
+                )
+            if provisional_upright_edge:
+                posture = "standing"
+                track["world_posture_override_reason"] = (
+                    "moving_upright_lateral_truncation"
+                )
+            classified_posture = str(posture)
+            track["world_posture_effective"] = classified_posture
             occlusion_assessment = (
                 assess_lower_body_occlusion(
                     state,
@@ -15773,34 +19868,159 @@ class _AnalyticsTelemetryProcessor:
                     bbox=bbox,
                     posture=posture,
                     now_ts=float(now_ts),
+                    evidence_ts=float(observation_ts),
                     config=self._human_ground_cfg,
                 )
                 if state is not None
                 else None
             )
+            if provisional_upright_edge and state is not None:
+                # The lateral crop has removed part of a previously complete
+                # moving body.  Enter the existing upright occlusion episode
+                # so its immutable metric-root gravity transport remains the
+                # sole fallback; this is not a new estimator or source type.
+                state.lower_body_occluded = True
+                state.post_occlusion_reacquire_support_required = True
+                state.lower_body_occlusion_level = "waist_hips"
+                state.lower_body_occlusion_confidence = max(
+                    0.90,
+                    float(state.lower_body_occlusion_confidence),
+                )
+                state.lower_body_occlusion_reason = (
+                    "moving_upright_lateral_truncation"
+                )
+                state.lower_body_clear_frames = 0
+                state.lower_body_clear_since_ts = -1.0
             force_occlusion_gravity = bool(
-                occlusion_assessment is not None
-                and occlusion_assessment.active
+                (
+                    provisional_upright_edge
+                    or (
+                        occlusion_assessment is not None
+                        and occlusion_assessment.active
+                    )
+                )
                 and state is not None
                 and state.height_ref_scene is not None
+                and classified_posture not in ("sitting", "lying")
+            )
+            pending_non_upright_transition = bool(
+                state is not None
+                and occlusion_assessment is not None
+                and occlusion_assessment.active
+                and classified_posture in ("sitting", "lying")
+                and int(state.lower_body_non_upright_frames) > 0
             )
             if force_occlusion_gravity:
                 posture = "standing"
             if state is not None:
                 state.posture = str(posture)
-            stationary_hold_eligible = bool(
-                state is not None
-                and state.last_good_world is not None
-                and bbox_stationary_supported
-                and posture in ("sitting", "lying")
+                if (
+                    (
+                        posture in ("sitting", "lying")
+                        or str(state.motion_mode) in ("sit", "lie")
+                    )
+                ):
+                    clear_inferred_ground_continuity_anchor(state)
+            trusted_metric_lifecycle = bool(
+                state is not None and state.last_good_world is not None
             )
-
+            current_detector_semantic_confidence = self._person_admission_confidence(
+                track,
+                trusted_lifecycle=False,
+            )
             pose_anchor = (
                 self._resolve_pose_floor_anchor(pose_kpts_abs, posture=posture)
                 if pose_kpts_abs is not None
                 else None
             )
+            torso_reference_supported = bool(
+                posture != "lying"
+                and self._person_admission_confidence(
+                    track,
+                    trusted_lifecycle=trusted_metric_lifecycle,
+                )
+                >= float(self._min_unposed_detection_confidence)
+            )
+            pose_torso_reference_anchor = (
+                self._resolve_pose_torso_motion_anchor(
+                    pose_kpts_abs,
+                    bbox=bbox,
+                )
+                if pose_kpts_abs is not None and torso_reference_supported
+                else None
+            )
+            # Every confident non-lying row may use the exact current torso as
+            # independent image-motion corroboration. If current floor evidence
+            # is missing/rejected, the same reference may consume only the
+            # fixed, accepted pose-to-foot bundle below; silhouette, anatomy,
+            # articulation, lifecycle, ray, speed, and TTL gates still decide
+            # whether that projective continuation exists.
+            pose_torso_reference_uv_calib: Optional[Tuple[float, float]] = None
+            if pose_torso_reference_anchor is not None:
+                reference_u, reference_v = self._scale_uv_to_image_size(
+                    float(pose_torso_reference_anchor.u),
+                    float(pose_torso_reference_anchor.v),
+                    track_image_size,
+                    calib_image_size,
+                )
+                pose_torso_reference_uv_calib = (
+                    float(reference_u),
+                    float(reference_v),
+                )
             person_anchor = self._resolve_person_depth_anchor(depth_result)
+            if (
+                person_anchor is not None
+                and str(person_anchor.contact_basis)
+                in {
+                    "depth:torso_core",
+                    "depth:pose_torso_support",
+                }
+            ):
+                # A pose-bounded torso capsule is useful only as a bridge for
+                # a known person whose lower body is genuinely unavailable.
+                # Admitting it on every upright/unknown row lets ordinary pose
+                # dropout compete with accurate floor contact and can pull the
+                # filter along a body-range ray. Keep the range branch exact-
+                # cohort, confidence-gated, lifecycle-backed, and limited to
+                # seated or explicitly lower-body-occluded observations.
+                exact_current_seated_torso = bool(
+                    posture == "sitting"
+                    and pose_torso_reference_anchor is not None
+                    and self._depth_measurement_is_current(
+                        depth_result,
+                        track=track,
+                    )
+                )
+                torso_lifecycle_trusted = bool(
+                    state is not None
+                    and (
+                        state.last_good_world is not None
+                        or state.height_ref_scene is not None
+                    )
+                    or exact_current_seated_torso
+                )
+                torso_context_supported = bool(
+                    posture == "sitting"
+                    or (
+                        posture != "lying"
+                        and occlusion_assessment is not None
+                        and occlusion_assessment.active
+                    )
+                )
+                torso_confidence_supported = bool(
+                    self._person_admission_confidence(
+                        track,
+                        trusted_lifecycle=trusted_metric_lifecycle,
+                    )
+                    >= max(0.60, float(self._min_unposed_detection_confidence))
+                )
+                if not (
+                    torso_lifecycle_trusted
+                    and torso_context_supported
+                    and torso_confidence_supported
+                    and self._depth_measurement_is_current(depth_result, track=track)
+                ):
+                    person_anchor = None
             depth_reports_no_ground_contact = bool(
                 depth_result is not None
                 and str(depth_result.status or "") == "no_ground_contact"
@@ -15818,6 +20038,87 @@ class _AnalyticsTelemetryProcessor:
                 # candidate available, but never floor-project this estimate
                 # for a known non-upright person.
                 pose_anchor = None
+            observed_pose_floor_contact = bool(
+                pose_anchor is not None
+                and str(pose_anchor.source)
+                in {
+                    "pose_ankle_floor",
+                    "pose_single_ankle_floor",
+                    "pose_ankle_support",
+                }
+            )
+            upright_pose_projection: Optional[
+                Tuple[np.ndarray, Matrix3, float, float, int, bool]
+            ] = None
+            if (
+                posture == "standing"
+                and pose_kpts_project is not None
+                and not observed_pose_floor_contact
+                and current_detector_semantic_confidence
+                >= max(
+                    0.58,
+                    float(self._min_unposed_detection_confidence),
+                )
+            ):
+                upright_pose_projection = self._upright_pose_ground_projection(
+                    calib,
+                    kpts_abs=pose_kpts_project,
+                    bbox=bbox_project,
+                    state=state,
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                )
+            upright_body_occlusion_active = bool(
+                upright_pose_projection is not None
+                and (
+                    depth_reports_no_ground_contact
+                    or pose_anchor is None
+                    or str(pose_anchor.source) == "pose_leg_floor"
+                )
+            )
+            if upright_body_occlusion_active:
+                (
+                    upright_candidate,
+                    _upright_covariance,
+                    upright_height_m,
+                    upright_scatter_m,
+                    upright_anchor_count,
+                    upright_strong_internal_proof,
+                ) = upright_pose_projection
+                track["world_upright_body_candidate"] = [
+                    float(upright_candidate[0]),
+                    float(calib.floor_y),
+                    float(upright_candidate[2]),
+                ]
+                track["world_upright_body_height_m"] = float(upright_height_m)
+                track["world_upright_body_scatter_m"] = float(
+                    upright_scatter_m
+                )
+                track["world_upright_body_anchor_count"] = int(
+                    upright_anchor_count
+                )
+                track["world_upright_body_strong_proof"] = bool(
+                    upright_strong_internal_proof
+                )
+                if pose_anchor is not None and str(pose_anchor.source) == "pose_leg_floor":
+                    pose_anchor = None
+                if state is not None:
+                    # Current multi-plane anatomy proves a standing body whose
+                    # physical floor contact is absent. Preserve that fact even
+                    # for a cold lifecycle; the ordinary occlusion assessor can
+                    # later clear it only after sustained full-body evidence.
+                    state.lower_body_occluded = True
+                    state.post_occlusion_reacquire_support_required = True
+                    state.lower_body_occlusion_level = "feet_ankles"
+                    state.lower_body_occlusion_confidence = max(
+                        0.88,
+                        float(state.lower_body_occlusion_confidence),
+                    )
+                    state.lower_body_occlusion_reason = (
+                        "upright_body_planes_without_floor_contact"
+                    )
+                    state.lower_body_clear_frames = 0
+                    state.lower_body_clear_since_ts = -1.0
             if pose_anchor is None:
                 anchor_candidate = person_anchor
             else:
@@ -15828,15 +20129,26 @@ class _AnalyticsTelemetryProcessor:
             # usable pose payload and the native depth capsule reports
             # ``no_ground_contact``.  Preserve a bounded detector-bottom
             # hypothesis for that case so the universal resolver has a
-            # current candidate.  Never use it for a seated/lying posture;
+            # current candidate.  A torso-only depth anchor is useful range
+            # evidence, but it is not a floor contact; do not let its mere
+            # presence suppress the independent detector-bottom hypothesis.
+            # Never use this fallback for a seated/lying posture;
             # pose-without-contact requires an already walking or height-
             # locked lifecycle, while a genuinely unposed row may start from
             # the detector silhouette itself.
-            if anchor_candidate is None:
-                depth_allows_bbox = bool(
-                    depth_result is None or depth_reports_no_ground_contact
+            if not self._anchor_is_verified_ground_contact(anchor_candidate):
+                # This branch is reached only when neither pose nor depth has
+                # verified ground contact. Depth status is diagnostic here:
+                # an error/not-ready/ambiguous torso result must not suppress
+                # the independently guarded detector-bottom floor hypothesis.
+                depth_allows_bbox = True
+                # Tracker confidence may establish nonpublishing geometric
+                # continuity for a cold row, but only detector confidence may
+                # finalize the cold semantic seed below.
+                admission_confidence = self._person_admission_confidence(
+                    track,
+                    trusted_lifecycle=True,
                 )
-                admission_confidence = self._person_admission_confidence(track)
                 confidence_allows_bbox = bool(
                     admission_confidence
                     >= float(self._min_unposed_detection_confidence)
@@ -15875,11 +20187,20 @@ class _AnalyticsTelemetryProcessor:
                 if (
                     depth_allows_bbox
                     and pose_lifecycle_support
+                    and upright_pose_projection is None
                     and posture not in ("sitting", "lying")
-                    and bbox_height_px >= 48.0
-                    and bbox_width_px / max(1.0, bbox_height_px) <= 0.85
+                    and self._bbox_floor_candidate_has_resolved_silhouette(
+                        bbox_width_px=bbox_width_px,
+                        bbox_height_px=bbox_height_px,
+                        image_size=calib_image_size,
+                    )
                 ):
-                    anchor_candidate = self._resolve_bbox_floor_anchor(bbox_project)
+                    bbox_anchor = self._resolve_bbox_floor_anchor(bbox_project)
+                    if bbox_anchor is not None:
+                        # Keep ``person_anchor`` untouched below so its
+                        # registered-depth hypothesis is appended alongside
+                        # this independent floor-contact hypothesis.
+                        anchor_candidate = bbox_anchor
 
             contact_basis = (
                 str(anchor_candidate.contact_basis or anchor_candidate.source)
@@ -15888,30 +20209,181 @@ class _AnalyticsTelemetryProcessor:
             )
             image_motion_supported = False
             if state is not None:
+                # The guarded detector-bottom fallback is itself an exact-
+                # cohort image contact: it was admitted above only for a
+                # confident, upright class-0 lifecycle with usable geometry.
+                # Let its *multi-observation motion* corroborate a physical
+                # reanchor. This does not make one bbox row authoritative;
+                # observe_coherent_image_motion still requires three bounded,
+                # same-basis published observations and the world filter still
+                # requires a mutually consistent three-sample metric run.
+                bbox_anchor_is_current = bool(
+                    anchor_candidate is not None
+                    and str(anchor_candidate.source) == "bbox_bottom"
+                )
                 anchor_is_current = bool(
                     anchor_candidate is not None
                     and not force_occlusion_gravity
                     and (
                         pose_anchor is not None
                         or self._depth_measurement_is_current(depth_result, track=track)
+                        or bbox_anchor_is_current
                     )
+                )
+                # The exact current torso is an independent motion witness on
+                # any confident non-lying lifecycle. It never replaces the
+                # selected ground candidate and never becomes a floor/depth
+                # hypothesis. On an established standing lifecycle, three
+                # coherent exact-current torso observations may also drive the
+                # learned-height process lane when the apparent floor contact
+                # is rejected. That lane remains non-metric and independently
+                # proof-checked by CanonicalWorldService.
+                motion_anchor = (
+                    pose_torso_reference_anchor
+                    if pose_torso_reference_anchor is not None
+                    else (anchor_candidate if anchor_is_current else None)
                 )
                 try:
                     current_frame_id = int(track.get("frame_id", -1))
                 except Exception:
                     current_frame_id = -1
-                image_motion_supported = observe_coherent_image_motion(
-                    state,
-                    frame_id=current_frame_id,
-                    image_foot_uv=(
-                        (float(anchor_candidate.u), float(anchor_candidate.v))
-                        if anchor_is_current and anchor_candidate is not None
-                        else None
-                    ),
-                    bbox=bbox if anchor_is_current else None,
-                    contact_basis=contact_basis if anchor_is_current else None,
-                    config=self._human_ground_cfg,
+                if motion_anchor is None:
+                    mark_image_motion_observation_unavailable(
+                        state,
+                        observation_ts=float(observation_ts),
+                        config=self._human_ground_cfg,
+                    )
+                else:
+                    image_motion_supported = observe_coherent_image_motion(
+                        state,
+                        frame_id=current_frame_id,
+                        observation_ts=float(observation_ts),
+                        image_foot_uv=(
+                            float(motion_anchor.u),
+                            float(motion_anchor.v),
+                        ),
+                        bbox=bbox,
+                        contact_basis=str(
+                            motion_anchor.contact_basis or motion_anchor.source
+                        ),
+                        config=self._human_ground_cfg,
+                    )
+            coherent_torso_process = bool(
+                not force_occlusion_gravity
+                and trusted_metric_lifecycle
+                and state is not None
+                and bool(image_motion_supported)
+                and bool(state.image_motion_supported)
+                and int(state.image_motion_streak)
+                >= int(self._human_ground_cfg.static_exit_frames)
+                and str(state.image_motion_contact_basis or "")
+                == "pose:torso_motion"
+                and pose_torso_reference_anchor is not None
+                and str(
+                    pose_torso_reference_anchor.contact_basis
+                    or pose_torso_reference_anchor.source
+                    or ""
                 )
+                == "pose:torso_motion"
+                and posture == "standing"
+                and str(state.motion_mode) not in ("sit", "lie")
+                and track.get("tracker_lifecycle_generation") is not None
+                and self._person_admission_confidence(
+                    track,
+                    trusted_lifecycle=True,
+                )
+                    >= float(self._min_unposed_detection_confidence)
+            )
+            inferred_ground_anchor_current = False
+            if state is not None:
+                anchor = state.inferred_ground_continuity_anchor
+                if anchor is not None:
+                    try:
+                        current_lifecycle = int(
+                            track.get("tracker_lifecycle_generation")
+                        )
+                        trusted_reference = (
+                            metric_output_reference_at_entry
+                            or output_reference_at_entry
+                        )
+                        if trusted_reference is None:
+                            raise ValueError("missing trusted output segment")
+                        current_segment = int(trusted_reference[4])
+                        anchor_lifecycle = int(anchor.lifecycle_generation)
+                        anchor_segment = int(anchor.trail_segment_id)
+                        current_pts = self._valid_world_media_pts_ns(
+                            track.get("media_pts_ns")
+                        )
+                        if state.inferred_ground_raw_history:
+                            (
+                                latest_raw_ts,
+                                _latest_raw_observed_at_us,
+                                latest_raw_pts,
+                                _latest_raw_x,
+                                _latest_raw_y,
+                                _latest_raw_z,
+                            ) = state.inferred_ground_raw_history[-1]
+                        else:
+                            latest_raw_ts = anchor.raw_origin_ts
+                            latest_raw_pts = anchor.raw_origin_media_pts_ns
+                        if current_pts is not None and latest_raw_pts is not None:
+                            anchor_age_s = (
+                                int(current_pts) - int(latest_raw_pts)
+                            ) / 1_000_000_000.0
+                        else:
+                            anchor_age_s = float(now_ts) - float(latest_raw_ts)
+                        inferred_ground_anchor_current = bool(
+                            current_lifecycle == anchor_lifecycle
+                            and current_segment == anchor_segment
+                            and math.isfinite(anchor_age_s)
+                            and 0.0
+                            <= anchor_age_s
+                            <= float(self._human_ground_cfg.reset_after_s)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        inferred_ground_anchor_current = False
+            if (
+                state is not None
+                and state.inferred_ground_continuity_anchor is not None
+                and not inferred_ground_anchor_current
+            ):
+                # An eligible support row cannot revive an episode whose most
+                # recent raw evidence exceeded the reset horizon (or crossed
+                # its lifecycle/visible segment). Block re-arm until metric
+                # recovery rather than letting this row establish a new root
+                # that the strict service would reject against its old cache.
+                clear_inferred_ground_continuity_anchor(
+                    state,
+                    block_rearm=True,
+                    blocked_after_media_pts_ns=(
+                        self._valid_world_media_pts_ns(
+                            track.get("media_pts_ns")
+                        )
+                    ),
+                )
+            elif (
+                state is not None
+                and state.inferred_ground_continuity_anchor is None
+                and not force_occlusion_gravity
+                and not coherent_torso_process
+                and not pending_non_upright_transition
+            ):
+                # Unsupported rows may occur between exact-current observations
+                # while an established root is still within its lifecycle,
+                # segment, and reset horizon.  Keep that immutable root alive;
+                # explicit posture/motion transitions have already cleared it.
+                clear_inferred_ground_continuity_anchor(state)
+            # ``observe_coherent_image_motion`` deliberately revokes the
+            # weaker bbox-stationarity evidence when accumulated, coherent
+            # movement becomes current. Derive hold eligibility only after
+            # that observation so this frame cannot retain a stale frozen
+            # anchor permission computed earlier in the hook.
+            stationary_hold_eligible = bool(
+                state is not None
+                and state.last_good_world is not None
+                and state.bbox_stationary_supported
+                and posture in ("sitting", "lying")
+            )
 
             hit: Optional[np.ndarray] = None
             floor_candidate: Optional[np.ndarray] = None
@@ -15935,13 +20407,31 @@ class _AnalyticsTelemetryProcessor:
             universal_candidates: List[Dict[str, Any]] = []
             canonical_resolved: Optional[ResolvedGroundMeasurement] = None
             canonical_resolved_point: Optional[np.ndarray] = None
+            selected_upright_pose_projection = False
+            pose_projection_strongly_conflicts_with_pcf = False
+            upright_body_reacquire_support = False
+            upright_body_four_plane_sample = False
+            # Exact-current learned-height reconstruction may bridge a known
+            # standing person's lower-body occlusion as weak process evidence.
+            # It is deliberately kept separate from ``hit`` and from resolver
+            # metric authority: only the bounded projective integration path
+            # below may consume it, and it never updates last_good_world.
+            inferred_process_candidate: Optional[np.ndarray] = None
+            inferred_process_raw_candidate: Optional[np.ndarray] = None
+            inferred_process_robust_raw_candidate: Optional[np.ndarray] = None
+            inferred_process_image_foot: Optional[Tuple[float, float]] = None
+            inferred_process_provenance: Optional[Dict[str, Any]] = None
             occlusion_fraction = (
                 0.75
                 if force_occlusion_gravity
                 else (
+                    0.65
+                    if upright_body_occlusion_active
+                    else (
                     0.35
                     if occlusion_assessment is not None and occlusion_assessment.active
                     else 0.0
+                    )
                 )
             )
 
@@ -16107,6 +20597,28 @@ class _AnalyticsTelemetryProcessor:
                             depth_weight=depth_weight,
                             track=track,
                         )
+                    floor_contact_depth_corroborated = (
+                        self._torso_depth_corroborates_floor_contact(
+                            calib=calib,
+                            track=track,
+                            state=state,
+                            depth_result=depth_result,
+                            torso_uv=pose_torso_reference_uv_calib,
+                            floor_candidate=floor_candidate,
+                            floor_anchor_source=str(
+                                anchor_candidate.source
+                            ),
+                            floor_contact_basis=str(
+                                anchor_candidate.contact_basis
+                                or anchor_candidate.source
+                            ),
+                            posture=str(posture),
+                            bbox=bbox_project,
+                            image_size=calib_image_size,
+                            flip_u=flip_u,
+                            flip_v=flip_v,
+                        )
+                    )
                     floor_ray_admitted = self._admit_floor_ray_range(
                         camera_id,
                         calib=calib,
@@ -16116,6 +20628,9 @@ class _AnalyticsTelemetryProcessor:
                         bbox=bbox_project,
                         flip_u=flip_u,
                         flip_v=flip_v,
+                        below_silhouette_corroborated=bool(
+                            floor_contact_depth_corroborated
+                        ),
                     )
                     if not floor_ray_admitted:
                         floor_ray_rejection_reason = str(
@@ -16141,12 +20656,14 @@ class _AnalyticsTelemetryProcessor:
                         and floor_ray_admitted
                         and anchor_candidate.height_lock_eligible
                         and posture in ("standing", "unknown")
+                        and state.inferred_ground_continuity_anchor is None
                     ):
                         self._maybe_update_world_height_reference(
                             state,
                             calib,
                             bbox_project,
                             hit,
+                            foot_uv=(float(pose_u), float(pose_v)),
                             flip_u=flip_u,
                             flip_v=flip_v,
                             pose_kpts_abs=pose_kpts_project,
@@ -16185,6 +20702,10 @@ class _AnalyticsTelemetryProcessor:
                                 quality=quality,
                                 contact_basis=contact_basis,
                                 image_motion_supported=image_motion_supported,
+                                media_pts_ns=self._valid_world_media_pts_ns(
+                                    track.get("media_pts_ns")
+                                ),
+                                display_output=display_recovery_reference_at_entry,
                             )
                         else:
                             hit = None
@@ -16230,6 +20751,10 @@ class _AnalyticsTelemetryProcessor:
                                 quality=quality,
                                 contact_basis=contact_basis,
                                 image_motion_supported=image_motion_supported,
+                                media_pts_ns=self._valid_world_media_pts_ns(
+                                    track.get("media_pts_ns")
+                                ),
+                                display_output=display_recovery_reference_at_entry,
                             )
                         else:
                             hit = None
@@ -16254,10 +20779,22 @@ class _AnalyticsTelemetryProcessor:
                                     else "fusion_policy_requires_registered_depth"
                                 )
                             )
-                        if depth_measurement_not_current and state is not None:
+                        if (
+                            depth_measurement_not_current
+                            and state is not None
+                            and not self._world_resolver_enabled
+                        ):
+                            # In universal-resolver mode this is only one
+                            # unavailable modality. Do not clear an independent
+                            # exact-current floor-ray consensus before the
+                            # resolver selects the cohort's admissible
+                            # hypothesis. The post-resolver path owns the final
+                            # unavailable-state transition.
                             mark_world_measurement_unavailable(
                                 state,
                                 reason="depth_measurement_not_current",
+                                now_ts=now_ts,
+                                config=self._human_ground_cfg,
                             )
                 else:
                     hit = None
@@ -16290,6 +20827,231 @@ class _AnalyticsTelemetryProcessor:
                     flip_u=flip_u,
                     flip_v=flip_v,
                 )
+                if upright_body_occlusion_active and upright_pose_projection is not None:
+                    (
+                        upright_candidate,
+                        upright_covariance,
+                        _upright_height_m,
+                        upright_scatter_m,
+                        upright_anchor_count,
+                        upright_strong_internal_proof,
+                    ) = upright_pose_projection
+                    if self._admit_world_observation_range(
+                        camera_id,
+                        calib=calib,
+                        world_candidate=np.asarray(
+                            upright_candidate,
+                            dtype=np.float64,
+                        ),
+                        track=track,
+                    ):
+                        scatter_ratio = max(
+                            0.0,
+                            min(1.0, float(upright_scatter_m) / 0.55),
+                        )
+                        universal_candidates.append(
+                            {
+                                "candidate_id": "upright_pose_projection",
+                                "kind": "pose_scale",
+                                "position": np.asarray(
+                                    upright_candidate,
+                                    dtype=np.float64,
+                                ),
+                                "covariance": upright_covariance,
+                                "anchor": "upright_body_plane",
+                                "contact_basis": "pose:upright_body_planes",
+                                "support_state": "unknown",
+                                "confidence": max(
+                                    0.68,
+                                    min(
+                                        0.90,
+                                        0.88
+                                        - 0.16 * scatter_ratio
+                                        + (
+                                            0.02
+                                            if upright_anchor_count >= 5
+                                            else 0.0
+                                        ),
+                                    ),
+                                ),
+                                "posture": "standing",
+                                "occlusion": max(
+                                    0.60,
+                                    float(occlusion_fraction),
+                                ),
+                                "motion_consistency": (
+                                    1.0 if image_motion_supported else 0.82
+                                ),
+                                "support_score": (
+                                    0.86
+                                    if upright_strong_internal_proof
+                                    else 0.74
+                                ),
+                                "posture_compatibility": 1.0,
+                                "source_reliability": (
+                                    0.88
+                                    if upright_strong_internal_proof
+                                    else 0.82
+                                ),
+                                "pixel_uncertainty_px": max(
+                                    3.0,
+                                    min(
+                                        8.0,
+                                        0.003
+                                        * float(max(calib_image_size)),
+                                    ),
+                                ),
+                                "correlation_group": (
+                                    "upright_pose_projection:"
+                                    f"{int(sensor_id)}:"
+                                    f"{int(track.get('tracker_id', -1))}"
+                                ),
+                                "pcf": self._world_prior_evidence(
+                                    camera_id,
+                                    upright_candidate,
+                                ),
+                            }
+                        )
+                seated_registered_depth_available = any(
+                    str(candidate.get("kind") or "") == "registered_depth"
+                    and str(candidate.get("support_state") or "") == "seat"
+                    and str(candidate.get("anchor") or "")
+                    == "person_body_projection"
+                    for candidate in universal_candidates
+                )
+                track["world_seated_registered_depth_available"] = bool(
+                    seated_registered_depth_available
+                )
+                seated_pose_semantic_ready = bool(
+                    posture == "sitting"
+                    and pose_torso_reference_uv_calib is not None
+                    and not seated_registered_depth_available
+                    and current_detector_semantic_confidence
+                    >= (
+                        max(
+                            0.60,
+                            float(self._min_unposed_detection_confidence),
+                        )
+                        if trusted_metric_lifecycle
+                        else max(
+                            0.72,
+                            float(self._min_unposed_detection_confidence),
+                        )
+                    )
+                )
+                if seated_pose_semantic_ready:
+                    track["world_seated_torso_uv"] = [
+                        float(pose_torso_reference_uv_calib[0]),
+                        float(pose_torso_reference_uv_calib[1]),
+                    ]
+                    seated_projection = self._seated_pose_ground_projection(
+                        calib,
+                        torso_uv=pose_torso_reference_uv_calib,
+                        state=state,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                    )
+                    if seated_projection is not None:
+                        (
+                            seated_pose_candidate,
+                            seated_pose_covariance,
+                            seated_torso_height_m,
+                        ) = seated_projection
+                        if self._admit_world_observation_range(
+                            camera_id,
+                            calib=calib,
+                            world_candidate=np.asarray(
+                                seated_pose_candidate,
+                                dtype=np.float64,
+                            ),
+                            track=track,
+                        ):
+                            track["world_seated_pose_candidate"] = [
+                                float(seated_pose_candidate[0]),
+                                float(calib.floor_y),
+                                float(seated_pose_candidate[2]),
+                            ]
+                            track["world_seated_torso_height_m"] = float(
+                                seated_torso_height_m
+                            )
+                            universal_candidates.append(
+                                {
+                                    "candidate_id": "seated_pose_projection",
+                                    "kind": "pose_scale",
+                                    "position": np.asarray(
+                                        seated_pose_candidate,
+                                        dtype=np.float64,
+                                    ),
+                                    "covariance": seated_pose_covariance,
+                                    "anchor": "seated_torso_plane",
+                                    "contact_basis": "pose:seated_torso_plane",
+                                    "support_state": "seat",
+                                    "confidence": max(
+                                        0.62,
+                                        min(
+                                            0.85,
+                                            0.55
+                                            + 0.30
+                                            * float(
+                                                current_detector_semantic_confidence
+                                            ),
+                                        ),
+                                    ),
+                                    "posture": "sitting",
+                                    "occlusion": float(occlusion_fraction),
+                                    "motion_consistency": (
+                                        1.0
+                                        if image_motion_supported
+                                        else 0.75
+                                    ),
+                                    "support_score": 0.72,
+                                    "posture_compatibility": 1.0,
+                                    "source_reliability": 0.82,
+                                    "pixel_uncertainty_px": max(
+                                        2.0,
+                                        min(
+                                            8.0,
+                                            0.003
+                                            * float(
+                                                max(calib_image_size)
+                                            ),
+                                        ),
+                                    ),
+                                    "correlation_group": (
+                                        "seated_pose_projection:"
+                                        f"{int(sensor_id)}:"
+                                        f"{int(track.get('tracker_id', -1))}"
+                                    ),
+                                    "pcf": self._world_prior_evidence(
+                                        camera_id,
+                                        seated_pose_candidate,
+                                    ),
+                                }
+                            )
+                seated_registered_floor_available = any(
+                    str(candidate.get("kind") or "") == "registered_depth"
+                    and str(candidate.get("support_state") or "") == "floor"
+                    for candidate in universal_candidates
+                )
+                if posture == "sitting" and not seated_registered_floor_available:
+                    before_count = len(universal_candidates)
+                    universal_candidates[:] = [
+                        candidate
+                        for candidate in universal_candidates
+                        if (
+                            str(candidate.get("kind") or "") != "floor_ray"
+                            or str(candidate.get("anchor") or "")
+                            == "pose_ankle_floor"
+                        )
+                    ]
+                    if len(universal_candidates) != before_count:
+                        # A seated pose ankle without independent registered
+                        # lower-body support is often a knee/furniture
+                        # hallucination. Suppress extrapolated and single-ankle
+                        # rays even when a torso projection is unavailable, but
+                        # retain an exact observed ankle pair that passed the
+                        # ordinary contact/range gates.
+                        track["world_seated_floor_ray_suppressed"] = True
                 quality_reason = (
                     f"universal_candidates={len(universal_candidates)},"
                     f"depth={depth_reason}"
@@ -16320,16 +21082,36 @@ class _AnalyticsTelemetryProcessor:
                     )
                 if state is not None and str(state.motion_mode) in ("sit", "lie"):
                     allow_gravity_hypothesis = False
+                inferred_height_ref_scene: Optional[float] = None
+                if state is not None and state.height_ref_scene is not None:
+                    inferred_height_ref_scene = float(
+                        state.inferred_ground_continuity_anchor.height_ref_scene
+                        if state.inferred_ground_continuity_anchor is not None
+                        else state.height_ref_scene
+                    )
+                upright_body_candidate_available = any(
+                    str(candidate.get("candidate_id") or "")
+                    == "upright_pose_projection"
+                    for candidate in universal_candidates
+                )
                 if (
                     allow_gravity_hypothesis
                     and state is not None
-                    and state.height_ref_scene is not None
+                    and inferred_height_ref_scene is not None
+                    # Both branches are projections of the same current body
+                    # through the same calibration. Fusing them is not extra
+                    # evidence and, because both carry unknown support, can
+                    # incorrectly demote the typed body footprint to a generic
+                    # non-floor result. Prefer the current multi-plane solve;
+                    # learned-height gravity remains available on pose-dropout
+                    # rows.
+                    and not upright_body_candidate_available
                     and (force_occlusion_gravity or not universal_candidates)
                 ):
                     gravity_candidate = self._gravity_drop_world(
                         calib,
                         bbox_project,
-                        float(state.height_ref_scene),
+                        inferred_height_ref_scene,
                         flip_u=flip_u,
                         flip_v=flip_v,
                         pose_kpts_abs=pose_kpts_project,
@@ -16358,6 +21140,289 @@ class _AnalyticsTelemetryProcessor:
                         except Exception:
                             gravity_covariance = None
                         if gravity_covariance is not None:
+                            established_inferred_process = bool(
+                                (force_occlusion_gravity or coherent_torso_process)
+                                and trusted_metric_lifecycle
+                                and posture == "standing"
+                                and state is not None
+                                and str(state.motion_mode) not in ("sit", "lie")
+                                and track.get("tracker_lifecycle_generation")
+                                is not None
+                                and self._person_admission_confidence(
+                                    track,
+                                    trusted_lifecycle=True,
+                                )
+                                >= float(self._min_unposed_detection_confidence)
+                            )
+                            if established_inferred_process:
+                                inferred_process_support_kind = (
+                                    "lower_body_occlusion"
+                                    if force_occlusion_gravity
+                                    else "coherent_torso_motion"
+                                )
+                                inferred_process_raw_candidate = np.asarray(
+                                    gravity_candidate,
+                                    dtype=np.float64,
+                                ).copy()
+                                aligned_process = align_inferred_ground_observation(
+                                    state,
+                                    raw_measurement=inferred_process_raw_candidate,
+                                    floor_y=float(calib.floor_y),
+                                    now_ts=float(now_ts),
+                                    observed_at_us=int(
+                                        track.get("observed_at_us", 0)
+                                    ),
+                                    media_pts_ns=self._valid_world_media_pts_ns(
+                                        track.get("media_pts_ns")
+                                    ),
+                                    lifecycle_generation=int(
+                                        track["tracker_lifecycle_generation"]
+                                    ),
+                                    height_ref_scene=inferred_height_ref_scene,
+                                    world_frame_id=world_frame_id,
+                                    world_frame_revision=world_frame_revision,
+                                    world_transform_sha256=world_transform_sha256,
+                                    trusted_output_reference=(
+                                        metric_output_reference_at_entry
+                                        if output_reference_committed_at_entry
+                                        else None
+                                    ),
+                                    config=self._human_ground_cfg,
+                                )
+                                if aligned_process is not None:
+                                    (
+                                        adjusted_candidate,
+                                        continuity_anchor,
+                                        raw_delta,
+                                        robust_raw_candidate,
+                                        raw_consensus_count,
+                                        raw_consensus_span_s,
+                                        raw_consensus_ts_s,
+                                        raw_consensus_observed_at_us,
+                                        raw_consensus_media_pts_ns,
+                                        raw_evidence_gap_s,
+                                    ) = aligned_process
+                                    inferred_process_robust_raw_candidate = (
+                                        np.asarray(
+                                            robust_raw_candidate,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                    # The raw body-plane observation was
+                                    # range-admitted above.  Re-admit the
+                                    # bias-aligned point too: subtracting a
+                                    # constant origin bias must not bypass the
+                                    # active calibration envelope.
+                                    if self._admit_world_observation_range(
+                                        camera_id,
+                                        calib=calib,
+                                        world_candidate=np.asarray(
+                                            adjusted_candidate,
+                                            dtype=np.float64,
+                                        ),
+                                        track=track,
+                                    ):
+                                        inferred_process_candidate = np.asarray(
+                                            adjusted_candidate,
+                                            dtype=np.float64,
+                                        ).copy()
+                                        current_media_pts_ns = (
+                                            self._valid_world_media_pts_ns(
+                                                track.get("media_pts_ns")
+                                            )
+                                        )
+                                        inferred_process_provenance = {
+                                            "type": "inferred_ground_process_observation",
+                                            "non_authoritative": True,
+                                            "origin": "learned_body_height",
+                                            "transport": (
+                                                "fixed_occlusion_origin_raw_world_delta"
+                                                if inferred_process_support_kind
+                                                == "lower_body_occlusion"
+                                                else "fixed_torso_origin_raw_world_delta"
+                                            ),
+                                            "support_kind": str(
+                                                inferred_process_support_kind
+                                            ),
+                                            "image_motion_supported": bool(
+                                                state.image_motion_supported
+                                            ),
+                                            "image_motion_streak": int(
+                                                state.image_motion_streak
+                                            ),
+                                            "image_motion_contact_basis": str(
+                                                state.image_motion_contact_basis
+                                                or ""
+                                            ),
+                                            "detector_confidence": float(
+                                                self._person_admission_confidence(
+                                                    track,
+                                                    trusted_lifecycle=True,
+                                                )
+                                            ),
+                                            "trusted_origin_kind": "queue_admitted_metric_world_output",
+                                            "age_s": max(
+                                                0.0,
+                                                float(now_ts)
+                                                - float(
+                                                    continuity_anchor.raw_origin_ts
+                                                ),
+                                            ),
+                                            "raw_origin_ts_s": float(
+                                                continuity_anchor.raw_origin_ts
+                                            ),
+                                            "current_ts_s": float(now_ts),
+                                            "origin_observed_at_us": int(
+                                                continuity_anchor.raw_origin_observed_at_us
+                                            ),
+                                            "observed_at_us": int(
+                                                track.get("observed_at_us", 0)
+                                            ),
+                                            "raw_origin_media_pts_ns": (
+                                                int(
+                                                    continuity_anchor.raw_origin_media_pts_ns
+                                                )
+                                                if continuity_anchor.raw_origin_media_pts_ns
+                                                is not None
+                                                else None
+                                            ),
+                                            "trusted_origin_media_pts_ns": (
+                                                int(
+                                                    continuity_anchor.trusted_origin_media_pts_ns
+                                                )
+                                                if continuity_anchor.trusted_origin_media_pts_ns
+                                                is not None
+                                                else None
+                                            ),
+                                            "current_media_pts_ns": (
+                                                int(current_media_pts_ns)
+                                                if current_media_pts_ns is not None
+                                                else None
+                                            ),
+                                            "trusted_origin_filter_ts_s": float(
+                                                continuity_anchor.trusted_origin_filter_ts
+                                            ),
+                                            "tracker_lifecycle_generation": int(
+                                                continuity_anchor.lifecycle_generation
+                                            ),
+                                            "origin_trail_segment_id": int(
+                                                continuity_anchor.trail_segment_id
+                                            ),
+                                            "world_frame": continuity_anchor.world_frame_id,
+                                            "world_frame_revision": continuity_anchor.world_frame_revision,
+                                            "world_transform_sha256": continuity_anchor.world_transform_sha256,
+                                            "resolver_candidate_id": "gravity_reconstruction",
+                                            "raw_sample": [
+                                                float(
+                                                    inferred_process_raw_candidate[0]
+                                                ),
+                                                float(calib.floor_y),
+                                                float(
+                                                    inferred_process_raw_candidate[2]
+                                                ),
+                                            ],
+                                            "raw_consensus": [
+                                                float(
+                                                    inferred_process_robust_raw_candidate[0]
+                                                ),
+                                                float(calib.floor_y),
+                                                float(
+                                                    inferred_process_robust_raw_candidate[2]
+                                                ),
+                                            ],
+                                            "raw_consensus_ts_s": float(
+                                                raw_consensus_ts_s
+                                            ),
+                                            "raw_consensus_observed_at_us": int(
+                                                raw_consensus_observed_at_us
+                                            ),
+                                            "raw_consensus_media_pts_ns": (
+                                                int(raw_consensus_media_pts_ns)
+                                                if raw_consensus_media_pts_ns
+                                                is not None
+                                                else None
+                                            ),
+                                            "raw_consensus_method": "xz_medoid",
+                                            "raw_consensus_count": int(
+                                                raw_consensus_count
+                                            ),
+                                            "raw_consensus_span_s": float(
+                                                raw_consensus_span_s
+                                            ),
+                                            "raw_evidence_gap_s": float(
+                                                raw_evidence_gap_s
+                                            ),
+                                            "raw_origin": [
+                                                float(
+                                                    continuity_anchor.raw_origin[0]
+                                                ),
+                                                float(calib.floor_y),
+                                                float(
+                                                    continuity_anchor.raw_origin[2]
+                                                ),
+                                            ],
+                                            "raw_delta": [
+                                                float(raw_delta[0]),
+                                                float(raw_delta[1]),
+                                                float(raw_delta[2]),
+                                            ],
+                                            "trusted_world_origin": [
+                                                float(
+                                                    continuity_anchor.trusted_world_origin[0]
+                                                ),
+                                                float(calib.floor_y),
+                                                float(
+                                                    continuity_anchor.trusted_world_origin[2]
+                                                ),
+                                            ],
+                                            "process_observation": [
+                                                float(
+                                                    inferred_process_candidate[0]
+                                                ),
+                                                float(calib.floor_y),
+                                                float(
+                                                    inferred_process_candidate[2]
+                                                ),
+                                            ],
+                                            "height_ref_scene": float(
+                                                continuity_anchor.height_ref_scene
+                                            ),
+                                            "occlusion_level": str(
+                                                state.lower_body_occlusion_level
+                                            ),
+                                            "occlusion_confidence": float(
+                                                state.lower_body_occlusion_confidence
+                                            ),
+                                        }
+                                        projection_fields: Dict[str, Any] = {}
+                                        self._set_track_image_base_from_world(
+                                            projection_fields,
+                                            calib=calib,
+                                            world_point=inferred_process_candidate,
+                                            flip_u=flip_u,
+                                            flip_v=flip_v,
+                                        )
+                                        projected_foot = projection_fields.get(
+                                            "image_base"
+                                        )
+                                        if (
+                                            isinstance(
+                                                projected_foot,
+                                                (list, tuple),
+                                            )
+                                            and len(projected_foot) >= 2
+                                        ):
+                                            try:
+                                                inferred_process_image_foot = (
+                                                    float(projected_foot[0]),
+                                                    float(projected_foot[1]),
+                                                )
+                                            except (
+                                                TypeError,
+                                                ValueError,
+                                                OverflowError,
+                                            ):
+                                                inferred_process_image_foot = None
                             universal_candidates.append(
                                 {
                                     "candidate_id": "gravity_reconstruction",
@@ -16392,16 +21457,267 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if measurement_set is None:
                     raise RuntimeError("unable to construct exact world measurement cohort")
+                resolver_contact_basis_by_candidate = {
+                    str(candidate.get("candidate_id")): str(
+                        candidate.get("contact_basis")
+                    ).strip()
+                    for candidate in universal_candidates
+                    if str(candidate.get("candidate_id") or "").strip()
+                    and str(candidate.get("contact_basis") or "").strip()
+                }
                 resolved_hit, resolved = self._apply_resolved_world_measurement(
                     track,
                     measurement_set,
+                    contact_basis_by_candidate=resolver_contact_basis_by_candidate,
                 )
                 canonical_resolved = resolved
                 canonical_resolved_point = resolved_hit
-                if (
+                resolved_support_ids = set(
+                    resolved.contributor_ids
+                    if resolved is not None
+                    else ()
+                )
+                if resolved is not None and resolved.selected_candidate_id:
+                    resolved_support_ids.add(
+                        str(resolved.selected_candidate_id)
+                    )
+                resolved_support_candidates = tuple(
+                    candidate
+                    for candidate in measurement_set.hypotheses
+                    if candidate.candidate_id in resolved_support_ids
+                )
+                resolved_has_ground_footprint_support = bool(
+                    resolved_support_ids
+                    and len(resolved_support_candidates)
+                    == len(resolved_support_ids)
+                    and all(
+                        self._resolver_candidate_is_ground_footprint_supported(
+                            candidate
+                        )
+                        for candidate in resolved_support_candidates
+                    )
+                )
+                verified_reacquire_support = any(
+                    str(candidate.support_state) == "floor"
+                    and (
+                        self._person_ground_consensus_contact_basis(
+                            resolver_contact_basis_by_candidate.get(
+                                str(candidate.candidate_id),
+                                str(candidate.anchor),
+                            )
+                        )
+                        in {
+                            "pose_ankle_floor",
+                            "pose_single_ankle_floor",
+                        }
+                        or str(candidate.kind) == "registered_depth"
+                    )
+                    for candidate in resolved_support_candidates
+                )
+                current_pose_floor_support = bool(
+                    pose_anchor is not None
+                    and self._person_ground_consensus_contact_basis(
+                        str(
+                            pose_anchor.contact_basis
+                            or pose_anchor.source
+                            or ""
+                        )
+                    )
+                    in {
+                        "pose_ankle_floor",
+                        "pose_single_ankle_floor",
+                    }
+                )
+                selected_resolver_candidate = next(
+                    (
+                        candidate
+                        for candidate in measurement_set.hypotheses
+                        if resolved is not None
+                        and candidate.candidate_id
+                        == resolved.selected_candidate_id
+                    ),
+                    None,
+                )
+                selected_resolver_basis = (
+                    self._person_ground_consensus_contact_basis(
+                        resolver_contact_basis_by_candidate.get(
+                            str(
+                                selected_resolver_candidate.candidate_id
+                                if selected_resolver_candidate is not None
+                                else ""
+                            ),
+                            str(
+                                selected_resolver_candidate.anchor
+                                if selected_resolver_candidate is not None
+                                else ""
+                            ),
+                        )
+                    )
+                )
+                current_first_output_ankle_contact_tight = (
+                    self._first_output_ankle_contact_is_tight(track)
+                )
+                exact_first_output_ankle_geometry = bool(
+                    not output_reference_committed_at_entry
+                    and state is not None
+                    and resolved_hit is not None
+                    and resolved is not None
+                    and resolved.status == "measured"
+                    and str(resolved.quality) == "weak"
+                    and selected_resolver_candidate is not None
+                    and str(selected_resolver_candidate.kind) == "floor_ray"
+                    and str(selected_resolver_candidate.support_state) == "floor"
+                    and str(selected_resolver_candidate.anchor)
+                    == "pose_ankle_floor"
+                    and selected_resolver_basis == "pose_ankle_floor"
+                    and pose_anchor is not None
+                    and str(pose_anchor.source)
+                    == "pose_ankle_floor"
+                    and posture == "standing"
+                    and not depth_reports_no_ground_contact
+                    and bool(track.get("world_floor_contact_plausible"))
+                    and current_detector_semantic_confidence
+                    >= float(self._min_unposed_detection_confidence)
+                )
+                exact_first_output_ankle_candidate = bool(
+                    exact_first_output_ankle_geometry
+                    and current_first_output_ankle_contact_tight
+                )
+                temporal_first_output_ankle = bool(
+                    state is not None
+                    and observe_first_output_ankle_proof(
+                        state,
+                        measurement=(
+                            np.asarray(resolved_hit, dtype=np.float64)
+                            if exact_first_output_ankle_candidate
+                            and resolved_hit is not None
+                            else None
+                        ),
+                        now_ts=float(now_ts),
+                        exact_ankle_pair=bool(
+                            exact_first_output_ankle_candidate
+                        ),
+                        output_committed=bool(
+                            output_reference_committed_at_entry
+                        ),
+                        proof_binding=output_watermark_key,
+                        config=self._human_ground_cfg,
+                    )
+                )
+                verified_first_output_pose_floor_seed = bool(
+                    temporal_first_output_ankle
+                )
+                if verified_first_output_pose_floor_seed and state is not None:
+                    clear_first_output_ankle_proof(state)
+                    self._clear_uncommitted_world_output_state(
+                        state,
+                        output_watermark_key,
+                    )
+                verified_first_output_contact = (
+                    bool(verified_first_output_pose_floor_seed)
+                    and current_first_output_ankle_contact_tight
+                )
+                track["world_first_output_ankle_contact_supported"] = bool(
+                    verified_first_output_contact
+                )
+                verified_reacquire_support = bool(
+                    verified_reacquire_support
+                    or (
+                        current_pose_floor_support
+                        and current_detector_semantic_confidence
+                        >= max(
+                            0.58,
+                            float(self._min_unposed_detection_confidence),
+                        )
+                        and any(
+                            str(candidate.kind) == "floor_ray"
+                            for candidate in resolved_support_candidates
+                        )
+                    )
+                )
+                inferred_support = bool(
                     resolved_hit is not None
                     and resolved is not None
-                    and str(resolved.quality) != "weak"
+                    and not resolved_has_ground_footprint_support
+                )
+                weak_ground_supported = bool(
+                    resolved is not None
+                    and self._weak_resolver_measurement_is_ground_supported(
+                        resolved,
+                        measurement_set,
+                        state=state,
+                        image_motion_supported=image_motion_supported,
+                        depth_corroborated=bool(
+                            track.get("world_floor_depth_corroborated")
+                        ),
+                        verified_first_output_contact=bool(
+                            verified_first_output_contact
+                        ),
+                    )
+                )
+                cold_floor_semantic_blocked = bool(
+                    resolved_hit is not None
+                    and resolved is not None
+                    and selected_resolver_candidate is not None
+                    and str(selected_resolver_candidate.kind) == "floor_ray"
+                    and metric_output_reference_at_entry is None
+                    and current_detector_semantic_confidence
+                    < float(self._min_unposed_detection_confidence)
+                )
+                cold_floor_incidence_blocked = bool(
+                    resolved_hit is not None
+                    and resolved is not None
+                    and selected_resolver_candidate is not None
+                    and str(selected_resolver_candidate.kind) == "floor_ray"
+                    and metric_output_reference_at_entry is None
+                    and not self._cold_floor_ray_incidence_is_adequate(track)
+                )
+                if cold_floor_semantic_blocked:
+                    # Pose can hallucinate convincing ankles on furniture and
+                    # NvDCF can assign that static box a high association
+                    # confidence. Until this lifecycle owns a queue-published
+                    # metric point, only detector confidence establishes that
+                    # the floor ray belongs to a person; tracker confidence is
+                    # deliberately not a semantic substitute.
+                    hit = None
+                    source_measurement_rejected = True
+                    quality = "invalid"
+                    quality_reason = (
+                        "cold_floor_semantic_confidence_below_minimum"
+                    )
+                elif cold_floor_incidence_blocked:
+                    # Unobserved PCF space is neutral by design, so a mirror
+                    # ray can otherwise look like a high-quality single
+                    # hypothesis and seed a false lifecycle before the prior
+                    # has grounds to call it contradictory. Shallow incidence
+                    # is itself insufficient metric geometry; wait for body,
+                    # depth, or a better-conditioned floor observation.
+                    hit = None
+                    source_measurement_rejected = True
+                    quality = "invalid"
+                    quality_reason = "cold_floor_ray_incidence_below_minimum"
+                elif inferred_support:
+                    # Gravity reconstruction and torso-range hypotheses infer
+                    # the foot from body geometry; they are not an observed
+                    # floor contact. Never let an ``estimated`` resolver score
+                    # bypass that distinction or steer the metric/process
+                    # posterior. Body motion can corroborate a separately
+                    # observed floor measurement, but it cannot manufacture
+                    # one. Existing bounded hold/CV state remains available
+                    # below without training on this inferred geometry.
+                    hit = None
+                    source_measurement_rejected = True
+                    quality = "invalid"
+                    quality_reason = (
+                        "world_resolver_non_floor_diagnostic_only"
+                    )
+                elif (
+                    resolved_hit is not None
+                    and resolved is not None
+                    and (
+                        str(resolved.quality) != "weak"
+                        or weak_ground_supported
+                    )
                 ):
                     selected_kind = str(resolved.selected_kind or "")
                     contributor_kinds = {
@@ -16415,13 +21731,147 @@ class _AnalyticsTelemetryProcessor:
                         world_source = "person_anchor_depth_only"
                     elif selected_kind == "floor_ray":
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
+                    elif selected_kind == "pose_scale":
+                        world_source = "gravity_drop"
                     elif selected_kind == "gravity_reconstruction":
                         world_source = "gravity_drop"
                     else:
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
-                    quality = str(resolved.quality)
-                    if quality not in ("good", "estimated"):
-                        quality = "estimated"
+                    filter_quality = str(resolved.quality)
+                    selected_seated_projection = bool(
+                        selected_resolver_candidate is not None
+                        and self._resolver_candidate_is_ground_footprint_supported(
+                            selected_resolver_candidate
+                        )
+                        and str(
+                            selected_resolver_candidate.support_state
+                        )
+                        == "seat"
+                    )
+                    selected_seated_pose_projection = bool(
+                        selected_seated_projection
+                        and str(selected_resolver_candidate.kind) == "pose_scale"
+                    )
+                    selected_upright_pose_projection = bool(
+                        selected_resolver_candidate is not None
+                        and str(selected_resolver_candidate.kind) == "pose_scale"
+                        and str(selected_resolver_candidate.anchor)
+                        == "upright_body_plane"
+                        and str(selected_resolver_candidate.support_state)
+                        == "unknown"
+                        and str(selected_resolver_candidate.posture) == "standing"
+                    )
+                    pose_projection_strongly_conflicts_with_pcf = bool(
+                        str(resolved.reason)
+                        == "selected_hypothesis_strongly_conflicts_with_pcf"
+                    )
+                    upright_body_anchor_count = int(
+                        track.get("world_upright_body_anchor_count") or 0
+                    )
+                    try:
+                        upright_body_scatter_m = float(
+                            track.get("world_upright_body_scatter_m")
+                        )
+                        upright_body_height_m = float(
+                            track.get("world_upright_body_height_m")
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        upright_body_scatter_m = math.inf
+                        upright_body_height_m = math.nan
+                    upright_body_reacquire_support = bool(
+                        selected_upright_pose_projection
+                        and not pose_projection_strongly_conflicts_with_pcf
+                        and current_detector_semantic_confidence
+                        >= max(
+                            0.58,
+                            float(self._min_unposed_detection_confidence),
+                        )
+                        and upright_body_anchor_count >= 5
+                        and math.isfinite(upright_body_scatter_m)
+                        and upright_body_scatter_m <= 0.50
+                        and math.isfinite(upright_body_height_m)
+                        and 1.0 <= upright_body_height_m <= 2.25
+                    )
+                    upright_body_four_plane_sample = bool(
+                        selected_upright_pose_projection
+                        and not pose_projection_strongly_conflicts_with_pcf
+                        and current_detector_semantic_confidence
+                        >= max(
+                            0.58,
+                            float(self._min_unposed_detection_confidence),
+                        )
+                        and upright_body_anchor_count == 4
+                        and math.isfinite(upright_body_scatter_m)
+                        and upright_body_scatter_m <= 0.50
+                        and math.isfinite(upright_body_height_m)
+                        and 1.0 <= upright_body_height_m <= 2.25
+                    )
+                    if selected_upright_pose_projection:
+                        track["world_upright_body_reacquire_support"] = bool(
+                            upright_body_reacquire_support
+                        )
+                    # Five exact-current body planes with a plausible solved
+                    # height are typed support for the person's ground
+                    # footprint even when furniture hides every physical
+                    # contact point. A four-plane solve is separately typed so
+                    # exactly two compatible cold samples can prove the first
+                    # coordinate; it still cannot finalize an established
+                    # relocation. PCF contradictions remain quarantined.
+                    verified_reacquire_support = bool(
+                        verified_reacquire_support
+                        or upright_body_reacquire_support
+                    )
+                    if selected_seated_pose_projection:
+                        # A current seated torso plus a compatible, revision-
+                        # bound floorplan prior is enough to show the person on
+                        # the first callback. Broad height uncertainty remains
+                        # in covariance. A strong PCF contradiction still uses
+                        # the ordinary same-basis temporal quarantine.
+                        filter_quality = (
+                            "weak"
+                            if pose_projection_strongly_conflicts_with_pcf
+                            else "estimated"
+                        )
+                    if selected_upright_pose_projection:
+                        # Five convergent planes spanning head, shoulders, and
+                        # hips are sufficient within-frame geometric proof to
+                        # seed a cold furniture-occluded person unless the
+                        # bound Scene Prior strongly contradicts the footprint.
+                        filter_quality = (
+                            "estimated"
+                            if bool(track.get("world_upright_body_strong_proof"))
+                            and not pose_projection_strongly_conflicts_with_pcf
+                            else "weak"
+                        )
+                    selected_contact_basis = str(
+                        track.get("world_resolver_contact_basis") or ""
+                    ).strip()
+                    cold_bbox_temporal_consensus = bool(
+                        not trusted_metric_lifecycle
+                        and selected_kind == "floor_ray"
+                        and selected_contact_basis
+                        in {"bbox:bottom_center", "bbox_bottom"}
+                    )
+                    cold_bbox_semantic_ready = bool(
+                        current_detector_semantic_confidence
+                        >= float(self._min_unposed_detection_confidence)
+                    )
+                    if cold_bbox_temporal_consensus:
+                        # A detector-bottom ray is useful for a far/unposed
+                        # person, but resolver geometry alone cannot make one
+                        # cold row semantic truth. Detector confidence gated
+                        # the candidate above; force its cold seed through the
+                        # shared weak, same-basis three-sample consensus even
+                        # when the geometric resolver labels it estimated.
+                        filter_quality = "weak"
+                        track["world_bbox_cold_semantic_ready"] = bool(
+                            cold_bbox_semantic_ready
+                        )
+                    quality = (
+                        filter_quality
+                        if filter_quality in ("good", "estimated")
+                        else "estimated"
+                    )
                     depth_weight_for_admission = float(
                         next(
                             (
@@ -16436,10 +21886,52 @@ class _AnalyticsTelemetryProcessor:
                         track,
                         state,
                         candidate_source=world_source,
-                        quality=quality,
+                        quality=filter_quality,
                         depth_weight=depth_weight_for_admission,
                         posture=str(posture),
                     )
+                    if (
+                        selected_seated_projection
+                        and state is not None
+                        and output_reference_at_entry is not None
+                    ):
+                        try:
+                            (
+                                visible_x,
+                                visible_z,
+                                _visible_pts,
+                                visible_filter_ts,
+                                _visible_segment,
+                            ) = output_reference_at_entry
+                            visible_x = float(visible_x)
+                            visible_z = float(visible_z)
+                            visible_filter_ts = float(visible_filter_ts)
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                        else:
+                            if all(
+                                math.isfinite(value)
+                                for value in (
+                                    visible_x,
+                                    visible_z,
+                                    visible_filter_ts,
+                                )
+                            ) and float(now_ts) >= visible_filter_ts:
+                                # Rate-suppressed callbacks can leave a
+                                # speculative walking posterior ahead of the
+                                # point the tracking/world/BEV queue actually
+                                # exposed. A seated measurement must begin at
+                                # that immutable visible point with no inherited
+                                # walking velocity; the current body observation
+                                # then moves it through the ordinary physical
+                                # filter and final output gate.
+                                state.world_x = visible_x
+                                state.world_z = visible_z
+                                state.filtered_ts = visible_filter_ts
+                                state.vel_world_x = 0.0
+                                state.vel_world_z = 0.0
+                                state.locked_world = None
+                                track["world_seated_filter_rebased"] = True
                     hit = self._update_track_world_state(
                         track,
                         state,
@@ -16448,19 +21940,92 @@ class _AnalyticsTelemetryProcessor:
                         now_ts=float(now_ts),
                         alpha=(
                             float(self._world_smooth_alpha_good)
-                            if quality == "good"
+                            if filter_quality == "good"
                             else float(self._world_smooth_alpha_weak)
                         ),
                         beta=0.15,
-                        quality=quality,
+                        quality=filter_quality,
+                        force_accept=False,
                         contact_basis=(
-                            str(track.get("world_resolver_contact_basis"))
-                            if track.get("world_resolver_contact_basis")
-                            else contact_basis
+                            "pose:upright_body_planes:four_plane"
+                            if upright_body_four_plane_sample
+                            else self._person_ground_consensus_contact_basis(
+                                (
+                                    str(track.get("world_resolver_contact_basis"))
+                                    if track.get("world_resolver_contact_basis")
+                                    else contact_basis
+                                )
+                            )
                         ),
                         image_motion_supported=image_motion_supported,
+                        verified_reacquire_support=bool(
+                            verified_reacquire_support
+                        ),
+                        verified_first_output_pose_floor_seed=bool(
+                            verified_first_output_pose_floor_seed
+                        ),
+                        defer_weak_seed=bool(
+                            cold_bbox_temporal_consensus
+                            and not cold_bbox_semantic_ready
+                        ),
+                        media_pts_ns=self._valid_world_media_pts_ns(
+                            track.get("media_pts_ns")
+                        ),
+                        display_output=display_recovery_reference_at_entry,
                     )
+                    if (
+                        selected_seated_projection
+                        and state is not None
+                        and bool(state.measurement_accepted)
+                    ):
+                        state.vel_world_x = 0.0
+                        state.vel_world_z = 0.0
+                        track["world_seated_velocity_reset"] = True
+                        if bbox_stationary_supported:
+                            state.motion_mode = "sit"
+                            state.locked_world = (
+                                float(hit[0]),
+                                float(hit[2]),
+                            )
+                            state.trail_append_allowed = False
+                            track["world_seated_stationary_lock"] = True
+                    if (
+                        selected_upright_pose_projection
+                        and state is not None
+                        and bool(state.measurement_accepted)
+                    ):
+                        try:
+                            solved_height_scene = float(
+                                track["world_upright_body_height_m"]
+                            ) * float(self._scene_per_meter(calib))
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            solved_height_scene = math.nan
+                        if math.isfinite(solved_height_scene) and solved_height_scene > 0.0:
+                            if state.height_ref_scene is None:
+                                state.height_ref_scene = float(solved_height_scene)
+                            else:
+                                state.height_ref_scene = float(
+                                    float(state.height_ref_scene)
+                                    + 0.12
+                                    * (
+                                        float(solved_height_scene)
+                                        - float(state.height_ref_scene)
+                                    )
+                                )
+                            track["world_upright_body_height_lock"] = True
                     quality_reason = str(resolved.reason)
+                    if weak_ground_supported:
+                        quality_reason = (
+                            f"{quality_reason},weak_ground_temporal_consensus"
+                        )
+                    if selected_seated_projection:
+                        quality_reason = (
+                            f"{quality_reason},seated_ground_projection"
+                        )
+                    if selected_upright_pose_projection:
+                        quality_reason = (
+                            f"{quality_reason},upright_body_ground_projection"
+                        )
                 elif resolved_hit is not None and resolved is not None:
                     # A weak resolver result remains visible in the bounded
                     # diagnostic payload, but it is not a current metric
@@ -16513,7 +22078,11 @@ class _AnalyticsTelemetryProcessor:
                 gravity_hit = self._gravity_drop_world(
                     calib,
                     bbox_project,
-                    float(state.height_ref_scene),
+                    float(
+                        state.inferred_ground_continuity_anchor.height_ref_scene
+                        if state.inferred_ground_continuity_anchor is not None
+                        else state.height_ref_scene
+                    ),
                     flip_u=flip_u,
                     flip_v=flip_v,
                     pose_kpts_abs=pose_kpts_project,
@@ -16561,6 +22130,10 @@ class _AnalyticsTelemetryProcessor:
                             quality="estimated",
                             contact_basis="gravity_drop",
                             image_motion_supported=False,
+                            media_pts_ns=self._valid_world_media_pts_ns(
+                                track.get("media_pts_ns")
+                            ),
+                            display_output=display_recovery_reference_at_entry,
                         )
                         world_source = "gravity_drop"
                         quality = "estimated"
@@ -16636,22 +22209,74 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:
                     bbox_motion_material = True
             if state is not None and (measurement_rejected or hit is None):
-                projective_prediction = self._project_image_motion_prediction(
-                    camera_id=camera_id,
-                    state=state,
-                    bbox_project=bbox_project,
-                    calib=calib,
-                    now_ts=float(now_ts),
-                    lifecycle_generation=(
-                        int(track.get("tracker_lifecycle_generation"))
-                        if track.get("tracker_lifecycle_generation") is not None
-                        else None
-                    ),
-                    flip_u=flip_u,
-                    flip_v=flip_v,
-                    track=track,
-                )
-
+                if inferred_process_raw_candidate is not None:
+                    track["world_inferred_raw_sample"] = [
+                        float(inferred_process_raw_candidate[0]),
+                        float(inferred_process_raw_candidate[1]),
+                        float(inferred_process_raw_candidate[2]),
+                    ]
+                    robust_raw = (
+                        inferred_process_robust_raw_candidate
+                        if inferred_process_robust_raw_candidate is not None
+                        else inferred_process_raw_candidate
+                    )
+                    track["world_inferred_raw_observation"] = [
+                        float(robust_raw[0]),
+                        float(robust_raw[1]),
+                        float(robust_raw[2]),
+                    ]
+                if inferred_process_candidate is not None:
+                    track["world_inferred_process_observation"] = [
+                        float(inferred_process_candidate[0]),
+                        float(inferred_process_candidate[1]),
+                        float(inferred_process_candidate[2]),
+                    ]
+                    if inferred_process_image_foot is not None:
+                        track["world_inferred_process_image_foot"] = [
+                            float(inferred_process_image_foot[0]),
+                            float(inferred_process_image_foot[1]),
+                        ]
+                    if inferred_process_provenance is None:
+                        raise RuntimeError(
+                            "aligned inferred process candidate has no proof"
+                        )
+                    prediction_provenance = dict(
+                        inferred_process_provenance
+                    )
+                    if inferred_process_image_foot is not None:
+                        prediction_provenance["image_foot"] = [
+                            float(inferred_process_image_foot[0]),
+                            float(inferred_process_image_foot[1]),
+                        ]
+                    projective_prediction = (
+                        np.asarray(inferred_process_candidate, dtype=np.float64),
+                        prediction_provenance,
+                    )
+                else:
+                    projective_prediction = self._project_image_motion_prediction(
+                        camera_id=camera_id,
+                        state=state,
+                        bbox_project=bbox_project,
+                        calib=calib,
+                        now_ts=float(now_ts),
+                        lifecycle_generation=(
+                            int(track.get("tracker_lifecycle_generation"))
+                            if track.get("tracker_lifecycle_generation") is not None
+                            else None
+                        ),
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                        track=track,
+                        motion_anchor_uv=pose_torso_reference_uv_calib,
+                        motion_basis=(
+                            str(
+                                pose_torso_reference_anchor.contact_basis
+                                or pose_torso_reference_anchor.source
+                            )
+                            if pose_torso_reference_anchor is not None
+                            else None
+                        ),
+                    )
             # A projective point is allowed to influence the canonical state
             # only when the calibrated camera policy permits weak continuation
             # and this frame has no current metric candidate or its candidate
@@ -16672,10 +22297,66 @@ class _AnalyticsTelemetryProcessor:
                 camera_id,
                 track,
             )
+            upright_presence_hold_evidence_at_selection = (
+                self._upright_presence_output_hold_evidence(
+                    track,
+                    state=state,
+                    prior_output=output_reference_at_entry,
+                    floor_y=float(calib.floor_y),
+                )
+                if state is not None
+                else None
+            )
+            current_presence_hold_evidence_at_selection = (
+                self._current_presence_output_hold_evidence(
+                    track,
+                    kinematic_output=(
+                        kinematic_output_reference_at_entry
+                    ),
+                    kinematic_bbox_geometry=(
+                        kinematic_bbox_reference_at_entry
+                    ),
+                )
+            )
+            track["world_bbox_continuity_supported"] = bool(
+                current_presence_hold_evidence_at_selection is not None
+            )
+            if current_presence_hold_evidence_at_selection is not None:
+                track["world_bbox_continuity_size_ratio"] = float(
+                    current_presence_hold_evidence_at_selection[
+                        "bbox_size_ratio"
+                    ]
+                )
+                track["world_bbox_continuity_center_displacement_norm"] = (
+                    float(
+                        current_presence_hold_evidence_at_selection[
+                            "bbox_center_displacement_norm"
+                        ]
+                    )
+                )
+            else:
+                track.pop("world_bbox_continuity_size_ratio", None)
+                track.pop(
+                    "world_bbox_continuity_center_displacement_norm",
+                    None,
+                )
+            post_occlusion_upright_hold_pending = bool(
+                state is not None
+                and measurement_rejected
+                and state.post_occlusion_reacquire_support_required
+                and upright_presence_hold_evidence_at_selection is not None
+            )
+            # A rejected body-plane candidate must not blank an otherwise
+            # valid image-motion continuation. The projective integrator
+            # preserves (and never increments) the metric same-basis
+            # reacquisition candidate, so continuity can remain visible while
+            # the body solve earns or fails its ordinary consensus.
             if (
                 state is not None
                 and projective_prediction is not None
                 and projective_allowed
+                and output_reference_committed_at_entry
+                and not post_occlusion_upright_hold_pending
                 and (
                     anchor_candidate is None
                     or depth_measurement_not_current
@@ -16684,26 +22365,54 @@ class _AnalyticsTelemetryProcessor:
                 )
             ):
                 projective_point, prediction_provenance = projective_prediction
+                filter_transition: Dict[str, Any] = {}
                 integrated = integrate_projective_ground_observation(
                     state,
                     measurement=projective_point,
                     floor_y=float(calib.floor_y),
                     now_ts=float(now_ts),
                     config=self._human_ground_cfg,
+                    prior_output=(
+                        kinematic_output_reference_at_entry
+                        or output_reference_at_entry
+                    ),
+                    display_output=display_recovery_reference_at_entry,
+                    media_pts_ns=self._valid_world_media_pts_ns(
+                        track.get("media_pts_ns")
+                    ),
+                    transition_proof=filter_transition,
                 )
                 if integrated is not None:
                     hit = np.asarray(integrated, dtype=np.float64)
                     prediction_provenance = dict(prediction_provenance)
                     prediction_provenance["state_integrated"] = True
+                    prediction_provenance["process_observation"] = [
+                        float(projective_point[0]),
+                        float(calib.floor_y),
+                        float(projective_point[2]),
+                    ]
+                    prediction_provenance["filter_transition"] = dict(
+                        filter_transition
+                    )
                     track["world_filter_prediction"] = [
                         float(hit[0]),
                         float(calib.floor_y),
                         float(hit[2]),
                     ]
                     track["world_prediction_provenance"] = prediction_provenance
-                    track["world_prediction_image_foot"] = list(
-                        prediction_provenance["image_foot"]
+                    prediction_image_foot = prediction_provenance.get(
+                        "image_foot"
                     )
+                    if (
+                        isinstance(prediction_image_foot, (list, tuple))
+                        and len(prediction_image_foot) >= 2
+                    ):
+                        track["world_prediction_image_foot"] = [
+                            float(prediction_image_foot[0]),
+                            float(prediction_image_foot[1]),
+                        ]
+                    else:
+                        track.pop("world_prediction_image_foot", None)
                     world_source = "image_motion_prediction"
                     quality = "estimated"
                     projective_reason = (
@@ -16716,15 +22425,24 @@ class _AnalyticsTelemetryProcessor:
                         )
                     )
                     state.measurement_rejection_reason = projective_reason
-                    quality_reason = (
-                        f"{projective_reason},"
-                        "predicted_from_accepted_image_motion"
+                    prediction_detail = (
+                        "guided_by_inferred_body_geometry"
+                        if prediction_provenance.get("type")
+                        == "inferred_ground_process_observation"
+                        else "predicted_from_accepted_image_motion"
+                    )
+                    quality_reason = self._bounded_world_quality_reason(
+                        projective_reason,
+                        prediction_detail,
                     )
                     projective_integrated = True
                 else:
                     projective_rejection_reason = str(
                         state.measurement_rejection_reason
                         or "projective_observation_rejected"
+                    )
+                    track["world_projective_rejection_reason"] = str(
+                        projective_rejection_reason
                     )
 
             # A missing/filtered candidate must not inherit the previous
@@ -16742,6 +22460,8 @@ class _AnalyticsTelemetryProcessor:
                             if depth_measurement_not_current
                             else str(fallback_reason or "world_measurement_unavailable")
                         ),
+                        now_ts=now_ts,
+                        config=self._human_ground_cfg,
                     )
                     measurement_rejected = True
 
@@ -16750,23 +22470,149 @@ class _AnalyticsTelemetryProcessor:
                 # not reinterpret it as a held or display-only point below.
                 measurement_rejected = False
 
+            if projective_integrated or (
+                not measurement_rejected and state.measurement_accepted
+            ):
+                state.post_ghost_position_support_required = False
+
+            restored_short_ghost_without_position_evidence = bool(
+                state.post_ghost_position_support_required
+                and measurement_rejected
+            )
+
+            recent_process_bridge_allowed = bool(
+                recent_process_bridge_allowed_at_entry
+            )
+            force_exact_output_hold = False
+            exact_output_hold_stationary_evidence = False
+            exact_output_hold_process_observation: Optional[np.ndarray] = None
+            stationary_metric_hold_current = False
+            if metric_output_reference_at_entry is not None:
+                try:
+                    metric_origin_pts_ns = metric_output_reference_at_entry[2]
+                    if (
+                        valid_media_pts_ns is not None
+                        and metric_origin_pts_ns is not None
+                    ):
+                        stationary_metric_age_s = (
+                            int(valid_media_pts_ns) - int(metric_origin_pts_ns)
+                        ) / 1_000_000_000.0
+                    else:
+                        stationary_metric_age_s = float(now_ts) - float(
+                            metric_output_reference_at_entry[3]
+                        )
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    stationary_metric_hold_current = False
+                else:
+                    stationary_metric_hold_current = (
+                        self._hold_age_is_current(
+                            stationary_metric_age_s,
+                            ttl_s=float(self._world_stationary_hold_ttl_s),
+                        )
+                    )
+            latest_output_hold_current = False
+            if output_reference_at_entry is not None:
+                try:
+                    latest_output_origin_pts_ns = output_reference_at_entry[2]
+                    if (
+                        valid_media_pts_ns is not None
+                        and latest_output_origin_pts_ns is not None
+                    ):
+                        latest_output_age_s = (
+                            int(valid_media_pts_ns)
+                            - int(latest_output_origin_pts_ns)
+                        ) / 1_000_000_000.0
+                    else:
+                        latest_output_age_s = float(now_ts) - float(
+                            output_reference_at_entry[3]
+                        )
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    latest_output_hold_current = False
+                else:
+                    latest_output_hold_current = self._hold_age_is_current(
+                        latest_output_age_s,
+                        ttl_s=float(self._world_anchor_hold_ttl_s),
+                    )
+            post_occlusion_quarantine_hold = bool(
+                not restored_short_ghost_without_position_evidence
+                and measurement_rejected
+                and recent_process_bridge_allowed
+                and output_reference_committed_at_entry
+                and output_reference_at_entry is not None
+                and metric_output_reference_at_entry is not None
+                and state.post_occlusion_reacquire_support_required
+                and str(state.measurement_rejection_reason or "")
+                == "post_occlusion_reacquire_requires_verified_support"
+            )
+            stationary_queue_output_hold = bool(
+                not restored_short_ghost_without_position_evidence
+                and measurement_rejected
+                and stationary_hold_eligible
+                and output_reference_committed_at_entry
+                and output_reference_at_entry is not None
+                and metric_output_reference_at_entry is not None
+                and stationary_metric_hold_current
+                and state.bbox_stationary_supported
+                and str(state.posture or "") in {"sitting", "lying"}
+            )
+            upright_presence_queue_output_hold = bool(
+                not restored_short_ghost_without_position_evidence
+                and measurement_rejected
+                and output_reference_committed_at_entry
+                and output_reference_at_entry is not None
+                and metric_output_reference_at_entry is not None
+                and upright_presence_hold_evidence_at_selection is not None
+            )
+            current_presence_queue_output_hold = bool(
+                not restored_short_ghost_without_position_evidence
+                and measurement_rejected
+                and output_reference_committed_at_entry
+                and output_reference_at_entry is not None
+                and metric_output_reference_at_entry is not None
+                and current_presence_hold_evidence_at_selection is not None
+            )
             if measurement_rejected:
                 quality_reason = str(
                     state.measurement_rejection_reason or "physical_measurement_rejected"
                 )
                 fallback_reason = quality_reason
                 if stationary_hold_eligible:
-                    quality_reason = f"{quality_reason},stationary_bbox_hold"
+                    quality_reason = str(
+                        self._bounded_world_quality_reason(
+                            quality_reason,
+                            "stationary_bbox_hold",
+                        )
+                        or quality_reason
+                    )
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
                 hold_ttl_s = (
                     float(self._world_stationary_hold_ttl_s)
                     if stationary_hold_eligible
                     else float(self._world_anchor_hold_ttl_s)
                 )
+                hold_within_ttl = self._hold_age_is_current(
+                    hold_age,
+                    ttl_s=hold_ttl_s,
+                )
                 if (
+                    not restored_short_ghost_without_position_evidence
+                    and
+                    not (
+                        post_occlusion_quarantine_hold
+                        or stationary_queue_output_hold
+                        or upright_presence_queue_output_hold
+                        or current_presence_queue_output_hold
+                    )
+                    and
                     state.last_good_world is not None
-                    and hold_age <= hold_ttl_s
+                    and (
+                        hold_within_ttl
+                        or recent_process_bridge_allowed
+                    )
                 ):
+                    using_recent_process_bridge = bool(
+                        recent_process_bridge_allowed
+                    )
                     process_point = advance_human_cv_prediction(
                         state,
                         floor_y=float(calib.floor_y),
@@ -16775,12 +22621,66 @@ class _AnalyticsTelemetryProcessor:
                         reason=str(quality_reason),
                     )
                     if process_point is not None:
+                        if using_recent_process_bridge:
+                            state.projective_bridge_process_ts = float(
+                                state.filtered_ts
+                            )
                         track["world_filter_prediction"] = [
                             float(process_point[0]),
                             float(calib.floor_y),
                             float(process_point[2]),
                         ]
-                        if stationary_hold_eligible or (
+                        process_result_is_exact_hold = False
+                        if output_reference_at_entry is not None:
+                            try:
+                                process_result_is_exact_hold = bool(
+                                    str(
+                                        state.measurement_rejection_reason
+                                        or ""
+                                    )
+                                    == "bounded_process_continuity_exceeded"
+                                    and not state.trail_append_allowed
+                                    and math.hypot(
+                                        float(process_point[0])
+                                        - float(output_reference_at_entry[0]),
+                                        float(process_point[2])
+                                        - float(output_reference_at_entry[1]),
+                                    )
+                                    <= 1e-6
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                                IndexError,
+                                OverflowError,
+                            ):
+                                process_result_is_exact_hold = False
+                        if process_result_is_exact_hold:
+                            # The bounded process model rejected its own next
+                            # step and returned the exact queue-visible point.
+                            # Publish that as a gain-zero hold, not a zero-step
+                            # CV row: advancing the kinematic timestamp here
+                            # would make the next accurate reacquisition appear
+                            # to move in only one frame.
+                            hit = np.asarray(
+                                [
+                                    float(output_reference_at_entry[0]),
+                                    float(calib.floor_y),
+                                    float(output_reference_at_entry[1]),
+                                ],
+                                dtype=np.float64,
+                            )
+                            exact_output_hold_process_observation = (
+                                np.asarray(process_point, dtype=np.float64)
+                            )
+                            force_exact_output_hold = True
+                            world_source = "anchor_hold"
+                            quality = "held"
+                            quality_reason = str(
+                                state.measurement_rejection_reason
+                                or quality_reason
+                            )
+                        elif stationary_hold_eligible or (
                             int(current_frame_id) < 0 and not bbox_motion_material
                         ):
                             # ``advance_human_cv_prediction`` has already
@@ -16802,6 +22702,11 @@ class _AnalyticsTelemetryProcessor:
                             "type": "bounded_cv_process",
                             "non_authoritative": True,
                             "state_integrated": True,
+                            "origin": (
+                                "recent_projective_process"
+                                if using_recent_process_bridge
+                                else "last_metric_process"
+                            ),
                             "reason": str(quality_reason),
                         }
                         track["world_prediction_image_foot"] = list(
@@ -16817,6 +22722,72 @@ class _AnalyticsTelemetryProcessor:
                     world_source = None
 
             if (
+                (
+                    post_occlusion_quarantine_hold
+                    or stationary_queue_output_hold
+                    or upright_presence_queue_output_hold
+                    or current_presence_queue_output_hold
+                )
+                and hit is None
+            ):
+                try:
+                    prior_x = float(output_reference_at_entry[0])
+                    prior_z = float(output_reference_at_entry[1])
+                    process_x = float(
+                        state.world_x
+                        if state.world_x is not None
+                        else prior_x
+                    )
+                    process_z = float(
+                        state.world_z
+                        if state.world_z is not None
+                        else prior_z
+                    )
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    pass
+                else:
+                    if all(
+                        math.isfinite(value)
+                        for value in (prior_x, prior_z, process_x, process_z)
+                    ):
+                        hit = np.asarray(
+                            [prior_x, float(calib.floor_y), prior_z],
+                            dtype=np.float64,
+                        )
+                        exact_output_hold_process_observation = np.asarray(
+                            [process_x, float(calib.floor_y), process_z],
+                            dtype=np.float64,
+                        )
+                        track["world_filter_prediction"] = [
+                            prior_x,
+                            float(calib.floor_y),
+                            prior_z,
+                        ]
+                        world_source = "anchor_hold"
+                        quality = "held"
+                        quality_reason = str(
+                            state.measurement_rejection_reason
+                            or "post_occlusion_reacquire_requires_verified_support"
+                        )
+                        if current_presence_queue_output_hold:
+                            quality_reason = str(
+                                self._bounded_world_quality_reason(
+                                    quality_reason,
+                                    "current_bbox_presence_hold",
+                                )
+                                or quality_reason
+                            )
+                        state.trail_append_allowed = False
+                        if post_occlusion_quarantine_hold:
+                            state.projective_bridge_process_ts = float(
+                                state.filtered_ts
+                            )
+                        exact_output_hold_stationary_evidence = bool(
+                            stationary_queue_output_hold
+                        )
+                        force_exact_output_hold = True
+
+            if (
                 not measurement_rejected
                 and hit is None
                 and state is not None
@@ -16828,7 +22799,14 @@ class _AnalyticsTelemetryProcessor:
                     if stationary_hold_eligible
                     else float(self._world_anchor_hold_ttl_s)
                 )
-                if hold_age <= hold_ttl_s:
+                hold_within_ttl = self._hold_age_is_current(
+                    hold_age,
+                    ttl_s=hold_ttl_s,
+                )
+                if hold_within_ttl or recent_process_bridge_allowed:
+                    using_recent_process_bridge = bool(
+                        recent_process_bridge_allowed
+                    )
                     process_point = advance_human_cv_prediction(
                         state,
                         floor_y=float(calib.floor_y),
@@ -16841,17 +22819,71 @@ class _AnalyticsTelemetryProcessor:
                         ),
                     )
                     if process_point is not None:
+                        if using_recent_process_bridge:
+                            state.projective_bridge_process_ts = float(
+                                state.filtered_ts
+                            )
                         track["world_filter_prediction"] = [
                             float(process_point[0]),
                             float(calib.floor_y),
                             float(process_point[2]),
                         ]
-                        hit = np.asarray(process_point, dtype=np.float64)
-                        world_source = "cv_prediction"
+                        process_result_is_exact_hold = False
+                        if output_reference_at_entry is not None:
+                            try:
+                                process_result_is_exact_hold = bool(
+                                    str(
+                                        state.measurement_rejection_reason
+                                        or ""
+                                    )
+                                    == "bounded_process_continuity_exceeded"
+                                    and not state.trail_append_allowed
+                                    and math.hypot(
+                                        float(process_point[0])
+                                        - float(output_reference_at_entry[0]),
+                                        float(process_point[2])
+                                        - float(output_reference_at_entry[1]),
+                                    )
+                                    <= 1e-6
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                                IndexError,
+                                OverflowError,
+                            ):
+                                process_result_is_exact_hold = False
+                        if process_result_is_exact_hold:
+                            hit = np.asarray(
+                                [
+                                    float(output_reference_at_entry[0]),
+                                    float(calib.floor_y),
+                                    float(output_reference_at_entry[1]),
+                                ],
+                                dtype=np.float64,
+                            )
+                            exact_output_hold_process_observation = (
+                                np.asarray(process_point, dtype=np.float64)
+                            )
+                            force_exact_output_hold = True
+                            world_source = "anchor_hold"
+                            quality = "held"
+                            quality_reason = str(
+                                state.measurement_rejection_reason
+                                or quality_reason
+                            )
+                        else:
+                            hit = np.asarray(process_point, dtype=np.float64)
+                            world_source = "cv_prediction"
                         track["world_prediction_provenance"] = {
                             "type": "bounded_cv_process",
                             "non_authoritative": True,
                             "state_integrated": True,
+                            "origin": (
+                                "recent_projective_process"
+                                if using_recent_process_bridge
+                                else "last_metric_process"
+                            ),
                             "reason": str(
                                 "depth_measurement_not_current"
                                 if depth_measurement_not_current
@@ -16862,10 +22894,21 @@ class _AnalyticsTelemetryProcessor:
                         if world_source == "anchor_hold" and not depth_measurement_not_current:
                             quality_reason = fallback_reason
                         if stationary_hold_eligible and world_source == "anchor_hold":
-                            quality_reason = f"{quality_reason},stationary_bbox_hold"
+                            quality_reason = str(
+                                self._bounded_world_quality_reason(
+                                    quality_reason,
+                                    "stationary_bbox_hold",
+                                )
+                                or quality_reason
+                            )
                     else:
                         hit = None
                         world_source = None
+
+            if quality_reason:
+                quality_reason = self._bounded_world_quality_reason(
+                    quality_reason
+                )
 
             if hit is not None:
                 # The final point may be a bounded CV/hold posterior rather
@@ -16888,6 +22931,8 @@ class _AnalyticsTelemetryProcessor:
                         mark_world_measurement_unavailable(
                             state,
                             reason=rejection_reason,
+                            now_ts=now_ts,
+                            config=self._human_ground_cfg,
                         )
                         state.trail_append_allowed = False
                     track["world_estimator_evaluated"] = True
@@ -16975,7 +23020,10 @@ class _AnalyticsTelemetryProcessor:
                         world_source = "anchor_hold"
                     if world_source == "anchor_hold":
                         state.trail_append_allowed = False
-                    elif world_source in ("cv_prediction", "image_motion_prediction"):
+                    elif world_source in (
+                        "cv_prediction",
+                        "image_motion_prediction",
+                    ):
                         state.trail_append_allowed = True
                     if bounded_process_hit is not None:
                         # A stale idle lock is a process/display state, not a
@@ -17001,6 +23049,13 @@ class _AnalyticsTelemetryProcessor:
                             state.vel_world_x = 0.0
                             state.vel_world_z = 0.0
 
+                    output_candidate = np.asarray(
+                        exact_output_hold_process_observation
+                        if force_exact_output_hold
+                        and exact_output_hold_process_observation is not None
+                        else hit,
+                        dtype=np.float64,
+                    ).copy()
                     hit, output_continuous = admit_human_ground_output(
                         state,
                         candidate=np.asarray(hit, dtype=np.float64),
@@ -17008,11 +23063,38 @@ class _AnalyticsTelemetryProcessor:
                         now_ts=float(now_ts),
                         media_pts_ns=track.get("media_pts_ns", 0),
                         config=self._human_ground_cfg,
+                        allow_segment_break=bool(
+                            world_source
+                            not in (
+                                "anchor_hold",
+                                "cv_prediction",
+                                "image_motion_prediction",
+                            )
+                            and state.measurement_accepted
+                        ),
+                        prior_output=(
+                            (
+                                output_reference_at_entry
+                                if force_exact_output_hold
+                                else (
+                                    kinematic_output_reference_at_entry
+                                    or output_reference_at_entry
+                                )
+                            )
+                            if output_reference_committed_at_entry
+                            else None
+                        ),
+                        ignore_uncommitted_state_output=bool(
+                            not output_reference_committed_at_entry
+                        ),
                     )
-                    self._save_world_output_watermark(
-                        state,
-                        output_watermark_key,
-                    )
+                    if force_exact_output_hold:
+                        # Gain-zero publication semantics are distinct from a
+                        # successful zero-distance process step. Preserve the
+                        # latest visible coordinate while keeping the older
+                        # motion-bearing watermark for a later accurate
+                        # recovery.
+                        output_continuous = False
                     if not output_continuous:
                         world_source = "anchor_hold"
                         quality = "held"
@@ -17020,6 +23102,131 @@ class _AnalyticsTelemetryProcessor:
                             state.measurement_rejection_reason
                             or "physical_output_continuity_exceeded"
                         )
+                        # Final admission replaced the proposed process point
+                        # with the last queue-visible coordinate.  Rewrite the
+                        # diagnostics to describe that exact emitted hold;
+                        # retaining the rejected image/CV candidate here would
+                        # make the strict observation disagree with tracking.
+                        track["world_filter_prediction"] = [
+                            float(hit[0]),
+                            float(calib.floor_y),
+                            float(hit[2]),
+                        ]
+                        current_upright_presence_hold_evidence = (
+                            self._upright_presence_output_hold_evidence(
+                                track,
+                                state=state,
+                                prior_output=output_reference_at_entry,
+                                floor_y=float(calib.floor_y),
+                            )
+                        )
+                        bounded_provenance = (
+                            self._bounded_process_output_provenance(
+                                track,
+                                provenance_type="bounded_output_hold",
+                                provenance_origin="last_published_output",
+                                reason=str(quality_reason),
+                                prior_output=output_reference_at_entry,
+                                metric_output=metric_output_reference_at_entry,
+                                process_observation=output_candidate,
+                                emitted_point=np.asarray(hit, dtype=np.float64),
+                                output_continuous=False,
+                                emitted_trail_segment_id=int(
+                                    state.last_output_trail_segment_id
+                                ),
+                                world_frame_id=str(
+                                    world_frame_id or self._world_frame
+                                ),
+                                world_frame_revision=world_frame_revision,
+                                world_transform_sha256=world_transform_sha256,
+                                stationary_hold_posture=(
+                                    str(state.posture)
+                                    if exact_output_hold_stationary_evidence
+                                    else None
+                                ),
+                                upright_presence_evidence=(
+                                    current_upright_presence_hold_evidence
+                                ),
+                                current_presence_evidence=(
+                                    current_presence_hold_evidence_at_selection
+                                ),
+                            )
+                        )
+                        if bounded_provenance is not None:
+                            track["world_prediction_provenance"] = (
+                                bounded_provenance
+                            )
+                        else:
+                            state.trail_append_allowed = False
+                            self._clear_uncommitted_world_output_state(
+                                state,
+                                output_watermark_key,
+                            )
+                            track.pop("world_prediction_provenance", None)
+                            self._invalidate_world_track(
+                                track,
+                                "canonical_continuity_provenance_unavailable",
+                            )
+                            for key, value in state.as_public_fields().items():
+                                if value is not None:
+                                    track[key] = value
+                            return
+                    elif world_source in ("anchor_hold", "cv_prediction"):
+                        # The queue-visible commit snapshot is the only
+                        # authority for a projective bridge label. A candidate
+                        # assembled earlier in this callback can be downgraded
+                        # to an idle/held mode, or the service may have already
+                        # committed a metric/CV output. Neither case may carry
+                        # a stale recent-projective token into the final proof.
+                        prior_origin = (
+                            "recent_projective_process"
+                            if world_source == "cv_prediction"
+                            and recent_process_bridge_allowed_at_entry
+                            else "last_metric_process"
+                        )
+                        bounded_provenance = (
+                            self._bounded_process_output_provenance(
+                                track,
+                                provenance_type="bounded_cv_process",
+                                provenance_origin=prior_origin,
+                                reason=str(quality_reason),
+                                prior_output=(
+                                    kinematic_output_reference_at_entry
+                                    or output_reference_at_entry
+                                ),
+                                metric_output=metric_output_reference_at_entry,
+                                process_observation=output_candidate,
+                                emitted_point=np.asarray(hit, dtype=np.float64),
+                                output_continuous=True,
+                                emitted_trail_segment_id=int(
+                                    state.last_output_trail_segment_id
+                                ),
+                                world_frame_id=str(
+                                    world_frame_id or self._world_frame
+                                ),
+                                world_frame_revision=world_frame_revision,
+                                world_transform_sha256=world_transform_sha256,
+                            )
+                        )
+                        if bounded_provenance is not None:
+                            track["world_prediction_provenance"] = (
+                                bounded_provenance
+                            )
+                        else:
+                            state.trail_append_allowed = False
+                            self._clear_uncommitted_world_output_state(
+                                state,
+                                output_watermark_key,
+                            )
+                            track.pop("world_prediction_provenance", None)
+                            self._invalidate_world_track(
+                                track,
+                                "canonical_continuity_provenance_unavailable",
+                            )
+                            for key, value in state.as_public_fields().items():
+                                if value is not None:
+                                    track[key] = value
+                            return
 
                 if world_source in (
                     "anchor_hold",
@@ -17071,6 +23278,15 @@ class _AnalyticsTelemetryProcessor:
                     track["world_transform_sha256"] = world_transform_sha256
                 else:
                     track.pop("world_transform_sha256", None)
+                camera_calibration_sha256 = str(
+                    getattr(calib, "camera_calibration_sha256", None) or ""
+                ).strip()
+                if camera_calibration_sha256:
+                    track["world_calibration_sha256"] = (
+                        camera_calibration_sha256
+                    )
+                else:
+                    track.pop("world_calibration_sha256", None)
                 if world_source:
                     track["world_source"] = str(world_source)
                 else:
@@ -17079,11 +23295,28 @@ class _AnalyticsTelemetryProcessor:
                     for key, value in state.as_public_fields().items():
                         if value is not None:
                             track[key] = value
+                    if world_source in (
+                        "anchor_hold",
+                        "cv_prediction",
+                        "image_motion_prediction",
+                    ):
+                        # The internal filter may retain a pending metric
+                        # reanchor segment while this row emits the prior
+                        # queue-visible process/hold point. Publish the segment
+                        # attached to that emitted point; keep the pending break
+                        # only in state for the next accepted metric row.
+                        track["trail_segment_id"] = int(
+                            state.last_output_trail_segment_id
+                        )
+                        track["trail_break_required"] = False
                     if world_source not in (
                         "anchor_hold",
                         "cv_prediction",
                         "image_motion_prediction",
                     ):
+                        state.projective_bridge_origin_ts = -1.0
+                        state.projective_bridge_process_ts = -1.0
+                        state.projective_bridge_rows_remaining = 0
                         state.last_good_world = (float(wx), float(wy), float(wz))
                         state.last_good_ts = float(now_ts)
                         state.ts = float(now_ts)
@@ -17091,20 +23324,14 @@ class _AnalyticsTelemetryProcessor:
                         # accepted world point.  Predictions/holds never move
                         # this origin, which makes repeated rejected frames
                         # non-integrating by construction.
-                        accepted_foot = track.get("_world_current_image_foot_calib")
-                        if (
-                            not isinstance(accepted_foot, (list, tuple))
-                            or len(accepted_foot) < 2
-                        ):
-                            accepted_foot = track.get("image_base")
+                        accepted_foot = self._accepted_image_foot_for_recording(
+                            track,
+                            world_source=world_source,
+                            anchor=anchor_candidate,
+                        )
                         record_accepted_image_geometry(
                             state,
-                            image_foot_uv=(
-                                (float(accepted_foot[0]), float(accepted_foot[1]))
-                                if isinstance(accepted_foot, (list, tuple))
-                                and len(accepted_foot) >= 2
-                                else None
-                            ),
+                            image_foot_uv=accepted_foot,
                             bbox=bbox_project,
                             now_ts=float(now_ts),
                             lifecycle_generation=(
@@ -17112,7 +23339,27 @@ class _AnalyticsTelemetryProcessor:
                                 if track.get("tracker_lifecycle_generation") is not None
                                 else None
                             ),
+                            motion_anchor_uv=pose_torso_reference_uv_calib,
+                            motion_basis=(
+                                str(
+                                    pose_torso_reference_anchor.contact_basis
+                                    or pose_torso_reference_anchor.source
+                                )
+                                if pose_torso_reference_anchor is not None
+                                else None
+                            ),
+                            world_point=np.asarray(hit, dtype=np.float64),
                         )
+                if (
+                    metric_output_reference_at_entry is None
+                    and bool(accepted_current)
+                ):
+                    # A first defensible metric point can mature between the
+                    # normal scalar publication ticks. Publish this exact
+                    # proof-bearing callback as one ordered tracking/world/BEV
+                    # cohort instead of retaining an invisible process-local
+                    # seed that the next callback cannot claim as authority.
+                    track["_world_force_first_metric_publication"] = True
             else:
                 track["world_estimator_evaluated"] = True
                 track["world_valid"] = False
@@ -17152,6 +23399,7 @@ class _AnalyticsTelemetryProcessor:
         tracking_receipt: Optional[TrackingPublicationReceipt] = None,
         observed_at_us: Optional[int] = None,
         timestamp_us: Optional[int] = None,
+        source_epoch: Optional[int] = None,
         tracker_lifecycle_tombstones: Sequence[Mapping[str, Any]] = (),
     ) -> BevPublicationReceipt:
         if self.bev_renderer is None:
@@ -17266,6 +23514,9 @@ class _AnalyticsTelemetryProcessor:
                 footpoints=list(footpoints),
                 timestamp_us=ts_us,
                 source_id=int(sensor_id),
+                source_epoch=(
+                    int(source_epoch) if source_epoch is not None else None
+                ),
                 frame_id=frame_id,
                 observed_at_us=observed_at_us_value,
                 tracking_publication_sequence=tracking_sequence,

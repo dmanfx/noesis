@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -628,6 +629,44 @@ def test_depth_registration_apply_rejects_out_of_domain(tmp_path: Path) -> None:
     corrected, status, _reg_id = manager.apply(camera_id="cam0", raw_depth_m=99.0)
     assert corrected is None
     assert status == "out_of_domain_or_invalid"
+
+
+def test_depth_registration_apply_rejects_only_the_local_flat_interval(
+    tmp_path: Path,
+) -> None:
+    _snapshot0, _dav2_profile, _mapanything_profile, entry = _entry()
+    plateau_entry = replace(
+        entry,
+        raw_range_domain_m=(2.0, 8.0),
+        knots_raw_m=(2.0, 4.0, 6.0, 8.0),
+        knots_registered_m=(2.2, 3.4, 3.4, 4.8),
+    )
+    bundle_path = write_depth_registration_bundle(
+        path=tmp_path / "depth_registration.json",
+        entries={"cam0": plateau_entry},
+    )
+    manager = DepthRegistrationManager.load(bundle_path)
+
+    near_value, near_status, _near_id = manager.apply(
+        camera_id="cam0",
+        raw_depth_m=3.0,
+    )
+    flat_value, flat_status, flat_id = manager.apply(
+        camera_id="cam0",
+        raw_depth_m=5.0,
+    )
+    far_value, far_status, _far_id = manager.apply(
+        camera_id="cam0",
+        raw_depth_m=7.0,
+    )
+
+    assert near_status == "ok"
+    assert near_value == pytest.approx(2.8)
+    assert flat_value is None
+    assert flat_status == "unobservable_plateau"
+    assert flat_id == plateau_entry.registration_id
+    assert far_status == "ok"
+    assert far_value == pytest.approx(4.1)
 
 
 def test_depth_registration_runtime_loader_rejects_legacy_contract(tmp_path: Path) -> None:

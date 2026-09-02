@@ -269,6 +269,6 @@ visualization:
     show_labels: false
     color_key: stable_id
   osd_labels:
-    font_size: 18
+    font_size: 14
     font_name: Serif
     decimals: 2

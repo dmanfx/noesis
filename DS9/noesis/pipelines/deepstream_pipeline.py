@@ -1869,7 +1869,7 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
             "display-mask": int(raw_osd_cfg.get("display-mask", 1)),
             # Hide bbox rectangles to emphasize masks; set to 1 if you want both
             "display-bbox": int(raw_osd_cfg.get("display-bbox", 0)),
-            # Keep labels visible (class name + confidence)
+            # Keep compact ID + confidence labels visible.
             "display-text": int(raw_osd_cfg.get("display-text", 1)),
         },
         downstream=[],

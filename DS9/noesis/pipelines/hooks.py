@@ -57,6 +57,7 @@ from noesis.reid_swin_profile import (
 from noesis.identity_v2_osd import (
     IdentityV2PostResolutionOsdOperator as _SharedIdentityV2OsdOperator,
     IdentityV2PostResolutionOsdProcessor,
+    center_osd_text_above_object,
 )
 from noesis_core.v3dt_validation import (
     V3DTAxisMap,
@@ -1594,6 +1595,8 @@ def attach_analytics_telemetry_hook(
     except Exception:
         logger.exception("Failed to initialize OSD label processor; mosaic labels may be missing")
 
+    attach_osd_label_placement_hook(pipeline)
+
     attach_identity_v2_post_resolution_osd_hook(
         pipeline,
         camera_labels=camera_labels or {},
@@ -1656,6 +1659,27 @@ def attach_identity_v2_post_resolution_osd_hook(
         )
     except Exception:
         logger.exception("Failed to attach authoritative Identity v2 OSD probe")
+        raise
+
+
+def attach_osd_label_placement_hook(pipeline: "DeepStreamPipeline") -> None:
+    """Place existing object labels in final post-tiler mosaic coordinates."""
+
+    tiler = pipeline.components.get("tiler")
+    if tiler is None:
+        raise KeyError("tiler component missing; OSD label placement cannot be attached")
+    processor = _OsdLabelPlacementProcessor()
+    tiler.config["_osd_label_placement_processor"] = processor
+    setattr(pipeline, "osd_label_placement_processor", processor)
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug("Stored post-tiler OSD label placement processor for lazy execution")
+        return
+    try:
+        probe = Probe("osd_label_placement", _OsdLabelPlacementOperator(processor))
+        pipeline.ds_pipeline.attach(tiler.name, probe, tips="src")
+        logger.info("Attached OSD label placement probe to %s src", tiler.name)
+    except Exception:
+        logger.exception("Failed to attach post-tiler OSD label placement probe")
         raise
 
 
@@ -24297,9 +24321,8 @@ class _AnalyticsTelemetryProcessor:
 @dataclass
 class _OsdLabelProcessor:
     decimals: int = 2
-    font_size: Optional[int] = 22
+    font_size: Optional[int] = 14
     font_name: Optional[str] = "Sans"
-    show_both_ids: bool = False
     stable_id_mgr: Any = field(default=None, repr=False)
 
     @staticmethod
@@ -24327,21 +24350,18 @@ class _OsdLabelProcessor:
         decimals = max(0, decimals)
 
         font_size_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_SIZE", "")).strip()
-        font_size_raw = font_size_env if font_size_env else cfg.get("font_size", 22)
-        font_size = _int(font_size_raw, 22)
+        font_size_raw = font_size_env if font_size_env else cfg.get("font_size", 14)
+        font_size = _int(font_size_raw, 14)
         font_size = max(1, font_size)
 
         font_name_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_NAME", "")).strip()
         font_name_raw = font_name_env if font_name_env else cfg.get("font_name", "Sans")
         font_name = _str(font_name_raw).strip() or "Sans"
-        diag_raw = str(os.environ.get("NOESIS_REID_DIAG_USE_TRACKER_ID", "0") or "").strip().lower()
-        show_both = diag_raw in ("1", "true", "yes", "on", "y")
 
         return _OsdLabelProcessor(
             decimals=decimals,
             font_size=font_size,
             font_name=font_name,
-            show_both_ids=show_both,
         )
 
     def handle_servicemaker_frame(self, frame_meta: Any) -> None:
@@ -24377,6 +24397,7 @@ class _OsdLabelProcessor:
         except Exception:
             pass
         self._apply_font(text_params)
+        center_osd_text_above_object(obj_meta, text_params)
 
     def _apply_font(self, text_params: Any) -> None:
         if self.font_size is None and not self.font_name:
@@ -24384,23 +24405,24 @@ class _OsdLabelProcessor:
         font_params = getattr(text_params, "font_params", None)
         if font_params is None:
             return
-        if self.font_name and ds_osd is not None:
-            try:
-                name = str(self.font_name).strip()
-                family = None
-                if name:
-                    family = getattr(getattr(ds_osd, "FontFamily", None), name, None)
-                    if family is None:
-                        family = getattr(getattr(ds_osd, "FontFamily", None), name.capitalize(), None)
-                if family is not None:
-                    font_params.name = family
-            except Exception:
-                pass
+        if self.font_name:
+            for attr in ("font_name", "name"):
+                if not hasattr(font_params, attr):
+                    continue
+                try:
+                    setattr(font_params, attr, str(self.font_name).strip())
+                    break
+                except Exception:
+                    continue
         if self.font_size is not None:
-            try:
-                font_params.size = int(self.font_size)
-            except Exception:
-                pass
+            for attr in ("font_size", "size"):
+                if not hasattr(font_params, attr):
+                    continue
+                try:
+                    setattr(font_params, attr, int(self.font_size))
+                    break
+                except Exception:
+                    continue
 
     def _frame_source_id(self, frame_meta: Any) -> int:
         for attr in ("source_id", "pad_index", "camera_id"):
@@ -24476,7 +24498,7 @@ class _OsdLabelProcessor:
         except Exception:
             track_id = -1
 
-        parts: List[str] = [label]
+        parts: List[str] = []
         # Stable IDs are people-only; avoid showing raw tracker IDs for other classes.
         if class_id == 0 and track_id >= 0:
             stable_id = stable_id_override
@@ -24486,39 +24508,13 @@ class _OsdLabelProcessor:
                 stable_id_int = int(stable_id) if stable_id is not None else None
             except Exception:
                 stable_id_int = None
-            if self.show_both_ids:
-                tracker_text = str(track_id) if track_id >= 0 else "XX"
-                stable_text = str(stable_id_int) if stable_id_int is not None and stable_id_int > 0 else "XX"
-                parts.append(f"[{tracker_text}] | [{stable_text}]")
+            if stable_id_int is not None and stable_id_int > 0:
+                parts.append(f"{stable_id_int}")
             else:
-                if stable_id_int is not None and stable_id_int > 0:
-                    parts.append(f"{stable_id_int}")
-                else:
-                    parts.append("XX")
+                parts.append("XX")
+        if class_id != 0:
+            parts.append(label)
         base_label = " ".join([p for p in parts if p]).strip()
-
-        depth_text = None
-        if class_id == 0:
-            depth_override = getattr(obj_meta, "_noesis_depth_used_m", None)
-            if depth_override is not None:
-                try:
-                    depth_val = float(depth_override)
-                except Exception:
-                    depth_val = float("nan")
-                if math.isfinite(depth_val) and depth_val > 0.0:
-                    depth_text = f"depth={depth_val:.{max(0, int(self.decimals))}f}m"
-                else:
-                    depth_text = "depth=n/a"
-            else:
-                depth_text = _format_depth_label_fragment(
-                    _extract_object_depth_result_from_meta(obj_meta),
-                    decimals=self.decimals,
-                )
-        if depth_text:
-            if base_label:
-                base_label = f"{base_label} {depth_text}"
-            else:
-                base_label = depth_text
 
         try:
             confidence = float(getattr(obj_meta, "confidence", float("nan")))
@@ -24533,6 +24529,19 @@ class _OsdLabelProcessor:
         if base_label:
             return f"{base_label} {conf_text}"
         return conf_text
+
+
+@dataclass
+class _OsdLabelPlacementProcessor:
+    """Re-anchor formatted object text after the tiler transforms its bbox."""
+
+    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
+        object_items = getattr(frame_meta, "object_items", None) or ()
+        for obj_meta in object_items:
+            text_params = getattr(obj_meta, "text_params", None)
+            if text_params is None:
+                continue
+            center_osd_text_above_object(obj_meta, text_params)
 
 
 class _OsdLabelOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
@@ -24552,6 +24561,26 @@ class _OsdLabelOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requi
                 self._processor.handle_servicemaker_frame(frame_meta)
             except Exception:
                 logger.exception("Failed to stamp OSD labels within batch metadata")
+
+
+class _OsdLabelPlacementOperator(
+    _BatchMetadataOperatorBase
+):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: _OsdLabelPlacementProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:
+        if batch_meta is None:
+            return
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+        for frame_meta in frame_items:
+            try:
+                self._processor.handle_servicemaker_frame(frame_meta)
+            except Exception:
+                logger.exception("Failed to place OSD labels in post-tiler metadata")
 
 
 class _IdentityV2PostResolutionOsdOperator(

@@ -37,7 +37,13 @@ def _object(
         class_id=class_id,
         confidence=confidence,
         obj_label=label,
-        text_params=SimpleNamespace(display_text=label),
+        rect_params=SimpleNamespace(left=100.0, top=200.0, width=100.0, height=200.0),
+        text_params=SimpleNamespace(
+            display_text=label,
+            x_offset=0,
+            y_offset=0,
+            font_params=SimpleNamespace(font_size=14, font_name="Serif"),
+        ),
     )
 
 
@@ -58,7 +64,7 @@ def _processor(decisions):
     )
 
 
-def test_post_resolution_osd_uses_exact_decision_and_preserves_depth_fragment() -> None:
+def test_post_resolution_osd_uses_exact_decision_without_name_or_depth() -> None:
     resident = IdentityOsdDecision(
         camera_id="camera-a",
         frame_id=7,
@@ -95,8 +101,8 @@ def test_post_resolution_osd_uses_exact_decision_and_preserves_depth_fragment() 
     )
     processor.handle_servicemaker_frame(frame)
     assert rows.iterations == 1
-    assert rows.rows[0].text_params.display_text == "#1 Alice depth=2.37m 0.91"
-    assert rows.rows[1].text_params.display_text == "#1000 0.82"
+    assert rows.rows[0].text_params.display_text == "1 0.91"
+    assert rows.rows[1].text_params.display_text == "1000 0.82"
     assert rows.rows[2].text_params.display_text == "dog 0.70"
     assert not any("object" in key or "frame" in key for key in processor.__dict__)
 
@@ -127,8 +133,87 @@ def test_post_resolution_osd_is_neutral_on_camera_frame_or_tracker_mismatch(
             object_items=_OneShotObjects([obj]),
         )
     )
-    assert obj.text_params.display_text == "#XX z=1.20m 0.91"
+    assert obj.text_params.display_text == "XX 0.91"
     assert "999" not in obj.text_params.display_text
+    assert "depth" not in obj.text_params.display_text
+
+
+def test_post_resolution_osd_centers_label_above_box() -> None:
+    processor = _processor({})
+    obj = _object(11, label="person 11 depth=2.37m 0.91")
+    processor.handle_servicemaker_frame(
+        SimpleNamespace(
+            source_id=10,
+            frame_number=7,
+            object_items=_OneShotObjects([obj]),
+        )
+    )
+    assert obj.text_params.display_text == "XX 0.91"
+    assert 100 < obj.text_params.x_offset < 150
+    assert obj.text_params.y_offset == 160
+
+
+def test_base_osd_label_is_compact_and_uses_ds9_font_fields() -> None:
+    obj = _object(11, label="person 11 depth=2.37m 0.91")
+    obj._noesis_depth_used_m = 2.37
+    processor = hooks._OsdLabelProcessor(font_size=14, font_name="Serif")
+    processor._apply_label(obj, sensor_id=0, stable_id_override=7)
+    assert obj.text_params.display_text == "7 0.91"
+    assert obj.text_params.font_params.font_size == 14
+    assert obj.text_params.font_params.font_name == "Serif"
+    assert obj.text_params.y_offset == 160
+
+
+def test_post_tiler_placement_uses_transformed_bbox_without_reformatting() -> None:
+    obj = _object(11, label="7 0.91")
+    obj.rect_params = SimpleNamespace(
+        left=1300.0,
+        top=120.0,
+        width=80.0,
+        height=160.0,
+    )
+    processor = hooks._OsdLabelPlacementProcessor()
+    processor.handle_servicemaker_frame(
+        SimpleNamespace(object_items=_OneShotObjects([obj]))
+    )
+    assert obj.text_params.display_text == "7 0.91"
+    assert 1300 < obj.text_params.x_offset < 1380
+    assert obj.text_params.y_offset == 80
+
+
+def test_post_tiler_placement_attaches_to_explicit_tiler_src(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class Probe:
+        def __init__(self, name, operator):
+            self.name = name
+            self.operator = operator
+
+    monkeypatch.setattr(hooks, "BatchMetadataOperator", object)
+    monkeypatch.setattr(hooks, "Probe", Probe)
+    monkeypatch.setattr(
+        hooks,
+        "_OsdLabelPlacementOperator",
+        lambda processor: processor,
+    )
+
+    class DsPipeline:
+        def attach(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    tiler = SimpleNamespace(name="tiler", config={})
+    pipeline = SimpleNamespace(
+        components={"tiler": tiler},
+        ds_pipeline=DsPipeline(),
+    )
+    hooks.attach_osd_label_placement_hook(pipeline)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "tiler"
+    assert kwargs == {"tips": "src"}
+    assert tiler.config["_osd_label_placement_processor"] is pipeline.osd_label_placement_processor
 
 
 def test_authoritative_attach_uses_verified_explicit_tiler_sink_api(

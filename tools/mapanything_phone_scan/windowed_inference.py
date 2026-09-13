@@ -9,6 +9,12 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .calibrated_inference import (
+    add_calibration_summary,
+    calibration_frame_fields,
+    calibration_specs,
+    preserved_calibration_raw_fields,
+)
 from .inference import (
     MapAnythingScanError,
     MapAnythingScanSettings,
@@ -374,11 +380,19 @@ def run_windowed_mapanything_scan(
     frame_rows = prepared.get("frames")
     if not isinstance(frame_rows, list) or len(frame_rows) < 2:
         raise MapAnythingScanError("the scan has no valid prepared multi-view frame set")
+    try:
+        calibrated = calibration_specs(frame_rows, anchor_image=settings.anchor_image)
+    except ValueError as exc:
+        raise MapAnythingScanError(str(exc)) from exc
     ranges = _window_ranges(
         len(frame_rows), settings.max_joint_views, settings.window_overlap_views
     )
     if len(ranges) == 1:
-        return window_runner(scan_dir, output_dir, prepared, settings, progress)
+        result = window_runner(scan_dir, output_dir, prepared, settings, progress)
+        if isinstance(prepared.get("trajectory_refinement"), dict):
+            result["trajectory_refinement"] = prepared["trajectory_refinement"]
+        add_calibration_summary(result, prepared, calibrated, network_conditioned=True)
+        return result
     if settings.anchor_image is not None:
         raise MapAnythingScanError(
             "a fixed-camera anchor cannot be silently repeated across adaptive windows"
@@ -415,6 +429,10 @@ def run_windowed_mapanything_scan(
                 "global_end_exclusive": end,
             },
         }
+        if isinstance(prepared.get("trajectory_refinement"), dict):
+            window_prepared["trajectory_refinement"] = prepared["trajectory_refinement"]
+        if isinstance(prepared.get("camera_calibration"), dict):
+            window_prepared["camera_calibration"] = prepared["camera_calibration"]
         progress(
             0.02 + 0.62 * (window_index / len(ranges)),
             f"Running MapAnything window {window_index + 1} of {len(ranges)}",
@@ -551,6 +569,10 @@ def run_windowed_mapanything_scan(
         rotation = np.asarray(record["rotation"], dtype=np.float64)
         translation = np.asarray(record["translation"], dtype=np.float64)
         raw = _load_raw(Path(record["raw_path"]))
+        if calibrated is not None and any(
+            key not in raw for key in ("camera_intrinsics_json", "rectification_valid_mask")
+        ):
+            raise MapAnythingScanError("calibrated MapAnything window lost its calibration or border-validity evidence")
         world_points = _transform_points(
             raw["world_points"], scale, rotation, translation
         ).astype(np.float32)
@@ -574,6 +596,7 @@ def run_windowed_mapanything_scan(
             intrinsics=intrinsics,
             metric_scaling_factor=np.asarray([effective_scale], dtype=np.float32),
             model_rgb=model_rgb,
+            **preserved_calibration_raw_fields(raw),
         )
 
         preview_paths: dict[str, str] = {}
@@ -633,6 +656,9 @@ def run_windowed_mapanything_scan(
                 "camera_pose": pose.tolist(),
                 "intrinsics": intrinsics.tolist(),
                 "metric_scaling_factor": effective_scale,
+                **calibration_frame_fields(
+                    source_row, raw.get("rectification_valid_mask"), network_conditioned=True
+                ),
             }
         )
         if global_index % 16 == 0:
@@ -753,6 +779,9 @@ def run_windowed_mapanything_scan(
         },
         "frames": final_frames,
     }
+    if isinstance(prepared.get("trajectory_refinement"), dict):
+        summary["trajectory_refinement"] = prepared["trajectory_refinement"]
+    add_calibration_summary(summary, prepared, calibrated, network_conditioned=True)
     manifest_path = output_dir / "scan_outputs_manifest.json"
     summary["files"] = [
         {

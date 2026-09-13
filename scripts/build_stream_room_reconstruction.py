@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
 import json
 import math
 import sys
@@ -84,6 +85,10 @@ class FrameCloud:
     confidence: np.ndarray
     image_bgr: np.ndarray
     image_ref: str
+    # Keep the exact RGB producer record attached while floor/clipping passes
+    # copy the cloud.  Static-camera consumers must not reconstruct transform
+    # provenance from the depth snapshot or an invented frame attribute.
+    rgb_frame: RgbFrame | None = None
 
 
 def _normalize_vec3(value: np.ndarray, *, fallback: Sequence[float] = (0.0, 1.0, 0.0)) -> np.ndarray:
@@ -371,6 +376,77 @@ def _zarr_rgb_frames(snapshots: Sequence[DepthSnapshot]) -> list[RgbFrame]:
             )
         )
     return frames
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _static_image_contract(
+    *,
+    frame: FrameCloud,
+    camera: CameraCalibration,
+    revision_id: str,
+    keyframe_path: Path,
+) -> dict[str, Any] | None:
+    """Describe a static keyframe only when its image transform is measured."""
+    rgb_frame = frame.rgb_frame
+    if rgb_frame is None or not rgb_frame.transformed or not rgb_frame.dewarper_config:
+        return None
+    transform_path = Path(rgb_frame.dewarper_config).resolve()
+    transform = _load_dewarper_frame_transform(transform_path)
+    image = np.asarray(frame.image_bgr)
+    if image.ndim != 3 or image.shape[2] < 3:
+        raise RuntimeError("static keyframe has an invalid transformed image")
+    rectified_intrinsics = np.asarray(transform.rectified_intrinsics, dtype=np.float64).copy()
+    # _build_frame_clouds writes the keyframe at the depth grid dimensions;
+    # carry the same scale into K when those differ from the authored
+    # dewarper output dimensions.
+    authored_w, authored_h = (int(transform.output_size[0]), int(transform.output_size[1]))
+    image_w, image_h = int(image.shape[1]), int(image.shape[0])
+    if authored_w <= 0 or authored_h <= 0:
+        raise RuntimeError("dewarper output dimensions are invalid")
+    if (image_w, image_h) != (authored_w, authored_h):
+        sx = float(image_w) / float(authored_w)
+        sy = float(image_h) / float(authored_h)
+        rectified_intrinsics[0, 0] *= sx
+        rectified_intrinsics[0, 2] *= sx
+        rectified_intrinsics[1, 1] *= sy
+        rectified_intrinsics[1, 2] *= sy
+    if not np.isfinite(rectified_intrinsics).all():
+        raise RuntimeError("scaled rectified intrinsics are non-finite")
+    return {
+        "schema": "noesis.pcf.static_camera_image.v1",
+        "camera_id": camera.camera_id,
+        "image_size": [int(image.shape[1]), int(image.shape[0])],
+        "intrinsics": rectified_intrinsics.tolist(),
+        "distortion_model": "fisheye",
+        "distortion": [],
+        "source_distortion_model": "fisheye",
+        "source_distortion": np.asarray(transform.distortion, dtype=np.float64).reshape(-1).tolist(),
+        "rectification": {
+            "status": "rectified",
+            "source": "scripts/build_stream_room_reconstruction.py",
+            "config_path": _relative_path(transform_path),
+            "config_sha256": _sha256_file(transform_path),
+            "output_size": [int(transform.output_size[0]), int(transform.output_size[1])],
+        },
+        "distortion_provenance": "dewarper_config_and_rectified_intrinsics",
+        "source_frame": {
+            "frame_id": frame.frame_id,
+            "revision": str(revision_id),
+            "coordinate_frame": "backend_world_m_stream_points",
+            "units": "m",
+            "image_sha256": _sha256_file(keyframe_path),
+        },
+        "source_uri": rgb_frame.source_uri,
+        "source_index": int(rgb_frame.source_index),
+        "camera_calibration_fingerprint": calibration_fingerprint(camera.snapshot),
+    }
 
 
 def _snapshot_entries(depth_base: Path, camera_id: str) -> list[tuple[int, Path]]:
@@ -905,6 +981,7 @@ def _build_frame_clouds(
                 confidence=np.asarray(confidence, dtype=np.float32),
                 image_bgr=image_bgr[:, :, :3],
                 image_ref=str(rgb_frame.source_uri),
+                rgb_frame=rgb_frame,
             )
         )
     return frames
@@ -1175,6 +1252,7 @@ def _level_frame_clouds_to_floor(
                 confidence=frame.confidence,
                 image_bgr=frame.image_bgr,
                 image_ref=frame.image_ref,
+                rgb_frame=frame.rgb_frame,
             )
         )
 
@@ -1270,6 +1348,7 @@ def _clip_frame_clouds_to_ceiling(
                 confidence=frame.confidence[keep],
                 image_bgr=frame.image_bgr,
                 image_ref=frame.image_ref,
+                rgb_frame=frame.rgb_frame,
             )
         )
 
@@ -1614,6 +1693,13 @@ def _write_revision(
             raise RuntimeError(f"{camera.camera_id}: failed to write RGB keyframe {rel}")
         keyframe_refs[frame.frame_id] = str(rel)
 
+    static_image_contract = _static_image_contract(
+        frame=frames[0],
+        camera=camera,
+        revision_id=revision_id,
+        keyframe_path=revision_dir / keyframe_refs[frames[0].frame_id],
+    ) if frames else None
+
     floorplan_payload: dict[str, Any] | None = None
     floorplan_source_path: Path | None = None
     floorplan_summary: dict[str, Any] | None = None
@@ -1694,6 +1780,8 @@ def _write_revision(
         "color_space": "sRGB",
         "calibration_source": "CalibrationManager:cameras+extrinsics+alignment",
     }
+    if static_image_contract is not None:
+        room_meta["static_camera_image"] = static_image_contract
     write_json(revision_dir / "room_points_meta.json", room_meta)
 
     frame_rows = [

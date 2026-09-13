@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -85,6 +86,172 @@ class Candidate:
     alignment_method: str
 
 
+@dataclass
+class IndependentMeasurement:
+    measurement_id: str
+    points: np.ndarray
+    coordinate_frame: str
+    units: str
+    source_identity: str
+    provenance: dict[str, Any]
+    frame_identity: dict[str, str]
+    manifest_path: Path
+
+
+def _resolve_measurement_path(manifest_path: Path, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path.resolve()
+
+
+def _load_independent_evaluation(
+    path: Path,
+    *,
+    expected_frame_identity: dict[str, str] | None = None,
+) -> list[IndependentMeasurement]:
+    """Load withheld points with explicit provenance and no alignment fitting.
+
+    The points must already be expressed in backend world metres. This keeps
+    the evaluation side of the boundary independent: candidate alignment is
+    completed from the phone trajectory and validated DA3 carrier before these
+    points are read, and this loader never estimates a transform.
+    """
+    manifest_path = path.resolve()
+    if not manifest_path.is_file():
+        raise ValueError(f"independent evaluation manifest is missing: {path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid independent evaluation manifest: {path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("independent evaluation manifest must be a JSON object")
+    if manifest.get("schema") != "noesis.phone_walk.independent_evaluation.v1":
+        raise ValueError("unsupported independent evaluation schema")
+    rows = manifest.get("measurements")
+    if rows is None:
+        rows = [manifest]
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("independent evaluation has no measurements")
+    if manifest.get("alignment_fitted_on_evaluation_points") is True:
+        raise ValueError("evaluation points were used to fit alignment")
+
+    result: list[IndependentMeasurement] = []
+    seen_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"independent measurement {index} is not an object")
+        if row.get("alignment_fitted_on_evaluation_points") is True:
+            raise ValueError(f"measurement {index} was used to fit alignment")
+        measurement_id = str(row.get("measurement_id") or f"measurement_{index}")
+        if measurement_id in seen_ids:
+            raise ValueError(f"duplicate independent measurement id: {measurement_id}")
+        seen_ids.add(measurement_id)
+        coordinate_frame = str(row.get("coordinate_frame") or "")
+        if coordinate_frame != "backend_world_m_stream_points":
+            raise ValueError(
+                f"measurement {measurement_id} must declare backend_world_m_stream_points"
+            )
+        units = str(row.get("units") or "")
+        if units not in {"m", "metres", "meters"}:
+            raise ValueError(f"measurement {measurement_id} must declare metre units")
+        source_identity = str(row.get("source_identity") or "").strip()
+        provenance = row.get("provenance")
+        if not source_identity or not isinstance(provenance, dict) or not provenance:
+            raise ValueError(
+                f"measurement {measurement_id} lacks source identity/provenance"
+            )
+        frame_identity_value = row.get("frame_identity", manifest.get("frame_identity"))
+        if not isinstance(frame_identity_value, dict):
+            raise ValueError(
+                f"measurement {measurement_id} lacks exact frame identity"
+            )
+        frame_identity = {
+            "frame_id": str(frame_identity_value.get("frame_id") or "").strip(),
+            "revision": str(frame_identity_value.get("revision") or "").strip(),
+            "registration_fingerprint": str(
+                frame_identity_value.get("registration_fingerprint") or ""
+            ).strip(),
+        }
+        if not all(frame_identity.values()):
+            raise ValueError(
+                f"measurement {measurement_id} has incomplete exact frame identity"
+            )
+        if expected_frame_identity is not None and frame_identity != {
+            key: str(value) for key, value in expected_frame_identity.items()
+        }:
+            raise ValueError(
+                f"measurement {measurement_id} frame identity does not match the "
+                "candidate's target revision/registration"
+            )
+        points_value = row.get("points_file") or row.get("points_path")
+        if not isinstance(points_value, str) or not points_value:
+            raise ValueError(f"measurement {measurement_id} has no points file")
+        points_path = _resolve_measurement_path(manifest_path, points_value)
+        if not points_path.is_file():
+            raise ValueError(f"measurement points are missing: {points_path}")
+        points_key = str(row.get("points_key") or "points")
+        if points_path.suffix == ".npy":
+            points = np.load(points_path, allow_pickle=False)
+        elif points_path.suffix == ".npz":
+            with np.load(points_path, allow_pickle=False) as archive:
+                if points_key not in archive.files:
+                    raise ValueError(
+                        f"measurement {measurement_id} lacks NPZ key {points_key!r}"
+                    )
+                points = np.asarray(archive[points_key])
+        else:
+            raise ValueError("independent measurement points must be .npy or .npz")
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+            raise ValueError(f"measurement {measurement_id} points are malformed")
+        if points.shape[0] < 1:
+            raise ValueError(f"measurement {measurement_id} has no points")
+        result.append(
+            IndependentMeasurement(
+                measurement_id=measurement_id,
+                points=points,
+                coordinate_frame=coordinate_frame,
+                units=units,
+                source_identity=source_identity,
+                provenance=provenance,
+                frame_identity=frame_identity,
+                manifest_path=manifest_path,
+            )
+        )
+    return result
+
+
+def _independent_evaluation_metrics(
+    candidate: Candidate,
+    measurements: list[IndependentMeasurement],
+) -> dict[str, Any]:
+    rows = []
+    for measurement in measurements:
+        metrics = _full_cloud_metrics(candidate.cloud.points, measurement.points)
+        rows.append(
+            {
+                "measurement_id": measurement.measurement_id,
+                "coordinate_frame": measurement.coordinate_frame,
+                "units": measurement.units,
+                "source_identity": measurement.source_identity,
+                "provenance": measurement.provenance,
+                "frame_identity": measurement.frame_identity,
+                "manifest": str(measurement.manifest_path),
+                "measurement_point_count": int(measurement.points.shape[0]),
+                "candidate_metrics": metrics,
+            }
+        )
+    return {
+        "evaluation_type": "independent_withheld_measurements",
+        "independent": True,
+        "alignment_fitted_on_evaluation_points": False,
+        "status": "ok" if rows else "empty",
+        "measurement_count": len(rows),
+        "measurements": rows,
+    }
+
+
 def _load_target_points(revision: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(revision / "room_points.npz") as row:
         points = np.asarray(row["points"], dtype=np.float64)
@@ -92,6 +259,19 @@ def _load_target_points(revision: Path) -> tuple[np.ndarray, np.ndarray]:
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("static target point cloud is malformed")
     return points, colors
+
+
+def _registration_fingerprint(*paths: Path) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        resolved = path.resolve()
+        digest.update(str(resolved.name).encode("utf-8"))
+        digest.update(b"\0")
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _identity_candidate(
@@ -474,6 +654,14 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="Reuse an unchanged evaluation JSON and regenerate only presentation artifacts.",
     )
+    parser.add_argument(
+        "--independent-evaluation",
+        type=Path,
+        help=(
+            "Optional manifest of withheld point measurements. The manifest "
+            "must declare backend world metre coordinates and provenance."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -489,6 +677,15 @@ def main() -> int:
         raise ValueError(f"refusing to overwrite existing evaluation: {output_dir}")
     output_dir.mkdir(parents=True)
     target_revision = args.target_revision.resolve()
+    calibration_path = args.calibration.resolve()
+    world_from_da3_path = args.world_from_da3.resolve()
+    expected_frame_identity = {
+        "frame_id": "backend_world_m_stream_points",
+        "revision": target_revision.name,
+        "registration_fingerprint": _registration_fingerprint(
+            world_from_da3_path, calibration_path
+        ),
+    }
     target_points, _ = _load_target_points(target_revision)
     static = _load_static_reference(
         target_revision,
@@ -515,6 +712,18 @@ def main() -> int:
         0.10,
     )
     world_from_da3 = _load_world_from_da3(args.world_from_da3.resolve())
+    independent_measurements = (
+        _load_independent_evaluation(
+            args.independent_evaluation,
+            expected_frame_identity=expected_frame_identity,
+        )
+        if args.independent_evaluation is not None
+        else []
+    )
+    if independent_measurements and args.reuse_metrics_from is not None:
+        raise ValueError(
+            "cannot add independent evaluation while reusing prior metrics"
+        )
     da3_raw = args.da3_raw.resolve()
     da3_sequence = _load_sequence(da3_raw, "DA3")
     backend_da3_poses = _transform_poses(world_from_da3, da3_sequence.poses)
@@ -665,6 +874,7 @@ def main() -> int:
         metrics["scan_dir"] = str(scan_dir)
         metrics["metrics_reused_from"] = str(reuse_path)
         metrics["presentation"] = presentation_metadata
+        metrics["evaluation_frame_identity"] = expected_frame_identity
         metrics["candidates"] = {}
     else:
         metrics = {
@@ -672,6 +882,7 @@ def main() -> int:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "scan_dir": str(scan_dir),
             "coordinate_frame": "backend_world_m_stream_points",
+            "evaluation_frame_identity": expected_frame_identity,
             "alignment_reference": "validated DA3 phone trajectory mapped into static-camera backend world",
             "static_target_revision": str(target_revision),
             "shared_bev_bounds_xz_m": list(metric_bounds),
@@ -815,6 +1026,19 @@ def main() -> int:
                     "p80_error_m": consistency.p80_error_m,
                 },
                 "heldout_even_to_odd_reprojection": heldout,
+                "independent_evaluation": (
+                    _independent_evaluation_metrics(candidate, independent_measurements)
+                    if independent_measurements
+                    else {
+                        "evaluation_type": "independent_withheld_measurements",
+                        "independent": True,
+                        "alignment_fitted_on_evaluation_points": False,
+                        "frame_identity": expected_frame_identity,
+                        "status": "not_supplied",
+                        "measurement_count": 0,
+                        "measurements": [],
+                    }
+                ),
                 "static_cloud_full_metrics": full_metrics,
                 "static_cloud_room_bounds_metrics": bounded_metrics,
                 "fixed_camera_visible_cloud_metrics": visible_cloud_metrics,

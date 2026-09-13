@@ -47,6 +47,11 @@ from noesis_core.contracts.scene_prior import (
     ScenePriorRevision,
     ScenePriorSemanticBinding,
     ScenePriorSource,
+    ScenePriorMetricFrame,
+    ScenePriorWorldToScenePresentation,
+    metric_frame_revision_sha256,
+    scene_revision_sha256,
+    world_to_scene_presentation_sha256,
 )
 from noesis_core.scene_files import (
     SceneFileError,
@@ -69,6 +74,12 @@ MAX_TARGET_REVISION_METADATA_BYTES = 4 * 1024 * 1024
 MAX_CAMERA_MAP_LOCK_BYTES = 512 * 1024
 MAX_PREVIEW_DIMENSION = 2_048
 MAX_REVIEW_POINTS = 250_000
+_ACCEPTED_REGISTRATION_DISPOSITIONS = frozenset(
+    {"validated_cross_session_registration"}
+)
+_ACCEPTED_REGISTRATION_SCHEMAS = frozenset(
+    {"noesis.pcf.connector_multianchor_pose_graph.v1"}
+)
 
 
 class ScenePriorBuildError(RuntimeError):
@@ -95,6 +106,15 @@ class ScenePriorBuildConfig:
     obstacle_min_support: int = 3
     max_source_height_m: float = 3.20
     include_floorplan_layers: bool = True
+    # Optional v2 publication metadata.  Omitting these fields preserves the
+    # exact v1 catalog contract for existing shadow-only room priors.
+    metric_frame: ScenePriorMetricFrame | Mapping[str, Any] | None = None
+    world_presentation: ScenePriorWorldToScenePresentation | Mapping[str, Any] | None = None
+    # v2 is admitted only from one exact binding and the producer's passed
+    # registration report.  A binding is deliberately separate from the
+    # artifact revision created by this builder.
+    accepted_frame_binding: ScenePriorFrameBinding | Mapping[str, Any] | Path | None = None
+    registration_acceptance_report: Mapping[str, Any] | Path | None = None
 
     def validate(self) -> "ScenePriorBuildConfig":
         identifiers = {
@@ -144,6 +164,25 @@ class ScenePriorBuildConfig:
             )
         if int(self.obstacle_min_support) < 1:
             raise ScenePriorBuildError("obstacle_min_support must be positive")
+        if self.world_presentation is not None and self.metric_frame is None:
+            raise ScenePriorBuildError(
+                "world_presentation requires an accepted metric_frame"
+            )
+        if self.registration_acceptance_report is not None and self.accepted_frame_binding is None:
+            raise ScenePriorBuildError(
+                "registration_acceptance_report requires accepted_frame_binding"
+            )
+        if self.accepted_frame_binding is not None and self.metric_frame is None:
+            # The metric frame is carried by the imported v2 binding.  The
+            # legacy optional knobs cannot be used to relabel that target.
+            if self.world_presentation is not None:
+                raise ScenePriorBuildError(
+                    "world_presentation requires accepted_frame_binding and metric_frame"
+                )
+        if (self.metric_frame is not None or self.world_presentation is not None) and self.accepted_frame_binding is None:
+            raise ScenePriorBuildError(
+                "v2 metric/presentation metadata requires an accepted_frame_binding and registration report"
+            )
         return self
 
 
@@ -211,6 +250,164 @@ def _compact_json(value: Any) -> bytes:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _physical_camera_calibration_sha256(extrinsics: Mapping[str, Any]) -> str:
+    """Hash only calibrated E matrices, matching CalibrationManager v2."""
+
+    cameras = extrinsics.get("cameras") if isinstance(extrinsics, Mapping) else {}
+    physical: dict[str, dict[str, list[float]]] = {}
+    if isinstance(cameras, Mapping):
+        for camera_id, entry in sorted(cameras.items(), key=lambda item: str(item[0])):
+            if not isinstance(entry, Mapping):
+                continue
+            values = entry.get("E")
+            if not isinstance(values, list) or len(values) != 16:
+                continue
+            try:
+                physical[str(camera_id)] = {"E": [float(value) for value in values]}
+            except (TypeError, ValueError):
+                continue
+    return _sha256(_compact_json({"cameras": physical}))
+
+
+def _alignment_matrix_values(transform: Mapping[str, Any]) -> list[float]:
+    values = transform.get("matrix")
+    if isinstance(values, list) and len(values) == 16:
+        return [float(value) for value in values]
+    values = transform.get("world_from_source_row_major")
+    if isinstance(values, list) and len(values) == 4 and all(
+        isinstance(row, list) and len(row) == 4 for row in values
+    ):
+        return [float(value) for row in values for value in row]
+    raise ScenePriorBuildError(
+        "alignment transform must declare a 16-value physical matrix"
+    )
+
+
+def _physical_world_alignment_sha256(
+    transform: Mapping[str, Any],
+    target_metadata: Mapping[str, Any],
+) -> str:
+    """Hash source alignment physics, excluding authored presentation fields."""
+
+    try:
+        floor_y = float(
+            target_metadata.get(
+                "calibrated_floor_y",
+                target_metadata["floor_alignment"]["target_floor_y"],
+            )
+        )
+        scale = float(transform.get("scale", 1.0))
+        matrix = _alignment_matrix_values(transform)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenePriorBuildError("alignment transform physical identity is malformed") from exc
+    if not all(math.isfinite(value) for value in (*matrix, floor_y, scale)):
+        raise ScenePriorBuildError("alignment transform physical identity is non-finite")
+    return _sha256(
+        _compact_json(
+            {
+                "matrix": matrix,
+                "floor_y": floor_y,
+                "units": {"s_obj_to_m": scale},
+            }
+        )
+    )
+
+
+def _source_physical_frame(inputs: Mapping[str, Any]) -> tuple[RevisionedFrame, str, str]:
+    camera_sha256 = _physical_camera_calibration_sha256(inputs["camera_calibration"])
+    alignment_sha256 = _physical_world_alignment_sha256(
+        inputs["transform"], inputs["target_revision_metadata"]
+    )
+    revision = revisioned_frame_sha256(
+        BACKEND_WORLD_FRAME_ID,
+        artifact_sha256s=(camera_sha256, alignment_sha256),
+    )
+    return (
+        RevisionedFrame(frame_id=BACKEND_WORLD_FRAME_ID, revision=revision),
+        camera_sha256,
+        alignment_sha256,
+    )
+
+
+def _col_major_matrix(values: Sequence[float]) -> np.ndarray:
+    try:
+        matrix = np.asarray(tuple(float(value) for value in values), dtype=np.float64).reshape(
+            (4, 4), order="F"
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScenePriorBuildError("frame transform matrix must contain 16 values") from exc
+    if not np.isfinite(matrix).all() or not np.allclose(
+        matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8
+    ):
+        raise ScenePriorBuildError("frame transform matrix must be finite affine")
+    try:
+        determinant = float(np.linalg.det(matrix[:3, :3]))
+        np.linalg.inv(matrix)
+    except np.linalg.LinAlgError as exc:
+        raise ScenePriorBuildError("frame transform matrix must be invertible") from exc
+    if not math.isfinite(determinant) or determinant <= 1e-12:
+        raise ScenePriorBuildError("frame transform matrix must preserve orientation")
+    return matrix
+
+
+def _apply_col_major_transform(points: np.ndarray, values: Sequence[float]) -> np.ndarray:
+    matrix = _col_major_matrix(values)
+    source = np.asarray(points, dtype=np.float64)
+    homogeneous = np.concatenate(
+        (source, np.ones((source.shape[0], 1), dtype=np.float64)), axis=1
+    )
+    transformed = (matrix @ homogeneous.T).T
+    if not np.allclose(transformed[:, 3], 1.0, atol=1e-8):
+        raise ScenePriorBuildError("frame transform produced non-unit homogeneous coordinates")
+    return transformed[:, :3]
+
+
+def _reframe_camera_preview(
+    preview: _CameraPreviewFrame,
+    target_from_source_col_major: Sequence[float],
+    *,
+    source_floor_normal: Sequence[float],
+    source_floor_offset_m: float,
+    target_floor_y_m: float,
+) -> _CameraPreviewFrame:
+    """Move the camera pose from the metadata target into the accepted target."""
+
+    old = _col_major_matrix(preview.target_from_source_col_major)
+    new = _col_major_matrix(target_from_source_col_major)
+    try:
+        delta = new @ np.linalg.inv(old)
+    except np.linalg.LinAlgError as exc:
+        raise ScenePriorBuildError("camera preview frame transform is singular") from exc
+    position = delta[:3, :3] @ np.asarray(preview.camera_position_world_m) + delta[:3, 3]
+    right = delta[:3, :3] @ np.asarray((preview.camera_right_world_xz[0], 0.0, preview.camera_right_world_xz[1]))
+    forward = delta[:3, :3] @ np.asarray((preview.camera_forward_world_xz[0], 0.0, preview.camera_forward_world_xz[1]))
+    right_xz = right[[0, 2]]
+    forward_xz = forward[[0, 2]]
+    right_norm = float(np.linalg.norm(right_xz))
+    forward_norm = float(np.linalg.norm(forward_xz))
+    if right_norm <= 1e-8 or forward_norm <= 1e-8:
+        raise ScenePriorBuildError("accepted frame transform collapses camera ground axes")
+    right_xz /= right_norm
+    forward_xz /= forward_norm
+    if abs(float(np.dot(right_xz, forward_xz))) > 1e-4:
+        raise ScenePriorBuildError("accepted frame transform distorts camera ground axes")
+    return _CameraPreviewFrame(
+        camera_id=preview.camera_id,
+        camera_position_world_m=tuple(float(value) for value in position),
+        camera_right_world_xz=tuple(float(value) for value in right_xz),
+        camera_forward_world_xz=tuple(float(value) for value in forward_xz),
+        camera_calibration=preview.camera_calibration,
+        target_revision_metadata=preview.target_revision_metadata,
+        target_revision_id=preview.target_revision_id,
+        camera_map_lock=preview.camera_map_lock,
+        camera_pose_anchor=preview.camera_pose_anchor,
+        target_from_source_col_major=tuple(float(value) for value in target_from_source_col_major),
+        source_floor_normal=tuple(float(value) for value in source_floor_normal),
+        source_floor_offset_m=float(source_floor_offset_m),
+        target_floor_y_m=float(target_floor_y_m),
+    )
 
 
 def _timestamp_us(value: Any, *, label: str) -> int:
@@ -532,10 +729,12 @@ def _bundle_inputs(bundle_root: Path) -> dict[str, Any]:
         "aligned_bytes": aligned_bytes,
         "alignment": alignment,
         "alignment_bytes": alignment_bytes,
+        "transform": transform,
         "alignment_schema": str(alignment.get("schema") or "unknown"),
         "transform_bytes": transform_bytes,
         "reference_camera_id": camera_id,
         "camera_calibration_row": calibration_row,
+        "camera_calibration": camera_calibration,
         "camera_calibration_bytes": camera_calibration_bytes,
         "target_revision_metadata": target_metadata,
         "target_revision_metadata_bytes": target_metadata_bytes,
@@ -1483,6 +1682,331 @@ def _atomic_write_catalog(path: Path, payload: bytes) -> None:
         raise ScenePriorBuildError(str(exc)) from exc
 
 
+def _load_acceptance_report(
+    report_or_path: Mapping[str, Any] | Path | None,
+) -> Mapping[str, Any]:
+    if report_or_path is None:
+        raise ScenePriorBuildError(
+            "accepted room-to-home binding requires a registration acceptance report"
+        )
+    if isinstance(report_or_path, Mapping):
+        report: Any = report_or_path
+    else:
+        try:
+            _, report = _read_json_file(
+                Path(report_or_path),
+                label="room-to-home registration acceptance report",
+                max_bytes=MAX_TARGET_REVISION_METADATA_BYTES,
+            )
+        except (OSError, SceneFileError) as exc:
+            raise ScenePriorBuildError(str(exc)) from exc
+    if not isinstance(report, Mapping):
+        raise ScenePriorBuildError("registration acceptance report must be an object")
+    return report
+
+
+def _validate_room_to_home_acceptance_report(
+    report_or_path: Mapping[str, Any] | Path | None,
+    *,
+    binding: ScenePriorFrameBinding,
+) -> None:
+    """Require an existing report to authorize one exact immutable edge."""
+
+    report = _load_acceptance_report(report_or_path)
+    if report.get("schema") not in _ACCEPTED_REGISTRATION_SCHEMAS:
+        raise ScenePriorBuildError(
+            "registration acceptance report has an unsupported producer schema"
+        )
+    if report.get("status") != "passed":
+        raise ScenePriorBuildError(
+            "registration acceptance report must have status=passed"
+        )
+    if report.get("accepted_for_canonical_use") is not True:
+        raise ScenePriorBuildError(
+            "registration acceptance report is not accepted for canonical use"
+        )
+    disposition = str(report.get("disposition") or "").strip().lower()
+    if disposition not in _ACCEPTED_REGISTRATION_DISPOSITIONS:
+        raise ScenePriorBuildError(
+            "registration acceptance report has no canonical holdout disposition"
+        )
+    pose_graph = report.get("pose_graph")
+    if (
+        not isinstance(pose_graph, Mapping)
+        or pose_graph.get("accepted") is not True
+        or pose_graph.get("reason_codes") not in ([], ())
+    ):
+        raise ScenePriorBuildError(
+            "registration acceptance report pose_graph did not pass"
+        )
+    # The registration producer owns this evidence.  Keep the import shape
+    # exact so a caller cannot make an arbitrary disposition or alias satisfy
+    # the canonical holdout gate.
+    holdout = report.get("holdout")
+    if (
+        not isinstance(holdout, Mapping)
+        or holdout.get("source") != "pose_graph"
+        or holdout.get("status") != "passed"
+    ):
+        raise ScenePriorBuildError(
+            "registration acceptance report must declare holdout.status=passed"
+        )
+
+    exact = None
+    candidate = report.get("bound_transform")
+    if isinstance(candidate, Mapping):
+        exact = candidate
+    if exact is None:
+        raise ScenePriorBuildError(
+            "registration acceptance report lacks an exact bound_transform"
+        )
+
+    def _frame(payload: Any, label: str) -> tuple[str, str]:
+        if not isinstance(payload, Mapping):
+            raise ScenePriorBuildError(f"registration report {label} is missing")
+        return str(payload.get("frame_id") or ""), str(payload.get("revision") or "")
+
+    if _frame(exact.get("source_frame"), "source_frame") != (
+        binding.source_frame.frame_id,
+        binding.source_frame.revision,
+    ):
+        raise ScenePriorBuildError("registration report source frame does not match binding")
+    if _frame(exact.get("target_frame"), "target_frame") != (
+        binding.target_frame.frame_id,
+        binding.target_frame.revision,
+    ):
+        raise ScenePriorBuildError("registration report target frame does not match binding")
+    try:
+        report_matrix = tuple(
+            float(value) for value in exact["target_from_source_col_major"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenePriorBuildError(
+            "registration report bound transform matrix is malformed"
+        ) from exc
+    if report_matrix != binding.target_from_source_col_major:
+        raise ScenePriorBuildError(
+            "registration report bound transform does not match binding"
+        )
+    report_digest = str(exact.get("target_from_source_sha256") or "")
+    if report_digest != binding.target_from_source_sha256:
+        raise ScenePriorBuildError(
+            "registration report transform digest does not match binding"
+        )
+
+    for key, expected in (
+        ("source_floor_plane", binding.source_floor_plane),
+        ("target_floor_plane", binding.target_floor_plane),
+    ):
+        declared = exact.get(key)
+        if declared is None:
+            raise ScenePriorBuildError(
+                f"registration acceptance report lacks {key}"
+            )
+        if not isinstance(declared, Mapping):
+            raise ScenePriorBuildError(f"registration report {key} is malformed")
+        try:
+            normal = tuple(float(value) for value in declared["normal"])
+            offset = float(declared["offset_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ScenePriorBuildError(f"registration report {key} is malformed") from exc
+        if normal != expected.normal or offset != expected.offset_m:
+            raise ScenePriorBuildError(f"registration report {key} does not match binding")
+
+
+def build_accepted_room_to_home_binding(
+    *,
+    artifact_revision_id: str,
+    source_frame_revision: str,
+    target_coordinate_revision: str | None,
+    target_from_source_col_major: Sequence[float],
+    source_floor_normal: Sequence[float],
+    source_floor_offset_m: float,
+    target_floor_normal: Sequence[float],
+    target_floor_offset_m: float,
+    source_camera_calibration_sha256: str,
+    source_world_alignment_sha256: str,
+    source_camera_calibration_physical_sha256: str,
+    source_world_alignment_physical_sha256: str,
+    target_revision_id: str,
+    target_revision_metadata_sha256: str,
+    metric_frame_provenance: Sequence[ArtifactFingerprint],
+    acceptance_report: Mapping[str, Any] | Path | None = None,
+    world_to_scene_col_major: Sequence[float] | None = None,
+    world_to_scene_provenance: ArtifactFingerprint | None = None,
+) -> ScenePriorFrameBinding:
+    """Build one accepted room-to-home v2 frame edge from a report.
+
+    ``acceptance_report`` is the registration authority.  It must declare a
+    passed holdout, canonical acceptance, and an exact ``bound_transform``
+    object containing source/target frame revisions, floor planes, matrix, and
+    transform digest.  Geometry supplied separately is checked against that
+    report; the helper never upgrades a review-only assembly or infers a common
+    frame from room names.
+    """
+
+    try:
+        provenance = tuple(metric_frame_provenance)
+        if not provenance:
+            raise ScenePriorBuildError(
+                "accepted room-to-home binding requires physical provenance"
+            )
+        target_normal = tuple(float(value) for value in target_floor_normal)
+        target_offset = float(target_floor_offset_m)
+        target_revision = target_coordinate_revision or metric_frame_revision_sha256(
+            BACKEND_WORLD_FRAME_ID,
+            target_normal,
+            target_offset,
+            tuple(item.sha256 for item in provenance),
+        )
+        source_frame = ScenePriorFrameRef(
+            frame_id=BACKEND_WORLD_FRAME_ID,
+            revision=str(source_frame_revision),
+        )
+        target_frame = ScenePriorFrameRef(
+            frame_id=BACKEND_WORLD_FRAME_ID,
+            revision=str(target_revision),
+        )
+        source_plane = ScenePriorFloorPlane(
+            frame=source_frame,
+            normal=tuple(float(value) for value in source_floor_normal),
+            offset_m=float(source_floor_offset_m),
+        )
+        target_plane = ScenePriorFloorPlane(
+            frame=target_frame,
+            normal=tuple(float(value) for value in target_floor_normal),
+            offset_m=float(target_floor_offset_m),
+        )
+        metric_frame = ScenePriorMetricFrame(
+            contract="noesis.scene_prior.metric_frame",
+            contract_version=1,
+            frame=target_frame,
+            units="meters",
+            floor_plane=target_plane,
+            physical_provenance=provenance,
+            accepted=True,
+        )
+        edge_digest = revisioned_transform_sha256(
+            RevisionedFrame(
+                frame_id=source_frame.frame_id,
+                revision=source_frame.revision,
+            ),
+            RevisionedFrame(
+                frame_id=target_frame.frame_id,
+                revision=target_frame.revision,
+            ),
+            tuple(float(value) for value in target_from_source_col_major),
+        )
+        presentation = None
+        if world_to_scene_col_major is not None:
+            if world_to_scene_provenance is None:
+                raise ScenePriorBuildError(
+                    "world-to-scene mapping requires provenance"
+                )
+            presentation_values = tuple(
+                float(value) for value in world_to_scene_col_major
+            )
+            presentation = ScenePriorWorldToScenePresentation(
+                contract="noesis.scene_prior.world_to_scene_presentation",
+                contract_version=1,
+                world_frame=target_frame,
+                render_frame="menon_scene",
+                world_to_scene_col_major=presentation_values,
+                world_to_scene_sha256=world_to_scene_presentation_sha256(
+                    target_frame,
+                    "menon_scene",
+                    presentation_values,
+                ),
+                scene_revision_id=scene_revision_sha256(
+                    target_frame,
+                    "menon_scene",
+                    presentation_values,
+                ),
+                source_transform_sha256s=(edge_digest,),
+                provenance=world_to_scene_provenance,
+                accepted=True,
+            )
+        binding = ScenePriorFrameBinding(
+            contract="noesis.scene_prior.frame_binding",
+            contract_version=2,
+            source_frame=source_frame,
+            target_frame=target_frame,
+            source_camera_calibration_sha256=source_camera_calibration_sha256,
+            source_world_alignment_sha256=source_world_alignment_sha256,
+            target_revision_id=target_revision_id,
+            target_revision_metadata_sha256=target_revision_metadata_sha256,
+            target_from_source_col_major=tuple(
+                float(value) for value in target_from_source_col_major
+            ),
+            target_from_source_sha256=edge_digest,
+            source_floor_plane=source_plane,
+            target_floor_plane=target_plane,
+            metric_frame=metric_frame,
+            artifact_revision_id=artifact_revision_id,
+            source_camera_calibration_physical_sha256=(
+                source_camera_calibration_physical_sha256
+            ),
+            source_world_alignment_physical_sha256=(
+                source_world_alignment_physical_sha256
+            ),
+            presentation=presentation,
+        )
+        _validate_room_to_home_acceptance_report(
+            acceptance_report,
+            binding=binding,
+        )
+        return binding
+    except (CoordinateFrameError, TypeError, ValueError) as exc:
+        if isinstance(exc, ScenePriorBuildError):
+            raise
+        raise ScenePriorBuildError(
+            f"accepted room-to-home binding is invalid: {exc}"
+        ) from exc
+
+
+def import_accepted_room_to_home_binding(
+    payload_or_path: ScenePriorFrameBinding | Mapping[str, Any] | Path,
+    acceptance_report: Mapping[str, Any] | Path | None = None,
+) -> ScenePriorFrameBinding:
+    """Load an accepted v2 room-to-home binding with its acceptance report."""
+
+    if isinstance(payload_or_path, ScenePriorFrameBinding):
+        payload: Any = payload_or_path.model_dump(mode="json")
+    elif isinstance(payload_or_path, Mapping):
+        payload: Any = dict(payload_or_path)
+    else:
+        try:
+            _, payload = _read_json_file(
+                Path(payload_or_path),
+                label="accepted room-to-home frame binding",
+                max_bytes=MAX_TARGET_REVISION_METADATA_BYTES,
+            )
+        except (OSError, SceneFileError) as exc:
+            raise ScenePriorBuildError(str(exc)) from exc
+    report = acceptance_report
+    if isinstance(payload, Mapping):
+        embedded = payload.pop("acceptance_report", None)
+        if embedded is None:
+            embedded = payload.pop("registration_acceptance", None)
+        if report is None:
+            report = embedded
+        nested_binding = payload.pop("binding", None)
+        if isinstance(nested_binding, Mapping):
+            payload = nested_binding
+    try:
+        binding = ScenePriorFrameBinding.model_validate(payload)
+    except Exception as exc:
+        raise ScenePriorBuildError(
+            f"accepted room-to-home frame binding is invalid: {exc}"
+        ) from exc
+    if binding.contract_version != 2 or binding.metric_frame is None:
+        raise ScenePriorBuildError(
+            "accepted room-to-home import requires frame binding v2"
+        )
+    _validate_room_to_home_acceptance_report(report, binding=binding)
+    return binding
+
+
 def _updated_catalog(
     path: Path,
     *,
@@ -1590,10 +2114,10 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     geometry = AuthoredSceneGeometry.from_obj(cfg.authored_scene)
     if geometry.source_sha256 != authored_file.sha256:
         raise ScenePriorBuildError("authored scene changed while geometry was loaded")
-    similarity = load_similarity(cfg.world_to_scene)
-    triangles = _selected_authored_triangles(
-        geometry, authored_groups, similarity.matrix
-    )
+    try:
+        similarity = load_similarity(cfg.world_to_scene)
+    except (OSError, ValueError) as exc:
+        raise ScenePriorBuildError(f"world-to-scene similarity is invalid: {exc}") from exc
     world_to_scene_payload = load_strict_json(
         world_to_scene_file.data,
         label="world-to-scene alignment",
@@ -1610,6 +2134,150 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         ) from exc
     if not math.isfinite(floor_y_m):
         raise ScenePriorBuildError("world-to-scene floor_y must be finite")
+
+    camera_map_lock = _load_camera_map_lock(cfg.camera_map_lock, inputs)
+    camera_pose_anchor = _load_camera_pose_anchor(cfg.camera_pose_anchor, inputs)
+    preview_frame = _camera_preview_frame(
+        inputs,
+        camera_map_lock=camera_map_lock,
+        camera_pose_anchor=camera_pose_anchor,
+    )
+    try:
+        materialized_target_from_source = tuple(
+            float(value)
+            for value in inputs["target_revision_metadata"]["floor_alignment"][
+                "world_correction_col_major"
+            ]
+        )
+        _col_major_matrix(materialized_target_from_source)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenePriorBuildError(
+            "reference target metadata does not bind materialized point geometry"
+        ) from exc
+    accepted_binding: ScenePriorFrameBinding | None = None
+    effective_world_to_scene = np.asarray(similarity.matrix, dtype=np.float64)
+    if cfg.accepted_frame_binding is not None:
+        accepted_binding = import_accepted_room_to_home_binding(
+            cfg.accepted_frame_binding,
+            acceptance_report=cfg.registration_acceptance_report,
+        )
+        if accepted_binding.metric_frame is None:
+            raise ScenePriorBuildError("accepted v2 binding has no metric frame")
+        physical_source, physical_camera_sha256, physical_alignment_sha256 = (
+            _source_physical_frame(inputs)
+        )
+        if accepted_binding.source_frame != ScenePriorFrameRef(
+            frame_id=physical_source.frame_id,
+            revision=physical_source.revision,
+        ):
+            raise ScenePriorBuildError(
+                "accepted binding source frame does not match the physical bundle calibration"
+            )
+        if accepted_binding.source_camera_calibration_physical_sha256 != physical_camera_sha256:
+            raise ScenePriorBuildError(
+                "accepted binding camera physical identity does not match the bundle"
+            )
+        if accepted_binding.source_world_alignment_physical_sha256 != physical_alignment_sha256:
+            raise ScenePriorBuildError(
+                "accepted binding world-alignment physical identity does not match the bundle"
+            )
+        if accepted_binding.source_camera_calibration_sha256 != _sha256(
+            inputs["camera_calibration_bytes"]
+        ):
+            raise ScenePriorBuildError(
+                "accepted binding camera calibration artifact does not match the bundle"
+            )
+        if accepted_binding.source_world_alignment_sha256 != _sha256(
+            inputs["transform_bytes"]
+        ):
+            raise ScenePriorBuildError(
+                "accepted binding world-alignment artifact does not match the bundle"
+            )
+        if accepted_binding.target_revision_id != preview_frame.target_revision_id:
+            raise ScenePriorBuildError(
+                "accepted binding target revision does not match the bundle revision"
+            )
+        if accepted_binding.target_revision_metadata_sha256 != preview_frame.target_revision_metadata.sha256:
+            raise ScenePriorBuildError(
+                "accepted binding target metadata does not match the bundle revision"
+            )
+        source_plane = accepted_binding.source_floor_plane
+        if (
+            source_plane.normal != preview_frame.source_floor_normal
+            or source_plane.offset_m != preview_frame.source_floor_offset_m
+        ):
+            raise ScenePriorBuildError(
+                "accepted binding source floor plane does not match the bundle"
+            )
+        target_plane = accepted_binding.target_floor_plane
+        target_normal = np.asarray(target_plane.normal, dtype=np.float64)
+        if not np.allclose(target_normal, (0.0, 1.0, 0.0), atol=1e-6):
+            raise ScenePriorBuildError(
+                "accepted binding target floor plane must be horizontal and upward"
+            )
+        target_from_source = _col_major_matrix(
+            accepted_binding.target_from_source_col_major
+        )
+        try:
+            derived_world_to_scene = similarity.matrix @ np.linalg.inv(target_from_source)
+        except np.linalg.LinAlgError as exc:
+            raise ScenePriorBuildError(
+                "accepted room-to-home transform cannot compose authored presentation"
+            ) from exc
+        if accepted_binding.presentation is not None:
+            if cfg.world_presentation is not None:
+                try:
+                    configured_presentation = (
+                        cfg.world_presentation
+                        if isinstance(
+                            cfg.world_presentation,
+                            ScenePriorWorldToScenePresentation,
+                        )
+                        else ScenePriorWorldToScenePresentation.model_validate(
+                            cfg.world_presentation
+                        )
+                    )
+                except Exception as exc:
+                    raise ScenePriorBuildError(
+                        f"configured world presentation is invalid: {exc}"
+                    ) from exc
+                if configured_presentation != accepted_binding.presentation:
+                    raise ScenePriorBuildError(
+                        "configured world presentation does not equal accepted binding presentation"
+                    )
+            explicit_matrix = _col_major_matrix(
+                accepted_binding.presentation.world_to_scene_col_major
+            )
+            if accepted_binding.presentation.provenance.sha256 != world_to_scene_file.sha256:
+                raise ScenePriorBuildError(
+                    "accepted presentation provenance does not match the current authored registration"
+                )
+            if not np.allclose(explicit_matrix, similarity.matrix, atol=1e-8, rtol=1e-8):
+                raise ScenePriorBuildError(
+                    "accepted presentation is stale for the current authored registration"
+                )
+            effective_world_to_scene = explicit_matrix
+        else:
+            if cfg.world_presentation is not None:
+                raise ScenePriorBuildError(
+                    "world_presentation must be carried by the accepted binding"
+                )
+            effective_world_to_scene = derived_world_to_scene
+        floor_y_m = float(target_plane.offset_m) * -1.0
+        preview_frame = _reframe_camera_preview(
+            preview_frame,
+            accepted_binding.target_from_source_col_major,
+            source_floor_normal=source_plane.normal,
+            source_floor_offset_m=source_plane.offset_m,
+            target_floor_y_m=floor_y_m,
+        )
+    elif cfg.registration_acceptance_report is not None:
+        raise ScenePriorBuildError(
+            "registration acceptance report requires accepted_frame_binding"
+        )
+    triangles = _selected_authored_triangles(
+        geometry, authored_groups, effective_world_to_scene
+    )
     derivation = ScenePriorDerivation(
         algorithm="noesis_scene_prior_2_5d_full_evidence_v2",
         floor_y_m=floor_y_m,
@@ -1620,6 +2288,28 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         max_source_height_m=float(cfg.max_source_height_m),
     )
     points, colors = _load_points_glb(inputs["aligned_bytes"])
+    if accepted_binding is not None:
+        # The aligned GLB is materialized in the target revision named by the
+        # room metadata.  The accepted binding starts in the raw physical
+        # source frame, so convert the already-materialized points by the
+        # exact old-target -> accepted-target delta.  Applying the accepted
+        # source edge directly would apply the metadata floor correction a
+        # second time (and would disagree with the camera preview).
+        materialized_target = _col_major_matrix(materialized_target_from_source)
+        accepted_target = _col_major_matrix(
+            accepted_binding.target_from_source_col_major
+        )
+        try:
+            materialized_to_accepted = accepted_target @ np.linalg.inv(
+                materialized_target
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ScenePriorBuildError(
+                "accepted room-to-home transform cannot reframe materialized points"
+            ) from exc
+        points = _apply_col_major_transform(
+            points, materialized_to_accepted.flatten(order="F")
+        )
     extent_points = points[
         (
             points[:, 1]
@@ -1731,13 +2421,6 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
             producer="noesis",
         ),
     )
-    camera_map_lock = _load_camera_map_lock(cfg.camera_map_lock, inputs)
-    camera_pose_anchor = _load_camera_pose_anchor(cfg.camera_pose_anchor, inputs)
-    preview_frame = _camera_preview_frame(
-        inputs,
-        camera_map_lock=camera_map_lock,
-        camera_pose_anchor=camera_pose_anchor,
-    )
     preview_arrays, preview_bounds = _camera_local_preview_arrays(
         arrays,
         grid=grid,
@@ -1775,67 +2458,137 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         "preview": preview.model_dump(mode="json"),
         "derivation": derivation.model_dump(mode="json"),
     }
+    supplied_metric_frame: ScenePriorMetricFrame | None = None
+    supplied_presentation: ScenePriorWorldToScenePresentation | None = None
+    if cfg.metric_frame is not None:
+        try:
+            supplied_metric_frame = (
+                cfg.metric_frame
+                if isinstance(cfg.metric_frame, ScenePriorMetricFrame)
+                else ScenePriorMetricFrame.model_validate(cfg.metric_frame)
+            )
+        except Exception as exc:
+            raise ScenePriorBuildError(
+                f"configured metric frame is invalid: {exc}"
+            ) from exc
+        identity_payload["metric_frame"] = supplied_metric_frame.model_dump(
+            mode="json"
+        )
+    if cfg.world_presentation is not None:
+        try:
+            supplied_presentation = (
+                cfg.world_presentation
+                if isinstance(
+                    cfg.world_presentation,
+                    ScenePriorWorldToScenePresentation,
+                )
+                else ScenePriorWorldToScenePresentation.model_validate(
+                    cfg.world_presentation
+                )
+            )
+        except Exception as exc:
+            raise ScenePriorBuildError(
+                f"configured world presentation is invalid: {exc}"
+            ) from exc
+        identity_payload["world_presentation"] = supplied_presentation.model_dump(
+            mode="json"
+        )
+    if accepted_binding is not None:
+        if (
+            supplied_metric_frame is not None
+            and supplied_metric_frame != accepted_binding.metric_frame
+        ):
+            raise ScenePriorBuildError(
+                "configured metric frame does not equal accepted binding metric frame"
+            )
+        if (
+            supplied_presentation is not None
+            and supplied_presentation != accepted_binding.presentation
+        ):
+            raise ScenePriorBuildError(
+                "configured world presentation does not equal accepted binding presentation"
+            )
+        identity_payload["accepted_frame_binding"] = accepted_binding.model_dump(
+            mode="json"
+        )
+        # The source mapping is an input artifact; this composed mapping is
+        # the actual target-frame geometry used for grid construction.
+        identity_payload["effective_world_to_scene_col_major"] = [
+            float(value) for value in effective_world_to_scene.flatten(order="F")
+        ]
     identity_digest = _sha256(_compact_json(identity_payload))
     prior_id = f"sceneprior_{cfg.space_id}_{_timestamp_slug(captured_at_us)}_{identity_digest[:12]}"
-    source_frame = RevisionedFrame(
-        frame_id=BACKEND_WORLD_FRAME_ID,
-        revision=revisioned_frame_sha256(
-            BACKEND_WORLD_FRAME_ID,
-            artifact_sha256s=(
-                preview_frame.camera_calibration.sha256,
-                world_to_scene_fingerprint.sha256,
+    if accepted_binding is not None:
+        # Keep the producer-owned physical edge and target coordinate revision
+        # intact.  Only the scene-prior artifact identity is assigned here;
+        # the catalog validator intentionally binds that identity separately.
+        frame_payload = accepted_binding.model_dump(mode="json")
+        frame_payload["artifact_revision_id"] = prior_id
+        frame_binding = ScenePriorFrameBinding.model_validate(frame_payload)
+        source_frame = RevisionedFrame(
+            frame_id=frame_binding.source_frame.frame_id,
+            revision=frame_binding.source_frame.revision,
+        )
+    else:
+        source_frame = RevisionedFrame(
+            frame_id=BACKEND_WORLD_FRAME_ID,
+            revision=revisioned_frame_sha256(
+                BACKEND_WORLD_FRAME_ID,
+                artifact_sha256s=(
+                    preview_frame.camera_calibration.sha256,
+                    world_to_scene_fingerprint.sha256,
+                ),
             ),
-        ),
-    )
-    target_frame = RevisionedFrame(
-        frame_id=BACKEND_WORLD_FRAME_ID,
-        revision=prior_id,
-    )
-    transform_sha256 = revisioned_transform_sha256(
-        source_frame,
-        target_frame,
-        preview_frame.target_from_source_col_major,
-    )
-    frame_binding = ScenePriorFrameBinding(
-        contract="noesis.scene_prior.frame_binding",
-        contract_version=1,
-        source_frame=ScenePriorFrameRef(
-            frame_id=source_frame.frame_id,
-            revision=source_frame.revision,
-        ),
-        target_frame=ScenePriorFrameRef(
-            frame_id=target_frame.frame_id,
-            revision=target_frame.revision,
-        ),
-        source_camera_calibration_sha256=(
-            preview_frame.camera_calibration.sha256
-        ),
-        source_world_alignment_sha256=world_to_scene_fingerprint.sha256,
-        target_revision_id=preview_frame.target_revision_id,
-        target_revision_metadata_sha256=(
-            preview_frame.target_revision_metadata.sha256
-        ),
-        target_from_source_col_major=(
-            preview_frame.target_from_source_col_major
-        ),
-        target_from_source_sha256=transform_sha256,
-        source_floor_plane=ScenePriorFloorPlane(
-            frame=ScenePriorFrameRef(
+        )
+        target_frame = RevisionedFrame(
+            frame_id=BACKEND_WORLD_FRAME_ID,
+            revision=prior_id,
+        )
+        transform_sha256 = revisioned_transform_sha256(
+            source_frame,
+            target_frame,
+            preview_frame.target_from_source_col_major,
+        )
+        frame_binding = ScenePriorFrameBinding(
+            contract="noesis.scene_prior.frame_binding",
+            contract_version=1,
+            source_frame=ScenePriorFrameRef(
                 frame_id=source_frame.frame_id,
                 revision=source_frame.revision,
             ),
-            normal=preview_frame.source_floor_normal,
-            offset_m=preview_frame.source_floor_offset_m,
-        ),
-        target_floor_plane=ScenePriorFloorPlane(
-            frame=ScenePriorFrameRef(
+            target_frame=ScenePriorFrameRef(
                 frame_id=target_frame.frame_id,
                 revision=target_frame.revision,
             ),
-            normal=(0.0, 1.0, 0.0),
-            offset_m=-float(preview_frame.target_floor_y_m),
-        ),
-    )
+            source_camera_calibration_sha256=(
+                preview_frame.camera_calibration.sha256
+            ),
+            source_world_alignment_sha256=world_to_scene_fingerprint.sha256,
+            target_revision_id=preview_frame.target_revision_id,
+            target_revision_metadata_sha256=(
+                preview_frame.target_revision_metadata.sha256
+            ),
+            target_from_source_col_major=(
+                preview_frame.target_from_source_col_major
+            ),
+            target_from_source_sha256=transform_sha256,
+            source_floor_plane=ScenePriorFloorPlane(
+                frame=ScenePriorFrameRef(
+                    frame_id=source_frame.frame_id,
+                    revision=source_frame.revision,
+                ),
+                normal=preview_frame.source_floor_normal,
+                offset_m=preview_frame.source_floor_offset_m,
+            ),
+            target_floor_plane=ScenePriorFloorPlane(
+                frame=ScenePriorFrameRef(
+                    frame_id=target_frame.frame_id,
+                    revision=target_frame.revision,
+                ),
+                normal=(0.0, 1.0, 0.0),
+                offset_m=-float(preview_frame.target_floor_y_m),
+            ),
+        )
 
     grid_bytes = _deterministic_npz(arrays)
     metrics_payload = {
@@ -1941,5 +2694,7 @@ __all__ = [
     "ScenePriorBuildConfig",
     "ScenePriorBuildError",
     "ScenePriorBuildResult",
+    "build_accepted_room_to_home_binding",
     "build_scene_prior",
+    "import_accepted_room_to_home_binding",
 ]

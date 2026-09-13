@@ -194,20 +194,83 @@ def _align_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.eye(3) + skew + skew @ skew * ((1.0 - cosine) / (sine * sine))
 
 
-def _phone_floor_transform(cloud: PhoneCloud) -> tuple[np.ndarray, dict[str, float | list[float]]]:
+def _phone_floor_transform(cloud: PhoneCloud) -> tuple[np.ndarray, dict]:
     import open3d as o3d
 
-    stride = max(1, cloud.points.shape[0] // 180_000)
+    stride = max(1, math.ceil(cloud.points.shape[0] / 180_000))
     sampled = cloud.points[::stride].astype(np.float64)
+    sampled = sampled[np.isfinite(sampled).all(axis=1)]
+    if len(sampled) < 3:
+        raise ValueError("phone floor diagnostics need at least three finite points")
     camera_up = _normalize(-np.mean(cloud.camera_to_world[:, :3, 1], axis=0))
+    if np.linalg.norm(camera_up) < 0.5 or not np.isfinite(camera_up).all():
+        raise ValueError("phone floor diagnostics have no consistent camera-up direction")
     o3d.utility.random.seed(17)
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(sampled))
-    plane, inliers = pcd.segment_plane(distance_threshold=0.06, ransac_n=3, num_iterations=1_600)
-    normal = _normalize(np.asarray(plane[:3], dtype=np.float64))
-    offset = float(plane[3]) / float(np.linalg.norm(plane[:3]))
-    if float(np.dot(normal, camera_up)) < 0:
-        normal = -normal
-        offset = -offset
+    remaining = sampled
+    candidates = []
+    accepted = []
+    # A wall is often the largest plane. Inspect a bounded set instead of
+    # turning that wall into the floor. Camera-up is only a visual heuristic;
+    # it is not a calibrated IMU gravity measurement.
+    for index in range(8):
+        if len(remaining) < max(3, math.ceil(0.015 * len(sampled))):
+            break
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(remaining))
+        plane, inliers = pcd.segment_plane(
+            distance_threshold=0.06, ransac_n=3, num_iterations=1_600
+        )
+        if not inliers:
+            break
+        normal_length = float(np.linalg.norm(plane[:3]))
+        normal = np.asarray(plane[:3], dtype=np.float64) / normal_length
+        offset = float(plane[3]) / normal_length
+        if float(np.dot(normal, camera_up)) < 0:
+            normal = -normal
+            offset = -offset
+        angle = math.degrees(math.acos(float(np.clip(normal @ camera_up, -1.0, 1.0))))
+        heights = cloud.camera_to_world[:, :3, 3] @ normal + offset
+        signed_distances = sampled @ normal + offset
+        support = np.abs(signed_distances) <= 0.06
+        support_fraction = float(np.mean(support))
+        median_height = float(np.median(heights))
+        reasons = []
+        if angle > 35.0:
+            reasons.append("plane_not_aligned_with_camera_up")
+        if support_fraction < 0.015:
+            reasons.append("insufficient_plane_support")
+        # Preserve the camera-height bounds used by the phone alignment gate.
+        if not 0.7 <= median_height <= 2.2:
+            reasons.append("implausible_camera_height")
+        candidate = {
+            "index": index,
+            "normal_phone_world": normal.tolist(),
+            "plane_offset": offset,
+            "up_angle_deg": angle,
+            "inlier_fraction": support_fraction,
+            "residual_median_m": float(np.median(np.abs(signed_distances[support]))),
+            "camera_height_m": {
+                "min": float(np.min(heights)),
+                "median": median_height,
+                "max": float(np.max(heights)),
+            },
+            "points_below_plane_fraction": float(np.mean(signed_distances < -0.12)),
+            "rejection_reasons": reasons,
+        }
+        candidates.append(candidate)
+        if not reasons:
+            accepted.append(candidate)
+        keep = np.ones(len(remaining), dtype=bool)
+        keep[inliers] = False
+        remaining = remaining[keep]
+    if not accepted:
+        raise ValueError(
+            "no supported floor plane satisfies camera-up and camera-height checks; "
+            "refusing to label a wall or elevated surface as the floor"
+        )
+    # Prefer the lowest plausible supported plane over countertops and shelves.
+    selected = max(accepted, key=lambda row: row["camera_height_m"]["median"])
+    normal = np.asarray(selected["normal_phone_world"])
+    offset = selected["plane_offset"]
     rotation = _align_vectors(normal, np.array([0.0, 1.0, 0.0]))
     transform = np.eye(4)
     transform[:3, :3] = rotation
@@ -215,7 +278,14 @@ def _phone_floor_transform(cloud: PhoneCloud) -> tuple[np.ndarray, dict[str, flo
     return transform, {
         "floor_normal_phone_world": normal.tolist(),
         "floor_plane_offset": offset,
-        "floor_inlier_fraction": float(len(inliers) / sampled.shape[0]),
+        "floor_inlier_fraction": selected["inlier_fraction"],
+        "selection_policy": "lowest_supported_plane_with_camera_up_and_height_checks",
+        "orientation_reference": "mean_camera_up_visual_heuristic_not_imu",
+        "selected_candidate_index": selected["index"],
+        "camera_up_phone_world": camera_up.tolist(),
+        "camera_height_m": selected["camera_height_m"],
+        "sample_count": len(sampled),
+        "candidates": candidates,
     }
 
 
@@ -382,6 +452,8 @@ def _rasterize(cloud: PhoneCloud, bounds: tuple[float, float, float, float], gri
     structural[floor_edges] = (90, 220, 255)
 
     camera_positions = _camera_positions(cloud)
+    if not np.isfinite(camera_positions).all():
+        raise ValueError("camera path contains non-finite coordinates")
     camera_z, camera_x, camera_valid = camera_local_raster_indices(
         camera_positions[:, 0],
         camera_positions[:, 2],
@@ -391,14 +463,22 @@ def _rasterize(cloud: PhoneCloud, bounds: tuple[float, float, float, float], gri
         rows=rows,
         columns=cols,
     )
-    camera_x = np.clip(camera_x, 0, cols - 1).astype(int)
-    camera_z = np.clip(camera_z, 0, rows - 1).astype(int)
-    if not np.all(camera_valid):
-        raise ValueError("bounded camera path escaped its raster")
-    path = np.stack((camera_x, camera_z), axis=1).astype(np.int32)
-    cv2.polylines(structural, [path.reshape(-1, 1, 2)], False, (58, 255, 118), 1, cv2.LINE_AA)
-    cv2.circle(structural, tuple(path[0]), 2, (70, 255, 70), -1)
-    cv2.circle(structural, tuple(path[-1]), 2, (255, 90, 90), -1)
+    # A phone walk may legitimately extend outside the static-camera crop.
+    # Clip drawn segments, not camera coordinates: clamping points would invent
+    # a trajectory along the crop boundary. Geometry and crop remain unchanged.
+    path = np.stack((camera_x, camera_z), axis=1)
+    if np.any(np.abs(path) > 2**30):
+        raise ValueError("camera path exceeds the bounded drawing coordinate range")
+    for start, end in zip(path[:-1], path[1:]):
+        visible, clipped_start, clipped_end = cv2.clipLine(
+            (0, 0, cols, rows), tuple(start.tolist()), tuple(end.tolist()),
+        )
+        if visible:
+            cv2.line(structural, clipped_start, clipped_end, (58, 255, 118), 1, cv2.LINE_AA)
+    if len(path) and camera_valid[0]:
+        cv2.circle(structural, tuple(path[0].tolist()), 2, (70, 255, 70), -1)
+    if len(path) and camera_valid[-1]:
+        cv2.circle(structural, tuple(path[-1].tolist()), 2, (255, 90, 90), -1)
     return {
         "structural": structural,
         "density": density,

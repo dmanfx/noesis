@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import math
 import os
 import re
 import shutil
+import ssl
+import stat
 import subprocess
+import tarfile
 import threading
+import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -25,10 +31,41 @@ from fastapi.staticfiles import StaticFiles
 from .alignment import NoesisAlignmentSettings, run_noesis_alignment
 from .da3_inference import DA3PhoneScanSettings
 from .inference import MapAnythingScanSettings
+from .paired_static_reference import (
+    prepare_paired_static_reference,
+    validate_paired_static_reference,
+)
 from .windowed_inference import run_adaptive_mapanything_scan
 from .windowed_da3_inference import run_adaptive_da3_phone_scan
 from .pcf import run_pcf_review_candidate
 from .processing import FramePreparationSettings, prepare_video_frames
+from .phone_calibration import calibration_summary
+from .imu_calibration import MAX_BUNDLE_BYTES as MAX_IMU_BUNDLE_BYTES, ImuCalibrationError, retain_imu_bundle
+from .prepared_frame_identity import prepared_frame_identity
+from .capture import CaptureImportLimits, CaptureImportError, import_capture_bundle, validate_capture_manifest
+from .capture_upload import (
+    ASYNC_VIDEO_PROBE_TIMEOUT_S,
+    UPLOAD_RECEIPT_SCHEMA,
+    CaptureUploadBusy,
+    CaptureUploadQueue,
+)
+from .browser_capture import BROWSER_CAPTURE_SCHEMA
+from .companion_capture import (
+    COMPANION_SESSION_PATTERN,
+    CompanionCaptureBusy,
+    CompanionCaptureConflict,
+    CompanionCaptureError,
+    CompanionCaptureLimits,
+    CompanionCaptureManager,
+)
+from .vio import (
+    VIOError,
+    VIOSettings,
+    materialize_openvins_input,
+    run_openvins,
+    validate_vio_input,
+    validate_vio_result,
+)
 from .supplement import (
     SupplementIntegrationSettings,
     materialize_noesis_revision,
@@ -46,15 +83,19 @@ ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp"}
 INFERENCE_PROVIDERS = {"mapanything", "da3"}
 MAX_SCAN_NAME_LENGTH = 80
 RUNNING_STATUSES = {
+    "importing_capture",
     "processing_frames",
     "ma_queued",
     "ma_running",
     "da3_queued",
     "da3_running",
+    "vio_queued",
+    "vio_running",
 }
 SUPPLEMENT_RUNNING_STATUSES = {"uploading", "processing_frames", "queued", "running"}
 PCF_RUNNING_STATUSES = {"queued", "running"}
 PCF_APPLIANCE_TARGET = "menon-appliance.target"
+MAX_CA_CERT_BYTES = 256 * 1024
 
 
 def _utc_now() -> str:
@@ -71,6 +112,33 @@ def _sha256_file(path: Path) -> str:
 
 def _camera_display_name(camera_id: str) -> str:
     return " ".join(part.capitalize() for part in camera_id.replace("_", "-").split("-"))
+
+
+def _finalize_alignment_paths(build_dir: Path, final_dir: Path, result: dict[str, Any]) -> None:
+    """Keep reported artifact locations valid after the atomic directory move."""
+    paths = result.get("artifact_paths")
+    if not isinstance(paths, dict):
+        return
+    published: dict[str, str] = {}
+    for key, value in paths.items():
+        source = Path(str(value)).resolve()
+        try:
+            relative = source.relative_to(build_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError("Alignment output artifact is outside its build directory") from exc
+        if not source.is_file():
+            raise RuntimeError(f"Alignment output artifact is missing: {key}")
+        published[key] = str((final_dir / relative).resolve())
+    report_path = build_dir / "alignment_report.json"
+    report = _read_json_object(report_path, label="alignment report")
+    report["output_dir"] = str(final_dir.resolve())
+    report["artifact_paths"] = published
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    result["artifact_paths"] = published
+    for row in result.get("files") or []:
+        if isinstance(row, dict) and row.get("path") == "alignment/alignment_report.json":
+            row["size_bytes"] = report_path.stat().st_size
+            row["sha256"] = _sha256_file(report_path)
 
 
 def _env_int(name: str, default: int, *, minimum: int) -> int:
@@ -101,6 +169,59 @@ def _resolve_root(raw: str | None, default: Path) -> Path:
     if not path.is_absolute():
         path = REPO_ROOT / path
     return path.resolve()
+
+
+def _phone_scan_secure_url() -> str:
+    hostname = (
+        os.environ.get("NOESIS_PHONE_SCAN_TLS_HOSTNAME", "TauntonMainframe.local").strip()
+        or "TauntonMainframe.local"
+    )
+    port = _env_int("NOESIS_PHONE_SCAN_HTTPS_PORT", 8789, minimum=1)
+    return f"https://{hostname}:{port}"
+
+
+def _phone_scan_ca_certificate_path() -> Path:
+    # Keep the launcher and API endpoint on one configured public-CA path.
+    # Import lazily because the launcher imports this module from main().
+    from .__main__ import _ca_certificate_path
+
+    return _ca_certificate_path()
+
+
+def _validated_ca_certificate(path: Path) -> None:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "The appliance CA certificate is not installed; use the HTTPS listener's configured certificate setup.",
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The configured CA certificate is not a regular file")
+    if metadata.st_size <= 0 or metadata.st_size > MAX_CA_CERT_BYTES:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The configured CA certificate is missing or exceeds the safety limit")
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The appliance CA certificate could not be read") from exc
+    if b"PRIVATE KEY" in data or b"BEGIN RSA" in data or b"BEGIN EC" in data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The configured CA certificate contains private-key material")
+    blocks = re.findall(
+        rb"-----BEGIN CERTIFICATE-----\s*.*?-----END CERTIFICATE-----",
+        data,
+        flags=re.DOTALL,
+    )
+    if (
+        not blocks
+        or data.count(b"-----BEGIN CERTIFICATE-----")
+        != data.count(b"-----END CERTIFICATE-----")
+    ):
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The configured CA certificate is not a valid PEM certificate")
+    try:
+        for block in blocks:
+            ssl.PEM_cert_to_DER_cert(block.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The configured CA certificate is not a valid PEM certificate") from exc
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -255,6 +376,9 @@ class PhoneScanSettings:
     alignment_release_id: str | None = None
     pcf_storage_root: Path | None = None
     pcf_pause_appliance: bool = False
+    capture_limits: CaptureImportLimits = CaptureImportLimits()
+    vio: VIOSettings = VIOSettings()
+    companion_limits: CompanionCaptureLimits = CompanionCaptureLimits()
 
     @classmethod
     def from_env(cls) -> "PhoneScanSettings":
@@ -333,6 +457,11 @@ class PhoneScanSettings:
         anchor_image = (
             _resolve_root(anchor_image_raw, REPO_ROOT) if anchor_enabled else None
         )
+        phone_profile_raw = os.environ.get("NOESIS_PHONE_SCAN_CAMERA_CALIBRATION", "").strip()
+        phone_profile = _resolve_root(phone_profile_raw, REPO_ROOT) if phone_profile_raw else None
+        phone_capture_mode = os.environ.get("NOESIS_PHONE_SCAN_CALIBRATED_CAPTURE_MODE", "unbound").strip()
+        if phone_capture_mode not in {"unbound", "uploaded_video", "browser", "native_sensor_bundle"}:
+            raise ValueError("NOESIS_PHONE_SCAN_CALIBRATED_CAPTURE_MODE is not a supported capture mode")
         return cls(
             storage_root=storage_root,
             static_root=APP_ROOT / "static",
@@ -365,6 +494,8 @@ class PhoneScanSettings:
                     "NOESIS_PHONE_SCAN_MAX_KEYFRAME_INTERVAL_S", 1.25, minimum=0.30
                 ),
                 max_edge_px=_env_int("NOESIS_PHONE_SCAN_MAX_EDGE_PX", 1920, minimum=518),
+                phone_camera_calibration=phone_profile,
+                phone_camera_capture_mode=phone_capture_mode,
             ),
             mapanything=MapAnythingScanSettings(
                 model_id=os.environ.get(
@@ -423,6 +554,51 @@ class PhoneScanSettings:
             pcf_pause_appliance=_env_bool(
                 "NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE", False
             ),
+            capture_limits=CaptureImportLimits(
+                max_archive_bytes=_env_int(
+                    "NOESIS_PHONE_SCAN_MAX_CAPTURE_BYTES", 8 * 1024 * 1024 * 1024, minimum=1024 * 1024
+                ),
+                max_uncompressed_bytes=_env_int(
+                    "NOESIS_PHONE_SCAN_MAX_CAPTURE_UNCOMPRESSED_BYTES", 8 * 1024 * 1024 * 1024, minimum=1024 * 1024
+                ),
+                max_member_bytes=_env_int(
+                    "NOESIS_PHONE_SCAN_MAX_CAPTURE_MEMBER_BYTES", 8 * 1024 * 1024 * 1024, minimum=1024 * 1024
+                ),
+                max_files=_env_int("NOESIS_PHONE_SCAN_MAX_CAPTURE_FILES", 512, minimum=4),
+                max_imu_rows=_env_int("NOESIS_PHONE_SCAN_MAX_CAPTURE_IMU_ROWS", 2_000_000, minimum=2),
+                max_video_timestamps=_env_int("NOESIS_PHONE_SCAN_MAX_CAPTURE_VIDEO_FRAMES", 1_000_000, minimum=2),
+                max_time_gap_s=_env_float("NOESIS_PHONE_SCAN_MAX_CAPTURE_IMU_GAP_S", 0.25, minimum=0.001),
+            ),
+            vio=VIOSettings.from_env(),
+            companion_limits=CompanionCaptureLimits(
+                max_duration_s=_env_float(
+                    "NOESIS_PHONE_SCAN_COMPANION_MAX_DURATION_S", 15 * 60.0, minimum=0.1
+                ),
+                lease_s=_env_float(
+                    "NOESIS_PHONE_SCAN_COMPANION_LEASE_S", 45.0, minimum=0.1
+                ),
+                readiness_timeout_s=_env_float(
+                    "NOESIS_PHONE_SCAN_COMPANION_READINESS_TIMEOUT_S", 15.0, minimum=0.1
+                ),
+                max_session_bytes=_env_int(
+                    "NOESIS_PHONE_SCAN_COMPANION_MAX_BYTES",
+                    8 * 1024 * 1024 * 1024,
+                    minimum=1024 * 1024,
+                ),
+                max_tracking_records=_env_int(
+                    "NOESIS_PHONE_SCAN_COMPANION_MAX_TRACKING_RECORDS",
+                    1_000_000,
+                    minimum=1,
+                ),
+                max_packet_records=_env_int(
+                    "NOESIS_PHONE_SCAN_COMPANION_MAX_PACKET_RECORDS",
+                    2_000_000,
+                    minimum=1,
+                ),
+                max_markers=_env_int(
+                    "NOESIS_PHONE_SCAN_COMPANION_MAX_MARKERS", 10_000, minimum=1
+                ),
+            ),
         )
 
 
@@ -468,6 +644,60 @@ PCFRunner = Callable[
     ],
     dict[str, Any],
 ]
+VioRunner = Callable[
+    [Path, Path, dict[str, Any], dict[str, Any], VIOSettings, Callable[[float, str], None]],
+    dict[str, Any],
+]
+
+
+def _default_vio_runner(
+    capture_dir: Path,
+    output_dir: Path,
+    capture_report: dict[str, Any],
+    prepared: dict[str, Any],
+    settings: VIOSettings,
+    progress: Callable[[float, str], None],
+) -> dict[str, Any]:
+    validate_vio_input(capture_report, prepared)
+    materialized_dir, generated_config = materialize_openvins_input(
+        capture_dir,
+        capture_report,
+        output_dir,
+        settings,
+        progress,
+    )
+    result = run_openvins(
+        materialized_dir,
+        output_dir,
+        replace(settings, config=generated_config),
+        progress,
+    )
+    dense_pose_count = len(result.get("poses") or [])
+    prepared_by_time = {
+        int(row["capture_time_ns"]): row
+        for row in prepared.get("frames", [])
+        if isinstance(row, dict) and isinstance(row.get("capture_time_ns"), int)
+    }
+    selected_poses: list[dict[str, Any]] = []
+    for pose in result.get("poses", []):
+        timestamp = int(pose["capture_time_ns"])
+        prepared_row = prepared_by_time.get(timestamp)
+        if prepared_row is None:
+            continue
+        pose = dict(pose)
+        pose["prepared_frame_id"] = prepared_frame_identity(
+            int(prepared_row["index"]), str(prepared_row["sha256"])
+        )
+        pose["source_frame_index"] = prepared_row.get("source_frame_index")
+        selected_poses.append(pose)
+    if len(selected_poses) < 2:
+        raise VIOError("OpenVINS produced no two poses matching prepared exact frame timestamps")
+    result["poses"] = selected_poses
+    quality = dict(result.get("quality") or {})
+    quality["dense_pose_count"] = dense_pose_count
+    quality["prepared_pose_count"] = len(selected_poses)
+    result["quality"] = quality
+    return validate_vio_result(result)
 
 
 def _prepared_paths_in_scan(
@@ -534,16 +764,21 @@ class PhoneScanService:
         inference_runner: InferenceRunner = run_adaptive_mapanything_scan,
         da3_inference_runner: DA3InferenceRunner = run_adaptive_da3_phone_scan,
         alignment_runner: AlignmentRunner = run_noesis_alignment,
+        paired_static_runner: Callable[..., dict[str, Any]] = prepare_paired_static_reference,
         supplement_runner: SupplementRunner = run_supplement_integration,
         pcf_runner: PCFRunner = run_pcf_review_candidate,
+        vio_runner: VioRunner = _default_vio_runner,
+        companion_manager: CompanionCaptureManager | None = None,
     ) -> None:
         self.settings = settings
         self.frame_processor = frame_processor
         self.inference_runner = inference_runner
         self.da3_inference_runner = da3_inference_runner
         self.alignment_runner = alignment_runner
+        self.paired_static_runner = paired_static_runner
         self.supplement_runner = supplement_runner
         self.pcf_runner = pcf_runner
+        self.vio_runner = vio_runner
         self.supplement_settings = SupplementIntegrationSettings(
             max_total_views=self.settings.mapanything.max_joint_views,
             point_budget=max(
@@ -574,9 +809,38 @@ class PhoneScanService:
         self._inference_lock = threading.Lock()
         self._alignment_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PhoneScan")
+        self.capture_uploads = CaptureUploadQueue(self.settings.storage_root)
+        self.companion_capture = companion_manager or CompanionCaptureManager(
+            self.settings.storage_root,
+            limits=self.settings.companion_limits,
+        )
 
     def shutdown(self) -> None:
+        self.capture_uploads.shutdown()
+        self.companion_capture.shutdown()
         self._executor.shutdown(wait=False, cancel_futures=False)
+
+    def companion_cameras(self) -> list[dict[str, Any]]:
+        return self.companion_capture.list_cameras()
+
+    def start_companion_capture(
+        self,
+        camera_id: str,
+        *,
+        client_request_id: str | None = None,
+        phone_capture_id: str | None = None,
+        clock_probes: Any | None = None,
+    ) -> dict[str, Any]:
+        state = self.companion_capture.start_session(
+            camera_id,
+            client_request_id=client_request_id,
+            phone_capture_id=phone_capture_id,
+            clock_probes=clock_probes,
+        )
+        return self.companion_capture.public_state(str(state["session_id"]))
+
+    def companion_status(self, session_id: str) -> dict[str, Any]:
+        return self.companion_capture.public_state(session_id)
 
     def public_alignment_targets(self) -> list[dict[str, str]]:
         return [
@@ -770,7 +1034,17 @@ class PhoneScanService:
             except HTTPException:
                 continue
             previous = str(state.get("status") or "")
-            if previous == "processing_frames":
+            if previous == "importing_capture" and state.get("upload_receipt"):
+                self.update_state(
+                    scan_id,
+                    status="import_failed",
+                    message="Capture validation was interrupted by a tool restart",
+                    error="The uploaded archive is preserved; upload the same saved bundle to retry validation.",
+                    upload_import={**(state.get("upload_import") or {}), "phase": "interrupted"},
+                    upload_receipt={**state["upload_receipt"], "validation_status": "failed"},
+                )
+                self.capture_uploads.sync_state(directory)
+            elif previous == "processing_frames":
                 self.update_state(
                     scan_id,
                     status="frame_failed",
@@ -788,6 +1062,18 @@ class PhoneScanService:
                     message=f"{label} was interrupted by a tool restart",
                     error="The uploaded video and prepared frames are preserved; retry the selected provider.",
                 )
+            vio = state.get("vio")
+            if isinstance(vio, dict) and vio.get("status") in {"queued", "running"}:
+                self.update_state(
+                    scan_id,
+                    vio={
+                        **vio,
+                        "status": "failed",
+                        "progress": 0.0,
+                        "message": "OpenVINS was interrupted by a tool restart",
+                        "error": "The sensor bundle and RGB reconstruction are preserved; retry OpenVINS.",
+                    },
+                )
             alignment = state.get("alignment")
             if isinstance(alignment, dict) and alignment.get("status") in {
                 "queued",
@@ -801,6 +1087,13 @@ class PhoneScanService:
                         "error": "The original inference outputs are preserved; press Align to Noesis to retry.",
                     }
                 )
+                reference = alignment.get("static_reference")
+                if isinstance(reference, dict) and reference.get("status") in {"queued", "building"}:
+                    reference.update(
+                        status="failed",
+                        message="The paired static build was interrupted; retry alignment",
+                        error="The original paired recording is preserved",
+                    )
                 self.update_state(scan_id, alignment=alignment)
             restore_interrupted_appliance = False
             with self._lock(scan_id):
@@ -930,6 +1223,108 @@ class PhoneScanService:
             )
         except HTTPException:
             return
+
+    def initiate_vio(self, scan_id: str) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            capture = state.get("capture")
+            if not isinstance(capture, dict):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "OpenVINS requires an imported camera and IMU capture bundle",
+                )
+            if state.get("status") not in {"ready", "complete"}:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"OpenVINS cannot start while frame preparation status is {state.get('status')}",
+                )
+            existing = state.get("vio")
+            if isinstance(existing, dict) and existing.get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "OpenVINS is already running")
+            if capture.get("schema") == BROWSER_CAPTURE_SCHEMA:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "OpenVINS is blocked for browser camera + IMU captures; browser callback timestamps are not native acquisition timestamps",
+                )
+            if capture.get("metric_vio_allowed") is not True:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Metric OpenVINS is blocked because capture calibration or timing is incomplete",
+                )
+            vio = {
+                "schema": "noesis.phone_capture.vio_job.v1",
+                "estimator": "openvins",
+                "status": "queued",
+                "progress": 0.0,
+                "message": "OpenVINS queued",
+                "error": None,
+            }
+            state["vio"] = vio
+            self._write_state_unlocked(scan_id, state)
+        self._executor.submit(self._vio_worker, scan_id)
+        return state
+
+    def _vio_progress(self, scan_id: str, fraction: float, message: str) -> None:
+        try:
+            with self._lock(scan_id):
+                state = self._read_state_unlocked(scan_id)
+                vio = dict(state.get("vio") or {})
+                if vio.get("status") not in {"queued", "running"}:
+                    return
+                vio.update({"status": "running", "progress": float(min(1.0, max(0.0, fraction))), "message": str(message)})
+                state["vio"] = vio
+                self._write_state_unlocked(scan_id, state)
+        except HTTPException:
+            return
+
+    def _vio_worker(self, scan_id: str) -> None:
+        run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        output_dir = self.scan_dir(scan_id) / "vio" / run_id
+        try:
+            state = self.read_state(scan_id)
+            capture = state.get("capture")
+            prepared = state.get("prepared")
+            if not isinstance(capture, dict) or not isinstance(prepared, dict):
+                raise VIOError("timestamped capture or prepared views are missing")
+            report_path = self.scan_dir(scan_id) / str(capture.get("import_report") or "capture/capture_import.json")
+            capture_report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.update_state(scan_id, vio={**dict(state.get("vio") or {}), "status": "running", "message": "Starting OpenVINS"})
+            result = self.vio_runner(
+                self.scan_dir(scan_id) / "capture",
+                output_dir,
+                capture_report,
+                prepared,
+                self.settings.vio,
+                lambda fraction, message: self._vio_progress(scan_id, fraction, message),
+            )
+            result["artifact"] = f"vio/{run_id}/vio_result.json"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "vio_result.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+            self.update_state(
+                scan_id,
+                vio={
+                    "schema": "noesis.phone_capture.vio_job.v1",
+                    "estimator": "openvins",
+                    "status": "complete",
+                    "progress": 1.0,
+                    "message": f"OpenVINS produced {len(result.get('poses') or [])} camera poses",
+                    "error": None,
+                    "results": result,
+                },
+            )
+        except Exception as exc:
+            try:
+                state = self.read_state(scan_id)
+                vio = dict(state.get("vio") or {})
+                vio.update({
+                    "status": "failed",
+                    "progress": 0.0,
+                    "message": "OpenVINS failed; RGB reconstruction remains available",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                self.update_state(scan_id, vio=vio)
+            except HTTPException:
+                return
 
     def _prepare_worker(self, scan_id: str) -> None:
         try:
@@ -1249,6 +1644,67 @@ class PhoneScanService:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
+    def _paired_alignment_companion(
+        self, state: dict[str, Any], camera_id: str
+    ) -> dict[str, Any] | None:
+        recorded = state.get("companion_capture")
+        if recorded is None:
+            return None
+        if not isinstance(recorded, dict):
+            raise HTTPException(409, "The paired static capture reference is malformed")
+        session_id = str(recorded.get("session_id") or "")
+        if not COMPANION_SESSION_PATTERN.fullmatch(session_id):
+            raise HTTPException(409, "The paired static capture has no valid session identity")
+        if recorded.get("camera_id") != camera_id:
+            raise HTTPException(
+                422,
+                "This walk must align with its paired static camera: "
+                + str(recorded.get("camera_id") or "unknown"),
+            )
+        try:
+            companion = self.companion_capture.public_state(session_id)
+        except CompanionCaptureError as exc:
+            raise HTTPException(409, f"The paired static capture is unavailable: {exc}") from exc
+        phone = companion.get("phone") or {}
+        recorded_phone = recorded.get("phone") or {}
+        if (
+            companion.get("camera_id") != camera_id
+            or phone.get("scan_id") != state["id"]
+            or not companion.get("phone_capture_id")
+            or companion.get("phone_capture_id") != recorded.get("phone_capture_id")
+            or not phone.get("archive_sha256")
+            or phone.get("archive_sha256") != recorded_phone.get("archive_sha256")
+        ):
+            raise HTTPException(409, "The paired static capture does not match this phone archive")
+        if companion.get("status") != "stopped" or companion.get("error"):
+            raise HTTPException(409, "Paired alignment requires a successfully finalized static capture")
+        return companion
+
+    def _saved_alignment_target(
+        self, scan_id: str, alignment: dict[str, Any]
+    ) -> NoesisAlignmentSettings:
+        camera_id = str(alignment.get("target_camera_id") or "")
+        target = self._alignment_targets.get(camera_id)
+        if target is None:
+            raise HTTPException(409, "The aligned camera has no configured calibration")
+        if alignment.get("target_kind") != "paired_static":
+            return target
+        reference = alignment.get("static_reference")
+        if not isinstance(reference, dict) or reference.get("status") != "complete":
+            raise HTTPException(409, "The paired static reconstruction is not complete")
+        scan_dir = self.scan_dir(scan_id)
+        try:
+            validate_paired_static_reference(scan_dir, reference)
+        except Exception as exc:
+            raise HTTPException(409, f"The paired static reconstruction cannot be verified: {exc}") from exc
+        if reference.get("camera_id") != camera_id:
+            raise HTTPException(409, "The paired static reconstruction belongs to another camera")
+        return replace(
+            target,
+            target_revision=scan_dir / reference["target_revision"],
+            calibration_path=scan_dir / reference["calibration_path"],
+        )
+
     def initiate_alignment(self, scan_id: str, camera_id: str) -> dict[str, Any]:
         target = self._alignment_targets.get(str(camera_id).strip())
         if target is None:
@@ -1271,6 +1727,7 @@ class PhoneScanService:
                     status.HTTP_409_CONFLICT,
                     f"Noesis alignment cannot start while status is {alignment_status}",
                 )
+            companion = self._paired_alignment_companion(state, target.camera_id)
             state["alignment"] = {
                 "status": "queued",
                 "progress": 0.0,
@@ -1279,10 +1736,19 @@ class PhoneScanService:
                     "static camera"
                 ),
                 "error": None,
+                "target_kind": "paired_static" if companion is not None else "saved_static",
                 "target_camera_id": target.camera_id,
-                "target_revision_id": target.target_revision.name,
-                "target_release_id": self.settings.alignment_release_id,
+                "target_revision_id": None if companion is not None else target.target_revision.name,
+                "target_release_id": None if companion is not None else self.settings.alignment_release_id,
             }
+            if companion is not None:
+                state["alignment"]["static_reference"] = {
+                    "status": "queued",
+                    "session_id": companion["session_id"],
+                    "camera_id": target.camera_id,
+                    "message": "Waiting to reconstruct the paired static recording",
+                    "error": None,
+                }
             self._write_state_unlocked(scan_id, state)
         self._executor.submit(self._alignment_worker, scan_id, target.camera_id)
         return state
@@ -1327,6 +1793,37 @@ class PhoneScanService:
                     }
                 )
                 self.update_state(scan_id, alignment=alignment)
+                paired = alignment.get("target_kind") == "paired_static"
+                if paired:
+                    companion = self._paired_alignment_companion(state, camera_id)
+                    if companion is None:
+                        raise RuntimeError("The paired static capture disappeared before alignment")
+                    reference = dict(alignment.get("static_reference") or {})
+                    reference.update(status="building", message="Reconstructing the paired static recording")
+                    alignment["static_reference"] = reference
+                    self.update_state(scan_id, alignment=alignment)
+
+                    def static_progress(fraction: float, message: str) -> None:
+                        reference["message"] = str(message)
+                        alignment["progress"] = 0.01 + 0.34 * min(1.0, max(0.0, float(fraction)))
+                        alignment["message"] = str(message)
+                        self.update_state(scan_id, alignment=alignment)
+
+                    # Static inference shares the phone/PCF GPU lane. It never
+                    # enters an always-on DS9 callback or changes its producer.
+                    with self._inference_lock:
+                        reference = self.paired_static_runner(
+                            scan_dir=scan_dir,
+                            session_dir=self.companion_capture.session_root / companion["session_id"],
+                            companion=companion,
+                            model_settings=replace(self.settings.mapanything, anchor_image=None),
+                            current_calibration_path=target.calibration_path,
+                            progress=static_progress,
+                        )
+                    alignment["static_reference"] = reference
+                    alignment["target_revision_id"] = reference.get("revision_id")
+                    target = self._saved_alignment_target(scan_id, alignment)
+                    self.update_state(scan_id, alignment=alignment)
                 if build_dir.exists():
                     shutil.rmtree(build_dir)
                 build_dir.mkdir(parents=True, exist_ok=False)
@@ -1336,11 +1833,15 @@ class PhoneScanService:
                     state["outputs"],
                     target,
                     lambda fraction, message: self._alignment_progress(
-                        scan_id, fraction, message
+                        scan_id, (0.35 + 0.65 * fraction) if paired else fraction, message
                     ),
                 )
+                result["target_kind"] = alignment.get("target_kind", "saved_static")
+                if paired:
+                    result["static_reference"] = deepcopy(alignment["static_reference"])
                 if final_dir.exists():
                     raise RuntimeError("a completed alignment directory already exists")
+                _finalize_alignment_paths(build_dir, final_dir, result)
                 os.replace(build_dir, final_dir)
                 alignment.update(
                     {
@@ -1389,6 +1890,13 @@ class PhoneScanService:
                 try:
                     state = self.read_state(scan_id)
                     alignment = dict(state.get("alignment") or {})
+                    reference = alignment.get("static_reference")
+                    if isinstance(reference, dict) and reference.get("status") in {"queued", "building"}:
+                        reference.update(
+                            status="failed",
+                            message="The paired static reconstruction failed; the recordings are preserved",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
                     alignment.update(
                         {
                             "status": "failed",
@@ -1439,12 +1947,9 @@ class PhoneScanService:
                 or alignment.get("target_camera_id")
                 or ""
             )
-            target = self._alignment_targets.get(camera_id)
-            if target is None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    "The aligned camera is not available in the active scene release",
-                )
+            target = self._saved_alignment_target(scan_id, alignment)
+            if target.camera_id != camera_id:
+                raise HTTPException(409, "The alignment report names a different static camera")
             if alignment_results.get("target_revision_id") != target.target_revision.name:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -1527,7 +2032,6 @@ class PhoneScanService:
             self._write_state_unlocked(scan_id, state)
 
     def _pcf_worker(self, scan_id: str, run_id: str, camera_id: str) -> None:
-        target = self._alignment_targets[camera_id]
         with self._inference_lock:
             pcf_scan_root = self.pcf_scan_dir(scan_id)
             run_root = pcf_scan_root / "runs" / run_id
@@ -1538,6 +2042,9 @@ class PhoneScanService:
             result: dict[str, Any] | None = None
             try:
                 state = self.read_state(scan_id)
+                target = self._saved_alignment_target(scan_id, state.get("alignment") or {})
+                if target.camera_id != camera_id:
+                    raise RuntimeError("The aligned static camera changed before PCF started")
                 pcf = dict(state.get("pcf") or {})
                 if pcf.get("run_id") != run_id:
                     raise RuntimeError("PCF job identity changed before execution")
@@ -1748,6 +2255,9 @@ class PhoneScanService:
             if scan_dir.parent != self.settings.storage_root:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsafe scan path")
             shutil.rmtree(scan_dir)
+            receipt = state.get("upload_receipt")
+            if isinstance(receipt, dict):
+                self.capture_uploads.forget(receipt["capture_id"], receipt.get("companion_session_id"), scan_id)
             pcf_scan_dir = self.pcf_scan_dir(scan_id)
             if pcf_scan_dir.exists():
                 if pcf_scan_dir.parent != self.pcf_storage_root:
@@ -1817,9 +2327,34 @@ def _pcf_asset_url(scan_id: str, relative_path: str) -> str:
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     public = deepcopy(state)
     scan_id = str(public["id"])
+    receipt = public.get("upload_receipt")
+    if isinstance(receipt, dict):
+        public["validation_status"] = receipt.get("validation_status", "pending")
     video = public.get("video")
     if isinstance(video, dict) and isinstance(video.get("path"), str):
         video["url"] = _asset_url(scan_id, video["path"])
+    capture = public.get("capture")
+    if isinstance(capture, dict):
+        for key in (
+            "import_report",
+            "manifest",
+            "video_timestamps",
+            "imu_normalized",
+            "sensor_samples",
+        ):
+            if isinstance(capture.get(key), str):
+                capture[f"{key}_url"] = _asset_url(scan_id, capture[key])
+    companion = public.get("companion_capture")
+    if isinstance(companion, dict):
+        artifacts = companion.get("artifacts")
+        if isinstance(artifacts, dict):
+            companion["artifact_urls"] = {
+                key: f"/companion-assets/{quote(str(companion.get('session_id') or ''), safe='')}/{quote(str(value), safe='/')}"
+                for key, value in artifacts.items()
+                if isinstance(value, str)
+                and Path(value).is_absolute() is False
+                and ".." not in Path(value).parts
+            }
     prepared = public.get("prepared")
     if isinstance(prepared, dict):
         for key in ("contact_sheet", "manifest"):
@@ -1862,8 +2397,22 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
             for item in files:
                 if isinstance(item, dict) and isinstance(item.get("path"), str):
                     item["url"] = _asset_url(scan_id, item["path"])
+    vio = public.get("vio")
+    if isinstance(vio, dict):
+        results = vio.get("results")
+        if isinstance(results, dict) and isinstance(results.get("artifact"), str):
+            results["artifact_url"] = _asset_url(scan_id, results["artifact"])
     alignment = public.get("alignment")
     if isinstance(alignment, dict):
+        reference = alignment.get("static_reference")
+        if isinstance(reference, dict) and isinstance(reference.get("artifacts"), dict):
+            reference["artifact_urls"] = {
+                key: _asset_url(scan_id, value)
+                for key, value in reference["artifacts"].items()
+                if isinstance(value, str)
+                and not Path(value).is_absolute()
+                and ".." not in Path(value).parts
+            }
         results = alignment.get("results")
         if isinstance(results, dict):
             artifacts = results.get("artifacts")
@@ -1969,6 +2518,119 @@ def _video_suffix(filename: str, content_type: str) -> str:
         status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
         "Upload an MP4, MOV, M4V, WebM, MKV, or 3GP video",
     )
+
+
+def _read_sensor_bundle_manifest(
+    archive_path: Path,
+    *,
+    limits: CaptureImportLimits,
+) -> dict[str, Any] | None:
+    """Read only the bounded pairing manifest before allocating a scan.
+
+    ``import_capture_bundle`` remains the authority for full archive
+    validation and extraction.  This small preflight is only needed so a
+    manually retried TAR can recover its companion identifiers before the
+    upload transaction reserves a scan directory.
+    """
+
+    manifest_names = {"capture_manifest.json", "manifest.json"}
+    maximum = min(32 * 1024 * 1024, int(limits.max_member_bytes))
+
+    def read_bytes(handle: Any) -> bytes:
+        data = handle.read(maximum + 1)
+        if len(data) > maximum:
+            raise ValueError("capture manifest exceeds the preflight size limit")
+        return data
+
+    def decode(data: bytes) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            file_count = 0
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                file_count += 1
+                if file_count > limits.max_files:
+                    return None
+                if info.filename not in manifest_names:
+                    continue
+                if info.file_size > maximum:
+                    return None
+                with archive.open(info, "r") as handle:
+                    return decode(read_bytes(handle))
+            return None
+    except (OSError, zipfile.BadZipFile, ValueError):
+        pass
+
+    try:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            file_count = 0
+            while True:
+                member = archive.next()
+                if member is None:
+                    break
+                if member.isdir():
+                    continue
+                file_count += 1
+                if file_count > limits.max_files:
+                    return None
+                if member.name not in manifest_names or not member.isfile():
+                    continue
+                if member.size > maximum:
+                    return None
+                handle = archive.extractfile(member)
+                if handle is None:
+                    return None
+                with handle:
+                    return decode(read_bytes(handle))
+            return None
+    except (OSError, tarfile.TarError, ValueError):
+        return None
+
+
+def _sensor_bundle_pairing_reference(
+    manifest: dict[str, Any] | None,
+) -> dict[str, str | None]:
+    """Extract the optional companion reference carried by a capture TAR."""
+
+    if not isinstance(manifest, dict):
+        return {
+            "session_id": None,
+            "camera_id": None,
+            "phone_capture_id": None,
+            "capture_id": None,
+        }
+    nested = manifest.get("companion_capture")
+    if not isinstance(nested, dict):
+        nested = manifest.get("companion")
+    nested = nested if isinstance(nested, dict) else {}
+
+    def first_string(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    return {
+        "session_id": first_string(
+            nested.get("session_id"), manifest.get("companion_session_id")
+        ),
+        "camera_id": first_string(
+            nested.get("camera_id"), manifest.get("companion_camera_id")
+        ),
+        "phone_capture_id": first_string(
+            nested.get("phone_capture_id"),
+            manifest.get("companion_phone_capture_id"),
+            manifest.get("phone_capture_id"),
+        ),
+        "capture_id": first_string(manifest.get("capture_id")),
+    }
 
 
 def _current_review_assembly(
@@ -2169,10 +2831,20 @@ def create_app(
     inference_runner: InferenceRunner = run_adaptive_mapanything_scan,
     da3_inference_runner: DA3InferenceRunner = run_adaptive_da3_phone_scan,
     alignment_runner: AlignmentRunner = run_noesis_alignment,
+    paired_static_runner: Callable[..., dict[str, Any]] = prepare_paired_static_reference,
     supplement_runner: SupplementRunner = run_supplement_integration,
     pcf_runner: PCFRunner = run_pcf_review_candidate,
+    vio_runner: VioRunner = _default_vio_runner,
 ) -> FastAPI:
     configured = settings or PhoneScanSettings.from_env()
+    phone_camera_calibration = calibration_summary(configured.frame.phone_camera_calibration)
+    if phone_camera_calibration is not None:
+        phone_camera_calibration["capture_mode"] = configured.frame.phone_camera_capture_mode
+        phone_camera_calibration["status"] = (
+            "available_for_matching_capture"
+            if configured.frame.phone_camera_capture_mode != "unbound"
+            else "registered_capture_mode_unbound"
+        )
     if not configured.static_root.is_dir():
         raise RuntimeError(f"phone-scan static assets are missing: {configured.static_root}")
     if not (configured.three_root / "build" / "three.module.js").is_file():
@@ -2185,9 +2857,17 @@ def create_app(
         inference_runner=inference_runner,
         da3_inference_runner=da3_inference_runner,
         alignment_runner=alignment_runner,
+        paired_static_runner=paired_static_runner,
         supplement_runner=supplement_runner,
         pcf_runner=pcf_runner,
+        vio_runner=vio_runner,
     )
+    companion_upload_locks: dict[str, asyncio.Lock] = {}
+    companion_upload_locks_guard = threading.Lock()
+
+    def _companion_upload_lock(session_id: str) -> asyncio.Lock:
+        with companion_upload_locks_guard:
+            return companion_upload_locks.setdefault(session_id, asyncio.Lock())
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -2201,6 +2881,106 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
+    phone_diagnostic_lock = threading.Lock()
+    imu_upload_lock = asyncio.Lock()
+    capture_upload_admission_lock = asyncio.Lock()
+    capture_upload_acceptances: set[asyncio.Task[Any]] = set()
+
+    @app.post("/api/phone-calibration/imu-bundle", status_code=status.HTTP_201_CREATED)
+    async def upload_imu_calibration(request: Request) -> dict[str, Any]:
+        """Retain finalized stationary sensor evidence independently of scans."""
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/zip":
+            raise HTTPException(415, "Expected application/zip")
+        if imu_upload_lock.locked():
+            raise HTTPException(409, "An IMU calibration upload is already in progress")
+        try:
+            declared = int(request.headers.get("content-length", "0"))
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid Content-Length") from exc
+        if declared < 0 or declared > MAX_IMU_BUNDLE_BYTES:
+            raise HTTPException(413, "IMU bundle exceeds 512 MiB")
+        async with imu_upload_lock:
+            directory = configured.storage_root / ".imu-calibration"
+            directory.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(directory).free < 3 * MAX_IMU_BUNDLE_BYTES + 16 * 1024 * 1024:
+                raise HTTPException(507, "Not enough space to retain and validate an IMU recording")
+            temporary = directory / f".{uuid.uuid4().hex}.uploading"
+            try:
+                received = 0
+                with temporary.open("wb") as handle:
+                    async with asyncio.timeout(300):
+                        async for chunk in request.stream():
+                            received += len(chunk)
+                            if received > MAX_IMU_BUNDLE_BYTES:
+                                raise HTTPException(413, "IMU bundle exceeds 512 MiB")
+                            await asyncio.to_thread(handle.write, chunk)
+                if not received:
+                    raise HTTPException(400, "The IMU bundle is empty")
+                return await asyncio.to_thread(retain_imu_bundle, temporary, directory)
+            except TimeoutError as exc:
+                raise HTTPException(408, "IMU recording upload timed out") from exc
+            except ImuCalibrationError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    @app.post("/api/phone-diagnostics", status_code=status.HTTP_201_CREATED)
+    async def upload_phone_diagnostic(request: Request) -> dict[str, Any]:
+        """Retain a bounded, explicit capability report; never create a scan."""
+        limit = 512 * 1024
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > limit:
+                        raise HTTPException(413, "Phone report exceeds 512 KiB")
+                    body.extend(chunk)
+        except TimeoutError as exc:
+            raise HTTPException(408, "Phone report upload timed out") from exc
+        try:
+            def reject_constant(value: str) -> None:
+                raise ValueError(f"Invalid JSON number: {value}")
+
+            report = json.loads(body, parse_constant=reject_constant)
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise HTTPException(400, "Invalid phone report JSON") from exc
+        if (
+            not isinstance(report, dict)
+            or report.get("schema") != "noesis.phone_capture.android_capabilities.v1"
+            or not isinstance(report.get("device"), dict)
+            or not isinstance(report.get("cameras"), list)
+            or len(report["cameras"]) > 32
+            or any(not isinstance(camera, dict) for camera in report["cameras"])
+        ):
+            raise HTTPException(422, "Expected an Android camera capability report")
+        digest = hashlib.sha256(body).hexdigest()
+
+        def persist() -> None:
+            directory = configured.storage_root / ".phone-diagnostics"
+            with phone_diagnostic_lock:
+                directory.mkdir(parents=True, exist_ok=True)
+                target = directory / f"{digest}.json"
+                if target.is_file():
+                    return
+                if sum(1 for _ in directory.glob("*.json")) >= 128:
+                    raise HTTPException(507, "Phone report storage is full; retained reports need review")
+                if shutil.disk_usage(directory).free < len(body) + 16 * 1024 * 1024:
+                    raise HTTPException(507, "Not enough space to retain the phone report")
+                temporary = directory / f".{uuid.uuid4().hex}.uploading"
+                try:
+                    temporary.write_bytes(body)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+
+        await asyncio.to_thread(persist)
+        return {
+            "schema": "noesis.phone_capture.android_diagnostic_receipt.v1",
+            "id": digest, "sha256": digest, "size_bytes": len(body),
+            "diagnostic_only": True,
+        }
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -2242,7 +3022,181 @@ def create_app(
             "alignment_revision_id": configured.alignment.target_revision.name,
             "alignment_release_id": configured.alignment_release_id,
             "alignment_targets": service.public_alignment_targets(),
+            "paired_static_alignment_available": True,
+            "phone_camera_calibration": phone_camera_calibration,
+            "secure_capture_url": _phone_scan_secure_url(),
+            "ca_certificate_url": "/api/browser-capture/ca-certificate",
+            "sensor_capture": {
+                "schema": "noesis.phone_capture.v1",
+                "supported_schemas": [
+                    "noesis.phone_capture.v1",
+                    BROWSER_CAPTURE_SCHEMA,
+                ],
+                "max_archive_bytes": configured.capture_limits.max_archive_bytes,
+                "max_files": configured.capture_limits.max_files,
+                "max_imu_rows": configured.capture_limits.max_imu_rows,
+                "vio_estimator": configured.vio.estimator,
+                "vio_available": bool(
+                    configured.vio.executable
+                    and configured.vio.executable.is_file()
+                    and configured.vio.config
+                    and configured.vio.config.is_file()
+                ),
+            },
         }
+
+    @app.get("/api/browser-capture/ca-certificate")
+    async def browser_capture_ca_certificate() -> FileResponse:
+        certificate = _phone_scan_ca_certificate_path()
+        _validated_ca_certificate(certificate)
+        return FileResponse(
+            certificate,
+            media_type="application/x-x509-ca-cert",
+            filename="Noesis-Room-Walk-CA.crt",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    def _companion_error(exc: CompanionCaptureError) -> HTTPException:
+        if isinstance(exc, CompanionCaptureBusy):
+            return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+        if isinstance(exc, CompanionCaptureConflict):
+            return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+        return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
+
+    async def _companion_body(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Companion request body must be a JSON object")
+        return payload
+
+    @app.get("/api/companion-captures/cameras", response_model=None)
+    async def companion_capture_cameras() -> dict[str, Any]:
+        try:
+            rows = await asyncio.to_thread(service.companion_cameras)
+            return {"available": bool(rows), "cameras": rows, "reason": None if rows else "no active camera source is available"}
+        except CompanionCaptureError as exc:
+            # Camera inventory is a capability probe.  Returning a bounded
+            # unavailable response lets the browser explain the runtime
+            # condition and retry after DS9 is healthy again.
+            return {"available": False, "cameras": [], "reason": str(exc)}
+
+    @app.get("/api/companion-captures", response_model=None)
+    async def companion_capture_sessions() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(service.companion_capture.list_sessions)
+
+    @app.get("/api/companion-captures/clock", response_model=None)
+    async def companion_capture_clock() -> dict[str, str]:
+        received_mono = time.monotonic_ns()
+        received_unix = time.time_ns()
+        sent_mono = time.monotonic_ns()
+        sent_unix = time.time_ns()
+        return {
+            "server_received_unix_ns": str(received_unix),
+            "server_received_monotonic_ns": str(received_mono),
+            "server_sent_unix_ns": str(sent_unix),
+            "server_sent_monotonic_ns": str(sent_mono),
+            "synchronization_verified": "false",
+        }
+
+    @app.post("/api/companion-captures", status_code=status.HTTP_201_CREATED, response_model=None)
+    async def start_companion_capture(request: Request) -> JSONResponse:
+        payload = await _companion_body(request)
+        camera_id = str(payload.get("camera_id") or payload.get("cameraId") or "").strip()
+        request_id = request.headers.get("x-client-request-id") or payload.get("client_request_id")
+        phone_capture_id = request.headers.get("x-phone-capture-id") or payload.get("phone_capture_id")
+        try:
+            state = await asyncio.to_thread(
+                service.start_companion_capture,
+                camera_id,
+                client_request_id=str(request_id).strip() if request_id else None,
+                phone_capture_id=str(phone_capture_id).strip() if phone_capture_id else None,
+                clock_probes=payload.get("clock_probes"),
+            )
+        except CompanionCaptureError as exc:
+            raise _companion_error(exc) from exc
+        return JSONResponse(state, status_code=status.HTTP_201_CREATED)
+
+    @app.get("/api/companion-captures/{session_id}", response_model=None)
+    async def get_companion_capture(session_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(service.companion_status, session_id)
+        except CompanionCaptureError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    @app.post("/api/companion-captures/{session_id}/heartbeat", response_model=None)
+    async def heartbeat_companion_capture(session_id: str, request: Request) -> dict[str, Any]:
+        payload = await _companion_body(request)
+        try:
+            state = await asyncio.to_thread(
+                service.companion_capture.heartbeat,
+                session_id,
+                phone_capture_id=str(payload.get("phone_capture_id") or request.headers.get("x-phone-capture-id") or "") or None,
+                client_request_id=str(payload.get("client_request_id") or request.headers.get("x-client-request-id") or "") or None,
+                client_time_ms=payload.get("client_time_ms"),
+                client_send_time_ms=payload.get("client_send_time_ms"),
+                client_receive_time_ms=payload.get("client_receive_time_ms"),
+                clock_probes=payload.get("clock_probes"),
+            )
+            return await asyncio.to_thread(
+                service.companion_capture.public_state,
+                state["session_id"],
+            )
+        except CompanionCaptureError as exc:
+            raise _companion_error(exc) from exc
+
+    @app.post("/api/companion-captures/{session_id}/markers", response_model=None)
+    async def marker_companion_capture(session_id: str, request: Request) -> dict[str, Any]:
+        payload = await _companion_body(request)
+        try:
+            state = await asyncio.to_thread(
+                service.companion_capture.add_marker,
+                session_id,
+                payload,
+            )
+            response = await asyncio.to_thread(
+                service.companion_capture.public_state,
+                state["session_id"],
+            )
+            response["receipt_clock"] = state.get("last_marker_receipt_clock")
+            return response
+        except CompanionCaptureError as exc:
+            raise _companion_error(exc) from exc
+
+    @app.post("/api/companion-captures/{session_id}/stop", response_model=None)
+    async def stop_companion_capture(session_id: str, request: Request) -> dict[str, Any]:
+        payload = await _companion_body(request)
+        try:
+            state = await asyncio.to_thread(
+                service.companion_capture.stop_session,
+                session_id,
+                reason=str(payload.get("reason") or "user"),
+                phone_capture_id=str(payload.get("phone_capture_id") or request.headers.get("x-phone-capture-id") or "") or None,
+                clock_probes=payload.get("clock_probes"),
+                markers=payload.get("markers"),
+            )
+            return await asyncio.to_thread(
+                service.companion_capture.public_state,
+                state["session_id"],
+            )
+        except CompanionCaptureError as exc:
+            raise _companion_error(exc) from exc
+
+    @app.post("/api/companion-captures/{session_id}/finalize", response_model=None)
+    async def finalize_companion_capture(session_id: str, request: Request) -> dict[str, Any]:
+        payload = await _companion_body(request)
+        try:
+            return await asyncio.to_thread(
+                service.companion_capture.finalize_session,
+                session_id,
+                reason=str(payload.get("reason") or "finalize"),
+            )
+        except CompanionCaptureError as exc:
+            raise _companion_error(exc) from exc
 
     @app.get("/api/v1/scenes/current/review-assemblies/whole-home")
     async def current_whole_home_review_assembly() -> JSONResponse:
@@ -2379,6 +3333,565 @@ def create_app(
         service.submit_frame_preparation(scan_id)
         return JSONResponse(_public_state(state_payload), status_code=status.HTTP_201_CREATED)
 
+    @app.post("/api/scans/sensor-bundle", status_code=status.HTTP_201_CREATED)
+    async def create_scan_from_sensor_bundle(
+        request: Request,
+        name: str = Query(default="Phone room walk with sensors", max_length=MAX_SCAN_NAME_LENGTH),
+    ) -> JSONResponse:
+        filename = unquote(request.headers.get("x-file-name") or "phone_capture.zip")
+        filename = Path(filename).name[:160] or "phone_capture.zip"
+        content_type = request.headers.get("content-type") or "application/octet-stream"
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid Content-Length") from exc
+            if declared > configured.capture_limits.max_archive_bytes:
+                raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Sensor bundle exceeds the upload limit")
+
+        header_session_id = str(request.headers.get("x-companion-session") or "").strip() or None
+        header_camera_id = (
+            str(
+                request.headers.get("x-companion-camera-id")
+                or request.headers.get("x-camera-id")
+                or ""
+            ).strip()
+            or None
+        )
+        header_capture_id = str(request.headers.get("x-phone-capture-id") or "").strip() or None
+        if bool(header_session_id) != bool(header_capture_id):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "X-Companion-Session and X-Phone-Capture-ID must be supplied together",
+            )
+
+        if header_camera_id and not (header_session_id and header_capture_id):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "X-Companion-Camera-ID requires X-Companion-Session and X-Phone-Capture-ID",
+            )
+
+        # Always receive into a unique storage-root sibling first.  A retry
+        # must be hash-checked and paired before it can touch a scan directory.
+        temporary = service.settings.storage_root / f".companion-phone-{uuid.uuid4().hex}.uploading"
+        received = 0
+        archive_digest = hashlib.sha256()
+        receive_started = time.monotonic()
+        try:
+            with temporary.open("wb") as handle:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > configured.capture_limits.max_archive_bytes:
+                        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Sensor bundle exceeds the upload limit")
+                    handle.write(chunk)
+                    archive_digest.update(chunk)
+            receive_elapsed_s = max(time.monotonic() - receive_started, 1e-9)
+            if received <= 0:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded sensor bundle is empty")
+            archive_sha256 = archive_digest.hexdigest()
+
+            manifest = await asyncio.to_thread(
+                _read_sensor_bundle_manifest,
+                temporary,
+                limits=configured.capture_limits,
+            )
+            manifest_reference = _sensor_bundle_pairing_reference(manifest)
+            manifest_session_id = manifest_reference["session_id"]
+            manifest_camera_id = manifest_reference["camera_id"]
+            manifest_phone_capture_id = manifest_reference["phone_capture_id"]
+            manifest_capture_id = manifest_reference["capture_id"]
+            manifest_has_pair_fields = any(
+                manifest_reference[key]
+                for key in ("session_id", "camera_id", "phone_capture_id")
+            )
+            if manifest_has_pair_fields and not (
+                manifest_session_id and (manifest_phone_capture_id or manifest_capture_id)
+            ):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "The capture manifest has an incomplete companion reference",
+                )
+
+            companion_session_id = header_session_id or manifest_session_id
+            companion_capture_id = header_capture_id or manifest_phone_capture_id
+            companion_camera_id = header_camera_id or manifest_camera_id
+            if companion_session_id and not companion_capture_id:
+                companion_capture_id = manifest_capture_id
+            if bool(companion_session_id) != bool(companion_capture_id):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "The capture manifest must identify both companion session and phone capture",
+                )
+            if header_session_id and manifest_session_id and header_session_id != manifest_session_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "X-Companion-Session does not match the imported companion manifest",
+                )
+            if header_camera_id and manifest_camera_id and header_camera_id != manifest_camera_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "X-Companion-Camera-ID does not match the imported companion manifest",
+                )
+            if header_capture_id and manifest_phone_capture_id and header_capture_id != manifest_phone_capture_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "X-Phone-Capture-ID does not match the imported companion manifest",
+                )
+            if companion_capture_id and manifest_capture_id and companion_capture_id != manifest_capture_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "X-Phone-Capture-ID does not match the imported capture manifest",
+                )
+
+            async def process_upload(
+                queued_scan_id: str | None = None, retained_archive: Path | None = None,
+            ) -> JSONResponse:
+                source_archive = retained_archive or temporary
+                scan_id: str | None = None
+                scan_dir: Path | None = None
+                scan_dir_created = False
+                reservation_started = False
+                bound_camera_id: str | None = None
+
+                def cleanup_scan_dir() -> None:
+                    if queued_scan_id is not None:
+                        return
+                    if not scan_dir_created or scan_dir is None or not scan_dir.exists():
+                        return
+                    try:
+                        current = service.read_state(scan_id or "")
+                    except HTTPException:
+                        current = None
+                    # Once frame preparation has been published, the scan is
+                    # valid evidence even if a later request-side operation
+                    # fails.  Never remove that directory from retry cleanup.
+                    if isinstance(current, dict) and current.get("status") == "processing_frames":
+                        return
+                    shutil.rmtree(scan_dir, ignore_errors=True)
+
+                def record_failure(message: str) -> None:
+                    if queued_scan_id is not None:
+                        failed = service.read_state(queued_scan_id)
+                        if (failed.get("upload_import") or {}).get("phase") == "complete":
+                            service.update_state(
+                                queued_scan_id, status="frame_failed", progress=0.0,
+                                message="Capture is validated, but frame preparation could not start",
+                                error=message[:1000],
+                            )
+                            service.capture_uploads.sync_state(service.scan_dir(queued_scan_id))
+                            return
+                        service.update_state(
+                            queued_scan_id, status="import_failed", progress=0.0,
+                            message="Capture validation failed; the uploaded archive is preserved",
+                            error=message[:1000],
+                            upload_import={**(failed.get("upload_import") or {}), "phase": "failed"},
+                            upload_receipt={**failed["upload_receipt"], "validation_status": "failed"},
+                        )
+                        service.capture_uploads.sync_state(service.scan_dir(queued_scan_id))
+                        return
+                    if not (
+                        companion_session_id
+                        and companion_capture_id
+                        and reservation_started
+                        and source_archive.exists()
+                    ):
+                        source_archive.unlink(missing_ok=True)
+                        return
+                    try:
+                        service.companion_capture.record_upload_failure(
+                            companion_session_id,
+                            companion_capture_id,
+                            source_archive,
+                            message,
+                        )
+                    except CompanionCaptureError:
+                        source_archive.unlink(missing_ok=True)
+
+                try:
+                    if queued_scan_id is not None:
+                        scan_id = queued_scan_id
+                        scan_dir = service.scan_dir(scan_id)
+                        state_payload = service.read_state(scan_id)
+                        bound_camera_id = state_payload["upload_receipt"]["companion_camera_id"]
+                        state_payload["upload_import"]["phase"] = "running"
+                        state_payload["message"] = "Validating the stored camera and IMU capture"
+                        service._write_state_unlocked(scan_id, state_payload)
+                    else:
+                        if companion_session_id and companion_capture_id:
+                            try:
+                                companion_public = service.companion_capture.public_state(
+                                    companion_session_id
+                                )
+                                bound_camera_id = str(companion_public.get("camera_id") or "").strip() or None
+                                if (
+                                    companion_camera_id
+                                    and bound_camera_id
+                                    and companion_camera_id != bound_camera_id
+                                ):
+                                    raise CompanionCaptureConflict(
+                                        "companion camera ID conflicts with the selected session"
+                                    )
+                                prior = service.companion_capture.check_phone_archive(
+                                    companion_session_id,
+                                    companion_capture_id,
+                                    archive_sha256,
+                                )
+                            except CompanionCaptureError as exc:
+                                raise _companion_error(exc) from exc
+                            if prior is not None:
+                                existing_scan_id = str(
+                                    (prior.get("phone") or {}).get("scan_id") or ""
+                                )
+                                if not existing_scan_id:
+                                    raise HTTPException(
+                                        status.HTTP_409_CONFLICT,
+                                        "The companion archive is associated without a scan ID",
+                                    )
+                                try:
+                                    existing = service.read_state(existing_scan_id)
+                                except HTTPException as exc:
+                                    raise HTTPException(
+                                        status.HTTP_409_CONFLICT,
+                                        "The companion archive is associated but its scan is unavailable",
+                                    ) from exc
+                                source_archive.unlink(missing_ok=True)
+                                return JSONResponse(
+                                    _public_state(existing),
+                                    status_code=status.HTTP_200_OK,
+                                )
+                            try:
+                                scan_id = service.companion_capture.reserve_phone_scan_id(
+                                    companion_session_id,
+                                    companion_capture_id,
+                                )
+                            except CompanionCaptureError as exc:
+                                raise _companion_error(exc) from exc
+                            reservation_started = True
+                        else:
+                            scan_id = (
+                                f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+                                f"{uuid.uuid4().hex[:8]}"
+                            )
+
+                        scan_dir = service.scan_dir(scan_id)
+                        if scan_dir.exists():
+                            # A reserved companion scan must never be replaced by
+                            # a retry or by a partially-created directory.
+                            raise HTTPException(
+                                status.HTTP_409_CONFLICT,
+                                "A phone upload for this companion session is already in progress",
+                            )
+                        scan_dir.mkdir(parents=True, exist_ok=False)
+                        scan_dir_created = True
+                        state_payload: dict[str, Any] = {
+                            "schema": "noesis.phone_scan.state.v3",
+                            "id": scan_id,
+                            "name": name.strip() or "Phone room walk with sensors",
+                            "created_at": _utc_now(),
+                            "updated_at": _utc_now(),
+                            "status": "uploading",
+                            "progress": 0.0,
+                            "message": "Receiving timestamped camera and IMU bundle",
+                            "error": None,
+                            "input_mode": "sensor_bundle",
+                        }
+                        service._write_state_unlocked(scan_id, state_payload)
+
+                    # Archive extraction and bounded ffprobe/JSON validation
+                    # can be materially more expensive than a request callback.
+                    report = await asyncio.to_thread(
+                        import_capture_bundle,
+                        source_archive,
+                        scan_dir,
+                        limits=(
+                            replace(configured.capture_limits, video_probe_timeout_s=ASYNC_VIDEO_PROBE_TIMEOUT_S)
+                            if queued_scan_id is not None else configured.capture_limits
+                        ),
+                    )
+                    video_path = str(report["video_path"])
+                    report_manifest = report["manifest"]
+                    report_schema = str(report_manifest.get("schema") or report.get("schema") or "")
+                    if companion_capture_id:
+                        report_reference = _sensor_bundle_pairing_reference(report_manifest)
+                        report_checks = (
+                            ("session_id", companion_session_id, "companion session"),
+                            ("camera_id", companion_camera_id or bound_camera_id, "companion camera"),
+                            ("phone_capture_id", companion_capture_id, "phone capture"),
+                            ("capture_id", companion_capture_id, "capture"),
+                        )
+                        for field, expected, label in report_checks:
+                            actual = report_reference.get(field)
+                            if actual and expected and actual != expected:
+                                raise HTTPException(
+                                    status.HTTP_409_CONFLICT,
+                                    f"Imported {label} does not match the paired session",
+                                )
+                        if not report_reference.get("capture_id"):
+                            raise HTTPException(
+                                status.HTTP_409_CONFLICT,
+                                "Imported capture manifest has no capture_id",
+                            )
+                    browser_capture = report_schema == BROWSER_CAPTURE_SCHEMA
+                    if browser_capture:
+                        device = dict(report_manifest.get("device") or {})
+                        device_id = str(device.get("id") or "browser-session:unknown")
+                        capture_state = {
+                            "schema": BROWSER_CAPTURE_SCHEMA,
+                            "capture_kind": "browser_camera_imu",
+                            "capture_source": "browser camera + IMU",
+                            "capture_id": report_manifest["capture_id"],
+                            "device": device,
+                            "camera_sensor_id": f"{device_id}:camera",
+                            "imu_sensor_id": f"{device_id}:imu",
+                            "metric_vio_allowed": False,
+                            "native_vio_compatible": False,
+                            "camera_acquisition_timestamp_verified": False,
+                            "calibration": report["calibration"],
+                            "timing": report["timing"],
+                            "sensors": report["sensors"],
+                            "video_frames": report["video"],
+                            "interruptions": report["interruptions"],
+                            "stop_reason": report["stop_reason"],
+                            "coverage": report["coverage"],
+                            "manifest": report["manifest_path"],
+                            "sensor_samples": report["sensor_samples_path"],
+                            "import_report": report["import_report_path"],
+                        }
+                        state_message = "Browser camera + IMU capture saved; preparing RGB views from encoded video timestamps"
+                        video_content_type = str(report_manifest["video"].get("mime_type") or content_type)
+                    else:
+                        capture_state = {
+                            "schema": "noesis.phone_capture.v1",
+                            "capture_id": report_manifest["capture_id"],
+                            "device": report_manifest["device"],
+                            "camera_sensor_id": report_manifest["camera"]["id"],
+                            "imu_sensor_id": report_manifest["imu"]["sensor_id"],
+                            "metric_vio_allowed": bool(report["metric_vio_allowed"]),
+                            "calibration": report["calibration"],
+                            "import_report": report["import_report_path"],
+                            "video_timestamps": report["video_timestamps_path"],
+                            "imu_normalized": report["imu_normalized_path"],
+                            "coverage": report["coverage"],
+                        }
+                        state_message = "Sensor bundle saved; preparing timestamped reconstruction views"
+                        android_timing = report.get("android_capture")
+                        if isinstance(android_timing, dict):
+                            capture_state.update(
+                                {
+                                    "capture_kind": "android_camera_imu",
+                                    "capture_source": "Android Camera2 + IMU",
+                                    "camera_acquisition_timestamp_verified": android_timing.get("camera_acquisition_timestamp_verified") is True,
+                                    "timing": android_timing,
+                                    "manifest": report.get("manifest_path"),
+                                    "raw_streams_preserved": report.get("raw_streams_preserved") is True,
+                                }
+                            )
+                            if not capture_state["camera_acquisition_timestamp_verified"]:
+                                state_message = "Android camera + IMU saved; preparing RGB views from encoded video timestamps"
+                        video_content_type = content_type
+                    state_payload.update(
+                        {
+                            "status": "processing_frames",
+                            "progress": 0.0,
+                            "message": state_message,
+                            "video": {
+                                "path": video_path,
+                                "original_name": filename,
+                                "content_type": video_content_type,
+                                "size_bytes": int((scan_dir / video_path).stat().st_size),
+                            },
+                            "capture": capture_state,
+                            "bundle": {"original_name": filename, "size_bytes": received},
+                        }
+                    )
+                    if companion_session_id and companion_capture_id:
+                        try:
+                            service.companion_capture.associate_phone_bundle(
+                                companion_session_id,
+                                capture_id=companion_capture_id,
+                                archive_sha256=archive_sha256,
+                                scan_id=scan_id,
+                            )
+                            state_payload["companion_capture"] = service.companion_capture.public_state(
+                                companion_session_id
+                            )
+                        except CompanionCaptureError as exc:
+                            raise _companion_error(exc) from exc
+                    if queued_scan_id is not None:
+                        state_payload["upload_import"]["phase"] = "complete"
+                        state_payload["upload_receipt"]["validation_status"] = "complete"
+                    service._write_state_unlocked(scan_id, state_payload)
+                    if queued_scan_id is None:
+                        source_archive.unlink(missing_ok=True)
+                    else:
+                        service.capture_uploads.sync_state(scan_dir)
+                    service.submit_frame_preparation(scan_id)
+                    return JSONResponse(
+                        _public_state(state_payload),
+                        status_code=status.HTTP_201_CREATED,
+                    )
+                except CaptureImportError as exc:
+                    record_failure(str(exc))
+                    cleanup_scan_dir()
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+                except HTTPException as exc:
+                    if queued_scan_id is None and exc.status_code == status.HTTP_409_CONFLICT:
+                        source_archive.unlink(missing_ok=True)
+                    else:
+                        record_failure("HTTP upload/import failure")
+                    cleanup_scan_dir()
+                    raise
+                except Exception:
+                    record_failure("unexpected upload/import failure")
+                    cleanup_scan_dir()
+                    raise
+
+            async def enqueue_native_upload() -> JSONResponse:
+                try:
+                    normalized_manifest = validate_capture_manifest(manifest or {})
+                except CaptureImportError as exc:
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+                capture_id = normalized_manifest["capture_id"]
+                async with capture_upload_admission_lock:
+                    queue = service.capture_uploads
+                    scan_id = queue.lookup(capture_id, companion_session_id)
+                    bound_camera_id = None
+                    if companion_session_id and companion_capture_id:
+                        try:
+                            paired = service.companion_capture.public_state(companion_session_id)
+                            bound_camera_id = str(paired.get("camera_id") or "").strip() or None
+                            if companion_camera_id and bound_camera_id != companion_camera_id:
+                                raise CompanionCaptureConflict("companion camera ID conflicts with the selected session")
+                            prior = service.companion_capture.check_phone_archive(
+                                companion_session_id, companion_capture_id, archive_sha256,
+                            )
+                            reserved = service.companion_capture.reserve_phone_scan_id(
+                                companion_session_id, companion_capture_id,
+                            )
+                            if scan_id and scan_id != reserved:
+                                raise CompanionCaptureConflict("capture receipt conflicts with the reserved companion scan")
+                            scan_id = reserved
+                            if prior is not None and not (service.read_state(scan_id).get("upload_receipt")):
+                                temporary.unlink(missing_ok=True)
+                                return JSONResponse(_public_state(service.read_state(scan_id)), status_code=200)
+                        except CompanionCaptureError as exc:
+                            raise _companion_error(exc) from exc
+                    if scan_id is None:
+                        scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                    scan_dir = service.scan_dir(scan_id)
+                    existing = service.read_state(scan_id) if scan_dir.exists() else None
+                    receipt = {
+                        "schema": UPLOAD_RECEIPT_SCHEMA, "status": "stored",
+                        "size_bytes": received, "sha256": archive_sha256,
+                        "capture_id": capture_id,
+                        "companion_session_id": companion_session_id,
+                        "companion_camera_id": bound_camera_id,
+                        "validation_status": "pending",
+                        "receive_elapsed_ms": round(receive_elapsed_s * 1000, 3),
+                        "receive_mbps": received * 8 / receive_elapsed_s / 1_000_000,
+                    }
+                    if existing is not None:
+                        saved = existing.get("upload_receipt") or {}
+                        identity_fields = (
+                            "schema", "status", "size_bytes", "sha256", "capture_id",
+                            "companion_session_id", "companion_camera_id",
+                        )
+                        if any(saved.get(key) != receipt[key] for key in identity_fields):
+                            raise HTTPException(status.HTTP_409_CONFLICT, "Capture archive conflicts with its stored upload receipt")
+                        for metric in ("receive_elapsed_ms", "receive_mbps"):
+                            if metric in saved:
+                                receipt[metric] = saved[metric]
+                        if existing.get("status") != "import_failed":
+                            temporary.unlink(missing_ok=True)
+                            completed = (existing.get("upload_import") or {}).get("phase") == "complete"
+                            code = (200 if companion_session_id else 201) if completed else 202
+                            return JSONResponse(_public_state(existing), status_code=code)
+                    try:
+                        admitted = queue.reserve(scan_id)
+                    except CaptureUploadBusy as exc:
+                        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), headers={"Retry-After": "30"}) from exc
+                    if not admitted:
+                        raise HTTPException(status.HTTP_409_CONFLICT, "Previous capture validation is finishing; retry shortly")
+                    state_payload = {
+                        **(existing or {}),
+                        "schema": "noesis.phone_scan.state.v3", "id": scan_id,
+                        "name": name.strip() or "Phone room walk with sensors",
+                        "created_at": (existing or {}).get("created_at") or _utc_now(),
+                        "status": "importing_capture", "progress": 0.0,
+                        "message": "Upload stored; camera and IMU validation is queued",
+                        "error": None, "input_mode": "sensor_bundle",
+                        "upload_receipt": receipt,
+                        "upload_import": {
+                            "phase": "queued", "archive_path": "capture_upload.archive",
+                            "video_probe_timeout_s": ASYNC_VIDEO_PROBE_TIMEOUT_S,
+                        },
+                        "bundle": {"original_name": filename, "size_bytes": received},
+                    }
+                    try:
+                        # Only derived extraction is reset on an explicit exact-
+                        # archive retry. The durable original archive is retained.
+                        if existing is not None:
+                            for derived in (scan_dir / ".capture-importing", scan_dir / "capture"):
+                                if derived.exists():
+                                    await asyncio.to_thread(shutil.rmtree, derived)
+                        retained = await asyncio.to_thread(
+                            queue.persist, temporary, scan_dir, state_payload, service._write_state_unlocked,
+                        )
+                        queue.submit(scan_id, lambda: asyncio.run(process_upload(scan_id, retained)))
+                    except BaseException:
+                        queue.release(scan_id)
+                        if scan_dir.exists() and (scan_dir / "scan_state.json").exists():
+                            service.update_state(
+                                scan_id, status="import_failed",
+                                message="Capture import could not be queued; the stored archive is preserved",
+                                error="Upload the same saved bundle to retry validation.",
+                            )
+                            queue.sync_state(scan_dir)
+                        raise
+                    return JSONResponse(
+                        _public_state(state_payload), status_code=202,
+                        headers={"Preference-Applied": "respond-async"},
+                    )
+
+            prefer_async = any(
+                token.split(";", 1)[0].strip().lower() == "respond-async"
+                for token in (request.headers.get("prefer") or "").split(",")
+            ) and isinstance(manifest, dict) and manifest.get("schema") == "noesis.phone_capture.v1"
+            if prefer_async:
+                async def accept_native_upload() -> JSONResponse:
+                    try:
+                        if companion_session_id and companion_capture_id:
+                            async with _companion_upload_lock(companion_session_id):
+                                return await enqueue_native_upload()
+                        return await enqueue_native_upload()
+                    finally:
+                        temporary.unlink(missing_ok=True)
+
+                # The completed request body is now owned by this acceptance
+                # task. A disconnected client cannot cancel persistence or
+                # dequeue an acknowledged import. Keep a strong task reference.
+                acceptance = asyncio.create_task(accept_native_upload())
+                capture_upload_acceptances.add(acceptance)
+
+                def acceptance_done(task: asyncio.Task[Any]) -> None:
+                    capture_upload_acceptances.discard(task)
+                    if not task.cancelled():
+                        task.exception()
+
+                acceptance.add_done_callback(acceptance_done)
+                return await asyncio.shield(acceptance)
+            if companion_session_id and companion_capture_id:
+                async with _companion_upload_lock(companion_session_id):
+                    return await process_upload()
+            return await process_upload()
+        except HTTPException:
+            temporary.unlink(missing_ok=True)
+            raise
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
     @app.post(
         "/api/scans/{scan_id}/supplements",
         status_code=status.HTTP_201_CREATED,
@@ -2503,6 +4016,13 @@ def create_app(
             status_code=status.HTTP_202_ACCEPTED,
         )
 
+    @app.post("/api/scans/{scan_id}/initiate-vio", status_code=status.HTTP_202_ACCEPTED)
+    async def initiate_vio(scan_id: str) -> JSONResponse:
+        return JSONResponse(
+            _public_state(service.initiate_vio(scan_id)),
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
     @app.post("/api/scans/{scan_id}/initiate-inference", status_code=status.HTTP_202_ACCEPTED)
     async def initiate_inference(
         scan_id: str,
@@ -2555,6 +4075,11 @@ def create_app(
         "/pcf-assets",
         StaticFiles(directory=service.pcf_storage_root),
         name="phone-scan-pcf-assets",
+    )
+    app.mount(
+        "/companion-assets",
+        StaticFiles(directory=service.companion_capture.session_root),
+        name="phone-scan-companion-assets",
     )
     return app
 

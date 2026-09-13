@@ -7,8 +7,12 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .alignment import NoesisAlignmentSettings
+from .alignment import NoesisAlignmentSettings, run_noesis_alignment
 from .inference import MapAnythingScanSettings
+from .trajectory_refinement import (
+    TrajectoryRefinementSettings,
+    run_trajectory_refinement,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -114,10 +118,10 @@ def run_pcf_review_candidate(
     )
     _require_file(target.target_revision / "room_points.npz", label="static room cloud")
     _require_file(target.calibration_path, label="camera calibration")
-
     conditioned_dir = run_root / "mapanything_da3_pose_sparse_depth"
     consensus_dir = run_root / "prior_conditioned_consensus_da3_carrier"
     evaluation_dir = run_root / "evaluation_static_world"
+    trajectory_dir = run_root / "trajectory_refinement"
     log_path = run_root / "pcf_run.log"
     log_path.write_text(
         json.dumps(
@@ -135,14 +139,124 @@ def run_pcf_review_candidate(
     )
 
     progress(0.03, "Starting DA3-conditioned MapAnything")
+    # The phone service persists a validated OpenVINS result in state and its
+    # artifact directory.  Resolve that exact producer output here so the
+    # normal PCF path can consume it; callers never need to manufacture a
+    # second constraints file.  A bounded contiguous visit is withheld from
+    # fitting whenever enough views exist, making the post-fit gate real.
+    vio_constraints: Path | None = None
+    vio_state = state.get("vio")
+    vio_results = vio_state.get("results") if isinstance(vio_state, dict) else None
+    vio_artifact = vio_results.get("artifact") if isinstance(vio_results, dict) else None
+    if isinstance(vio_artifact, str) and vio_artifact:
+        candidate_vio = (scan_dir / vio_artifact).resolve()
+        try:
+            candidate_vio.relative_to(scan_dir)
+        except ValueError as exc:
+            raise PCFReviewError("persisted VIO artifact escapes the scan directory") from exc
+        if candidate_vio.is_file():
+            vio_constraints = candidate_vio
+    try:
+        prepared_payload = json.loads(prepared_manifest.read_text(encoding="utf-8"))
+        frame_count = len(prepared_payload.get("frames") or [])
+    except (OSError, json.JSONDecodeError, TypeError):
+        frame_count = 0
+    withheld_ranges: tuple[tuple[int, int], ...] = ()
+    if frame_count >= 12:
+        holdout_start = max(1, int(round(frame_count * 0.70)))
+        holdout_length = max(4, int(round(frame_count * 0.12)))
+        withheld_ranges = ((holdout_start, min(frame_count, holdout_start + holdout_length)),)
+
+    def revalidate_scaled_carrier(
+        candidate_raw: Path,
+        candidate_manifest: Path,
+        revalidation_dir: Path,
+        scale_factor: float,
+    ) -> dict[str, Any]:
+        """Run normal static alignment against the materialized scaled carrier."""
+        if revalidation_dir.exists():
+            raise PCFReviewError(
+                f"scaled-carrier alignment output already exists: {revalidation_dir}"
+            )
+        revalidation_dir.mkdir(parents=True, exist_ok=False)
+        alignment_outputs = _read_json(
+            candidate_manifest,
+            label="refined-carrier output manifest",
+        )
+        if int(alignment_outputs.get("view_count") or 0) != frame_count:
+            raise PCFReviewError(
+                "refined-carrier manifest view count does not match PCF input"
+            )
+        result = run_noesis_alignment(
+            scan_dir,
+            revalidation_dir,
+            alignment_outputs,
+            target,
+            lambda fraction, message: progress(
+                0.12 + 0.10 * float(fraction),
+                f"Revalidating scaled carrier: {message}",
+            ),
+            source_raw_root=candidate_raw,
+            source_output_manifest=candidate_manifest,
+        )
+        if not isinstance(result, dict) or result.get("quality_gate", {}).get("passed") is not True:
+            raise PCFReviewError("scaled-carrier alignment did not pass its quality gate")
+        return {
+            **result,
+            "transform_path": str(
+                (revalidation_dir / "phone_ma_to_noesis_world.json").resolve()
+            ),
+            "source_raw": str(candidate_raw.resolve()),
+            "source_manifest": str(candidate_manifest.resolve()),
+            "scale_factor": float(scale_factor),
+        }
+
+    trajectory_settings = TrajectoryRefinementSettings(
+        withheld_ranges=withheld_ranges,
+    )
+    trajectory_report = run_trajectory_refinement(
+        scan_dir,
+        da3_raw,
+        trajectory_dir,
+        trajectory_settings,
+        vio_constraints=vio_constraints,
+        revalidate_scaled_carrier=revalidate_scaled_carrier,
+    )
+    refined_raw_value = trajectory_report.get("refinement", {}).get("materialized", {})
+    refined_raw = (
+        Path(refined_raw_value["raw_dir"])
+        if trajectory_report.get("refinement", {}).get("raw_materialized")
+        and isinstance(refined_raw_value, dict)
+        and isinstance(refined_raw_value.get("raw_dir"), str)
+        else da3_raw
+    )
+    effective_world_from_da3 = world_from_da3
+    refinement = trajectory_report.get("refinement") or {}
+    scale_change = float(refinement.get("scale_change") or 1.0)
+    if refinement.get("raw_materialized") is True and abs(scale_change - 1.0) > 0.02:
+        mapping = refinement.get("world_alignment_revalidation")
+        mapping_path = (
+            Path(mapping["transform_path"]).resolve()
+            if isinstance(mapping, dict) and isinstance(mapping.get("transform_path"), str)
+            else None
+        )
+        if mapping_path is None or not mapping_path.is_file():
+            raise PCFReviewError(
+                "accepted metric trajectory refinement has no revalidated world transform"
+            )
+        effective_world_from_da3 = mapping_path
+    trajectory_report_path = _require_file(
+        trajectory_dir / "trajectory_refinement_report.json",
+        label="trajectory refinement report",
+    )
     conditioned_command = [
         sys.executable,
         str(REPO_ROOT / "tools" / "mapanything_phone_scan" / "run_mapanything_prior_variants.py"),
         str(scan_dir),
         "--da3-raw",
-        str(da3_raw),
+        str(refined_raw),
         "--world-from-da3",
-        str(world_from_da3),
+        str(effective_world_from_da3),
         "--target-revision",
         str(target.target_revision),
         "--calibration",
@@ -165,6 +279,8 @@ def run_pcf_review_candidate(
         str(mapanything.max_joint_views),
         "--window-overlap-views",
         str(mapanything.window_overlap_views),
+        "--trajectory-refinement-report",
+        str(trajectory_report_path),
     ]
     if not mapanything.local_files_only:
         conditioned_command.append("--allow-download")
@@ -183,7 +299,7 @@ def run_pcf_review_candidate(
             "--mapanything-raw",
             str(conditioned_dir / "raw"),
             "--da3-raw",
-            str(da3_raw),
+            str(refined_raw),
             "--pose-carrier",
             "da3",
             "--output-dir",
@@ -202,13 +318,13 @@ def run_pcf_review_candidate(
             "--suite-root",
             str(run_root),
             "--da3-raw",
-            str(da3_raw),
+            str(refined_raw),
             "--prior-consensus-raw",
             str(consensus_dir / "raw"),
             "--variants",
             "da3_pose_sparse_depth",
             "--world-from-da3",
-            str(world_from_da3),
+            str(effective_world_from_da3),
             "--target-revision",
             str(target.target_revision),
             "--calibration",
@@ -266,6 +382,7 @@ def run_pcf_review_candidate(
         / "fixed_camera_reprojection.jpg",
         "evaluation_metrics": evaluation_metrics_path,
         "run_log": log_path,
+        "trajectory_refinement_report": trajectory_report_path,
     }
     artifacts = {
         key: _require_file(path, label=key).relative_to(run_root).as_posix()
@@ -290,6 +407,9 @@ def run_pcf_review_candidate(
         )
         or {},
         "evaluation": candidate,
+        "trajectory_refinement": trajectory_report.get("refinement") or {},
+        "world_from_da3_source": str(effective_world_from_da3),
+        "world_alignment_revalidation": refinement.get("world_alignment_revalidation"),
         "artifacts": artifacts,
         "files": files,
     }

@@ -1,0 +1,3 @@
+static/downloads/*.pdf binary
+# Unified diffs retain a context marker on otherwise empty lines.
+native/*.patch whitespace=-blank-at-eol

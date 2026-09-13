@@ -2,11 +2,11 @@
 """Extend an existing PCF multi-room join with an accepted room and bridge walk.
 
 Existing joined voxels are immutable ownership authority.  Accepted room-walk
-voxels extend the world only outside a buffered X/Z authority envelope around
-the existing join, and the connector carrier fills only columns outside the
-buffered envelopes of all accepted room sources.  The envelope prevents a
-registration residual from painting a second copy of either endpoint room
-while retaining measured passage evidence between the rooms.
+voxels extend the world using the buffered X/Z envelope as an authority
+candidate, then require compatible three-dimensional geometry and retained
+camera/depth/pose support before suppressing a source voxel.  Different-height
+surfaces and measured passage evidence therefore remain available inside the
+same X/Z column.
 
 The connector transform may come from a rejected pose-graph candidate, but in
 that case the output is unconditionally marked review-only and non-canonical.
@@ -24,7 +24,7 @@ import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -35,9 +35,11 @@ if str(REPO_ROOT) not in sys.path:
 from tools.mapanything_phone_scan.reintegrate_pcf_rooms import (  # noqa: E402
     ReintegrationSettings,
     RoomSource,
+    ViewEvidence,
     _fuse_room,
     _points_from_records,
     _popcount_words,
+    _three_dimensional_compatibility,
 )
 
 
@@ -63,6 +65,7 @@ _CORE_FIELDS = (
     "owner_room_id",
     "room_contribution_mask",
     "room_presence_mask",
+    "geometry_status",
 )
 
 
@@ -162,7 +165,65 @@ def _record_payload(records: np.ndarray) -> dict[str, np.ndarray]:
         "source_selection_counts": records["source_selection_counts"].astype(
             np.uint32
         ),
+        "geometry_status": np.zeros(len(records), dtype=np.uint8),
     }
+
+
+def _manifest_view_evidence(room_report: Mapping[str, Any]) -> list[ViewEvidence]:
+    """Reload the exact retained RGB-D view evidence named by a prior report."""
+
+    raw_views = room_report.get("raw_views")
+    if not isinstance(raw_views, list) or not raw_views:
+        raise MultiroomExtensionError(
+            "existing room report has no explicit raw-view visibility provenance"
+        )
+    evidence: list[ViewEvidence] = []
+    for item in raw_views:
+        if not isinstance(item, Mapping):
+            raise MultiroomExtensionError("existing raw-view provenance is malformed")
+        path = Path(str(item.get("path") or ""))
+        try:
+            view_index = int(item["view_index"])
+            transform = np.asarray(
+                item["effective_world_from_local_row_major"], dtype=np.float64
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MultiroomExtensionError(
+                "existing raw-view provenance lacks an effective transform"
+            ) from exc
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            raise MultiroomExtensionError("existing raw-view transform is malformed")
+        try:
+            with np.load(path, allow_pickle=False) as row:
+                depth = np.asarray(row["depth_z"], dtype=np.float32).copy()
+                mask = np.asarray(row["mask"], dtype=bool).copy()
+                intrinsics = np.asarray(row["intrinsics"], dtype=np.float64).copy()
+                camera_pose = np.asarray(row["camera_pose"], dtype=np.float64)
+        except (OSError, KeyError, ValueError) as exc:
+            raise MultiroomExtensionError(
+                f"existing raw-view visibility evidence cannot be read: {path}"
+            ) from exc
+        if (
+            depth.ndim != 2
+            or mask.shape != depth.shape
+            or intrinsics.shape != (3, 3)
+            or camera_pose.shape != (4, 4)
+            or not np.isfinite(intrinsics).all()
+            or not np.isfinite(camera_pose).all()
+        ):
+            raise MultiroomExtensionError(
+                f"existing raw-view visibility evidence is malformed: {path}"
+            )
+        evidence.append(
+            ViewEvidence(
+                view_index=view_index,
+                intrinsics=intrinsics,
+                depth_z=depth,
+                mask=mask,
+                camera_to_world=transform @ camera_pose,
+            )
+        )
+    return evidence
 
 
 def _coverage_columns(points: np.ndarray, cell_m: float) -> np.ndarray:
@@ -226,6 +287,13 @@ def _append_source(
     room_bit: int,
     ownership_cell_m: float,
     authority_buffer_m: float,
+    existing_view_evidence: Sequence[ViewEvidence],
+    source_view_evidence: Sequence[ViewEvidence],
+    geometry_compatibility_distance_m: float = 0.06,
+    maximum_depth_m: float = 12.0,
+    minimum_depth_m: float = 0.05,
+    depth_tolerance_m: float = 0.05,
+    depth_tolerance_fraction: float = 0.03,
     retain_geometry: bool = True,
 ) -> dict[str, int]:
     existing_keys = _keys_as_structured(output["voxel_keys"])
@@ -254,7 +322,49 @@ def _append_source(
     column_owned = _column_membership(
         source["points"], covered_columns, ownership_cell_m
     )
-    suppressed = exact | column_owned
+    (
+        compatible_3d,
+        source_ray_valid,
+        existing_ray_valid,
+        nearest_existing_distance,
+        source_cross_free_space,
+        source_cross_unknown,
+        source_own_contradiction,
+        existing_own_contradiction,
+        source_own_unknown,
+        existing_own_unknown,
+    ) = (
+        _three_dimensional_compatibility(
+            output["points"],
+            source["points"],
+            existing_view_evidence,
+            source_view_evidence,
+            distance_m=geometry_compatibility_distance_m,
+            minimum_depth_m=minimum_depth_m,
+            maximum_depth_m=maximum_depth_m,
+            depth_tolerance_m=depth_tolerance_m,
+            depth_tolerance_fraction=depth_tolerance_fraction,
+        )
+    )
+    geometry_overlap = column_owned & compatible_3d
+    suppressed = exact | geometry_overlap
+    source_uncertain = source_own_contradiction | source_cross_free_space
+    contradictory_geometry = (
+        ~exact
+        & source_uncertain
+        & np.isfinite(nearest_existing_distance)
+        & (nearest_existing_distance > geometry_compatibility_distance_m)
+    )
+    source_existing_status = np.asarray(source["geometry_status"], dtype=np.uint8)
+    source_geometry_status = np.where(
+        source_uncertain | (source_existing_status == 1),
+        np.uint8(1),
+        np.where(
+            source_own_unknown | (source_existing_status == 2),
+            np.uint8(2),
+            np.uint8(0),
+        ),
+    )
     retained = ~suppressed
 
     exact_source = np.flatnonzero(exact)
@@ -267,6 +377,11 @@ def _append_source(
             continue
         output[name] = np.concatenate((output[name], source[name][retained]), axis=0)
     retained_count = int(np.count_nonzero(retained))
+    # Preserve source uncertainty and mark a co-visible but geometrically
+    # contradictory source row as uncertain.  It remains available for review
+    # with provenance, while it cannot be mistaken for an observed overlap.
+    if retained_count:
+        output["geometry_status"][-retained_count:] = source_geometry_status[retained]
     output["owner_room_id"] = np.concatenate(
         (
             output["owner_room_id"],
@@ -307,10 +422,48 @@ def _append_source(
         "covered_existing_xz_column_voxel_count": int(
             np.count_nonzero(column_owned)
         ),
+        "three_dimensional_compatible_voxel_count": int(
+            np.count_nonzero(compatible_3d)
+        ),
+        "source_ray_depth_pose_valid_count": int(np.count_nonzero(source_ray_valid)),
+        "existing_ray_depth_pose_valid_count": int(
+            np.count_nonzero(existing_ray_valid)
+        ),
+        "source_cross_room_unknown_count": int(
+            np.count_nonzero(source_cross_unknown)
+        ),
+        "source_cross_room_free_space_contradiction_count": int(
+            np.count_nonzero(source_cross_free_space)
+        ),
+        "source_own_view_free_space_contradiction_count": int(
+            np.count_nonzero(source_own_contradiction)
+        ),
+        "existing_own_view_free_space_contradiction_count": int(
+            np.count_nonzero(existing_own_contradiction)
+        ),
+        "source_own_view_unknown_count": int(np.count_nonzero(source_own_unknown)),
+        "existing_own_view_unknown_count": int(
+            np.count_nonzero(existing_own_unknown)
+        ),
         "measured_authority_column_count": int(len(measured_columns)),
         "buffered_authority_column_count": int(len(covered_columns)),
         "authority_buffer_m": authority_buffer_m,
         "suppressed_voxel_count": int(np.count_nonzero(suppressed)),
+        "suppressed_by_3d_compatibility_count": int(
+            np.count_nonzero(geometry_overlap & ~exact)
+        ),
+        "complementary_height_retained_count": int(
+            np.count_nonzero(column_owned & ~compatible_3d & ~exact)
+        ),
+        "contradictory_geometry_uncertain_count": int(
+            np.count_nonzero(contradictory_geometry & ~suppressed)
+        ),
+        "contradictory_geometry_within_conflict_band_count": int(
+            np.count_nonzero(
+                contradictory_geometry
+                & (nearest_existing_distance <= 0.30)
+            )
+        ),
         "retained_voxel_count": retained_count,
     }
 
@@ -420,10 +573,23 @@ def extend(
         shutil.rmtree(temporary_root, ignore_errors=True)
 
     with np.load(existing_npz_path, allow_pickle=False) as archive:
-        missing = sorted(set(_CORE_FIELDS).difference(archive.files))
+        # geometry_status was added after v1 artifacts were emitted.  Existing
+        # room ownership remains valid; absent status means observed/unknown
+        # was not recorded and is represented as the neutral value 0.
+        missing = sorted(
+            set(_CORE_FIELDS).difference(archive.files).difference({"geometry_status"})
+        )
         if missing:
             raise MultiroomExtensionError(f"existing NPZ is missing {missing}")
-        output = {name: np.asarray(archive[name]).copy() for name in _CORE_FIELDS}
+        output = {
+            name: np.asarray(archive[name]).copy()
+            for name in _CORE_FIELDS
+            if name in archive.files
+        }
+        if "geometry_status" not in output:
+            output["geometry_status"] = np.zeros(
+                len(output["points"]), dtype=np.uint8
+            )
         fixed_camera_positions = np.asarray(
             archive["fixed_camera_positions"], dtype=np.float32
         )
@@ -433,6 +599,10 @@ def extend(
         voxel_size = float(np.asarray(archive["voxel_size_m"]).reshape(-1)[0])
     if not math.isclose(voxel_size, 0.025, abs_tol=1e-6):
         raise MultiroomExtensionError(f"existing voxel size is {voxel_size}, not 0.025")
+    existing_view_evidence = (
+        _manifest_view_evidence(existing_manifest.get("fixed_room", {}))
+        + _manifest_view_evidence(existing_manifest.get("moving_room", {}))
+    )
 
     living_payload = _record_payload(living_fusion.records)
     connector_payload = _record_payload(connector_fusion.records)
@@ -443,6 +613,8 @@ def extend(
         room_bit=4,
         ownership_cell_m=ownership_cell_m,
         authority_buffer_m=accepted_room_authority_buffer_m,
+        existing_view_evidence=existing_view_evidence,
+        source_view_evidence=living_fusion.view_evidence,
     )
     connector_ownership = _append_source(
         output,
@@ -451,6 +623,8 @@ def extend(
         room_bit=8,
         ownership_cell_m=ownership_cell_m,
         authority_buffer_m=connector_endpoint_authority_buffer_m,
+        existing_view_evidence=existing_view_evidence + living_fusion.view_evidence,
+        source_view_evidence=connector_fusion.view_evidence,
         retain_geometry=include_connector_geometry,
     )
     output.update(
@@ -490,7 +664,7 @@ def extend(
                 if include_connector_geometry
                 else "registration_constraints_only_"
             )
-            + "confidence_agreement_weighted_2_5cm_voxels"
+            + "confidence_weighted_2_5cm_voxels_with_3d_overlap_gating"
         ),
         "whole_cloud_icp_used": False,
         "nearest_neighbor_surface_fitting_used": False,
@@ -526,6 +700,7 @@ def extend(
                 "selected_observation_count": living_fusion.counters[
                     "selected_observation_count"
                 ],
+                "visibility_views": living_fusion.view_files,
             },
             "connector": {
                 "raw_root": str(connector_raw_root),
@@ -541,6 +716,7 @@ def extend(
                 "selected_observation_count": connector_fusion.counters[
                     "selected_observation_count"
                 ],
+                "visibility_views": connector_fusion.view_files,
             },
         },
         "ownership": {
@@ -554,8 +730,10 @@ def extend(
             "connector_endpoint_authority_buffer_m": (
                 connector_endpoint_authority_buffer_m
             ),
-            "existing_xz_column_coverage_suppresses_later_sources": True,
-            "buffered_endpoint_room_envelopes_suppress_connector_duplicates": True,
+            "existing_xz_columns_are_authority_candidates_only": True,
+            "three_dimensional_compatibility_required_for_suppression": True,
+            "existing_xz_column_coverage_suppresses_later_sources": False,
+            "buffered_endpoint_room_envelopes_suppress_connector_duplicates": False,
             "connector_used_as_registration_constraint_only": (
                 not include_connector_geometry
             ),
@@ -581,6 +759,11 @@ def extend(
             "output_observation_count": int(
                 np.sum(output["observation_count"], dtype=np.uint64)
             ),
+            "geometry_status_values": {
+                "0": "observed_or_authoritative",
+                "1": "uncertain_own_or_cross_room_free_space_contradiction",
+                "2": "occluded_or_unknown_without_own_view_ray_support",
+            },
         },
         "artifacts": {
             "surfels_npz": {

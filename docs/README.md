@@ -50,6 +50,10 @@ document and live source/config win.
   orientation gates, and current three-room validation.
 - [`Phone_Walk_Fusion_Reconstruction.md`](Phone_Walk_Fusion_Reconstruction.md):
   PCF algorithm, selection evidence, and quality interpretation.
+- [`../tools/mapanything_phone_scan/README.md`](../tools/mapanything_phone_scan/README.md):
+  phone-walk capture, synchronized Android sensor import, and review workflow.
+- [`room_reconstruction_fitting.md`](room_reconstruction_fitting.md):
+  reusable fitting procedure, independent-reference checks, and experiment ledger.
 - [`scene_prior_v1.md`](scene_prior_v1.md): immutable runtime artifact and
   catalog contract built from approved PCF evidence.
 - [`Virtual_Twin_Reconstruction.md`](Virtual_Twin_Reconstruction.md):
@@ -89,6 +93,19 @@ canonical-world, BEV/capture, maintenance, and operator references.
   current identity contracts and uncompleted real-evidence authority gates.
 - [`../plans/noesis_menon_validation/README.md`](../plans/noesis_menon_validation/README.md):
   stable fixtures and direct Noesis-to-Menon validation tiers.
+- [`../plans/reconstruction_work_orders/WO-2.md`](../plans/reconstruction_work_orders/WO-2.md):
+  synchronized camera/IMU capture and the conventional OpenVINS baseline,
+  including its remaining phone evidence dependency.
+- [`../plans/reconstruction_work_orders/WO-1.md`](../plans/reconstruction_work_orders/WO-1.md):
+  revision-bound metric-frame, calibration, and Noesis-to-Menon presentation
+  transport, including mixed-source-hash fusion coverage.
+- [`../plans/reconstruction_work_orders/WO-3.md`](../plans/reconstruction_work_orders/WO-3.md):
+  bounded trajectory refinement and withheld temporal-pair evidence.
+- [`../plans/reconstruction_work_orders/WO-4.md`](../plans/reconstruction_work_orders/WO-4.md):
+  correlated confidence, multi-view support, and independent-evaluation
+  boundary contracts.
+- [`../plans/reconstruction_work_orders/WO-5.md`](../plans/reconstruction_work_orders/WO-5.md):
+  review-only multi-room reintegration and visibility-supported surface meshes.
 
 ## Historical material
 

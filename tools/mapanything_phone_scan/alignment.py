@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +20,7 @@ from noesis_core.coordinate_frames import (
 
 
 ProgressCallback = Callable[[float, str], None]
+DiagnosticCallback = Callable[[dict[str, Any], dict[str, np.ndarray]], None]
 
 
 class NoesisAlignmentError(RuntimeError):
@@ -45,6 +46,105 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_raw_paths(raw_root: Path, view_count: int) -> list[Path]:
+    """Return only the known sequential raw views for one output manifest."""
+    count = int(view_count)
+    if count < 2 or count > 4096:
+        raise NoesisAlignmentError(
+            f"source output manifest has an unsupported view count: {count}"
+        )
+    root = raw_root.resolve()
+    if not root.is_dir():
+        raise NoesisAlignmentError(f"source raw root is missing: {root}")
+    paths = [root / f"view_{index:04d}.npz" for index in range(count)]
+    missing = [path.name for path in paths if not path.is_file()]
+    if missing:
+        raise NoesisAlignmentError(
+            f"source raw root is missing known views: {', '.join(missing[:8])}"
+        )
+    return paths
+
+
+def _resolve_source_output_manifest(
+    scan_dir: Path,
+    outputs: dict[str, Any],
+    explicit: Path | None,
+) -> Path:
+    value: Any = explicit
+    if value is None:
+        value = outputs.get("manifest")
+    if value is None:
+        value = scan_dir / "outputs" / "scan_outputs_manifest.json"
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = scan_dir / path
+    path = path.resolve()
+    if not path.is_file():
+        raise NoesisAlignmentError(f"source output manifest is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise NoesisAlignmentError(
+            f"source output manifest is unreadable: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise NoesisAlignmentError("source output manifest must be a JSON object")
+    try:
+        manifest_count = int(payload.get("view_count"))
+        output_count = int(outputs.get("view_count"))
+    except (TypeError, ValueError) as exc:
+        raise NoesisAlignmentError(
+            "source output manifest and state lack an integer view count"
+        ) from exc
+    if manifest_count != output_count:
+        raise NoesisAlignmentError(
+            "source output manifest view count does not match alignment outputs"
+        )
+    return path
+
+
+def _source_raw_provenance(
+    raw_root: Path,
+    output_manifest: Path,
+    view_count: int,
+) -> dict[str, Any]:
+    """Hash the exact bounded raw view set consumed by alignment."""
+    rows: list[dict[str, Any]] = []
+    for path in _source_raw_paths(raw_root, view_count):
+        rows.append(
+            {
+                "path": str(path.resolve()),
+                "name": path.name,
+                "size_bytes": int(path.stat().st_size),
+                "sha256": _sha256(path),
+            }
+        )
+    set_digest = hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "name": row["name"],
+                    "sha256": row["sha256"],
+                    "size_bytes": row["size_bytes"],
+                }
+                for row in rows
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "raw_root": str(raw_root.resolve()),
+        "output_manifest": {
+            "path": str(output_manifest.resolve()),
+            "sha256": _sha256(output_manifest),
+        },
+        "view_count": int(view_count),
+        "views": rows,
+        "raw_view_set_sha256": set_digest,
+    }
 
 
 def _normalize(vector: np.ndarray, *, name: str) -> np.ndarray:
@@ -198,14 +298,12 @@ def _load_phone_clouds(
     scan_dir: Path,
     outputs: dict[str, Any],
     settings: NoesisAlignmentSettings,
+    *,
+    source_raw_root: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    raw_root = scan_dir / "outputs" / "raw"
-    raw_paths = sorted(raw_root.glob("view_*.npz"))
+    raw_root = (source_raw_root or scan_dir / "outputs" / "raw").resolve()
     view_count = int(outputs.get("view_count") or 0)
-    if view_count < 2 or len(raw_paths) != view_count:
-        raise NoesisAlignmentError(
-            f"expected {view_count} MapAnything raw views, found {len(raw_paths)}"
-        )
+    raw_paths = _source_raw_paths(raw_root, view_count)
     per_view_budget = max(1_000, settings.review_point_budget // view_count)
     registration_points: list[np.ndarray] = []
     review_points: list[np.ndarray] = []
@@ -423,10 +521,14 @@ def _structure_score(
     target_structure: np.ndarray,
     target_normals: np.ndarray,
     full_source: np.ndarray,
-) -> dict[str, float]:
+    *,
+    comparable_mask: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> dict[str, Any]:
     from scipy.spatial import cKDTree
 
     transformed_structure = _apply_yaw_parameters(source_structure, parameters)
+    if comparable_mask is not None:
+        transformed_structure = transformed_structure[comparable_mask(transformed_structure)]
     target_tree = cKDTree(target_structure)
     source_distance, target_indices = target_tree.query(transformed_structure, k=1)
     plane_residual = np.abs(
@@ -451,8 +553,11 @@ def _structure_score(
         "objective": objective,
         "plane_residual_median_m": float(np.median(usable)),
         "plane_residual_p80_m": float(np.percentile(usable, 80.0)),
-        "source_overlap_0_30m": float(np.mean(source_distance < 0.30)),
+        "source_overlap_0_30m": float(np.mean(source_distance < 0.30)) if len(source_distance) else 0.0,
         "target_overlap_0_30m": float(np.mean(target_distance < 0.30)),
+        "source_point_count": int(len(source_structure)),
+        "comparable_point_count": int(len(transformed_structure)),
+        "metric_domain": "fixed_camera_visible_source" if comparable_mask is not None else "all_source_structure",
     }
 
 
@@ -463,7 +568,9 @@ def _structure_refine(
     full_source: np.ndarray,
     initial: np.ndarray,
     bounds_delta: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict[str, float]]:
+    *,
+    comparable_mask: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     from scipy.optimize import least_squares
     from scipy.spatial import cKDTree
 
@@ -479,7 +586,10 @@ def _structure_refine(
     for iteration in range(12):
         transformed = _apply_yaw_parameters(source_structure, parameters)
         distances, indices = tree.query(transformed, k=1)
-        selected = np.flatnonzero(distances < min(0.75, 0.36 + iteration * 0.035))
+        eligible = distances < min(0.75, 0.36 + iteration * 0.035)
+        if comparable_mask is not None:
+            eligible &= comparable_mask(transformed)
+        selected = np.flatnonzero(eligible)
         if selected.size < 100:
             break
         if selected.size > 5_000:
@@ -507,6 +617,7 @@ def _structure_refine(
         target_structure,
         target_normals,
         full_source,
+        comparable_mask=comparable_mask,
     )
 
 
@@ -654,6 +765,9 @@ def _fixed_camera_visible_structure_metrics(
             "source_overlap_0_30m": 0.0,
             "plane_residual_median_m": math.inf,
             "plane_residual_p80_m": math.inf,
+            "all_comparable_plane_residual_median_m": math.inf,
+            "all_comparable_plane_residual_p80_m": math.inf,
+            "gate_residual_point_count": 0.0,
         }
     source_distance, target_indices = cKDTree(target_structure).query(selected, k=1)
     plane_residual = np.abs(
@@ -664,6 +778,7 @@ def _fixed_camera_visible_structure_metrics(
         )
     )
     usable = np.sort(plane_residual[source_distance < 0.80])
+    gate_point_count = max(1, int(0.75 * usable.size)) if usable.size else 0
     if usable.size == 0:
         usable = np.asarray([math.inf], dtype=np.float64)
     else:
@@ -673,6 +788,9 @@ def _fixed_camera_visible_structure_metrics(
         "source_overlap_0_30m": float(np.mean(source_distance < 0.30)),
         "plane_residual_median_m": float(np.median(usable)),
         "plane_residual_p80_m": float(np.percentile(usable, 80.0)),
+        "all_comparable_plane_residual_median_m": float(np.median(plane_residual)),
+        "all_comparable_plane_residual_p80_m": float(np.percentile(plane_residual, 80.0)),
+        "gate_residual_point_count": float(gate_point_count),
     }
 
 
@@ -684,6 +802,9 @@ def _visual_alignment_anchor(
     target_intrinsics: np.ndarray,
     leveled_poses: np.ndarray,
     progress: ProgressCallback,
+    *,
+    source_raw_root: Path | None = None,
+    target_valid_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     """Estimate a room transform from fixed/phone RGB overlap and phone poses."""
 
@@ -716,7 +837,11 @@ def _visual_alignment_anchor(
 
     sift = cv2.SIFT_create(nfeatures=5_000, contrastThreshold=0.02)
     target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
-    target_keypoints, target_descriptors = sift.detectAndCompute(target_gray, None)
+    if target_valid_mask is not None:
+        if target_valid_mask.shape != target_gray.shape:
+            raise NoesisAlignmentError("fixed-camera RGB exclusion mask dimensions disagree")
+        target_valid_mask = (target_valid_mask > 0).astype(np.uint8) * 255
+    target_keypoints, target_descriptors = sift.detectAndCompute(target_gray, target_valid_mask)
     if target_descriptors is None or len(target_keypoints) < 40:
         return None, {
             "status": "insufficient_target_features",
@@ -727,9 +852,10 @@ def _visual_alignment_anchor(
 
     projection_tree = cKDTree(target_pixels)
     matcher = cv2.BFMatcher(cv2.NORM_L2)
-    raw_paths = sorted((scan_dir / "outputs" / "raw").glob("view_*.npz"))
-    if len(raw_paths) != len(leveled_poses):
-        raise NoesisAlignmentError("phone RGB views do not match the reconstructed poses")
+    raw_paths = _source_raw_paths(
+        (source_raw_root or scan_dir / "outputs" / "raw").resolve(),
+        len(leveled_poses),
+    )
     rows: list[dict[str, Any]] = []
     ratio_threshold = 0.72
     for view_index, path in enumerate(raw_paths):
@@ -1215,9 +1341,26 @@ def run_noesis_alignment(
     outputs: dict[str, Any],
     settings: NoesisAlignmentSettings,
     progress: ProgressCallback,
+    *,
+    source_raw_root: Path | None = None,
+    source_output_manifest: Path | None = None,
+    diagnostic_callback: DiagnosticCallback | None = None,
 ) -> dict[str, Any]:
     camera_label = settings.camera_id.replace("-", " ").title()
     progress(0.02, f"Loading saved phone and {camera_label} reconstruction points")
+    resolved_source_raw_root = (
+        source_raw_root or scan_dir / "outputs" / "raw"
+    ).resolve()
+    resolved_source_output_manifest = _resolve_source_output_manifest(
+        scan_dir,
+        outputs,
+        source_output_manifest,
+    )
+    source_provenance = _source_raw_provenance(
+        resolved_source_raw_root,
+        resolved_source_output_manifest,
+        int(outputs.get("view_count") or 0),
+    )
     target_revision = settings.target_revision.resolve()
     target_npz = target_revision / "room_points.npz"
     target_meta_path = target_revision / "room_points_meta.json"
@@ -1248,6 +1391,7 @@ def run_noesis_alignment(
         scan_dir,
         outputs,
         settings,
+        source_raw_root=resolved_source_raw_root,
     )
     progress(0.12, "Estimating the phone walk floor and gravity direction")
     leveled_registration, leveled_poses, floor_transform, floor_metrics = _level_phone_floor(
@@ -1294,6 +1438,36 @@ def run_noesis_alignment(
         raise NoesisAlignmentError(
             f"fixed-camera keyframe is missing: {keyframe_path}"
         )
+    target_image = cv2.imread(str(keyframe_path), cv2.IMREAD_COLOR)
+    if target_image is None:
+        raise NoesisAlignmentError(
+            f"fixed-camera keyframe is unreadable: {keyframe_path}"
+        )
+    image_height, image_width = target_image.shape[:2]
+    target_valid_mask = None
+    keyframe_masks = target_meta.get("rgb_keyframe_valid_masks")
+    if keyframe_masks is not None:
+        mask_relative = keyframe_masks.get(settings.camera_id) if isinstance(keyframe_masks, dict) else None
+        if not isinstance(mask_relative, str):
+            raise NoesisAlignmentError("target revision has no RGB validity mask for the selected camera")
+        mask_path = (target_revision / mask_relative).resolve()
+        if not mask_path.is_relative_to(target_revision.resolve()):
+            raise NoesisAlignmentError("target RGB validity mask escapes its revision")
+        target_valid_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if target_valid_mask is None or target_valid_mask.shape != (image_height, image_width):
+            raise NoesisAlignmentError("target RGB validity mask is unreadable or has incorrect dimensions")
+    visibility_cell_px = 8
+    target_depth_grid = _project_depth_grid(
+        target_points, target_camera_from_world, intrinsics,
+        image_width, image_height, visibility_cell_px,
+    )
+
+    def comparable_structure(points: np.ndarray) -> np.ndarray:
+        return _fixed_camera_comparable_mask(
+            points, target_depth_grid, target_camera_from_world, intrinsics,
+            cell_px=visibility_cell_px,
+            occlusion_tolerance_m=0.30,
+        )[0]
 
     progress(0.22, "Extracting gravity-preserving wall and doorway structure")
     source_voxel = _voxel_points(leveled_registration, 0.14)
@@ -1342,6 +1516,8 @@ def run_noesis_alignment(
             intrinsics,
             leveled_poses,
             progress,
+            source_raw_root=resolved_source_raw_root,
+            target_valid_mask=target_valid_mask,
         )
         if visual_anchor_parameters is not None:
             selected_basins = [
@@ -1401,6 +1577,7 @@ def run_noesis_alignment(
                     else None
                 )
             ),
+            comparable_mask=comparable_structure,
         )
         candidate_rows.append(
             {
@@ -1434,27 +1611,16 @@ def run_noesis_alignment(
         if not duplicate:
             distinct_candidates.append(row)
     best = distinct_candidates[0]
+    global_vertical_metrics = _structure_score(
+        best["parameters"], source_structure, target_structure, target_normals,
+        leveled_registration,
+    )
     runner_up = distinct_candidates[1] if len(distinct_candidates) > 1 else None
     world_from_phone = _yaw_transform(best["parameters"]) @ floor_transform
     inverse = np.linalg.inv(world_from_phone)
     identity_error = float(np.max(np.abs(inverse @ world_from_phone - np.eye(4))))
     aligned_registration = _transform_points(registration_points, world_from_phone)
     full_metrics = _full_cloud_metrics(aligned_registration, target_points)
-    target_image = cv2.imread(str(keyframe_path), cv2.IMREAD_COLOR)
-    if target_image is None:
-        raise NoesisAlignmentError(
-            f"fixed-camera keyframe is unreadable: {keyframe_path}"
-        )
-    image_height, image_width = target_image.shape[:2]
-    visibility_cell_px = 8
-    target_depth_grid = _project_depth_grid(
-        target_points,
-        target_camera_from_world,
-        intrinsics,
-        image_width,
-        image_height,
-        visibility_cell_px,
-    )
     aligned_source_structure = _apply_yaw_parameters(
         source_structure,
         np.asarray(best["parameters"], dtype=np.float64),
@@ -1580,6 +1746,63 @@ def run_noesis_alignment(
         "full_target_overlap": bool(full_metrics["target_overlap_0_30m"] >= 0.40),
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
+    input_hashes = {
+        "phone_output_manifest_sha256": source_provenance["output_manifest"]["sha256"],
+        "target_points_sha256": _sha256(target_npz),
+        "target_meta_sha256": _sha256(target_meta_path),
+        "fixed_camera_keyframe_sha256": _sha256(keyframe_path),
+        "camera_calibration_sha256": _sha256(settings.calibration_path),
+        **({"fixed_camera_rgb_valid_mask_sha256": _sha256(mask_path)}
+           if target_valid_mask is not None else {}),
+    }
+    if diagnostic_callback is not None:
+        # Optional recorded-replay boundary. It runs before admission, so a
+        # rejected fit can still retain diagnostic evidence without publishing
+        # an accepted transform or changing any scan/runtime state.
+        diagnostic_callback(
+            {
+                "schema": "noesis.phone_scan.alignment_diagnostics.v1",
+                "camera_id": settings.camera_id,
+                "target_revision_id": target_revision.name,
+                "target_metadata": target_meta,
+                "settings": asdict(settings),
+                "alignment_source_sha256": _sha256(Path(__file__)),
+                "source_provenance": source_provenance,
+                "input_hashes": input_hashes,
+                "floor_metrics": floor_metrics,
+                "target_camera_orientation": target_camera_orientation,
+                "visual_anchor_report": visual_anchor_report,
+                "visual_anchor_metrics": visual_anchor_metrics,
+                "best_parameters": best["parameters"].tolist(),
+                "best_metrics": best["metrics"],
+                "global_vertical_metrics": global_vertical_metrics,
+                "visible_structure_metrics": visible_structure_metrics,
+                "visible_full_metrics": visible_full_metrics,
+                "full_metrics": full_metrics,
+                "checks": checks,
+                "failed_checks": failed_checks,
+                "quality_gate": {"passed": not failed_checks, "checks": checks},
+                "candidate_rows": candidate_rows,
+            },
+            {
+                "registration_points": registration_points,
+                "leveled_registration": leveled_registration,
+                "leveled_poses": leveled_poses,
+                "floor_transform": floor_transform,
+                "target_points": target_points,
+                "target_structure": target_structure,
+                "target_normals": target_normals,
+                "source_structure": source_structure,
+                "target_camera_from_world": target_camera_from_world,
+                "intrinsics": intrinsics,
+                "target_depth_grid": target_depth_grid,
+                "visual_anchor_parameters": (
+                    visual_anchor_parameters if visual_anchor_parameters is not None
+                    else np.empty(0, dtype=np.float64)
+                ),
+                "best_parameters": best["parameters"],
+            },
+        )
     if failed_checks:
         raise NoesisAlignmentError(
             "automatic alignment did not clear the quality gate: "
@@ -1688,17 +1911,34 @@ def run_noesis_alignment(
     )
 
     generated_at = datetime.now(timezone.utc).isoformat()
+    try:
+        target_locator = target_revision.relative_to(
+            Path(__file__).resolve().parents[2]
+        ).as_posix()
+    except ValueError:
+        target_locator = str(target_revision)
+    target_binding = {
+        "world_frame": target_meta.get("world_frame", "backend_world_m"),
+        "world_frame_revision": target_meta.get("world_frame_revision"),
+        "camera_frame_binding": target_meta.get("camera_frame_binding"),
+        "reference_kind": target_meta.get("reference_kind", "saved_static"),
+        "companion_session_id": target_meta.get("companion_session_id"),
+    }
     transform_payload = {
         "schema": "noesis.mapanything.phone_scan.world_alignment.v1",
         "generated_at": generated_at,
         "source_coordinate_frame": str(outputs.get("coordinate_frame") or "mapanything_metric_world_unaligned_to_noesis"),
         "target_coordinate_frame": coordinate_frame,
+        "target_binding": target_binding,
         "scale": 1.0,
         "world_from_mapanything_row_major": world_from_phone.tolist(),
         "world_from_mapanything_col_major": world_from_phone.reshape(-1, order="F").tolist(),
         "mapanything_from_world_row_major": inverse.tolist(),
         "round_trip_max_abs_error": identity_error,
         "phone_floor": floor_metrics,
+        "source_raw_root": source_provenance["raw_root"],
+        "source_output_manifest": source_provenance["output_manifest"],
+        "source_raw_view_set_sha256": source_provenance["raw_view_set_sha256"],
     }
     transform_path = output_dir / "phone_ma_to_noesis_world.json"
     transform_path.write_text(json.dumps(transform_payload, indent=2), encoding="utf-8")
@@ -1708,11 +1948,17 @@ def run_noesis_alignment(
         "generated_at": generated_at,
         "status": "passed",
         "admission": "saved_review_candidate_not_promoted_to_live_noesis",
+        "output_dir": str(output_dir.resolve()),
+        "artifact_paths": {
+            "transform": str(transform_path.resolve()),
+            "report": str((output_dir / "alignment_report.json").resolve()),
+        },
         "target": {
             "camera_id": settings.camera_id,
             "revision_id": target_meta.get("revision_id"),
             "coordinate_frame": coordinate_frame,
-            "revision_locator": f"data/virtual_twin/revisions/{target_revision.name}",
+            "revision_locator": target_locator,
+            **target_binding,
             "point_count": int(target_points.shape[0]),
             "camera_orientation": target_camera_orientation,
         },
@@ -1740,6 +1986,13 @@ def run_noesis_alignment(
             "source_metric_domain": (
                 "fixed_camera_visible_source_vs_single_view_target"
             ),
+            "refinement_source_domain": "fixed_camera_visible_source",
+            "refinement_visibility_recomputed_each_iteration": True,
+            "refinement_visibility_cell_px": visibility_cell_px,
+            "refinement_occlusion_tolerance_m": 0.30,
+            "vertical_gate_residual_policy": (
+                "median_of_lowest_75_percent_absolute_plane_residuals_with_neighbor_below_0_80m"
+            ),
         },
         "quality_gate": {
             "passed": True,
@@ -1751,7 +2004,7 @@ def run_noesis_alignment(
         "visual_anchor": visual_anchor_report,
         "vertical_structure": admitted_vertical_metrics,
         "full_cloud": admitted_full_metrics,
-        "global_vertical_structure": best["metrics"],
+        "global_vertical_structure": global_vertical_metrics,
         "global_full_cloud": full_metrics,
         "fixed_camera_visibility": {
             "vertical_structure": visible_structure_metrics,
@@ -1769,13 +2022,11 @@ def run_noesis_alignment(
             for row in distinct_candidates[:5]
         ],
         "inputs": {
-            "phone_output_manifest_sha256": _sha256(
-                scan_dir / "outputs" / "scan_outputs_manifest.json"
-            ),
-            "target_points_sha256": _sha256(target_npz),
-            "target_meta_sha256": _sha256(target_meta_path),
-            "fixed_camera_keyframe_sha256": _sha256(keyframe_path),
-            "camera_calibration_sha256": _sha256(settings.calibration_path),
+            "phone_source": source_provenance,
+            # Preserve the old flat hash for consumers that only need the
+            # output-manifest identity; the nested record names the exact
+            # source path and every bounded raw view consumed above.
+            **input_hashes,
         },
     }
     report_path = output_dir / "alignment_report.json"
@@ -1807,18 +2058,23 @@ def run_noesis_alignment(
         "coordinate_frame": coordinate_frame,
         "target_camera_id": settings.camera_id,
         "target_revision_id": target_meta.get("revision_id"),
+        "target_binding": target_binding,
         "target_camera_orientation": target_camera_orientation,
         "admission": "saved_review_candidate_not_promoted_to_live_noesis",
         "quality_gate": report["quality_gate"],
         "visual_anchor": visual_anchor_report,
         "vertical_structure": admitted_vertical_metrics,
         "full_cloud": admitted_full_metrics,
-        "global_vertical_structure": best["metrics"],
+        "global_vertical_structure": global_vertical_metrics,
         "global_full_cloud": full_metrics,
         "fixed_camera_visibility": report["fixed_camera_visibility"],
         "fixed_camera_reprojection": reprojection_metrics,
         "topdown_presentation": topdown_presentation,
         "artifacts": artifacts,
+        "artifact_paths": {
+            "transform": str(transform_path.resolve()),
+            "report": str(report_path.resolve()),
+        },
         "files": files,
     }
 

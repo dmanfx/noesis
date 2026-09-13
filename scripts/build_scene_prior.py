@@ -41,6 +41,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--room-group-map", type=Path, required=True)
     parser.add_argument("--world-to-scene", type=Path, required=True)
     parser.add_argument(
+        "--metric-frame",
+        type=Path,
+        help=(
+            "Optional accepted metric-frame JSON.  Supplying it publishes the "
+            "versioned v2 frame identity in the catalog."
+        ),
+    )
+    parser.add_argument(
+        "--world-presentation",
+        type=Path,
+        help=(
+            "Optional accepted backend-world to Menon-scene mapping JSON; it "
+            "requires --metric-frame."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-frame-binding",
+        type=Path,
+        help=(
+            "Exact accepted v2 room-to-home frame binding JSON.  This is "
+            "required together with --registration-acceptance-report for v2."
+        ),
+    )
+    parser.add_argument(
+        "--registration-acceptance-report",
+        type=Path,
+        help=(
+            "Producer report proving the binding passed canonical holdout and "
+            "contains the exact bound transform."
+        ),
+    )
+    parser.add_argument(
         "--camera-map-lock",
         type=Path,
         help=(
@@ -84,27 +116,48 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    config = ScenePriorBuildConfig(
-        source_bundle=args.source_bundle,
-        site_id=args.site_id,
-        space_id=args.space_id,
-        semantic_rooms=tuple(args.semantic_rooms),
-        authored_scene=args.authored_scene,
-        room_group_map=args.room_group_map,
-        world_to_scene=args.world_to_scene,
-        output_root=args.output_root,
-        camera_map_lock=args.camera_map_lock,
-        camera_pose_anchor=args.camera_pose_anchor,
-        camera_ids=tuple(args.camera_ids),
-        grid_resolution_m=args.grid_resolution_m,
-        floor_support_band_m=args.floor_support_band_m,
-        obstacle_min_height_m=args.obstacle_min_height_m,
-        obstacle_max_height_m=args.obstacle_max_height_m,
-        obstacle_min_support=args.obstacle_min_support,
-        max_source_height_m=args.max_source_height_m,
-        include_floorplan_layers=not args.no_floorplan_layers,
-    )
     try:
+        def load_optional_contract(path: Path | None):
+            if path is None:
+                return None
+            with path.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+            if not isinstance(value, dict):
+                raise ValueError(f"{path} must contain a JSON object")
+            return value
+
+        config = ScenePriorBuildConfig(
+            source_bundle=args.source_bundle,
+            site_id=args.site_id,
+            space_id=args.space_id,
+            semantic_rooms=tuple(args.semantic_rooms),
+            authored_scene=args.authored_scene,
+            room_group_map=args.room_group_map,
+            world_to_scene=args.world_to_scene,
+            output_root=args.output_root,
+            camera_map_lock=args.camera_map_lock,
+            camera_pose_anchor=args.camera_pose_anchor,
+            camera_ids=tuple(args.camera_ids),
+            grid_resolution_m=args.grid_resolution_m,
+            floor_support_band_m=args.floor_support_band_m,
+            obstacle_min_height_m=args.obstacle_min_height_m,
+            obstacle_max_height_m=args.obstacle_max_height_m,
+            obstacle_min_support=args.obstacle_min_support,
+            max_source_height_m=args.max_source_height_m,
+            include_floorplan_layers=not args.no_floorplan_layers,
+            metric_frame=load_optional_contract(args.metric_frame),
+            world_presentation=load_optional_contract(args.world_presentation),
+            accepted_frame_binding=(
+                load_optional_contract(args.accepted_frame_binding)
+                if args.accepted_frame_binding is not None
+                else None
+            ),
+            registration_acceptance_report=(
+                load_optional_contract(args.registration_acceptance_report)
+                if args.registration_acceptance_report is not None
+                else None
+            ),
+        )
         result = build_scene_prior(config)
     except (ScenePriorBuildError, OSError, ValueError) as exc:
         print(f"scene-prior build failed: {exc}", file=sys.stderr)

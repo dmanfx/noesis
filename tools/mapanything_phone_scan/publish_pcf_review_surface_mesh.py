@@ -115,6 +115,20 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
             str(owner): int(metrics["output_triangle_count"])
             for owner, metrics in mesh_manifest.get("owners", {}).items()
         }
+        support_class_counts = {"observed": 0, "uncertain": 0, "unknown": 0}
+        for metrics in mesh_manifest.get("owners", {}).values():
+            for key in support_class_counts:
+                support_class_counts[key] += int(
+                    metrics.get("support_class_counts", {}).get(key, 0)
+                )
+        frame_identity = mesh_manifest.get("frame_identity")
+        if not isinstance(frame_identity, dict):
+            raise ValueError("surface mesh has no source frame identity")
+        source_coordinate_frame = str(
+            frame_identity.get("coordinate_frame") or ""
+        ).strip()
+        if not source_coordinate_frame:
+            raise ValueError("surface mesh source frame identity is empty")
         descriptor = deepcopy(current)
         descriptor.update(
             {
@@ -134,6 +148,13 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
                     "vertex_count": int(mesh_output["vertex_count"]),
                     "triangle_count": int(mesh_output["triangle_count"]),
                     "owner_triangle_counts": owner_triangle_counts,
+                    "support": {
+                        "coordinate_frame": source_coordinate_frame,
+                        "class_counts": support_class_counts,
+                        "triangle_support_checks": True,
+                        "ray_visibility_checks": True,
+                        "source_frame_identity": frame_identity,
+                    },
                 },
             }
         )

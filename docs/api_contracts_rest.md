@@ -3,6 +3,23 @@ _Status: canonical native-host contract, updated 2026-08-15._
 
 This document describes the REST endpoints used by the DS9.1 runtime. Implementations must preserve these contracts unless all consumers are updated in lockstep.
 
+## Find the relevant contract
+
+| Task or endpoint family | Section |
+| --- | --- |
+| Serialization budgets and authentication | [Boundary metrics](#wire-render-and-boundary-metric-contract), [authentication](#authentication-boundary) |
+| Service readiness | [Capability health](#capability-health), [native deployment health](#native-deployment-health) |
+| Scene artifacts and PCF review | [Scene releases](#scene-releases), [whole-home review](#whole-home-pcf-review-assembly) |
+| Depth queries and dense components | [Depth API](#1-depth-api), [component stream](#exact-dense-snapshot-component-stream) |
+| Analytics ROI and persistence | [ROI API](#2-analytics-roi-api) |
+| Legacy aliases and current identity service | [Alias API](#3-reid-alias-api), [identity v2](#32-identity-v2-api) |
+| Planned household endpoints | [Planned identity REST](#31-household-identity-rest-planned) |
+| Virtual twin and alignment | [Virtual twin](#4-virtual-twin-api), [alignment walk](#5-guided-alignment-walk-api) |
+| Semantic capture and toolbox status | [Semantic capture](#6-manual-semantic-capture-api), [toolbox status](#7-validation-toolbox-api-status) |
+
+Read each section's implementation/planned status. A documented response schema
+does not prove endpoint activation or health in the selected native process.
+
 ## Wire-render and boundary-metric contract
 
 All 41 successful FastAPI-rendered product JSON routes shared by DS9.1 baseline and the disabled V3DT adapter keep

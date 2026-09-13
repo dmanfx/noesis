@@ -1224,6 +1224,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--point-budget", type=int, default=600_000)
     parser.add_argument("--max-joint-views", type=int, default=80)
     parser.add_argument("--window-overlap-views", type=int, default=24)
+    parser.add_argument(
+        "--trajectory-refinement-report",
+        type=Path,
+        help="Optional WO-3 report describing the DA3 raw carrier supplied to this run.",
+    )
     parser.add_argument("--consistency-threshold", type=float, default=0.55)
     parser.add_argument("--boundary-threshold", type=float, default=0.50)
     parser.add_argument("--sparse-sample-fraction", type=float, default=0.10)
@@ -1259,6 +1264,13 @@ def main() -> int:
         args.world_from_da3
     )
     carrier_poses = _transform_poses(carrier_from_da3, da3.poses)
+    trajectory_refinement: dict[str, Any] | None = None
+    if args.trajectory_refinement_report is not None:
+        trajectory_refinement = _load_json(args.trajectory_refinement_report.resolve())
+        if trajectory_refinement.get("schema") != "noesis.phone_walk.trajectory_refinement.v1":
+            raise MapAnythingScanError(
+                "--trajectory-refinement-report has an unsupported schema"
+            )
     print("Computing DA3-only temporal reliability for sparse depth priors", flush=True)
     sparse = _build_sparse_depth_priors(
         da3,
@@ -1387,6 +1399,13 @@ def main() -> int:
                     args.point_budget,
                 )
                 summary["joint_inference"] = window_report
+                if trajectory_refinement is not None:
+                    summary["trajectory_refinement"] = {
+                        "report": str(args.trajectory_refinement_report.resolve()),
+                        "report_sha256": _sha256(args.trajectory_refinement_report.resolve()),
+                        "status": trajectory_refinement.get("refinement", {}).get("status"),
+                        "raw_materialized": trajectory_refinement.get("refinement", {}).get("raw_materialized"),
+                    }
                 _rewrite_variant_manifest(stage_dir, summary)
                 os.replace(stage_dir, final_dir)
                 suite_rows.append(
@@ -1453,6 +1472,16 @@ def main() -> int:
                 "policy": "overlap_gated_conditioned_windows",
             },
             "sparse_depth_prior": sparse.metrics,
+            "trajectory_refinement": (
+                {
+                    "report": str(args.trajectory_refinement_report.resolve()),
+                    "report_sha256": _sha256(args.trajectory_refinement_report.resolve()),
+                    "status": trajectory_refinement.get("refinement", {}).get("status"),
+                    "raw_materialized": trajectory_refinement.get("refinement", {}).get("raw_materialized"),
+                }
+                if trajectory_refinement is not None
+                else {"status": "not_supplied"}
+            ),
             "variants": suite_rows,
         }
         (output_root / "variant_suite_manifest.json").write_text(

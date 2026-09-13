@@ -1,12 +1,24 @@
 # Prior-Conditioned Fusion (PCF) workflow
 
 Status: canonical room-reconstruction and Scene Prior handoff runbook,
-2026-08-26.
+2026-09-07 (phase boundaries; deployed inventory retains its dated evidence).
 
 Use this document when someone asks to **run PCF**, **reconstruct another room
-with PCF**, or **publish a PCF room to Noesis**. It is the single end-to-end
-entry point. The phone utility reference and fusion decision record linked at
-the end provide implementation detail, but they do not replace this sequence.
+with PCF**, or **publish a PCF room to Noesis**. Execute only the phases
+covered by the request. A candidate-generation or evaluation request ends with
+saved reconstruction evidence and diagnostics; it does not require sealing,
+catalog binding, or a service restart. The detailed references below supplement
+the relevant phase.
+
+## Phase boundaries and stopping points
+
+| Phase | Inputs and completion boundary |
+| --- | --- |
+| Prepare and align | One matched phone-view set, DA3 output, and passed alignment to the intended calibrated static-camera revision; reuse valid existing outputs. |
+| Generate and evaluate | Selected conditioning, DA3-carried fusion, static-world evaluation, and saved review evidence. Candidate requests stop here. |
+| Review for admission and seal | When authorized, review the candidate and pass the bundle builder's gates; retain the immutable source bundle. |
+| Derive and bind Scene Prior | When authorized, use the approved candidate, semantic room choice, authored mapping, and sealed bundle; verify the 2.5 cm revision and requested binding. |
+| Activate and verify | When authorized, load the deliberate binding change in the canonical service and verify readiness and affected PCF presentation. |
 
 ## What PCF means
 
@@ -62,7 +74,7 @@ flowchart LR
     MA --> FUSE
     FUSE --> EVAL["Held-out phone and independent static validation"]
     STATIC --> EVAL
-    EVAL --> BUNDLE["Sealed room-scan bundle"]
+    EVAL -->|"Authorized admission; gates pass"| BUNDLE["Sealed room-scan bundle"]
     BUNDLE --> SCENE["Immutable 2.5 cm Scene Prior"]
     AUTHORED["Authored room membership"] --> SCENE
     SCENE --> CATALOG["Camera binding in Scene Prior catalog"]
@@ -75,24 +87,41 @@ PCF evidence. The current full-evidence Scene Prior derivation retains the
 measured reconstruction extent, including legitimate doorway and appendage
 geometry outside the authored room surface.
 
-## Required inputs
+## Inputs by phase
 
-Do not start the expensive conditioned run until all of these exist:
+### Candidate generation and static-world evaluation
+
+Before the conditioned run, require:
 
 - the original phone video and `prepared_frames_manifest.json`;
 - DA3 raw output for exactly those prepared view identities;
 - a passed alignment under the same scan, camera, and static revision;
 - the approved static room revision with `room_points.npz`,
   `room_points_meta.json`, and its RGB keyframe;
-- the exact camera row in `config/camera_calibration.json`;
-- the authored scene, `config/authored_scene_room_groups.json`, and
-  `config/ply_alignment.json` for the site; and
-- a large-storage location for the suite and sealed source bundle.
+- the exact camera row in `config/camera_calibration.json`; and
+- a fresh suite directory with sufficient storage for raw evidence and diagnostics.
 
-The phone-scan runtime must have the official cached DA3 and MapAnything models
-and a DA3Metric-Large FP16 engine built for the installed TensorRT runtime. The
-current code resolves the engine from `NOESIS_DS9_ARTIFACT_ROOT` or an explicit
-`NOESIS_PHONE_SCAN_DA3_ENGINE`; it must not load a DS9.0 or older TensorRT plan.
+Use the selected phone-scan environment and required cached MapAnything model.
+If DA3 preparation is needed, its official models and DA3Metric-Large FP16
+engine must match the installed TensorRT runtime. The engine resolves from
+`NOESIS_DS9_ARTIFACT_ROOT` or `NOESIS_PHONE_SCAN_DA3_ENGINE`; never load a DS9.0
+or older TensorRT plan. Reusing valid DA3 raw output does not require rerunning
+DA3 or rebuilding its engine.
+
+### Admission, sealing, and activation
+
+Sealing requires the candidate/evaluation artifacts, retained provenance,
+documented admission review, passed machine gates below, and a fresh durable
+bundle destination. Scene Prior derivation additionally requires the approved
+site, space, camera, and semantic room choice; the authored scene;
+`config/authored_scene_room_groups.json`; and `config/ply_alignment.json`.
+These authored-scene inputs are not prerequisites for generating a candidate.
+
+Runtime activation requires the canonical service environment and the private
+assets needed by its readiness and presentation clients. Their absence blocks
+that phase, not completed offline candidate work. Do not print private values.
+The browser's disclosed GPU-resource pause/restore behavior below remains
+separate from Scene Prior activation authority.
 
 ## Capture once, then reconstruct offline
 
@@ -134,6 +163,15 @@ bind a Scene Prior. It also refuses an active added-video revision because the
 current PCF contract cannot silently include provider-specific supplement
 outputs.
 
+The browser orchestrator also runs trajectory refinement before conditioning.
+It consumes a validated persisted VIO artifact when available, without making
+VIO mandatory for RGB-only candidate generation or relaxing camera/IMU timing
+and calibration gates. A materialized carrier scale change above 2% requires
+world-alignment revalidation and its resulting transform. Preserve the exact
+refined raw carrier, transform, and refinement report through conditioning,
+fusion, and evaluation; missing required revalidation stops that path. See
+[`pcf.py`](../tools/mapanything_phone_scan/pcf.py).
+
 On this 12 GB host, the browser service is configured with
 `NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE=1`. The button visibly discloses that it
 will temporarily stop `menon-appliance.target` for MapAnything GPU headroom,
@@ -145,7 +183,11 @@ This is resource ownership only; it does not grant PCF live-world authority.
 
 The browser action is the routine candidate-generation path. Use the commands
 below for expert reruns, controlled multi-variant qualification, or recovery
-from a preserved partial run.
+from a preserved partial run. These low-level commands do not reproduce the
+browser's trajectory-refinement orchestration automatically. The example below
+uses an already passed, unrefined DA3 carrier; recovery of a refined run must
+reuse its exact raw carrier, effective world transform, and refinement report.
+Do not silently replace those with the original scan outputs.
 
 ### Set the room-specific inputs
 
@@ -156,16 +198,11 @@ begins with `replace-` before continuing.
 PCF_SCAN_ID="replace-with-scan-id"
 PCF_CAMERA_ID="replace-with-camera-id"
 PCF_TARGET_REVISION="data/virtual_twin/revisions/replace-with-revision-id"
-PCF_SITE_ID="replace-with-site-id"
-PCF_SPACE_ID="replace-with-space-id"
-PCF_SEMANTIC_ROOM="replace-with-exact-authored-room-label"
-PCF_AUTHORED_SCENE="data/virtual_twin/releases/replace-with-release-id/replace-with-scene.obj"
 PCF_LARGE_STORAGE="/replace-with-large-storage-root"
 
 PCF_SCAN_DIR="data/mapanything_phone_scans/${PCF_SCAN_ID}"
 PCF_SUITE_ROOT="${PCF_LARGE_STORAGE}/${PCF_SCAN_ID}/da3_prior_suite"
 PCF_EVALUATION_DIR="${PCF_SUITE_ROOT}/evaluation_static_world"
-PCF_BUNDLE_DIR="${PCF_LARGE_STORAGE}/room_scan_bundles/${PCF_CAMERA_ID}_${PCF_SCAN_ID}_pcf_v1"
 PCF_PHONE_PYTHON="data/mapanything_phone_scan_runtime/venv/bin/python"
 ```
 
@@ -180,7 +217,6 @@ test -f "${PCF_SCAN_DIR}/alignment/alignment_report.json"
 test -f "${PCF_SCAN_DIR}/alignment/phone_ma_to_noesis_world.json"
 test -f "${PCF_TARGET_REVISION}/room_points.npz"
 test -f "${PCF_TARGET_REVISION}/room_points_meta.json"
-test -f "${PCF_AUTHORED_SCENE}"
 ```
 
 Confirm that the passed alignment names the intended camera and target
@@ -195,9 +231,12 @@ jq '{status, quality_gate, target}' \
 
 ### 1. Run prior-conditioned MapAnything
 
-The routine path runs only `da3_pose_sparse_depth`. Omit `--variants` when
-requalifying the method, a model version, a materially changed capture
-protocol, or a new alignment algorithm against all four controlled variants.
+The routine path explicitly selects only `da3_pose_sparse_depth` in both the
+runner and evaluator. Both CLIs default to all four variants if `--variants` is
+omitted. Use that full suite only for requested controlled qualification of the
+method, model, capture protocol, or alignment algorithm; a changed version does
+not automatically require a sweep. The runner's optional phone-local carrier
+mode does not satisfy this runbook's canonical static-world alignment gates.
 
 ```bash
 "${PCF_PHONE_PYTHON}" \
@@ -258,6 +297,11 @@ calculations. It produces the expanded **Diagnostic layers**, 2.5 cm
 point-preserving review layers, the static top view, fixed-camera reprojection,
 overview, and `evaluation_metrics.json`.
 
+Candidate-generation and evaluation requests stop here. Report the saved
+artifacts, coordinate frame, scan/camera/revision identity, diagnostics, and
+limitations as review-only evidence. A candidate does not claim admission or
+publication. Continue below only within authorized admission or activation work.
+
 ## Admission review
 
 Review the candidate before sealing or changing the runtime catalog. A clean
@@ -315,6 +359,7 @@ provider manifests remain part of the wider reproducibility record even though
 they are not copied into this compact runtime source bundle.
 
 ```bash
+PCF_BUNDLE_DIR="${PCF_LARGE_STORAGE}/room_scan_bundles/${PCF_CAMERA_ID}_${PCF_SCAN_ID}_pcf_v1"
 python3 \
   tools/mapanything_phone_scan/build_conditioned_scene_prior_bundle.py \
   --scan-dir "${PCF_SCAN_DIR}" \
@@ -341,7 +386,17 @@ have been approved.
 The current deployed room priors deliberately use 2.5 cm cells. Specify that
 value explicitly; the builder's generic default is 5 cm.
 
+Set these later-phase inputs only when derivation/binding is authorized:
+
 ```bash
+PCF_SITE_ID="replace-with-site-id"
+PCF_SPACE_ID="replace-with-space-id"
+PCF_SEMANTIC_ROOM="replace-with-exact-authored-room-label"
+PCF_AUTHORED_SCENE="data/virtual_twin/releases/replace-with-release-id/replace-with-scene.obj"
+test -f "${PCF_AUTHORED_SCENE}"
+test -f config/authored_scene_room_groups.json
+test -f config/ply_alignment.json
+
 python3 scripts/build_scene_prior.py \
   --source-bundle "${PCF_BUNDLE_DIR}" \
   --site-id "${PCF_SITE_ID}" \
@@ -377,8 +432,8 @@ jq '{prior_id, site_id, space_id, source, semantic_binding, grid, quality}' \
 ## Load it in the native DS9.1 application
 
 `DS9/config/infer.yaml` points to `data/scene_priors/catalog.json`. Scene Priors
-are verified and loaded at runtime startup, so restart the single canonical
-native service after a deliberate binding change:
+are verified and loaded at runtime startup. When activation is authorized,
+restart the single canonical native service after the deliberate binding change:
 
 ```bash
 systemctl --user restart noesis-appliance.service
@@ -452,19 +507,21 @@ Keep enough material to reproduce the decision without rerunning capture:
 - `evaluation_metrics.json` and the compact approved image evidence;
 - phone-to-world transform, alignment report, calibration identity, and target
   revision identity;
-- the complete sealed room-scan bundle; and
-- the catalog plus every immutable Scene Prior revision it references.
+- the complete sealed room-scan bundle, if created; and
+- the catalog and referenced immutable Scene Prior revisions, if bound.
 
 Reproducible scratch renders, Python bytecode, abandoned temporary directories,
 and duplicate mesh exports may be removed only after the manifests, raw arrays,
-evaluation, sealed bundle, and active revision are protected. Do not delete raw
-provider evidence merely because a later raster or mesh looks better.
+evaluation, and any created bundle or active revision are protected. Cleanup
+does not require creating later-phase artifacts. Do not delete raw provider
+evidence merely because a later raster or mesh looks better.
 
 ## Failure and retry rules
 
 - A provider, alignment, identity, metric-scale, or bundle gate failure stops
-  the workflow. There is no alternate model, local-frame, or static-only
-  fallback.
+  the affected phase and dependent phases. Admission failure does not erase
+  retained review-only candidate evidence. There is no alternate model,
+  local-frame, or static-only fallback.
 - Output directories are intentionally immutable. Retry into a new suite or
   bundle directory instead of overwriting evidence.
 - Never substitute another scan, camera, room revision, view count, or frame
@@ -492,18 +549,21 @@ referenced manifest before relying on current bindings.
 
 ## A safe handoff request for another agent
 
-Use wording like this:
+For candidate work, use wording like this:
 
 > Run the canonical Prior-Conditioned Fusion (PCF) workflow in
 > `docs/PCF_Workflow.md` for `<room>`, starting from phone scan `<scan-id>` and
 > aligning to camera `<camera-id>` / static revision `<revision-id>`. Build and
 > review `prior_conditioned_consensus_da3_carrier`, preserve the phone-only
-> inference boundary, seal the passed candidate, and only then build a 2.5 cm
-> Scene Prior and bind it after approval. Do not substitute static-only
-> reconstruction or mix a static frame into the phone batch.
+> inference boundary, and save the candidate and evaluation diagnostics as
+> review-only evidence. Stop before sealing, binding, or activation. Do not
+> substitute static-only reconstruction or mix a static frame into the phone batch.
 
-That phrasing identifies the algorithm, authority boundaries, selected
-candidate, resolution, and activation checkpoint.
+For separately authorized admission or activation, identify the existing
+candidate and requested later phases explicitly. Preserve the documented human
+review and machine gates; specify the approved semantic room, 2.5 cm derivation,
+requested camera binding, and whether runtime activation is included. Do not
+repeat candidate generation when its evidence remains valid.
 
 ## Detailed references
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,11 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
+
+from .prepared_frame_identity import prepared_frame_identity
+from .browser_capture import BROWSER_CAPTURE_SCHEMA
+from .phone_calibration import calibration_for_video, rectify_selected_frames
+from .imu_motion import load_native_motion
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -33,6 +39,8 @@ class FramePreparationSettings:
     max_keyframe_interval_s: float = 1.25
     max_edge_px: int = 1920
     jpeg_quality: int = 94
+    phone_camera_calibration: Path | None = None
+    phone_camera_capture_mode: str = "unbound"
 
 
 @dataclass
@@ -51,7 +59,12 @@ class _Candidate:
     small_gray: np.ndarray
     keypoints: list[Any]
     descriptors: np.ndarray | None
+    content_digest: bytes = b""
+    capture_time_ns: int | None = None
+    source_frame_index: int | None = None
+    timestamp_source: str | None = None
     quality_score: float = 0.0
+    imu_motion: dict[str, Any] | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -92,7 +105,7 @@ def probe_video(video_path: Path) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration,size,format_name",
+            "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:stream_tags=rotate:stream_side_data=rotation:format=duration,size,format_name",
             "-of",
             "json",
             str(video_path),
@@ -122,10 +135,17 @@ def probe_video(video_path: Path) -> dict[str, Any]:
         source_fps = float(Fraction(rate_text))
     except (ValueError, ZeroDivisionError):
         source_fps = 0.0
+    rotation = float((stream.get("tags") or {}).get("rotate") or 0.0)
+    for side_data in stream.get("side_data_list") or []:
+        if "rotation" in side_data:
+            rotation = float(side_data["rotation"])
+    if not math.isfinite(rotation):
+        raise FramePreparationError("the video reports invalid image rotation")
     return {
         "codec": str(stream.get("codec_name") or "unknown"),
         "width": width,
         "height": height,
+        "rotation_degrees": rotation,
         "source_fps": source_fps if math.isfinite(source_fps) else 0.0,
         "duration_s": duration,
         "reported_frame_count": int(stream.get("nb_frames") or 0)
@@ -183,21 +203,165 @@ def _scale_filter(edge_px: int) -> str:
     )
 
 
+_MAX_ENCODED_PTS_FRAMES = 1_000_000
+
+
+def _probe_encoded_frame_timestamps(video_path: Path) -> list[float]:
+    """Return the encoded video PTS values without manufacturing a cadence.
+
+    The regular browser upload has no trustworthy camera acquisition clock, but
+    its encoded PTS still describe which recorded frames exist.  Keeping those
+    values lets a long encoder freeze remain a real temporal gap after repeat
+    removal.  The bound keeps this preparation-side probe finite and matches the
+    native capture import limit.
+    """
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        f"%+#{_MAX_ENCODED_PTS_FRAMES + 1}",
+        "-show_entries",
+        "frame=best_effort_timestamp_time",
+        "-of",
+        "csv=p=0",
+        str(video_path),
+    ]
+    with tempfile.TemporaryFile() as stderr_sink:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_sink,
+            text=True,
+        )
+        timestamps: list[float] = []
+        previous = -math.inf
+        assert process.stdout is not None
+
+        def abort_probe() -> None:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+        try:
+            for index, line in enumerate(process.stdout):
+                if index >= _MAX_ENCODED_PTS_FRAMES:
+                    abort_probe()
+                    raise FramePreparationError(
+                        "the video has too many encoded frame timestamps "
+                        f"(>{_MAX_ENCODED_PTS_FRAMES})"
+                    )
+                value = line.strip().rstrip(",")
+                if not value:
+                    continue
+                try:
+                    timestamp = float(value)
+                except ValueError as exc:
+                    abort_probe()
+                    raise FramePreparationError(
+                        f"encoded frame timestamp {index} is missing or invalid"
+                    ) from exc
+                if not math.isfinite(timestamp) or timestamp < previous:
+                    abort_probe()
+                    raise FramePreparationError("encoded frame timestamps are not monotonic")
+                timestamps.append(timestamp)
+                previous = timestamp
+            return_code = process.wait()
+            stderr_sink.flush()
+            stderr_sink.seek(0, 2)
+            stderr_sink.seek(max(0, stderr_sink.tell() - 2000))
+            detail = stderr_sink.read().decode("utf-8", errors="replace").strip()
+            if return_code != 0:
+                raise FramePreparationError(
+                    f"ffprobe encoded frame timestamp extraction failed: "
+                    f"{detail or return_code}"
+                )
+            if not timestamps:
+                raise FramePreparationError("the video has no encoded frame timestamps")
+            return timestamps
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+
+def _select_timestamp_indices(
+    timestamps_s: list[float], candidate_fps: float, max_frames: int
+) -> list[int]:
+    """Choose existing encoded frames nearest the requested cadence."""
+
+    if len(timestamps_s) < 2:
+        raise FramePreparationError("encoded timestamps produced too few candidate frames")
+    selected: list[int] = []
+    cursor = 0
+    start = timestamps_s[0]
+    for output_index in range(int(max_frames)):
+        target = start + output_index / max(candidate_fps, 1e-6)
+        if target > timestamps_s[-1]:
+            break
+        while (
+            cursor + 1 < len(timestamps_s)
+            and abs(timestamps_s[cursor + 1] - target)
+            <= abs(timestamps_s[cursor] - target)
+        ):
+            cursor += 1
+        if not selected or selected[-1] != cursor:
+            selected.append(cursor)
+    if len(selected) < 2:
+        raise FramePreparationError("encoded timestamps produced too few candidate frames")
+    return selected
+
+
 def _extract_candidates(
     video_path: Path,
     candidate_dir: Path,
     candidate_fps: float,
     settings: FramePreparationSettings,
+    source_capture_timestamps_ns: list[int] | None = None,
 ) -> list[Path]:
     selected_edge_px = min(settings.candidate_edge_px, settings.max_edge_px)
-    video_filter = f"fps={candidate_fps:.8f},{_scale_filter(selected_edge_px)}"
-    _run_ffmpeg(
-        [
+    selected_indices: list[int] = []
+    encoded_timestamps_s: list[float] | None = None
+    if source_capture_timestamps_ns:
+        if len(source_capture_timestamps_ns) < 2 or any(
+            source_capture_timestamps_ns[index] >= source_capture_timestamps_ns[index + 1]
+            for index in range(len(source_capture_timestamps_ns) - 1)
+        ):
+            raise FramePreparationError("source capture timestamps are not strictly increasing")
+        cursor = 0
+        start_ns = source_capture_timestamps_ns[0]
+        for output_index in range(int(settings.max_candidate_frames)):
+            target_ns = start_ns + int(round(output_index * 1e9 / max(candidate_fps, 1e-6)))
+            if target_ns > source_capture_timestamps_ns[-1]:
+                break
+            while cursor + 1 < len(source_capture_timestamps_ns) and abs(source_capture_timestamps_ns[cursor + 1] - target_ns) <= abs(source_capture_timestamps_ns[cursor] - target_ns):
+                cursor += 1
+            if not selected_indices or selected_indices[-1] != cursor:
+                selected_indices.append(cursor)
+        if len(selected_indices) < 2:
+            raise FramePreparationError("source capture timestamps produced too few candidate frames")
+        selection = "+".join(f"eq(n\\,{index})" for index in selected_indices)
+        video_filter = f"select='{selection}',{_scale_filter(selected_edge_px)},showinfo"
+    else:
+        encoded_timestamps_s = _probe_encoded_frame_timestamps(video_path)
+        selected_indices = _select_timestamp_indices(
+            encoded_timestamps_s,
+            candidate_fps,
+            int(settings.max_candidate_frames),
+        )
+        selection = "+".join(f"eq(n\\,{index})" for index in selected_indices)
+        video_filter = f"select='{selection}',{_scale_filter(selected_edge_px)},showinfo"
+    input_flags = ["-noautorotate"] if source_capture_timestamps_ns else []
+    command = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel",
-            "error",
+            "-loglevel", "info",
             "-nostdin",
+            *input_flags,
             "-i",
             str(video_path),
             "-map",
@@ -208,13 +372,71 @@ def _extract_candidates(
             str(int(settings.max_candidate_frames)),
             "-q:v",
             "3",
+            "-fps_mode",
+            "vfr",
             "-start_number",
             "0",
             str(candidate_dir / "candidate_%05d.jpg"),
-        ],
-        description="ffmpeg candidate extraction",
+        ]
+    completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
     )
-    return sorted(candidate_dir.glob("candidate_*.jpg"))
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-2000:]
+        raise FramePreparationError(
+            f"ffmpeg candidate extraction failed: {detail or completed.returncode}"
+        )
+    # showinfo is attached to this exact extraction filter chain.  Re-probing
+    # the input and guessing which VFR source frame the fps filter selected is
+    # not sufficient for acquisition-time provenance.
+    matches = re.findall(r"showinfo.*?\bn:\s*(\d+).*?\bpts_time:\s*([-+]?\d+(?:\.\d+)?)", completed.stderr)
+    timestamps_s = [float(value) for _, value in sorted(matches, key=lambda row: int(row[0]))]
+    paths = sorted(candidate_dir.glob("candidate_*.jpg"))
+    if len(timestamps_s) != len(paths):
+        raise FramePreparationError(
+            "ffmpeg candidate extraction did not return one showinfo timestamp per decoded candidate"
+        )
+    if encoded_timestamps_s is not None:
+        # `select` must preserve the source-frame order and the PTS spacing.
+        # Compare intervals so a decoder-wide origin shift does not matter,
+        # while still failing closed if the filter produced a different frame
+        # sequence than the ffprobe mapping used to build it.
+        observed_origin = timestamps_s[0]
+        expected_origin = encoded_timestamps_s[selected_indices[0]]
+        if any(
+            abs(
+                (observed - observed_origin)
+                - (encoded_timestamps_s[source_index] - expected_origin)
+            )
+            > 0.025
+            for observed, source_index in zip(timestamps_s, selected_indices, strict=True)
+        ):
+            raise FramePreparationError(
+                "ffmpeg selected-frame timestamps disagree with the encoded PTS mapping"
+            )
+    if source_capture_timestamps_ns:
+        selected_timestamps_ns = [source_capture_timestamps_ns[index] for index in selected_indices]
+        if len(selected_timestamps_ns) != len(paths):
+            raise FramePreparationError("explicit source-frame selection did not preserve frame identity")
+        (candidate_dir / "candidate_timestamps_ns.json").write_text(
+            json.dumps(selected_timestamps_ns, separators=(",", ":")), encoding="utf-8"
+        )
+        (candidate_dir / "candidate_source_indices.json").write_text(
+            json.dumps(selected_indices, separators=(",", ":")), encoding="utf-8"
+        )
+    else:
+        if encoded_timestamps_s is None:
+            raise FramePreparationError("encoded timestamp selection was not initialized")
+        selected_timestamps_s = [encoded_timestamps_s[index] for index in selected_indices]
+        (candidate_dir / "candidate_timestamps_s.json").write_text(
+            json.dumps(selected_timestamps_s, separators=(",", ":")), encoding="utf-8"
+        )
+    return paths
 
 
 def _feature_coverage(keypoints: list[Any], width: int, height: int) -> float:
@@ -238,6 +460,10 @@ def _analyze_candidates(
     candidate_fps: float,
     feature_edge_px: int,
     progress: ProgressCallback,
+    capture_timestamps_ns: list[int] | None = None,
+    source_frame_indices: list[int] | None = None,
+    encoded_timestamps_s: list[float] | None = None,
+    timestamp_source: str | None = None,
 ) -> list[_Candidate]:
     detector = cv2.ORB_create(
         nfeatures=1600,
@@ -247,6 +473,27 @@ def _analyze_candidates(
         fastThreshold=10,
     )
     candidates: list[_Candidate] = []
+    capture_time_rows: list[int | None] = None
+    if capture_timestamps_ns:
+        if len(capture_timestamps_ns) != len(paths):
+            raise FramePreparationError(
+                "exact candidate timestamp count does not match extracted candidate frames"
+            )
+        capture_time_rows = [int(value) for value in capture_timestamps_ns]
+    if source_frame_indices is not None and len(source_frame_indices) != len(paths):
+        raise FramePreparationError(
+            "source frame identity count does not match extracted candidate frames"
+        )
+    if encoded_timestamps_s is not None:
+        if len(encoded_timestamps_s) != len(paths):
+            raise FramePreparationError(
+                "encoded candidate timestamp count does not match extracted candidate frames"
+            )
+        if any(
+            encoded_timestamps_s[index] > encoded_timestamps_s[index + 1]
+            for index in range(len(encoded_timestamps_s) - 1)
+        ):
+            raise FramePreparationError("encoded candidate timestamps are not monotonic")
     for index, path in enumerate(paths):
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
@@ -268,7 +515,13 @@ def _analyze_candidates(
         candidates.append(
             _Candidate(
                 index=index,
-                timestamp_s=float(index / candidate_fps),
+                timestamp_s=(
+                    float((capture_time_rows[index] - capture_time_rows[0]) * 1e-9)
+                        if capture_time_rows and capture_time_rows[index] is not None
+                    else float(encoded_timestamps_s[index])
+                        if encoded_timestamps_s is not None
+                    else float(index / candidate_fps)
+                ),
                 path=path,
                 width=int(feature_gray.shape[1]),
                 height=int(feature_gray.shape[0]),
@@ -283,6 +536,17 @@ def _analyze_candidates(
                 small_gray=small_gray,
                 keypoints=keypoints,
                 descriptors=descriptors,
+                content_digest=hashlib.blake2s(
+                    image.tobytes(),
+                    digest_size=16,
+                ).digest(),
+                capture_time_ns=(capture_time_rows[index] if capture_time_rows else None),
+                source_frame_index=(source_frame_indices[index] if source_frame_indices is not None else None),
+                timestamp_source=(
+                    timestamp_source
+                    if capture_time_rows is not None or encoded_timestamps_s is not None
+                    else None
+                ),
             )
         )
         if index % 16 == 0:
@@ -398,6 +662,164 @@ def _edge_score(edge: dict[str, Any]) -> float:
     )
 
 
+_REPEAT_MEAN_DELTA_MAX = 1.50
+_REPEAT_P95_DELTA_MAX = 4.0
+_REPEAT_CHANGED_FRACTION_MAX = 0.02
+_REPEAT_MIN_MATCHES = 20
+_REPEAT_MIN_INLIERS = 16
+_REPEAT_MIN_INLIER_RATIO = 0.50
+_REPEAT_MIN_COVERAGE = 0.08
+_REPEAT_MAX_DISPLACEMENT = 0.004
+
+
+def _is_frozen_repeat(
+    anchor: _Candidate,
+    candidate: _Candidate,
+    visual_edge: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Classify only strong adjacent repeats as safe to discard.
+
+    The comparison is always against the fixed run anchor.  This keeps a
+    sequence of individually small camera motions from chasing the anchor and
+    disappearing as one apparent freeze.  Exact decoded content is safe even
+    for textureless images; an image with encoding noise must also have strong
+    spatial support, because missing features do not prove that nothing moved.
+    """
+
+    if (
+        anchor.content_digest
+        and candidate.content_digest
+        and anchor.content_digest == candidate.content_digest
+    ):
+        return True, "exact_content"
+    delta = np.abs(
+        anchor.small_gray.astype(np.int16) - candidate.small_gray.astype(np.int16)
+    ).astype(np.float32)
+    mean_delta = float(np.mean(delta))
+    if mean_delta > _REPEAT_MEAN_DELTA_MAX:
+        return False, "changed"
+    p95_delta = float(np.percentile(delta, 95.0))
+    changed_fraction = float(np.mean(delta > 4.0))
+    if (
+        p95_delta > _REPEAT_P95_DELTA_MAX
+        or changed_fraction > _REPEAT_CHANGED_FRACTION_MAX
+    ):
+        return False, "changed"
+    edge = visual_edge if visual_edge is not None else _visual_edge(anchor, candidate)
+    if (
+        int(edge["match_count"]) >= _REPEAT_MIN_MATCHES
+        and int(edge["inlier_count"]) >= _REPEAT_MIN_INLIERS
+        and float(edge["inlier_ratio"]) >= _REPEAT_MIN_INLIER_RATIO
+        and min(float(edge["source_coverage"]), float(edge["target_coverage"]))
+        >= _REPEAT_MIN_COVERAGE
+        and float(edge["median_displacement_norm"]) <= _REPEAT_MAX_DISPLACEMENT
+    ):
+        return True, "spatial_repeat"
+    return False, "insufficient_spatial_evidence"
+
+
+def _deduplicate_candidates(
+    candidates: list[_Candidate],
+) -> tuple[list[_Candidate], dict[str, Any]]:
+    """Drop bounded adjacent frozen runs before adaptive selection.
+
+    A run's representative may be the sharpest member, but its anchor remains
+    the first retained candidate until a real visual change arrives.  This is
+    deliberately a single adjacent pass, so its cost is linear in the bounded
+    candidate set and it cannot turn a long frozen recording into fabricated
+    cadence frames.
+    """
+
+    if not candidates:
+        return [], {
+            "policy": "adjacent_frozen_run_anchor_v1",
+            "candidate_count_before": 0,
+            "candidate_count_after": 0,
+            "dropped_candidate_count": 0,
+            "frozen_run_count": 0,
+            "exact_content_drop_count": 0,
+            "spatial_repeat_drop_count": 0,
+            "dropped_candidate_indices": [],
+            "frozen_runs": [],
+            "frozen_span_s": _distribution([]),
+            "frozen_span_total_s": 0.0,
+        }
+
+    retained: list[_Candidate] = []
+    dropped_indices: list[int] = []
+    frozen_runs: list[dict[str, Any]] = []
+    exact_drop_count = 0
+    spatial_drop_count = 0
+    anchor = candidates[0]
+    representative = anchor
+    last_in_run = anchor
+    run_candidates: list[_Candidate] = [anchor]
+    dropped_in_run = 0
+    run_drop_reasons: dict[str, int] = {"exact_content": 0, "spatial_repeat": 0}
+
+    def flush_run() -> None:
+        nonlocal anchor, representative, last_in_run, run_candidates, dropped_in_run
+        if dropped_in_run:
+            dropped_indices.extend(
+                int(candidate.index)
+                for candidate in run_candidates
+                if candidate is not representative
+            )
+            start_s = float(anchor.timestamp_s)
+            end_s = float(last_in_run.timestamp_s)
+            frozen_runs.append(
+                {
+                    "anchor_candidate_index": int(anchor.index),
+                    "representative_candidate_index": int(representative.index),
+                    "start_timestamp_s": start_s,
+                    "end_timestamp_s": end_s,
+                    "span_s": max(0.0, end_s - start_s),
+                    "dropped_count": int(dropped_in_run),
+                    "drop_reason_counts": dict(run_drop_reasons),
+                }
+            )
+        retained.append(representative)
+
+    for candidate in candidates[1:]:
+        duplicate, reason = _is_frozen_repeat(anchor, candidate)
+        if duplicate:
+            run_candidates.append(candidate)
+            dropped_in_run += 1
+            last_in_run = candidate
+            run_drop_reasons[reason] = run_drop_reasons.get(reason, 0) + 1
+            if reason == "exact_content":
+                exact_drop_count += 1
+            else:
+                spatial_drop_count += 1
+            if candidate.quality_score > representative.quality_score:
+                representative = candidate
+            continue
+        flush_run()
+        anchor = candidate
+        representative = candidate
+        last_in_run = candidate
+        run_candidates = [candidate]
+        dropped_in_run = 0
+        run_drop_reasons = {"exact_content": 0, "spatial_repeat": 0}
+    flush_run()
+
+    spans = [float(row["span_s"]) for row in frozen_runs]
+    summary = {
+        "policy": "adjacent_frozen_run_anchor_v1",
+        "candidate_count_before": len(candidates),
+        "candidate_count_after": len(retained),
+        "dropped_candidate_count": len(dropped_indices),
+        "frozen_run_count": len(frozen_runs),
+        "exact_content_drop_count": exact_drop_count,
+        "spatial_repeat_drop_count": spatial_drop_count,
+        "dropped_candidate_indices": dropped_indices,
+        "frozen_runs": frozen_runs,
+        "frozen_span_s": _distribution(spans),
+        "frozen_span_total_s": float(sum(spans)),
+    }
+    return retained, summary
+
+
 def _select_keyframes(
     candidates: list[_Candidate], settings: FramePreparationSettings
 ) -> tuple[
@@ -418,13 +840,31 @@ def _select_keyframes(
         return edge_cache[key]
 
     quality_floor = float(np.percentile([row.quality_score for row in candidates], 12.0))
-    bootstrap_end = min(
-        len(candidates) - 1,
-        max(0, int(round(0.50 * settings.candidate_fps))),
-    )
+    bootstrap_end = 0
+    bootstrap_start_s = float(candidates[0].timestamp_s)
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate.timestamp_s - bootstrap_start_s > 0.50:
+            break
+        bootstrap_end = candidate_index
     first = max(range(bootstrap_end + 1), key=lambda index: candidates[index].quality_score)
     selected = [first]
     reasons = {first: "bootstrap_quality"}
+
+    def append_selected(candidate_index: int, reason: str) -> bool:
+        """Append only a candidate that is not a frozen repeat of the anchor."""
+
+        if selected:
+            previous = selected[-1]
+            duplicate, _ = _is_frozen_repeat(
+                candidates[previous],
+                candidates[candidate_index],
+                edge(previous, candidate_index),
+            )
+            if duplicate:
+                return False
+        selected.append(candidate_index)
+        reasons[candidate_index] = reason
+        return True
 
     index = first + 1
     while index < len(candidates):
@@ -461,14 +901,12 @@ def _select_keyframes(
                     ),
                 )
                 if bridge > last:
-                    selected.append(bridge)
-                    reasons[bridge] = "connectivity_bridge"
-                    continue
+                    if append_selected(bridge, "connectivity_bridge"):
+                        continue
 
         if (novelty and quality_ok) or must_cover:
             reason = "viewpoint_change" if novelty and quality_ok else "coverage_interval"
-            selected.append(index)
-            reasons[index] = reason
+            append_selected(index, reason)
         index += 1
 
     last_candidate = len(candidates) - 1
@@ -477,8 +915,7 @@ def _select_keyframes(
         and candidates[last_candidate].timestamp_s - candidates[selected[-1]].timestamp_s
         >= settings.min_keyframe_interval_s * 0.70
     ):
-        selected.append(last_candidate)
-        reasons[last_candidate] = "walk_endpoint"
+        append_selected(last_candidate, "walk_endpoint")
 
     # Repair weak selected-to-selected links with dense temporal bridge candidates.
     repair_index = 0
@@ -493,8 +930,21 @@ def _select_keyframes(
             repair_index += 1
             continue
         midpoint = (candidates[left].timestamp_s + candidates[right].timestamp_s) * 0.5
+        valid_pool: list[int] = []
+        for candidate_index in pool:
+            left_repeat, _ = _is_frozen_repeat(
+                candidates[left], candidates[candidate_index], edge(left, candidate_index)
+            )
+            right_repeat, _ = _is_frozen_repeat(
+                candidates[candidate_index], candidates[right], edge(candidate_index, right)
+            )
+            if not left_repeat and not right_repeat:
+                valid_pool.append(candidate_index)
+        if not valid_pool:
+            repair_index += 1
+            continue
         bridge = max(
-            pool,
+            valid_pool,
             key=lambda candidate_index: (
                 min(
                     _edge_score(edge(left, candidate_index)),
@@ -518,6 +968,10 @@ def _select_keyframes(
             if elapsed > settings.max_keyframe_interval_s * 1.35:
                 continue
             if not bool(replacement["passes_connectivity"]):
+                continue
+            if _is_frozen_repeat(
+                candidates[left], candidates[right], replacement
+            )[0]:
                 continue
             current_value = (
                 0.50 * candidates[current].quality_score
@@ -571,6 +1025,78 @@ def prepare_video_frames(
     progress(0.03, "Inspecting the uploaded video")
     probe = probe_video(video_path)
     duration = probe.get("duration_s")
+
+    capture_timestamps_ns: list[int] | None = None
+    capture_report_path = scan_dir / "capture" / "capture_import.json"
+    capture_report_schema = ""
+    capture_report: dict[str, Any] = {}
+    use_native_acquisition_mapping = True
+    if capture_report_path.is_file():
+        try:
+            capture_report = json.loads(capture_report_path.read_text(encoding="utf-8"))
+            if isinstance(capture_report, dict):
+                capture_report_schema = str(capture_report.get("schema") or "")
+                android_timing = capture_report.get("android_capture")
+                if isinstance(android_timing, dict):
+                    use_native_acquisition_mapping = android_timing.get("camera_acquisition_timestamp_verified") is True
+                capture_video = capture_report.get("video")
+                if not isinstance(capture_video, dict):
+                    capture_video = {}
+                probe_timestamp_source = str(capture_video.get("timestamp_source") or "")
+                # Browser MediaRecorder WebM can omit container duration. The
+                # importer has already validated this encoded duration from
+                # ffprobe frame timestamps, so use it for preparation metrics
+                # while retaining the source in the prepared manifest.
+                if (
+                    capture_report_schema == BROWSER_CAPTURE_SCHEMA
+                    and (duration is None or duration <= 0.0)
+                ):
+                    encoded_duration = capture_video.get("encoded_duration_s")
+                    try:
+                        encoded_duration = float(encoded_duration)
+                    except (TypeError, ValueError):
+                        encoded_duration = None
+                    if (
+                        encoded_duration is not None
+                        and math.isfinite(encoded_duration)
+                        and encoded_duration > 0.0
+                    ):
+                        duration = encoded_duration
+                        probe["duration_s"] = encoded_duration
+                        probe["duration_source"] = "capture_import.video.encoded_duration_s"
+            else:
+                probe_timestamp_source = ""
+            # Browser callback/media observations are deliberately not source
+            # acquisition timestamps.  Keep normal encoded-PTS extraction for
+            # those captures. Android companion bundles use acquisition times
+            # only after the importer verifies their original encoded mapping.
+            if capture_report_schema != BROWSER_CAPTURE_SCHEMA and use_native_acquisition_mapping:
+                timestamp_path = scan_dir / "capture" / "video_timestamps_ns.json"
+                raw_timestamps = json.loads(timestamp_path.read_text(encoding="utf-8"))
+                if isinstance(raw_timestamps, list) and len(raw_timestamps) >= 2:
+                    capture_timestamps_ns = [int(value) for value in raw_timestamps]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise FramePreparationError(
+                f"sensor capture timestamp mapping is unreadable: {exc}"
+            ) from exc
+    else:
+        probe_timestamp_source = ""
+
+    capture_mode = (
+        "browser" if capture_report_schema == BROWSER_CAPTURE_SCHEMA
+        else "native_sensor_bundle" if capture_report_schema
+        else "uploaded_video"
+    )
+    motion, motion_summary = load_native_motion(
+        scan_dir / "capture", capture_report if isinstance(capture_report, dict) else {}
+    )
+    phone_calibration, phone_calibration_summary = calibration_for_video(
+        settings.phone_camera_calibration,
+        configured_capture_mode=settings.phone_camera_capture_mode,
+        capture_mode=capture_mode,
+        video=probe,
+    )
+
     candidate_fps = float(settings.candidate_fps)
     if isinstance(duration, (int, float)) and duration > 0.0:
         candidate_fps = min(candidate_fps, settings.max_candidate_frames / float(duration))
@@ -584,16 +1110,95 @@ def prepare_video_frames(
     with tempfile.TemporaryDirectory(prefix=".frame_candidates-", dir=scan_dir) as raw_temp:
         candidate_dir = Path(raw_temp)
         candidate_paths = _extract_candidates(
-            video_path, candidate_dir, candidate_fps, settings
+            video_path,
+            candidate_dir,
+            candidate_fps,
+            settings,
+            capture_timestamps_ns,
         )
+        exact_candidate_timestamps_ns: list[int] | None = None
+        exact_candidate_source_indices: list[int] | None = None
+        encoded_candidate_timestamps_s: list[float] | None = None
+        if capture_report_path.is_file() and capture_report_schema != BROWSER_CAPTURE_SCHEMA and use_native_acquisition_mapping:
+            try:
+                if capture_timestamps_ns:
+                    exact_candidate_timestamps_ns = [
+                        int(value)
+                        for value in json.loads(
+                            (candidate_dir / "candidate_timestamps_ns.json").read_text(encoding="utf-8")
+                        )
+                    ]
+                    exact_candidate_source_indices = [
+                        int(value)
+                        for value in json.loads(
+                            (candidate_dir / "candidate_source_indices.json").read_text(encoding="utf-8")
+                        )
+                    ]
+                else:
+                    exact_timestamps_s = json.loads(
+                        (candidate_dir / "candidate_timestamps_s.json").read_text(encoding="utf-8")
+                    )
+                    capture_epoch_ns = int(
+                        (json.loads(capture_report_path.read_text(encoding="utf-8"))
+                         .get("manifest", {})
+                         .get("clocks", {})
+                         .get("camera_start_time_ns") or 0)
+                    )
+                    exact_candidate_timestamps_ns = [
+                        int(round(float(value) * 1e9)) + capture_epoch_ns
+                        for value in exact_timestamps_s
+                    ]
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise FramePreparationError(
+                    f"exact sensor timestamp mapping is unreadable: {exc}"
+                ) from exc
+        elif not capture_timestamps_ns:
+            try:
+                encoded_candidate_timestamps_s = [
+                    float(value)
+                    for value in json.loads(
+                        (candidate_dir / "candidate_timestamps_s.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                ]
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise FramePreparationError(
+                    f"encoded candidate timestamp mapping is unreadable: {exc}"
+                ) from exc
         if len(candidate_paths) < 2:
             raise FramePreparationError(
                 f"MapAnything needs at least two useful views; only {len(candidate_paths)} candidate was extracted"
             )
         progress(0.20, f"Scoring {len(candidate_paths)} candidate views")
         candidates = _analyze_candidates(
-            candidate_paths, candidate_fps, settings.feature_edge_px, progress
+            candidate_paths,
+            candidate_fps,
+            settings.feature_edge_px,
+            progress,
+            exact_candidate_timestamps_ns,
+            exact_candidate_source_indices,
+            encoded_candidate_timestamps_s,
+            "encoded_pts" if encoded_candidate_timestamps_s is not None else probe_timestamp_source,
         )
+        raw_candidate_count = len(candidates)
+        if motion is not None:
+            for candidate in candidates:
+                candidate.imu_motion = motion.frame(candidate.capture_time_ns)
+                if candidate.imu_motion["status"] == "available":
+                    candidate.imu_motion["visual_quality_score_before_motion"] = candidate.quality_score
+                    candidate.quality_score = max(
+                        0.0, candidate.quality_score - candidate.imu_motion["visual_quality_penalty"]
+                    )
+            motion_summary["candidate_count_with_motion"] = sum(
+                row.imu_motion.get("status") == "available" for row in candidates
+            )
+        candidates, repeat_summary = _deduplicate_candidates(candidates)
+        if len(candidates) < 2:
+            raise FramePreparationError(
+                "MapAnything needs at least two useful views after removing "
+                f"{repeat_summary['dropped_candidate_count']} frozen repeat candidates"
+            )
         progress(0.52, "Selecting informative views and repairing overlap gaps")
         (
             selected,
@@ -606,6 +1211,17 @@ def prepare_video_frames(
         frame_paths = _extract_selected_frames(
             frames_dir, [candidates[index] for index in selected]
         )
+        calibration_rows = (
+            rectify_selected_frames(frame_paths, phone_calibration, phone_calibration_summary)
+            if phone_calibration is not None and phone_calibration_summary is not None
+            else [{} for _ in frame_paths]
+        )
+        if phone_calibration is not None:
+            # Keep the exact imported profile with this preparation. Its original
+            # archive/source fingerprints remain available after service changes.
+            (scan_dir / "phone_camera_calibration.json").write_text(
+                json.dumps(phone_calibration, indent=2) + "\n", encoding="utf-8"
+            )
 
         progress(0.76, "Building selected-view previews and provenance")
         frame_rows: list[dict[str, Any]] = []
@@ -654,17 +1270,32 @@ def prepare_video_frames(
             thumb_path = thumbs_dir / f"frame_{output_index:04d}.jpg"
             if not cv2.imwrite(str(thumb_path), thumb, [cv2.IMWRITE_JPEG_QUALITY, 84]):
                 raise FramePreparationError(f"failed to write thumbnail {thumb_path.name}")
+            frame_sha256 = _sha256(frame_path)
+            if calibration_rows[output_index]:
+                source_hash = calibration_rows[output_index]["calibration_processing"]["source_frame_sha256"]
+                calibration_rows[output_index]["calibration_processing"]["source_frame_id"] = prepared_frame_identity(
+                    output_index, source_hash
+                )
             frame_rows.append(
                 {
                     "index": output_index,
-                    "candidate_index": candidate_index,
+                    "frame_id": prepared_frame_identity(output_index, frame_sha256),
+                    "candidate_index": int(candidate.index),
                     "timestamp_s": candidate.timestamp_s,
+                    "capture_time_ns": candidate.capture_time_ns,
+                    "source_frame_index": candidate.source_frame_index,
+                    "timestamp_source": (
+                        candidate.timestamp_source
+                        or ("derived_candidate_period" if candidate.capture_time_ns is None else probe_timestamp_source)
+                    ),
                     "selection_reason": reasons.get(candidate_index, "adaptive_selection"),
                     "frame": str(frame_path.relative_to(scan_dir)),
                     "thumbnail": str(thumb_path.relative_to(scan_dir)),
                     "width": int(image.shape[1]),
                     "height": int(image.shape[0]),
-                    "sha256": _sha256(frame_path),
+                    "sha256": frame_sha256,
+                    **({"imu_motion": candidate.imu_motion} if candidate.imu_motion else {}),
+                    **calibration_rows[output_index],
                     "quality": {
                         "luminance_p10": candidate.luminance_p10,
                         "luminance_p50": candidate.luminance_p50,
@@ -701,10 +1332,12 @@ def prepare_video_frames(
     selection_summary = {
         "policy": "adaptive_quality_motion_overlap_connectivity_v1",
         "candidate_fps": candidate_fps,
-        "candidate_count": len(candidates),
+        "candidate_count": raw_candidate_count,
+        "candidate_count_after_repeat_dedup": len(candidates),
+        "repeat_dedup": repeat_summary,
         "selected_count": len(frame_rows),
         "pre_limit_selected_count": pre_limit_selected_count,
-        "rejected_candidate_count": len(candidates) - len(frame_rows),
+        "rejected_candidate_count": raw_candidate_count - len(frame_rows),
         "emergency_selected_limit": int(settings.max_selected_frames),
         "selection_limited": selection_limited,
         "min_keyframe_interval_s": float(settings.min_keyframe_interval_s),
@@ -744,6 +1377,8 @@ def prepare_video_frames(
             "selection": selection_summary,
         },
         "frames": frame_rows,
+        "imu_motion": motion_summary,
+        **({"camera_calibration": phone_calibration_summary} if phone_calibration_summary else {}),
     }
     manifest_path = scan_dir / "prepared_frames_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -751,13 +1386,16 @@ def prepare_video_frames(
     return {
         "probe": probe,
         "frame_count": len(frame_rows),
-        "candidate_count": len(candidates),
+        "candidate_count": raw_candidate_count,
+        "candidate_count_after_repeat_dedup": len(candidates),
         "effective_fps": effective_fps,
         "selection": selection_summary,
         "quality_warning_counts": warning_counts,
         "frames": frame_rows,
         "contact_sheet": str(contact_sheet.relative_to(scan_dir)),
         "manifest": str(manifest_path.relative_to(scan_dir)),
+        "imu_motion": motion_summary,
+        **({"camera_calibration": phone_calibration_summary} if phone_calibration_summary else {}),
     }
 
 

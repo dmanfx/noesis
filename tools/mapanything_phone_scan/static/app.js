@@ -1,13 +1,37 @@
 import * as THREE from "three";
 import { OrbitControls } from "/three/examples/controls/OrbitControls.js";
 import { GLTFLoader } from "/three/examples/loaders/GLTFLoader.js";
+import BrowserCapture from "./browser_capture.js?v=2.1.0";
+import CompanionCapture from "./companion_capture.js?v=1.0.1";
 
 const healthPill = document.querySelector("#health-pill");
 const scanList = document.querySelector("#scan-list");
 const scanDetail = document.querySelector("#scan-detail");
 const scanName = document.querySelector("#scan-name");
-const cameraInput = document.querySelector("#camera-video");
+const recordPhoneWalkButton = document.querySelector("#record-phone-walk-button");
 const existingInput = document.querySelector("#existing-video");
+const sensorBundleInput = document.querySelector("#sensor-bundle");
+const browserCapturePanel = document.querySelector("#browser-capture-panel");
+const browserPreview = document.querySelector("#browser-preview");
+const browserCloseButton = document.querySelector("#browser-close-button");
+const browserCaptureStatus = document.querySelector("#browser-capture-status");
+const browserCaptureError = document.querySelector("#browser-capture-error");
+const browserStartButton = document.querySelector("#browser-start-button");
+const browserStopButton = document.querySelector("#browser-stop-button");
+const browserDownloadButton = document.querySelector("#browser-download-button");
+const browserRetryButton = document.querySelector("#browser-retry-button");
+const browserDiscardButton = document.querySelector("#browser-discard-button");
+const browserAccelerometerCount = document.querySelector("#browser-accelerometer-count");
+const browserGyroscopeCount = document.querySelector("#browser-gyroscope-count");
+const browserVideoFrameCount = document.querySelector("#browser-video-frame-count");
+const browserCaptureBytes = document.querySelector("#browser-capture-bytes");
+const companionCameraSelect = document.querySelector("#companion-camera-select");
+const companionCameraStatus = document.querySelector("#companion-camera-status");
+const companionCaptureStatus = document.querySelector("#companion-capture-status");
+const companionHeartbeatStatus = document.querySelector("#companion-heartbeat-status");
+const browserMarkerButton = document.querySelector("#browser-marker-button");
+const browserMarkerRetryButton = document.querySelector("#browser-marker-retry-button");
+const companionStopRetryButton = document.querySelector("#companion-stop-retry-button");
 const uploadPanel = document.querySelector("#upload-panel");
 const uploadLabel = document.querySelector("#upload-label");
 const uploadPercent = document.querySelector("#upload-percent");
@@ -17,6 +41,9 @@ const newWalkButton = document.querySelector("#new-walk-button");
 const captureCard = document.querySelector(".capture-card");
 const workspace = document.querySelector(".workspace");
 const toast = document.querySelector("#toast");
+const secureCaptureNote = document.querySelector("#secure-capture-note");
+const secureCaptureLink = document.querySelector("#secure-capture-link");
+const secureCaptureCaLink = document.querySelector("#secure-capture-ca-link");
 
 const NEW_WALK_MODE_KEY = "phoneScanNewWalkMode";
 const LONG_PRESS_MS = 650;
@@ -35,9 +62,41 @@ let suppressScanClicksUntil = 0;
 let alignmentTargets = [];
 let alignmentReleaseId = null;
 let pcfPausesAppliance = false;
+let pairedStaticAlignmentAvailable = false;
+let browserBundleUploadFailed = false;
+
+function handleCompanionFailure(error) {
+  const message = error?.message || "The static room camera or tracking stream became unavailable.";
+  toastMessage(`${message} The phone capture will stop and remain available for download or retry.`);
+  if (browserCapture?.isRecording) void browserCapture.stop("companion_capture_lost").catch(() => {});
+}
+
+const companionCapture = new CompanionCapture({
+  onStateChange: renderCompanionCaptureState,
+  onFailure: handleCompanionFailure,
+});
+
+const browserCapture = new BrowserCapture({
+  onStateChange: renderBrowserCaptureState,
+  onBundleReady: handleBrowserBundleReady,
+  onBeforeFinalize: async ({ reason }) => {
+    if (companionCapture.needsServerStop) {
+      try {
+        await companionCapture.stop(reason || "user");
+      } catch (error) {
+        // The phone TAR remains authoritative local evidence even when the
+        // static stop request fails or times out.
+        toastMessage(`Static capture stop failed: ${error.message || error}. Phone capture was preserved.`);
+      }
+    }
+    browserCapture.setCompanionCapture(companionCapture.companionContext());
+  },
+});
 
 const statusLabels = {
   uploading: "Uploading",
+  importing_capture: "Validating received capture",
+  import_failed: "Capture validation needs attention",
   processing_frames: "Preparing frames",
   ready: "Ready for inference",
   frame_failed: "Frame preparation failed",
@@ -47,6 +106,8 @@ const statusLabels = {
   da3_queued: "DA3 queued",
   da3_running: "DA3 running",
   da3_failed: "DA3 failed",
+  vio_queued: "OpenVINS queued",
+  vio_running: "OpenVINS running",
   complete: "Complete",
 };
 
@@ -101,6 +162,17 @@ function alignmentTargetFor(cameraId) {
   return alignmentTargets.find((target) => target.camera_id === cameraId) || null;
 }
 
+function companionCaptureFor(scan) {
+  return scan?.companion_capture || scan?.capture?.companion_capture || null;
+}
+
+function pairedCameraIdFor(scan) {
+  const companion = companionCaptureFor(scan);
+  const sessionId = typeof companion?.session_id === "string" ? companion.session_id.trim() : "";
+  const cameraId = typeof companion?.camera_id === "string" ? companion.camera_id.trim() : "";
+  return sessionId && cameraId ? cameraId : "";
+}
+
 function cameraLabel(cameraId) {
   const configured = alignmentTargetFor(cameraId)?.label;
   if (configured) return configured;
@@ -112,27 +184,85 @@ function cameraLabel(cameraId) {
     .join(" ");
 }
 
-function alignmentTargetControls(selectedCameraId, buttonLabel) {
-  const selectedIsAvailable = Boolean(alignmentTargetFor(selectedCameraId));
-  const options = alignmentTargets.map((target) => `
-    <option value="${escapeHtml(target.camera_id)}" ${target.camera_id === selectedCameraId ? "selected" : ""}>
+function alignmentTargetControls(scan, selectedCameraId, buttonLabel) {
+  const pairedCameraId = pairedCameraIdFor(scan);
+  const selectedId = pairedCameraId || selectedCameraId;
+  const pairedCapabilityReady = !pairedCameraId || pairedStaticAlignmentAvailable;
+  const selectedIsAvailable = pairedCapabilityReady && Boolean(alignmentTargetFor(selectedId));
+  const targets = pairedCameraId
+    ? alignmentTargets.filter((target) => target.camera_id === pairedCameraId)
+    : alignmentTargets;
+  const options = targets.length
+    ? targets.map((target) => `
+    <option value="${escapeHtml(target.camera_id)}" ${target.camera_id === selectedId ? "selected" : ""}>
       ${escapeHtml(target.label)} camera
-    </option>`).join("");
+    </option>`).join("")
+    : pairedCameraId
+      ? `<option value="" selected disabled>${escapeHtml(cameraLabel(pairedCameraId))} camera is unavailable in the active release</option>`
+      : "";
   const releaseNote = alignmentReleaseId
     ? `Validated scene release: ${escapeHtml(alignmentReleaseId)}`
     : "No validated scene release is available";
+  const sourceLabel = pairedCameraId ? "Paired static camera" : "Saved static camera for this room";
+  const sourceNote = pairedCameraId
+    ? !pairedStaticAlignmentAvailable
+      ? "Paired alignment is being updated; wait for the updated service before aligning."
+      : selectedIsAvailable
+        ? "Uses the static video recorded alongside this walk."
+        : `Paired session ${escapeHtml(companionCaptureFor(scan)?.session_id)} has no matching validated target.`
+    : releaseNote;
+  const chooseOption = pairedCameraId && !targets.length
+    ? ""
+    : `<option value="" ${selectedIsAvailable ? "" : "selected"}>Choose camera…</option>`;
   return `
     <div class="alignment-actions">
       <label class="provider-picker alignment-picker">
-        <span>Static camera for this room</span>
-        <select id="alignment-target" ${alignmentTargets.length ? "" : "disabled"}>
-          <option value="" ${selectedIsAvailable ? "" : "selected"}>Choose camera…</option>
+        <span>${sourceLabel}</span>
+        <select id="alignment-target" ${targets.length ? "" : "disabled"} ${pairedCameraId ? "disabled" : ""}>
+          ${chooseOption}
           ${options}
         </select>
-        <small>${releaseNote}</small>
+        <small>${sourceNote}</small>
       </label>
-      <button id="align-noesis" class="primary-button" type="button" ${selectedIsAvailable ? "" : "disabled"}>${escapeHtml(buttonLabel)}</button>
+      <button id="align-noesis" class="primary-button" type="button" ${selectedIsAvailable ? "" : "disabled"} data-paired-camera-id="${escapeHtml(pairedCameraId)}">${escapeHtml(buttonLabel)}</button>
     </div>`;
+}
+
+function staticReferencePanel(scan) {
+  const reference = scan?.alignment?.static_reference || scan?.static_reference || null;
+  if (!reference || typeof reference !== "object") return "";
+  const rawStatus = typeof reference.status === "string" ? reference.status.toLowerCase() : "unknown";
+  const statusLabel = {
+    building: "Building",
+    complete: "Ready",
+    failed: "Failed",
+  }[rawStatus] || rawStatus;
+  const message = typeof reference.message === "string" ? reference.message : "";
+  const error = typeof reference.error === "string" ? reference.error : "";
+  const artifactUrls = reference.artifact_urls && typeof reference.artifact_urls === "object"
+    ? reference.artifact_urls
+    : {};
+  const artifactLabels = {
+    keyframe: "Static keyframe",
+    static_keyframe: "Static keyframe",
+    depth_preview: "Static depth preview",
+    manifest: "Static reference manifest",
+    points: "Static reference points",
+    static_points: "Static reference points",
+  };
+  const links = Object.entries(artifactUrls)
+    .filter(([, url]) => typeof url === "string" && url)
+    .map(([name, url]) => {
+      const label = artifactLabels[name] || name.replaceAll("_", " ");
+      return `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`;
+    })
+    .join("");
+  const detail = error
+    ? `<div class="error-box">${escapeHtml(error)}</div>`
+    : message
+      ? `<p class="alignment-note">${escapeHtml(message)}</p>`
+      : "";
+  return `<div class="status-panel alignment-static-reference"><div class="status-line"><span>Static reference build</span><b>${escapeHtml(statusLabel)}</b></div>${detail}${links ? `<div class="artifact-row">${links}</div>` : ""}</div>`;
 }
 
 function toastMessage(message) {
@@ -140,6 +270,140 @@ function toastMessage(message) {
   toast.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.add("hidden"), 3600);
+}
+
+function companionHeartbeatAge(status) {
+  const heartbeat = status?.lastHeartbeat;
+  if (!heartbeat) return "no heartbeat yet";
+  const current = performance.now?.() ?? 0;
+  const age = Math.max(0, current - Number(heartbeat.client_monotonic_ms || current));
+  return `${(age / 1000).toFixed(1)}s ago`;
+}
+
+function renderCompanionCaptureState(status = companionCapture.status) {
+  if (!companionCameraSelect) return;
+  const cameras = Array.isArray(status?.cameras) ? status.cameras : [];
+  const selected = status?.selectedCameraId || "";
+  const active = ["starting", "recording", "stopping", "finalizing"].includes(status?.state);
+  const options = ['<option value="">Choose the room camera…</option>']
+    .concat(cameras.map((camera) => {
+      const label = camera.label || camera.camera_id;
+      const availability = camera.available === true ? "" : ` · unavailable${camera.reason ? `: ${camera.reason}` : ""}`;
+      return `<option value="${escapeHtml(camera.camera_id)}" ${camera.camera_id === selected ? "selected" : ""} ${camera.available === true ? "" : "disabled"}>${escapeHtml(label)}${escapeHtml(availability)}</option>`;
+    }));
+  const currentOptions = companionCameraSelect.innerHTML;
+  const nextOptions = options.join("");
+  if (currentOptions !== nextOptions) companionCameraSelect.innerHTML = nextOptions;
+  companionCameraSelect.value = selected;
+  companionCameraSelect.disabled = active || !status?.camerasAvailable;
+
+  const availableCount = cameras.filter((camera) => camera.available === true).length;
+  if (!status?.camerasAvailable) {
+    companionCameraStatus.textContent = status?.cameraReason || "No available static room cameras were reported by the appliance.";
+  } else if (active) {
+    companionCameraStatus.textContent = `${availableCount} room camera${availableCount === 1 ? "" : "s"} available · selected ${status.cameraId || selected}`;
+  } else if (selected) {
+    companionCameraStatus.textContent = "Selected camera is required for the paired recording.";
+  } else {
+    companionCameraStatus.textContent = "Choose the physically installed room camera before starting the walk.";
+  }
+
+  const staticStatus = status?.state === "recording"
+    ? `Static camera recording · video ${status.videoStatus || "unknown"} · tracking ${status.trackingStatus || "unknown"}`
+    : status?.state === "stopping" || status?.state === "finalizing"
+      ? `Static capture ${status.state} · finalizing server recording`
+      : status?.state === "stopped"
+        ? "Static capture finalized"
+        : status?.state === "failed"
+          ? `Static capture failed${status.error ? `: ${status.error.message || status.error}` : ""}`
+          : "Static capture is required before phone recording starts";
+  if (companionCaptureStatus) companionCaptureStatus.textContent = staticStatus;
+  if (companionHeartbeatStatus) {
+    const heartbeat = status?.lastHeartbeat;
+    const sequence = heartbeat?.tracking_sequence === null || heartbeat?.tracking_sequence === undefined ? "sequence unavailable" : `tracking sequence ${heartbeat.tracking_sequence}`;
+    companionHeartbeatStatus.textContent = status?.state === "recording"
+      ? `Heartbeat ${companionHeartbeatAge(status)} · ${sequence}`
+      : status?.clockProbeCount ? `${status.clockProbeCount} server clock probes retained` : "No static session yet";
+  }
+  if (browserMarkerButton) {
+    browserMarkerButton.disabled = status?.state !== "recording";
+    browserMarkerButton.classList.toggle("hidden", status?.state !== "recording");
+  }
+  if (browserMarkerRetryButton) {
+    browserMarkerRetryButton.disabled = status?.pendingMarkerCount <= 0 || status?.state !== "recording";
+    browserMarkerRetryButton.classList.toggle("hidden", status?.pendingMarkerCount <= 0);
+  }
+  if (companionStopRetryButton) {
+    companionStopRetryButton.disabled = status?.state === "recording" || !status?.needsServerStop;
+    companionStopRetryButton.classList.toggle("hidden", !status?.needsServerStop || status?.state === "recording");
+  }
+  if (browserStartButton) {
+    const phoneReady = browserCapture.status.state === "ready" && browserCapture.status.ready === true;
+    browserStartButton.disabled = !phoneReady || !companionCapture.readyToStart;
+  }
+}
+
+function renderBrowserCaptureState(status) {
+  if (!browserCapturePanel) return;
+  const state = status?.state || "idle";
+  const counts = status?.counts || {};
+  const error = status?.error;
+  browserAccelerometerCount.textContent = Number(counts.accelerometer || 0).toLocaleString();
+  browserGyroscopeCount.textContent = Number(counts.gyroscope || 0).toLocaleString();
+  browserVideoFrameCount.textContent = Number(status?.videoFrames || 0).toLocaleString();
+  browserCaptureBytes.textContent = formatBytes(status?.bytes || 0);
+  const cameraSettings = status?.camera?.settings;
+  const modeStatus = document.querySelector("#browser-mode-status");
+  if (modeStatus) modeStatus.textContent = `${cameraSettings ? `Camera reports ${cameraSettings.width} × ${cameraSettings.height}. Encoded dimensions will be checked on upload.` : "Requests unscaled rear-camera 8K; unsupported modes stop setup."} Synchronization is unverified: this browser recorder cannot associate IMU acquisition times with encoded frames. The bounded capture holds about ${status?.estimatedMaxVideoSeconds || 31}s at the requested bitrate; actual capacity varies.`;
+  renderCompanionCaptureState(companionCapture.status);
+  browserStartButton.disabled = state !== "ready" || status.ready !== true || !companionCapture.readyToStart;
+  browserStopButton.disabled = state !== "recording";
+  browserCloseButton.disabled = ["recording", "stopping"].includes(state) || companionCapture.needsServerStop;
+  browserDownloadButton.classList.toggle("hidden", !status.bundle);
+  browserRetryButton.classList.toggle("hidden", !status.bundle || !browserBundleUploadFailed);
+  browserDiscardButton.classList.toggle("hidden", !status.bundle);
+  const modeLabel = status.sensorMode === "devicemotion_fallback"
+    ? "DeviceMotion fallback (event timestamps, rotation converted from deg/s)"
+    : status.sensorMode === "generic_sensor" ? "Generic Sensor API" : "sensor setup";
+  const messages = {
+    idle: "Camera and motion permission are required.",
+    starting: "Requesting camera and motion access…",
+    waiting_sensors: "Keep the phone stationary while both sensor streams initialize.",
+    ready: `8K camera preview and both sensor streams are progressing (${modeLabel}). Choose the static room camera. This records video and motion observations; synchronized capture requires the native recorder.`,
+    recording: `Recording phone camera + motion with the selected static room capture (${modeLabel}). Walk slowly; ${Math.round(Number(status.durationMs || 0) / 1000)}s elapsed.`,
+    stopping: "Stopping the phone recorder and finalizing the static capture…",
+    complete: browserBundleUploadFailed ? "Capture is still in this tab. Retry upload or download before closing." : "Capture is ready. Video and motion are saved together. Timing and calibration still need checking before IMU-based reconstruction.",
+    closed: "Browser capture is closed.",
+    error: browserBundleUploadFailed && status.bundle ? "Capture is still in this tab. Retry upload or download before closing." : error?.message || "Browser capture stopped with an error. Any partial capture remains available for download or retry.",
+  };
+  browserCaptureStatus.textContent = messages[state] || "Browser capture ready.";
+  browserCaptureError.classList.toggle("hidden", !error);
+  if (error) {
+    const help = error.helpUrl ? ` <a href="${escapeHtml(error.helpUrl)}" target="_blank" rel="noopener">secure-context guidance</a>` : "";
+    browserCaptureError.innerHTML = `${escapeHtml(error.message || String(error))}${help}`;
+  } else {
+    browserCaptureError.textContent = "";
+  }
+}
+
+function browserCaptureBlocked(action = "start another upload") {
+  if (!browserCapture.hasUnsavedWork() && !companionCapture.hasUnsavedWork()) return false;
+  browserCapturePanel?.classList.remove("hidden");
+  toastMessage(`Finish or retry the current browser capture before you ${action}. Download it if you need a local copy.`);
+  browserCapturePanel?.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
+}
+
+function handleBrowserBundleReady(bundle, status) {
+  browserBundleUploadFailed = false;
+  renderBrowserCaptureState(status);
+  if (!bundle?.uploadable) {
+    browserBundleUploadFailed = true;
+    renderBrowserCaptureState(browserCapture.status);
+    toastMessage("The browser bundle is available for download, but its byte limit prevents upload.");
+    return;
+  }
+  uploadSensorBundle(bundle.blob, { fileName: bundle.fileName, fromBrowser: true });
 }
 
 function setScanDetailVisible(visible) {
@@ -181,12 +445,17 @@ function startNewWalk() {
     toastMessage("The current walk is still uploading. It will open as soon as it is safely saved.");
     return;
   }
+  if (browserCaptureBlocked("start a new walk")) return;
+  if (["starting", "waiting_sensors", "ready", "complete", "error"].includes(browserCapture.status.state)) {
+    void browserCapture.close();
+    browserCapturePanel.classList.add("hidden");
+  }
+  if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
   newWalkMode = true;
   selectedId = null;
   localStorage.setItem(NEW_WALK_MODE_KEY, "1");
   localStorage.removeItem("phoneScanSelected");
   scanName.value = "Phone room walk";
-  cameraInput.value = "";
   existingInput.value = "";
   uploadPanel.classList.add("hidden");
   outputPage = 0;
@@ -311,23 +580,49 @@ async function refreshHealth() {
     const health = await jsonFetch("/api/health");
     healthPill.textContent = `${health.device} · adaptive views · ${health.max_selected_frames} emergency max`;
     healthPill.className = "health-pill online";
+    const calibrationNote = document.querySelector("#phone-calibration-note");
+    const phoneCalibration = health.phone_camera_calibration;
+    if (calibrationNote) {
+      calibrationNote.classList.toggle("hidden", !phoneCalibration);
+      if (phoneCalibration) {
+        const resolution = (phoneCalibration.resolution || []).join(" × ");
+        const mode = { uploaded_video: "uploaded videos", browser: "browser recordings", native_sensor_bundle: "native camera recordings" }[phoneCalibration.capture_mode];
+        calibrationNote.textContent = mode
+          ? `Phone calibration is available for ${resolution} ${mode} made with the same lens and capture settings as the calibration video.`
+          : `Phone calibration imported (${resolution}). Its recording mode must be matched before it can be applied.`;
+      }
+    }
+    const secureUrl = typeof health.secure_capture_url === "string" ? health.secure_capture_url : "";
+    const caUrl = typeof health.ca_certificate_url === "string" ? health.ca_certificate_url : "";
+    const showSecureHint = location.protocol !== "https:" && Boolean(secureUrl);
+    secureCaptureNote.classList.toggle("hidden", !showSecureHint);
+    if (showSecureHint) {
+      secureCaptureLink.href = secureUrl;
+      secureCaptureLink.textContent = secureUrl;
+      secureCaptureCaLink.classList.toggle("hidden", !caUrl);
+      if (caUrl) secureCaptureCaLink.href = caUrl;
+    }
     const nextTargets = Array.isArray(health.alignment_targets)
       ? health.alignment_targets.filter((target) => target?.camera_id && target?.revision_id)
       : [];
     const nextReleaseId = health.alignment_release_id || null;
     const nextPcfPausesAppliance = health.pcf_pauses_appliance === true;
+    const nextPairedStaticAlignmentAvailable = health.paired_static_alignment_available === true;
     const alignmentConfigChanged = JSON.stringify([
       alignmentTargets,
       alignmentReleaseId,
       pcfPausesAppliance,
+      pairedStaticAlignmentAvailable,
     ]) !== JSON.stringify([
       nextTargets,
       nextReleaseId,
       nextPcfPausesAppliance,
+      nextPairedStaticAlignmentAvailable,
     ]);
     alignmentTargets = nextTargets;
     alignmentReleaseId = nextReleaseId;
     pcfPausesAppliance = nextPcfPausesAppliance;
+    pairedStaticAlignmentAvailable = nextPairedStaticAlignmentAvailable;
     if (alignmentConfigChanged) {
       lastDetailFingerprint = "";
       renderSelected();
@@ -335,6 +630,11 @@ async function refreshHealth() {
   } catch (error) {
     healthPill.textContent = "Tool offline";
     healthPill.className = "health-pill offline";
+    if (pairedStaticAlignmentAvailable) {
+      pairedStaticAlignmentAvailable = false;
+      lastDetailFingerprint = "";
+      renderSelected();
+    }
   }
 }
 
@@ -362,14 +662,15 @@ function renderScanList() {
 
 function statusPanel(scan) {
   const progress = Math.round(Math.max(0, Math.min(1, Number(scan.progress || 0))) * 100);
-  const running = ["uploading", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status);
+  const importing = scan.status === "importing_capture";
+  const running = ["uploading", "importing_capture", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status);
   return `
     <div class="status-panel">
       <div class="status-line">
         <span>${escapeHtml(scan.message || statusLabels[scan.status] || scan.status)}</span>
-        <b>${running ? `${progress}%` : escapeHtml(statusLabels[scan.status] || scan.status)}</b>
+        <b>${importing ? (scan.upload_import?.phase === "queued" ? "Queued" : "Validating") : running ? `${progress}%` : escapeHtml(statusLabels[scan.status] || scan.status)}</b>
       </div>
-      ${running ? `<div class="progress-track"><span style="width:${progress}%"></span></div>` : ""}
+      ${running && !importing ? `<div class="progress-track"><span style="width:${progress}%"></span></div>` : ""}
       ${scan.error ? `<div class="error-box">${escapeHtml(scan.error)}</div>` : ""}
     </div>`;
 }
@@ -379,6 +680,11 @@ function preparedSection(scan) {
   if (!prepared) return "";
   const selection = prepared.selection || {};
   const warnings = prepared.quality_warning_counts || {};
+  const calibration = prepared.camera_calibration;
+  const calibrationMessage = !calibration ? ""
+    : calibration.status === "applied" ? "Phone camera calibration applied; lens distortion corrected."
+    : calibration.reason_codes?.includes("capture_mode_not_bound") ? "Phone calibration is registered; its recording mode has not been matched yet."
+    : "Phone calibration was not applied: this recording does not match its capture mode, dimensions, or orientation.";
   const warningHtml = Object.entries(warnings)
     .filter(([, count]) => Number(count) > 0)
     .map(([name, count]) => `<span class="warning-chip">${escapeHtml(name.replaceAll("_", " "))}: ${Number(count)}</span>`)
@@ -397,6 +703,7 @@ function preparedSection(scan) {
       <div class="stat"><b>${formatDuration(prepared.probe?.duration_s)}</b><span>Video duration</span></div>
       <div class="stat"><b>${Number(selection.adjacent_connectivity_pass_fraction ?? 0).toLocaleString(undefined, { style: "percent", maximumFractionDigits: 0 })}</b><span>Connected view pairs</span></div>
     </div>
+    ${calibrationMessage ? `<p class="microcopy">${escapeHtml(calibrationMessage)}</p>` : ""}
     ${selection.selection_limited ? '<div class="warning-row"><span class="warning-chip">Emergency view ceiling reached</span></div>' : ""}
     ${warningHtml ? `<div class="warning-row">${warningHtml}</div>` : ""}
     <div class="media-panel">
@@ -405,6 +712,58 @@ function preparedSection(scan) {
     </div>
     <div class="subheading"><div><span class="eyebrow">Prepared input</span><h3>Adaptive reconstruction views</h3></div><span class="status-badge">First ${Math.min(24, prepared.frame_count)} shown</span></div>
     <div class="thumb-grid">${thumbs}</div>`;
+}
+
+function companionCaptureSection(companion) {
+  if (!companion) return "";
+  const links = Object.entries(companion.artifact_urls || {})
+    .filter(([, url]) => typeof url === "string" && url)
+    .slice(0, 12)
+    .map(([name, url]) => `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(name.replaceAll("_", " "))}</a>`)
+    .join("");
+  return `<div class="companion-result"><div><span class="eyebrow">Paired static room recording</span><p><b>${escapeHtml(companion.camera_id || "Selected room camera")}</b> · ${escapeHtml(companion.status || "unknown")}</p><p>Retained with this phone walk for independent room reconstruction and alignment.</p><div class="sensor-checks"><span>video: ${escapeHtml(companion.video_status || companion.recorder?.status || "unknown")}</span><span>tracking: ${escapeHtml(companion.tracking_status || companion.tracking?.status || "unknown")}</span><span>${Number(companion.clock_probes?.length || 0)} clock probes</span></div>${companion.error ? `<p class="error-box">${escapeHtml(companion.error)}</p>` : ""}</div>${links ? `<div class="artifact-row">${links}</div>` : ""}</div>`;
+}
+
+function captureSection(scan) {
+  const capture = scan.capture || (scan.companion_capture ? { schema: "noesis.phone_capture.browser.v1", companion_capture: scan.companion_capture } : null);
+  if (!capture) return "";
+  const isBrowserCapture = capture.schema === "noesis.phone_capture.browser.v1"
+    || capture.kind === "browser"
+    || scan.input_mode === "browser_capture";
+  if (isBrowserCapture) {
+    const sensors = capture.sensors || {};
+    const accel = sensors.accelerometer || {};
+    const gyro = sensors.gyroscope || {};
+    const count = (sensor) => Number(sensor.sample_count ?? sensor.samples?.length ?? 0).toLocaleString();
+    const durationMs = Number(capture.timing?.duration_ms ?? 0);
+    const stopReason = capture.stop_reason || scan.stop_reason || "unknown";
+    const manifestUrl = capture.manifest_url || capture.urls?.manifest || scan.urls?.capture_manifest;
+    const videoUrl = capture.video_url || capture.urls?.video || scan.video?.url;
+    const links = [
+      manifestUrl ? `<a class="artifact-link" href="${escapeHtml(manifestUrl)}" target="_blank" rel="noopener">Capture manifest</a>` : "",
+      videoUrl ? `<a class="artifact-link" href="${escapeHtml(videoUrl)}" target="_blank" rel="noopener">Captured video</a>` : "",
+    ].filter(Boolean).join("");
+    const companionHtml = companionCaptureSection(capture.companion_capture || scan.companion_capture);
+    return `<div class="ready-callout sensor-callout browser-saved-capture"><div><span class="eyebrow">Browser camera + IMU</span><h3>${escapeHtml(capture.device?.model || "Browser capture")}</h3><p>Video and motion were collected in this browser session. Timing and calibration still need checking before IMU-based reconstruction.</p><div class="sensor-checks"><span>${count(accel)} accelerometer samples</span><span>${count(gyro)} gyroscope samples</span><span>${formatDuration(durationMs / 1000)} captured</span><span>stop reason: ${escapeHtml(stopReason)}</span></div></div>${links ? `<div class="artifact-row">${links}</div>` : ""}${companionHtml}</div>`;
+  }
+  const vio = scan.vio || {};
+  const metricReady = capture.metric_vio_allowed === true;
+  const running = ["queued", "running"].includes(vio.status);
+  const canRun = metricReady && scan.prepared && !running && [undefined, "failed"].includes(vio.status);
+  const status = running
+    ? `<div class="status-panel"><div class="status-line"><span>${escapeHtml(vio.message || "Running OpenVINS")}</span><b>${Math.round(Number(vio.progress || 0) * 100)}%</b></div><div class="progress-track"><span style="width:${Math.round(Number(vio.progress || 0) * 100)}%"></span></div></div>`
+    : vio.status === "failed" ? `<div class="error-box">${escapeHtml(vio.error || "OpenVINS failed")}</div>` : "";
+  const result = vio.status === "complete" && vio.results ? `<span class="status-badge aligned-badge">${Number(vio.results.poses?.length || 0)} camera poses · metric VIO</span>` : "";
+  const motion = scan.prepared?.imu_motion;
+  const motionText = motion?.status === "available"
+    ? `IMU motion was used to score ${Number(motion.candidate_count_with_motion || 0)} candidate views. Exact frame timestamps, angular speed, and acceleration evidence are retained in the frame manifest.`
+    : "Raw IMU streams are retained with the phone video for later analysis.";
+  const links = [
+    [scan.video?.url, "Phone video"], [capture.imu_normalized_url, "IMU samples"],
+    [capture.video_timestamps_url, "Frame timestamps"], [capture.import_report_url, "Capture evidence"],
+    [capture.manifest_url, "Capture manifest"], [scan.prepared?.manifest_url, "Frame motion evidence"],
+  ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>`).join("");
+  return `<div class="ready-callout sensor-callout"><div><span class="eyebrow">Native phone video + IMU</span><h3>${escapeHtml(capture.device?.model || "Camera + IMU bundle")}</h3><p>${escapeHtml(motionText)}</p><p>${metricReady ? "Calibration and coverage admit metric VIO." : "Metric camera poses require validated camera/IMU calibration; this does not prevent capture or reconstruction."}</p></div><div class="sensor-actions">${result}${canRun ? '<button id="initiate-vio" class="primary-button" type="button">Run OpenVINS</button>' : ""}</div>${links ? `<div class="artifact-row">${links}</div>` : ""}${companionCaptureSection(capture.companion_capture || scan.companion_capture)}</div>${status}`;
 }
 
 function outputFrameCards(outputs) {
@@ -440,21 +799,34 @@ function outputFrameCards(outputs) {
 function alignmentSection(scan) {
   const alignment = scan.alignment;
   if (!alignment) {
-    return `<div class="ready-callout alignment-callout"><div><h3>Register this walk to the correct room camera.</h3><p>Choose the static camera physically installed in this room. The tool will preserve metric scale and gravity, fit against that camera's validated reconstruction, and reject ambiguous fits.</p></div>${alignmentTargetControls("", "Align to selected camera")}</div>`;
+    const paired = Boolean(pairedCameraIdFor(scan));
+    const heading = paired ? "Register this walk to its paired room camera." : "Register this walk to the correct room camera.";
+    const note = paired
+      ? pairedStaticAlignmentAvailable
+        ? "Alignment will build a static reference from the camera video recorded alongside this walk."
+        : "Paired alignment is being updated; wait for the updated service before starting."
+      : "Choose the static camera physically installed in this room. The tool will preserve metric scale and gravity, fit against that camera's validated reconstruction, and reject ambiguous fits.";
+    return `<div class="ready-callout alignment-callout"><div><h3>${heading}</h3><p>${note}</p></div>${alignmentTargetControls(scan, "", "Align to selected camera")}</div>${staticReferencePanel(scan)}`;
   }
   if (["queued", "running"].includes(alignment.status)) {
     const progress = Math.round(Math.max(0, Math.min(1, Number(alignment.progress || 0))) * 100);
-    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Aligning to Noesis")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div><p class="alignment-target-note">Target: ${escapeHtml(cameraLabel(alignment.target_camera_id))} · ${escapeHtml(alignment.target_revision_id || "validated revision")}</p></div>`;
+    const source = alignment.target_kind === "paired_static" || pairedCameraIdFor(scan)
+      ? "paired static recording"
+      : "saved static reference";
+    const revisionLabel = alignment.target_revision_id || "reference being prepared";
+    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Aligning to Noesis")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div><p class="alignment-target-note">Target: ${escapeHtml(cameraLabel(alignment.target_camera_id))} · ${escapeHtml(revisionLabel)} · ${source}</p>${staticReferencePanel(scan)}</div>`;
   }
   if (alignment.status === "failed") {
-    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Noesis alignment failed")}</span><b>Not aligned</b></div><div class="error-box">${escapeHtml(alignment.error || "The automatic fit did not pass its quality gate.")}</div><p class="alignment-target-note">Previous target: ${escapeHtml(cameraLabel(alignment.target_camera_id))}</p>${alignmentTargetControls(alignment.target_camera_id || "", "Try selected camera")}</div>`;
+    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Noesis alignment failed")}</span><b>Not aligned</b></div><div class="error-box">${escapeHtml(alignment.error || "The automatic fit did not pass its quality gate.")}</div><p class="alignment-target-note">Previous target: ${escapeHtml(cameraLabel(alignment.target_camera_id))}</p>${staticReferencePanel(scan)}${alignmentTargetControls(scan, alignment.target_camera_id || "", "Try selected camera")}</div>`;
   }
   const results = alignment.results;
-  if (alignment.status !== "complete" || !results) return "";
+  if (alignment.status !== "complete" || !results) return staticReferencePanel(scan);
   const urls = results.artifact_urls || {};
   const vertical = results.vertical_structure || {};
   const full = results.full_cloud || {};
   const reprojection = results.fixed_camera_reprojection || {};
+  const paired = alignment.target_kind === "paired_static" || Boolean(pairedCameraIdFor(scan));
+  const targetLabel = cameraLabel(results.target_camera_id || alignment.target_camera_id);
   const links = [
     [urls.aligned_phone_glb, "Aligned RGB GLB"],
     [urls.comparison_glb, "Noesis comparison GLB"],
@@ -463,9 +835,9 @@ function alignmentSection(scan) {
     [urls.camera_solution_npz, "Aligned solution NPZ"],
     [urls.report, "Quality report"],
   ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${url}" target="_blank" rel="noopener">${label}</a>`).join("");
-  return `
-    <div class="subheading"><div><span class="eyebrow">Noesis registration</span><h3>${escapeHtml(cameraLabel(results.target_camera_id || alignment.target_camera_id))} alignment passed</h3></div><span class="status-badge aligned-badge">Backend world · metric</span></div>
-    <p class="alignment-note">This is a saved, quality-gated review candidate aligned against ${escapeHtml(results.target_revision_id || alignment.target_revision_id || "the selected revision")}. It has not changed or promoted the live Noesis world.</p>
+  return `${staticReferencePanel(scan)}
+    <div class="subheading"><div><span class="eyebrow">Noesis registration</span><h3>${escapeHtml(targetLabel)} alignment passed</h3></div><span class="status-badge aligned-badge">Backend world · metric</span></div>
+    <p class="alignment-note">This is a saved, quality-gated review candidate aligned against ${escapeHtml(results.target_revision_id || alignment.target_revision_id || "the selected revision")} using the ${paired ? "paired static recording" : "saved static reference"}. It has not changed or promoted the live Noesis world.</p>
     <div class="stat-grid">
       <div class="stat"><b>${(Number(vertical.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Camera-visible structure match</span></div>
       <div class="stat"><b>${(Number(vertical.target_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Fixed-view coverage</span></div>
@@ -511,6 +883,9 @@ function pcfSection(scan) {
   const multiview = results.multiview_consistency?.consensus || {};
   const heldout = results.heldout_even_to_odd_reprojection?.consensus || {};
   const staticVisible = results.evaluation?.fixed_camera_visible_cloud_metrics || {};
+  const pcfConfidence = results.pcf_confidence || scan.pcf_confidence || {};
+  const metric = (value, suffix = "") => Number.isFinite(Number(value)) ? `${Number(value).toFixed(3)}${suffix}` : "—";
+  const fraction = (value) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : "—";
   const links = [
     [urls.pcf_glb, "PCF surfel GLB"],
     [urls.conditioned_mapanything_glb, "Conditioned MapAnything GLB"],
@@ -537,8 +912,10 @@ function pcfSection(scan) {
         <div class="stat"><b>${Number(surfels.surfel_count || 0).toLocaleString()}</b><span>PCF surfels</span></div>
         <div class="stat"><b>${(Number(fusion.agreement_fraction_of_both || 0) * 100).toFixed(1)}%</b><span>Provider agreement</span></div>
         <div class="stat"><b>${Number(multiview.p80_error_m || 0).toFixed(3)}m</b><span>Multiview p80</span></div>
-        <div class="stat"><b>${(Number(heldout.odd_frame_valid_pixel_coverage_fraction || 0) * 100).toFixed(1)}%</b><span>Held-out coverage</span></div>
-        <div class="stat"><b>${Number(heldout.even_frame_map_to_odd_frame_depth_median_m || 0).toFixed(3)}m</b><span>Held-out median</span></div>
+        <div class="stat"><b>${fraction(heldout.odd_frame_valid_pixel_coverage_fraction)}</b><span>Internal comparison coverage</span></div>
+        <div class="stat"><b>${metric(heldout.even_frame_map_to_odd_frame_depth_median_m, "m")}</b><span>Internal depth residual</span></div>
+        <div class="stat"><b>${fraction(heldout.large_error_fraction_gt_2m ?? pcfConfidence.large_error_fraction_gt_2m)}</b><span>&gt;2m internal error</span></div>
+        <div class="stat"><b>${heldout.independent === false ? "Internal only" : heldout.independent === true ? "Independent" : "—"}</b><span>Comparison provenance</span></div>
         <div class="stat"><b>${(Number(staticVisible.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Static-visible match</span></div>
       </div>
       <div class="artifact-row">${links}</div>
@@ -785,6 +1162,20 @@ function wireDetailActions(scan) {
       toastMessage(`${label} could not start: ${error.message}`);
     }
   });
+  document.querySelector("#initiate-vio")?.addEventListener("click", async (event) => {
+    event.currentTarget.disabled = true;
+    try {
+      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/initiate-vio`, { method: "POST" });
+      const index = scans.findIndex((item) => item.id === scan.id);
+      if (index >= 0) scans[index] = updated;
+      lastDetailFingerprint = "";
+      renderSelected();
+      toastMessage("OpenVINS started on the synchronized capture");
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      toastMessage(`OpenVINS could not start: ${error.message}`);
+    }
+  });
   document.querySelector("#additional-camera-video")?.addEventListener("change", (event) => {
     void uploadSupplementVideo(scan, event.currentTarget.files?.[0]);
   });
@@ -832,18 +1223,37 @@ function wireDetailActions(scan) {
   const alignmentTarget = document.querySelector("#alignment-target");
   const alignmentButton = document.querySelector("#align-noesis");
   alignmentTarget?.addEventListener("change", () => {
-    if (alignmentButton) alignmentButton.disabled = !alignmentTarget.value;
+    if (!alignmentButton) return;
+    const pairedCameraId = alignmentButton.dataset.pairedCameraId || "";
+    alignmentButton.disabled = pairedCameraId
+      ? alignmentTarget.value !== pairedCameraId || !alignmentTargetFor(pairedCameraId)
+      : !alignmentTarget.value;
   });
   alignmentButton?.addEventListener("click", async (event) => {
     const cameraId = alignmentTarget?.value || "";
+    const pairedCameraId = event.currentTarget.dataset.pairedCameraId || "";
+    if (pairedCameraId && !pairedStaticAlignmentAvailable) {
+      toastMessage("Paired alignment is being updated; wait for the updated service before aligning.");
+      event.currentTarget.disabled = true;
+      return;
+    }
+    if (pairedCameraId && cameraId !== pairedCameraId) {
+      toastMessage(`This paired walk must use the ${cameraLabel(pairedCameraId)} static recording.`);
+      event.currentTarget.disabled = true;
+      return;
+    }
     const target = alignmentTargetFor(cameraId);
     if (!target) {
-      toastMessage("Choose the static camera for this room before aligning");
+      toastMessage(pairedCameraId
+        ? `The paired ${cameraLabel(pairedCameraId)} camera has no matching validated target.`
+        : "Choose the static camera for this room before aligning");
       event.currentTarget.disabled = true;
       return;
     }
     const accepted = window.confirm(
-      `Align “${scan.name}” to the ${target.label} camera reconstruction?`,
+      pairedCameraId
+        ? `Align “${scan.name}” using the paired ${target.label} static recording?`
+        : `Align “${scan.name}” to the ${target.label} camera reconstruction?`,
     );
     if (!accepted) return;
     event.currentTarget.disabled = true;
@@ -913,7 +1323,7 @@ function renderSelected() {
   const alignmentRunning = ["queued", "running"].includes(scan.alignment?.status);
   const supplementRunning = (scan.supplements || []).some((addition) => ["uploading", "processing_frames", "queued", "running"].includes(addition.status));
   const pcfRunning = ["queued", "running"].includes(scan.pcf?.status);
-  const canDelete = !["uploading", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning && !supplementRunning && !pcfRunning;
+  const canDelete = !["uploading", "importing_capture", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning && !supplementRunning && !pcfRunning;
   const canInitiate = ["ready", "ma_failed", "da3_failed"].includes(scan.status);
   const videoSize = formatBytes(scan.video?.size_bytes);
   scanDetail.innerHTML = `
@@ -925,12 +1335,13 @@ function renderSelected() {
       </div>
       <div class="detail-actions">
         ${scan.status === "complete" && !supplementRunning && !pcfRunning ? '<label class="secondary-button" for="additional-camera-video">＋ Add Video</label><input id="additional-camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />' : ""}
-        <a class="ghost-button" href="${scan.video?.url}" target="_blank" rel="noopener">Original video</a>
+        ${scan.video?.url ? `<a class="ghost-button" href="${scan.video.url}" target="_blank" rel="noopener">Original video</a>` : ""}
         <button id="rename-scan" class="ghost-button" type="button">Rename</button>
         ${canDelete ? '<button id="delete-scan" class="danger-button" type="button">Delete scan</button>' : ""}
       </div>
     </div>
     ${statusPanel(scan)}
+    ${captureSection(scan)}
     ${canInitiate ? `<div class="ready-callout inference-callout"><div><h3>${scan.status.endsWith("_failed") ? "The prepared views are still safe." : "The room walk is ready."}</h3><p>Reconstruction uses all ${Number(scan.prepared?.frame_count || 0)} adaptive phone views. MapAnything automatically uses overlapping registered windows above its measured joint-view capacity. DA3 uses DA3-BASE any-view geometry plus the validated DA3Metric-Large FP16 TensorRT engine for metric scale.</p></div><label class="provider-picker"><span>Provider</span><select id="inference-provider"><option value="mapanything" ${scan.provider !== "da3" ? "selected" : ""}>MapAnything</option><option value="da3" ${scan.provider === "da3" ? "selected" : ""}>DA3</option></select></label><button id="initiate-inference" class="primary-button" type="button">Run reconstruction</button></div>` : ""}
     ${scan.status === "complete" ? outputsSection(scan) : preparedSection(scan)}
     ${scan.status !== "complete" && scan.video?.url ? `<div class="subheading"><div><span class="eyebrow">Source</span><h3>Original phone video</h3></div></div><div class="media-panel"><video src="${scan.video.url}" controls preload="metadata" playsinline></video><div class="media-caption"><span>${escapeHtml(scan.video.original_name || "phone video")}</span><span>${videoSize}</span></div></div>` : ""}`;
@@ -972,6 +1383,7 @@ async function refreshScans({ force = false } = {}) {
 
 function uploadVideo(file) {
   if (!file) return;
+  if (browserCaptureBlocked("use another video")) return;
   if (uploadInProgress) {
     toastMessage("A walk is already uploading");
     return;
@@ -994,7 +1406,6 @@ function uploadVideo(file) {
   });
   xhr.addEventListener("load", async () => {
     uploadInProgress = false;
-    cameraInput.value = "";
     existingInput.value = "";
     if (xhr.status < 200 || xhr.status >= 300) {
       let detail = `${xhr.status} upload failed`;
@@ -1019,6 +1430,71 @@ function uploadVideo(file) {
   });
   xhr.addEventListener("abort", () => {
     uploadInProgress = false;
+  });
+  xhr.send(file);
+}
+
+function uploadSensorBundle(file, { fileName = file?.name, fromBrowser = false } = {}) {
+  if (!file) return;
+  if (!fromBrowser && browserCaptureBlocked("import another sensor bundle")) return;
+  if (uploadInProgress) {
+    toastMessage("A walk is already uploading");
+    return;
+  }
+  uploadInProgress = true;
+  uploadPanel.classList.remove("hidden");
+  const uploadName = fileName || file.name || "phone_capture.tar";
+  const browserBundle = fromBrowser ? browserCapture.status.bundle : null;
+  uploadLabel.textContent = `Uploading sensor bundle ${uploadName}`;
+  uploadPercent.textContent = "0%";
+  uploadBar.style.width = "0%";
+  const xhr = new XMLHttpRequest();
+  const name = scanName.value.trim() || "Phone room walk with sensors";
+  xhr.open("POST", `/api/scans/sensor-bundle?name=${encodeURIComponent(name)}`);
+  xhr.setRequestHeader("Content-Type", file.type || "application/x-tar");
+  xhr.setRequestHeader("X-File-Name", encodeURIComponent(uploadName));
+  const companion = fromBrowser ? browserCapture.status.manifest?.companion_capture : null;
+  if (companion?.session_id) xhr.setRequestHeader("X-Companion-Session", companion.session_id);
+  if (companion?.phone_capture_id) xhr.setRequestHeader("X-Phone-Capture-ID", companion.phone_capture_id);
+  xhr.upload.addEventListener("progress", (event) => {
+    if (!event.lengthComputable) return;
+    const percent = Math.round((event.loaded / event.total) * 100);
+    uploadPercent.textContent = `${percent}%`;
+    uploadBar.style.width = `${percent}%`;
+  });
+  xhr.addEventListener("load", async () => {
+    uploadInProgress = false;
+    if (!fromBrowser) sensorBundleInput.value = "";
+    if (xhr.status < 200 || xhr.status >= 300) {
+      let detail = `${xhr.status} sensor bundle upload failed`;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) { /* keep HTTP detail */ }
+      if (fromBrowser && browserCapture.status.bundle?.blob === file) {
+        browserBundleUploadFailed = true;
+        renderBrowserCaptureState(browserCapture.status);
+      }
+      uploadLabel.textContent = detail;
+      toastMessage(detail);
+      return;
+    }
+    const scan = JSON.parse(xhr.responseText);
+    if (fromBrowser && browserCapture.status.bundle?.blob !== file) return;
+    if (fromBrowser) browserCapture.markBundleUploaded();
+    rememberSelectedScan(scan.id);
+    uploadPercent.textContent = "100%";
+    uploadBar.style.width = "100%";
+    uploadLabel.textContent = "Sensor bundle saved · preparing timestamped frames";
+    toastMessage("Sensor capture auto-saved; frame preparation started");
+    await refreshScans({ force: true });
+    setTimeout(() => uploadPanel.classList.add("hidden"), 1800);
+  });
+  xhr.addEventListener("error", () => {
+    uploadInProgress = false;
+    if (fromBrowser && browserCapture.status.bundle === browserBundle) {
+      browserBundleUploadFailed = true;
+      renderBrowserCaptureState(browserCapture.status);
+    }
+    uploadLabel.textContent = "Sensor bundle connection failed";
+    toastMessage("Sensor bundle upload failed. Confirm the phone is still on home Wi-Fi.");
   });
   xhr.send(file);
 }
@@ -1077,8 +1553,124 @@ function uploadSupplementVideo(scan, file) {
   xhr.send(file);
 }
 
-cameraInput.addEventListener("change", () => uploadVideo(cameraInput.files?.[0]));
+recordPhoneWalkButton.addEventListener("click", async () => {
+  if (uploadInProgress) {
+    toastMessage("Finish the current upload before starting another recording.");
+    return;
+  }
+  if (browserCaptureBlocked("start a new browser recording")) return;
+  browserCapturePanel.classList.remove("hidden");
+  browserCapturePanel.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (["idle", "closed", "complete", "error"].includes(browserCapture.status.state)) {
+    if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
+    try {
+      await browserCapture.open(browserPreview);
+    } catch (error) {
+      browserCapture.error = error;
+      browserCapture.state = "error";
+      renderBrowserCaptureState(browserCapture.status);
+      return;
+    }
+    await companionCapture.listCameras().catch(() => {
+      renderCompanionCaptureState(companionCapture.status);
+      renderBrowserCaptureState(browserCapture.status);
+    });
+  }
+});
+companionCameraSelect?.addEventListener("change", (event) => {
+  try {
+    companionCapture.selectCamera(event.currentTarget.value);
+  } catch (error) {
+    event.currentTarget.value = "";
+    toastMessage(error.message || String(error));
+    renderCompanionCaptureState(companionCapture.status);
+  }
+});
+browserStartButton.addEventListener("click", async () => {
+  browserStartButton.disabled = true;
+  let startedStatic = false;
+  try {
+    if (!companionCapture.readyToStart) throw new Error("Choose an available static room camera before starting the paired recording.");
+    const phoneCaptureId = companionCapture.reservePhoneCaptureId();
+    await companionCapture.start({
+      cameraId: companionCameraSelect.value,
+      phoneCaptureId,
+      browserCapture,
+    });
+    startedStatic = true;
+    browserCapture.start({ captureId: phoneCaptureId, companionCapture: companionCapture.companionContext() });
+    toastMessage("Static room video and phone camera are recording together");
+  } catch (error) {
+    if (startedStatic || companionCapture.hasLiveSession || companionCapture.needsServerStop) {
+      await companionCapture.stop("phone_start_failed").catch(() => {});
+    }
+    browserCapture.error = error;
+    renderBrowserCaptureState(browserCapture.status);
+  }
+});
+browserStopButton.addEventListener("click", async () => {
+  browserStopButton.disabled = true;
+  try {
+    await browserCapture.stop("user");
+  } catch (error) {
+    browserCapture.error = error;
+    renderBrowserCaptureState(browserCapture.status);
+  }
+});
+browserCloseButton.addEventListener("click", async () => {
+  if (browserCapture.isRecording || browserCapture.status.state === "stopping" || companionCapture.needsServerStop) {
+    toastMessage("Stop and save the recording before closing this capture.");
+    return;
+  }
+  await browserCapture.close();
+  if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
+  browserCapturePanel.classList.add("hidden");
+});
+browserMarkerButton?.addEventListener("click", async () => {
+  try {
+    await companionCapture.addMarker("user_event");
+    toastMessage("Event marker saved with the paired capture");
+  } catch (error) {
+    toastMessage(`Marker retained for retry: ${error.message || error}`);
+  }
+});
+browserMarkerRetryButton?.addEventListener("click", async () => {
+  browserMarkerRetryButton.disabled = true;
+  await companionCapture.retryMarkers();
+  renderCompanionCaptureState(companionCapture.status);
+  toastMessage(companionCapture.status.pendingMarkerCount ? "Some markers remain pending" : "Pending markers delivered");
+});
+companionStopRetryButton?.addEventListener("click", async () => {
+  companionStopRetryButton.disabled = true;
+  const result = await companionCapture.stop("retry");
+  renderCompanionCaptureState(companionCapture.status);
+  toastMessage(result.needsServerStop ? "Static capture still needs finalization; keep this page open." : "Static capture finalization acknowledged");
+});
+browserDownloadButton.addEventListener("click", () => {
+  if (!browserCapture.downloadBundle()) toastMessage("The capture download is not available in this browser.");
+});
+browserRetryButton.addEventListener("click", () => {
+  const bundle = browserCapture.status.bundle;
+  if (bundle) uploadSensorBundle(bundle.blob, { fileName: bundle.fileName, fromBrowser: true });
+});
+browserDiscardButton.addEventListener("click", () => {
+  if (uploadInProgress) {
+    toastMessage("Wait for the current upload to finish before discarding this capture.");
+    return;
+  }
+  browserCapture.discardBundle();
+  if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
+  browserBundleUploadFailed = false;
+  browserCapturePanel.classList.add("hidden");
+  toastMessage("The local browser capture was discarded.");
+});
+window.addEventListener("beforeunload", (event) => {
+  if (!browserCapture.hasUnsavedWork() && !companionCapture.hasUnsavedWork()) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 existingInput.addEventListener("change", () => uploadVideo(existingInput.files?.[0]));
+sensorBundleInput.addEventListener("change", () => uploadSensorBundle(sensorBundleInput.files?.[0]));
 refreshButton.addEventListener("click", () => refreshScans({ force: true }));
 newWalkButton.addEventListener("click", startNewWalk);
 

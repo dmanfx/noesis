@@ -12,6 +12,15 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from .calibrated_inference import (
+    add_calibration_summary,
+    calibrated_input_views,
+    calibration_frame_fields,
+    calibration_raw_fields,
+    calibration_specs,
+    rectification_valid_mask,
+)
+
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -244,12 +253,15 @@ def _write_trajectory_preview(
     all_xz = np.concatenate([cloud_xz, cameras_xz], axis=0)
     low = np.percentile(all_xz, 1.0, axis=0)
     high = np.percentile(all_xz, 99.0, axis=0)
+    low = np.minimum(low, cameras_xz.min(axis=0))
+    high = np.maximum(high, cameras_xz.max(axis=0))
     span = np.maximum(high - low, 1e-6)
     margin = 60
 
     def project(values: np.ndarray) -> np.ndarray:
-        normalized = (values - low) / span
-        xy = normalized * (canvas_size - 2 * margin) + margin
+        # One scale preserves distances on both axes, including narrow walks.
+        normalized = (values - (low + high) / 2.0) / float(np.max(span))
+        xy = normalized * (canvas_size - 2 * margin) + canvas_size / 2.0
         xy[:, 1] = canvas_size - xy[:, 1]
         return np.round(xy).astype(np.int32)
 
@@ -263,7 +275,7 @@ def _write_trajectory_preview(
     for index, (x, y) in enumerate(path_xy):
         color = (96, 220, 96) if index == 0 else (44, 148, 255)
         cv2.circle(canvas, (int(x), int(y)), 7, color, -1, cv2.LINE_AA)
-    cv2.putText(canvas, "Top-down MapAnything world frame", (34, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (235, 235, 235), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "Camera trajectory - reconstruction X/Z", (34, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (235, 235, 235), 2, cv2.LINE_AA)
     if not cv2.imwrite(str(path), canvas, [cv2.IMWRITE_PNG_COMPRESSION, 4]):
         raise MapAnythingScanError("failed to write camera trajectory preview")
 
@@ -281,6 +293,10 @@ def run_mapanything_scan(
     frame_rows = prepared.get("frames")
     if not isinstance(frame_rows, list) or len(frame_rows) < 2:
         raise MapAnythingScanError("the scan has no valid prepared multi-view frame set")
+    try:
+        calibrated = calibration_specs(frame_rows, anchor_image=settings.anchor_image)
+    except ValueError as exc:
+        raise MapAnythingScanError(str(exc)) from exc
     phone_frame_paths = [scan_dir / str(row["frame"]) for row in frame_rows]
     inference_rows = list(frame_rows)
     anchor_view_index: int | None = None
@@ -311,6 +327,11 @@ def run_mapanything_scan(
     missing = [path.name for path in frame_paths if not path.is_file()]
     if missing:
         raise MapAnythingScanError(f"prepared MapAnything frames are missing: {missing[:4]}")
+    calibrated_views = None
+    if calibrated is not None:
+        calibrated_views = calibrated_input_views(
+            frame_paths, calibrated, frame_rows=frame_rows, scan_dir=scan_dir
+        )
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     progress(0.02, "Loading the Apache MapAnything model")
@@ -320,7 +341,7 @@ def run_mapanything_scan(
     try:
         import torch
         from mapanything.models import MapAnything
-        from mapanything.utils.image import load_images
+        from mapanything.utils.image import load_images, preprocess_inputs
 
         if settings.device.startswith("cuda") and not torch.cuda.is_available():
             raise MapAnythingScanError(
@@ -333,7 +354,11 @@ def run_mapanything_scan(
         ).to(device)
         model.eval()
         progress(0.14, f"Loading and normalizing {len(frame_paths)} prepared views")
-        views = load_images([str(path) for path in frame_paths])
+        if calibrated is None:
+            views = load_images([str(path) for path in frame_paths])
+        else:
+            views = preprocess_inputs(calibrated_views)
+            del calibrated_views
         if len(views) != len(frame_paths):
             raise MapAnythingScanError(
                 f"MapAnything loaded {len(views)} views, expected {len(frame_paths)}"
@@ -398,6 +423,10 @@ def run_mapanything_scan(
             scale = _scalar(pred.get("metric_scaling_factor"), name="metric_scaling_factor")
             if depth.shape != mask.shape or confidence.shape != mask.shape or world_points.shape[:2] != mask.shape:
                 raise MapAnythingScanError(f"MapAnything prediction {index} has inconsistent map shapes")
+            rectification_mask = None
+            if calibrated is not None:
+                rectification_mask = rectification_valid_mask(calibrated[index], intrinsics, depth.shape)
+                mask &= rectification_mask
 
             stem = f"view_{index:04d}"
             model_rgb_path = preview_root / f"{stem}_rgb.png"
@@ -419,6 +448,7 @@ def run_mapanything_scan(
                 intrinsics=intrinsics,
                 metric_scaling_factor=np.asarray([scale], dtype=np.float32),
                 model_rgb=np.asarray(image_rgb, dtype=np.float32),
+                **calibration_raw_fields(inference_rows[index], rectification_mask),
             )
 
             valid = mask & np.isfinite(depth) & (depth > 0.0) & np.isfinite(world_points).all(axis=2)
@@ -454,6 +484,9 @@ def run_mapanything_scan(
                     "camera_pose": pose.tolist(),
                     "intrinsics": intrinsics.tolist(),
                     "metric_scaling_factor": scale,
+                    **calibration_frame_fields(
+                        inference_rows[index], rectification_mask, network_conditioned=True
+                    ),
                 }
             )
             outputs[index] = {}
@@ -537,6 +570,7 @@ def run_mapanything_scan(
             },
             "frames": frame_results,
         }
+        add_calibration_summary(summary, prepared, calibrated, network_conditioned=True)
         manifest_path = output_dir / "scan_outputs_manifest.json"
         summary["artifacts"]["manifest"] = "outputs/scan_outputs_manifest.json"
         files = []

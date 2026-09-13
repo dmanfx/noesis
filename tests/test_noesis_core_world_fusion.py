@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from noesis_core.contracts.base import ArtifactFingerprint, Matrix3, ProducerRef, Vector3
@@ -767,6 +769,49 @@ def test_mixed_target_frame_revisions_are_conflict_evidence_not_fused() -> None:
         source.rejection_reason == "registration_identity_conflict"
         for source in entity.sources
     )
+
+
+def test_same_target_frame_with_different_source_edges_serializes_without_one_edge_hash() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(
+        _observation(
+            "kitchen",
+            0,
+            1,
+            1_000_000,
+            1.0,
+            world_frame_revision="home-r1",
+            world_transform_sha256="a" * 64,
+            calibration_revision="calibration-k",
+        ),
+        _subject(),
+    )
+    fusion.ingest(
+        _observation(
+            "family-room",
+            1,
+            1,
+            1_050_000,
+            1.2,
+            world_frame_revision="home-r1",
+            world_transform_sha256="b" * 64,
+            calibration_revision="calibration-f",
+        ),
+        _subject(),
+    )
+
+    snapshot = fusion.snapshot(published_at_us=1_100_000)
+    serialized = json.loads(snapshot.model_dump_json())
+    restored = type(snapshot).model_validate(serialized)
+    entity = restored.entities[0]
+    assert entity.world_frame_revision == "home-r1"
+    assert entity.world_transform_sha256 is None
+    assert {source.world_transform_sha256 for source in entity.sources} == {
+        "a" * 64,
+        "b" * 64,
+    }
+    assert entity.position is not None
+    assert entity.covariance is not None
 
 
 def test_distinct_camera_edges_can_fuse_when_the_target_revision_matches() -> None:

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install RoomWalk for Android</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color:#182a2a;background:#f5f7f6;color-scheme:light}
+    body{margin:0;padding:28px 20px;line-height:1.55}main{max-width:540px;margin:24px auto}
+    .brand{color:#176b64;font-size:14px;font-weight:700;letter-spacing:.08em}h1{font-size:30px;line-height:1.2;margin:12px 0}
+    p,li{font-size:16px}ol{padding-left:24px}li{margin:12px 0}.button{display:block;box-sizing:border-box;width:100%;border:0;font:inherit;padding:16px;background:#176b64;color:white;text-decoration:none;border-radius:10px;text-align:center;font-weight:650;margin:24px 0 10px;cursor:pointer}.button:disabled{opacity:.65;cursor:wait}[hidden]{display:none!important}
+    a{color:#176b64}.small{font-size:14px;color:#526966}.note{padding:16px;background:#fff;border:1px solid #dbe4df;border-radius:10px}footer{margin-top:28px}
+  </style>
+</head>
+<body><main>
+  <div class="brand">ROOMWALK</div>
+  <h1>Install the Android companion</h1>
+  <p>Record native phone video and motion together with the matching room-camera recording and tracking evidence, then upload the linked capture to RoomWalk.</p>
+  <button id="prepare" class="button" type="button">Prepare APK in browser</button>
+  <a id="save" class="button" download="roomwalk-companion-0.1.11.apk" hidden>Save APK to phone</a>
+  <p class="small">Version 0.1.11 · 279.1 kB · Android 13 or newer for recording</p>
+  <p id="download-status" class="note" role="status">Tap Prepare APK in browser, then Save APK to phone. Keep this page open until Chrome finishes saving the file.</p>
+  <ol>
+    <li>Open this page in your phone’s regular browser. Tap <b>Prepare APK in browser</b>, wait for the file check, then tap <b>Save APK to phone</b>.</li>
+    <li>After the browser finishes saving the APK, open it from Downloads. Android may ask to allow installation from that browser or file manager.</li>
+    <li>Open RoomWalk, allow camera access, tap <b>Check phone</b>, and select the matching room camera. Tap <b>Capture</b> to open the viewer. Run the <b>10-second test</b> before your first walk.</li>
+  </ol>
+  <p>Use <b>Record</b>, walk slowly, and tap <b>Stop &amp; save</b>. Keep RoomWalk open while recording. <b>Upload</b> sends the phone video and IMU with the exact room recording attached; originals remain saved. No separate noise recording or printed calibration board is needed for a normal walk.</p>
+  <p class="small">Version 0.1.11 keeps the main app in portrait and opens Capture in landscape. Upload continues with the screen off and shows progress in a notification. Once RoomWalk has saved the archive, video and timing validation continue on the server. The fixed LAN address is preserved.</p>
+  <p class="small">The app checks actual native 8K support on your phone. Timing and camera/IMU calibration remain separate checks.</p>
+  <footer><a href="/">Return to RoomWalk</a> · <a href="./roomwalk-companion-0.1.11.apk.sha256">APK checksum</a><p class="small"><a href="./roomwalk-companion-0.1.11.apk" download="roomwalk-companion-0.1.11.apk">Direct APK download</a></p></footer>
+</main>
+<script>
+  const prepare = document.querySelector('#prepare');
+  const save = document.querySelector('#save');
+  const status = document.querySelector('#download-status');
+  const apkName = 'roomwalk-companion-0.1.11.apk';
+  const apkBytes = 279137;
+  const apkSha256 = 'd0a80fdfe005b5d7d6bd4028116989d295fd2701a4d5b7b610fe2717ffe9fc44';
+  let preparedUrl;
+  prepare.addEventListener('click', async () => {
+    prepare.disabled = true;
+    save.hidden = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      if (!globalThis.crypto?.subtle) {
+        throw new Error('File verification is unavailable. Open this page over trusted HTTPS.');
+      }
+      status.textContent = 'Fetching the APK in this browser…';
+      const response = await fetch('./' + apkName, {
+        cache: 'no-store', redirect: 'error', signal: controller.signal,
+      });
+      if (!response.ok) throw new Error('The server returned HTTP ' + response.status + '.');
+      if (!response.body) throw new Error('This browser cannot read the download.');
+      // This installer page is bound to one signed release. Bound memory and reject
+      // truncated, oversized, or changed responses before exposing a save link.
+      const bytes = new Uint8Array(apkBytes);
+      const reader = response.body.getReader();
+      let received = 0;
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        if (received + value.length > apkBytes) {
+          await reader.cancel();
+          throw new Error('The APK size does not match this release.');
+        }
+        bytes.set(value, received);
+        received += value.length;
+        status.textContent = 'Received ' + received.toLocaleString() + ' of ' + apkBytes.toLocaleString() + ' bytes…';
+      }
+      if (received !== apkBytes) throw new Error('The APK transfer was incomplete. Tap Prepare to retry.');
+      const digest = await crypto.subtle.digest('SHA-256', bytes);
+      const actual = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+      if (actual !== apkSha256) throw new Error('The APK file check failed. It has not been offered for saving.');
+      if (preparedUrl) URL.revokeObjectURL(preparedUrl);
+      preparedUrl = URL.createObjectURL(new Blob([bytes], {type: 'application/vnd.android.package-archive'}));
+      save.href = preparedUrl;
+      save.hidden = false;
+      prepare.hidden = true;
+      status.textContent = 'APK received and verified. Tap Save APK to phone, then open it from Downloads.';
+    } catch (error) {
+      status.textContent = error.name === 'AbortError'
+        ? 'The transfer timed out. Check your Wi-Fi connection and tap Prepare to retry.'
+        : 'Could not prepare the APK: ' + error.message;
+    } finally {
+      clearTimeout(timeout);
+      prepare.disabled = false;
+    }
+  });
+  save.addEventListener('click', () => {
+    status.textContent = 'Save requested. Keep this page open and check Chrome’s download confirmation. This page cannot confirm when the file is saved.';
+  });
+</script>
+</body>
+</html>

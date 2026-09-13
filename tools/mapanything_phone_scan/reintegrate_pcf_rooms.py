@@ -8,12 +8,13 @@ world-space corrections.  All accepted pixels are streamed into 2.5 cm
 weighted voxels, with source-room, source-view, observation, consensus-
 agreement, and model-reliability provenance retained in the output NPZ.
 
-The fixed room owns overlapping evidence.  By default, overlap is the moving
-room evidence whose X/Z column is covered by at least two fixed-room views
-(with a small configurable dilation); exact shared voxels always belong to the
+The fixed room owns overlapping evidence.  By default, a covered X/Z column is
+only an authority candidate: exact shared voxels or points with compatible
+three-dimensional geometry and retained camera/depth support belong to the
 fixed room.  A reviewed fixed-room ownership polygon may be supplied when the
-door/opening boundary is known more precisely.  Moving-room-only evidence is
-retained, so the second room continues beyond the shared opening.
+door/opening boundary is known more precisely, but it does not suppress
+different-height surfaces by itself.  Moving-room-only and complementary
+surfaces are retained, so the second room continues beyond the shared opening.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 
 class PCFReintegrationError(RuntimeError):
@@ -44,7 +46,15 @@ class ReintegrationSettings:
     minimum_confidence: float = 0.35
     minimum_depth_m: float = 0.05
     maximum_depth_m: float = 12.0
-    agreement_weight_bonus: float = 0.25
+    # Kept as a serialized compatibility field for older callers.  Consensus
+    # agreement is reported as evidence, but it is not applied as a second
+    # confidence weight because MapAnything and DA3 are conditioned and
+    # correlated observations.
+    agreement_weight_bonus: float = 0.0
+    geometry_compatibility_distance_m: float = 0.06
+    geometry_conflict_distance_m: float = 0.30
+    visibility_depth_tolerance_m: float = 0.05
+    visibility_depth_tolerance_fraction: float = 0.03
     ownership_cell_m: float = 0.10
     ownership_dilation_m: float = 0.10
     fixed_owner_minimum_views: int = 2
@@ -93,6 +103,18 @@ class RoomFusion:
     counters: dict[str, int]
     view_count: int
     view_mask_words: int
+    view_evidence: list["ViewEvidence"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ViewEvidence:
+    """Bounded source-view data retained for overlap visibility checks."""
+
+    view_index: int
+    intrinsics: np.ndarray
+    depth_z: np.ndarray
+    mask: np.ndarray
+    camera_to_world: np.ndarray
 
 
 _REQUIRED_RAW_FIELDS = {
@@ -108,6 +130,7 @@ _REQUIRED_RAW_FIELDS = {
     "absolute_depth_disagreement_m",
     "mapanything_reliability",
     "da3_reliability",
+    "intrinsics",
 }
 
 
@@ -322,9 +345,7 @@ def _aggregate_view(
     da3_reliability = da3_reliability[order].astype(np.float64, copy=False)
     source_selection = source_selection[order]
     starts = _group_starts(keys)
-    weights = confidence * (
-        1.0 + settings.agreement_weight_bonus * agreement.astype(np.float64)
-    )
+    weights = confidence
     result = np.zeros(len(starts), dtype=dtype)
     result["key"] = keys[starts]
     result["point_weighted_sum"] = np.add.reduceat(
@@ -406,6 +427,10 @@ def _compact_runs(
 
 def _popcount_words(words: np.ndarray) -> np.ndarray:
     values = np.asarray(words, dtype=np.uint64)
+    if values.ndim != 2:
+        raise PCFReintegrationError("view-mask words must be a two-dimensional array")
+    if values.shape[0] == 0:
+        return np.zeros(0, dtype=np.uint16)
     if hasattr(np, "bitwise_count"):
         return np.sum(np.bitwise_count(values), axis=1, dtype=np.uint16)
     bytes_view = values.view(np.uint8).reshape(values.shape[0], -1)
@@ -451,6 +476,7 @@ def _fuse_room(
     dtype = _record_dtype(view_mask_words)
     run_paths: list[Path] = []
     camera_positions: list[np.ndarray] = []
+    view_evidence: list[ViewEvidence] = []
     view_files: list[dict[str, Any]] = []
     counters = {
         "raw_pixel_count": 0,
@@ -488,6 +514,7 @@ def _fuse_room(
             da3_reliability = np.asarray(row["da3_reliability"], dtype=np.float32)
             source_selection = np.asarray(row["source_selection"], dtype=np.uint8)
             camera_pose = np.asarray(row["camera_pose"], dtype=np.float64)
+            intrinsics = np.asarray(row["intrinsics"], dtype=np.float64)
         expected = depth.shape
         pixel_fields = (
             confidence,
@@ -505,6 +532,14 @@ def _fuse_room(
             raise PCFReintegrationError(f"provenance field shape mismatch in {path}")
         if camera_pose.shape != (4, 4):
             raise PCFReintegrationError(f"camera pose is malformed in {path}")
+        if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
+            raise PCFReintegrationError(f"intrinsics are malformed in {path}")
+        if (
+            intrinsics[0, 0] <= 0.0
+            or intrinsics[1, 1] <= 0.0
+            or intrinsics[2, 2] <= 0.0
+        ):
+            raise PCFReintegrationError(f"intrinsics are non-positive in {path}")
         if np.any(source_selection > 5):
             raise PCFReintegrationError(f"unknown source-selection code in {path}")
 
@@ -565,6 +600,16 @@ def _fuse_room(
         np.save(run_path, aggregated, allow_pickle=False)
         run_paths.append(run_path)
         camera_positions.append(_transform_points(camera_pose[None, :3, 3], transform)[0])
+        camera_to_world = transform @ camera_pose
+        view_evidence.append(
+            ViewEvidence(
+                view_index=view_index,
+                intrinsics=intrinsics.copy(),
+                depth_z=depth.copy(),
+                mask=mask.copy(),
+                camera_to_world=camera_to_world.copy(),
+            )
+        )
         view_files.append(
             {
                 "view_index": view_index,
@@ -594,6 +639,7 @@ def _fuse_room(
             else len(source.included_view_indices)
         ),
         view_mask_words=view_mask_words,
+        view_evidence=view_evidence,
     )
 
 
@@ -601,6 +647,222 @@ def _points_from_records(records: np.ndarray) -> np.ndarray:
     return (
         records["point_weighted_sum"]
         / np.maximum(records["weight_sum"][:, None], 1e-12)
+    )
+
+
+def _depth_visibility_evidence(
+    points: np.ndarray,
+    views: Sequence[ViewEvidence],
+    *,
+    minimum_depth_m: float,
+    maximum_depth_m: float,
+    absolute_tolerance_m: float,
+    relative_tolerance: float,
+    chunk_size: int = 8192,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project fused points into retained source RGB-D views.
+
+    The result is ``(surface_supported, occluded_or_unknown,
+    free_space_contradiction)``.  A point is surface-supported only when its
+    projected pixel is inside the image, retained by the original mask, has a
+    finite measured depth, and agrees with that depth under an explicit
+    absolute/relative tolerance.  All loops are bounded by ``chunk_size``;
+    source depth/mask arrays are retained at their original image resolution.
+    """
+
+    values = np.asarray(points, dtype=np.float64)
+    count = len(values)
+    supported = np.zeros(count, dtype=bool)
+    occluded_or_unknown = np.zeros(count, dtype=bool)
+    free_space_contradiction = np.zeros(count, dtype=bool)
+    if values.ndim != 2 or values.shape[1] != 3 or not views:
+        return supported, occluded_or_unknown, free_space_contradiction
+
+    for view in views:
+        depth = np.asarray(view.depth_z, dtype=np.float32)
+        mask = np.asarray(view.mask, dtype=bool)
+        intrinsics = np.asarray(view.intrinsics, dtype=np.float64)
+        camera_to_world = np.asarray(view.camera_to_world, dtype=np.float64)
+        if (
+            depth.ndim != 2
+            or mask.shape != depth.shape
+            or intrinsics.shape != (3, 3)
+            or camera_to_world.shape != (4, 4)
+            or not np.isfinite(intrinsics).all()
+            or not np.isfinite(camera_to_world).all()
+        ):
+            continue
+        try:
+            world_to_camera = np.linalg.inv(camera_to_world)
+        except np.linalg.LinAlgError:
+            continue
+        height, width = depth.shape
+        for start in range(0, count, chunk_size):
+            end = min(start + chunk_size, count)
+            block = values[start:end]
+            homogeneous = np.concatenate(
+                (block, np.ones((len(block), 1), dtype=np.float64)), axis=1
+            )
+            camera = (world_to_camera @ homogeneous.T).T[:, :3]
+            z = camera[:, 2]
+            finite = np.isfinite(camera).all(axis=1) & np.isfinite(z)
+            positive = finite & (z >= float(minimum_depth_m)) & (
+                z <= float(maximum_depth_m)
+            )
+            safe_z = np.where(positive, z, 1.0)
+            projected = (intrinsics @ camera.T).T
+            projected_u = np.rint(projected[:, 0] / safe_z).astype(np.int64)
+            projected_v = np.rint(projected[:, 1] / safe_z).astype(np.int64)
+            inside = positive & (
+                (projected_u >= 0)
+                & (projected_u < width)
+                & (projected_v >= 0)
+                & (projected_v < height)
+            )
+            if not np.any(inside):
+                occluded_or_unknown[start:end] |= ~positive | (positive & ~inside)
+                continue
+            indices = np.flatnonzero(inside)
+            measured = depth[projected_v[indices], projected_u[indices]].astype(
+                np.float64
+            )
+            measured_mask = mask[projected_v[indices], projected_u[indices]]
+            measured_valid = measured_mask & np.isfinite(measured) & (
+                measured >= float(minimum_depth_m)
+            ) & (measured <= float(maximum_depth_m))
+            tolerance = float(absolute_tolerance_m) + float(relative_tolerance) * np.maximum(
+                measured, z[indices]
+            )
+            difference = z[indices] - measured
+            visible_indices = indices[measured_valid & (np.abs(difference) <= tolerance)]
+            supported[start + visible_indices] = True
+            behind_indices = indices[measured_valid & (difference > tolerance)]
+            occluded_or_unknown[start + behind_indices] = True
+            free_indices = indices[measured_valid & (difference < -tolerance)]
+            free_space_contradiction[start + free_indices] = True
+            unknown_indices = indices[~measured_valid]
+            occluded_or_unknown[start + unknown_indices] = True
+            occluded_or_unknown[start:end] |= ~positive | (positive & ~inside)
+    return supported, occluded_or_unknown, free_space_contradiction
+
+
+def _three_dimensional_compatibility(
+    reference_points: np.ndarray,
+    query_points: np.ndarray,
+    reference_views: Sequence[ViewEvidence],
+    query_views: Sequence[ViewEvidence],
+    *,
+    distance_m: float,
+    minimum_depth_m: float,
+    maximum_depth_m: float,
+    depth_tolerance_m: float,
+    depth_tolerance_fraction: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Return nearest 3-D compatibility plus source-view depth checks.
+
+    X/Z ownership is only an authority candidate.  A candidate becomes an
+    overlap conflict after a real 3-D proximity check, with both source and
+    fixed evidence retaining valid camera/depth support.
+    """
+
+    reference = np.asarray(reference_points, dtype=np.float64)
+    query = np.asarray(query_points, dtype=np.float64)
+    query_visible, _query_occluded, query_contradiction = _depth_visibility_evidence(
+        query,
+        query_views,
+        minimum_depth_m=minimum_depth_m,
+        maximum_depth_m=maximum_depth_m,
+        absolute_tolerance_m=depth_tolerance_m,
+        relative_tolerance=depth_tolerance_fraction,
+    )
+    reference_visible, _reference_occluded, reference_contradiction = (
+        _depth_visibility_evidence(
+        reference,
+        reference_views,
+        minimum_depth_m=minimum_depth_m,
+        maximum_depth_m=maximum_depth_m,
+        absolute_tolerance_m=depth_tolerance_m,
+        relative_tolerance=depth_tolerance_fraction,
+        )
+    )
+    compatible = np.zeros(len(query), dtype=bool)
+    nearest_distance = np.full(len(query), np.inf, dtype=np.float64)
+    reference_valid = reference_visible & ~reference_contradiction
+    # A source point can be valid in its own room while landing in the other
+    # room's measured free space.  That opposite-room ray is the evidence that
+    # distinguishes a co-visible contradictory wall from an unobserved or
+    # merely adjacent surface.  Out-of-image/occluded samples stay unknown.
+    _query_in_reference_supported, query_in_reference_unknown, query_in_reference_free = (
+        _depth_visibility_evidence(
+            query,
+            reference_views,
+            minimum_depth_m=minimum_depth_m,
+            maximum_depth_m=maximum_depth_m,
+            absolute_tolerance_m=depth_tolerance_m,
+            relative_tolerance=depth_tolerance_fraction,
+        )
+    )
+    nearest_reference_index = np.full(len(query), -1, dtype=np.int64)
+    if len(reference) and len(query) and np.any(reference_valid):
+        tree = cKDTree(reference[reference_valid])
+        nearest_distance, nearest_local_index = tree.query(query, k=1, workers=1)
+        valid_reference_indices = np.flatnonzero(reference_valid)
+        nearest_reference_index = valid_reference_indices[nearest_local_index]
+        compatible = np.isfinite(nearest_distance) & (
+            nearest_distance <= float(distance_m) + 1e-9
+        )
+    compatible &= query_visible & ~query_contradiction
+    nearest_reference_points = np.zeros((len(query), 3), dtype=np.float64)
+    nearest_available = nearest_reference_index >= 0
+    if np.any(nearest_available):
+        nearest_reference_points[nearest_available] = reference[
+            nearest_reference_index[nearest_available]
+        ]
+    _reference_in_query_supported, reference_in_query_unknown, reference_in_query_free = (
+        _depth_visibility_evidence(
+            nearest_reference_points,
+            query_views,
+            minimum_depth_m=minimum_depth_m,
+            maximum_depth_m=maximum_depth_m,
+            absolute_tolerance_m=depth_tolerance_m,
+            relative_tolerance=depth_tolerance_fraction,
+        )
+    )
+    reference_in_query_unknown &= nearest_available
+    reference_in_query_free &= nearest_available
+    cross_free_space_contradiction = (
+        query_in_reference_free | reference_in_query_free
+    )
+    cross_occluded_or_unknown = (
+        query_in_reference_unknown | reference_in_query_unknown
+    ) & ~cross_free_space_contradiction
+    query_own_unknown = ~query_visible & ~query_contradiction
+    reference_own_unknown = ~reference_visible & ~reference_contradiction
+    # A candidate that is contradicted by an opposite-room depth ray cannot
+    # suppress the existing geometry even when its Euclidean distance is small.
+    compatible &= ~cross_free_space_contradiction
+    return (
+        compatible,
+        query_visible & ~query_contradiction,
+        reference_valid,
+        nearest_distance,
+        cross_free_space_contradiction,
+        cross_occluded_or_unknown,
+        query_contradiction,
+        reference_contradiction,
+        query_own_unknown,
+        reference_own_unknown,
     )
 
 
@@ -710,15 +972,60 @@ def _compose_output(
             dtype=bool,
             count=len(moving_columns),
         )
-        ownership_method = "fixed_multiview_xz_coverage_with_dilation"
+        ownership_method = "fixed_multiview_xz_candidate_then_3d_compatible_overlap"
     else:
         column_owned = _polygon_contains(moving_points[:, [0, 2]], fixed_owner_polygon_xz)
         ownership_method = "reviewed_fixed_room_xz_polygon"
-    suppressed = exact_fixed | column_owned
+    fixed_points = _points_from_records(fixed.records)
+    (
+        compatible_3d,
+        moving_ray_valid,
+        fixed_ray_valid,
+        nearest_fixed_distance,
+        moving_cross_free_space,
+        moving_cross_unknown,
+        moving_own_contradiction,
+        fixed_own_contradiction,
+        moving_own_unknown,
+        fixed_own_unknown,
+    ) = _three_dimensional_compatibility(
+        fixed_points,
+        moving_points,
+        fixed.view_evidence,
+        moving.view_evidence,
+        distance_m=settings.geometry_compatibility_distance_m,
+        minimum_depth_m=settings.minimum_depth_m,
+        maximum_depth_m=settings.maximum_depth_m,
+        depth_tolerance_m=settings.visibility_depth_tolerance_m,
+        depth_tolerance_fraction=settings.visibility_depth_tolerance_fraction,
+    )
+    # A covered X/Z column is only a candidate.  Preserve complementary
+    # heights and passage surfaces unless the two clouds have compatible
+    # three-dimensional geometry with valid retained camera/depth support.
+    geometry_overlap = column_owned & compatible_3d
+    suppressed = exact_fixed | geometry_overlap
+    moving_uncertain = moving_own_contradiction | moving_cross_free_space
+    contradictory_geometry = (
+        ~exact_fixed
+        & moving_uncertain
+        & np.isfinite(nearest_fixed_distance)
+        & (nearest_fixed_distance > settings.geometry_compatibility_distance_m)
+    )
     retained_moving = moving.records[~suppressed]
     suppressed_moving = moving.records[suppressed]
 
     combined_records = np.concatenate((fixed.records, retained_moving))
+    fixed_geometry_status = np.where(
+        fixed_own_contradiction,
+        np.uint8(1),
+        np.where(fixed_own_unknown, np.uint8(2), np.uint8(0)),
+    )
+    moving_geometry_status = np.where(
+        moving_uncertain,
+        np.uint8(1),
+        np.where(moving_own_unknown, np.uint8(2), np.uint8(0)),
+    )
+    retained_status = moving_geometry_status[~suppressed]
     owner_room_id = np.concatenate(
         (
             np.ones(len(fixed.records), dtype=np.uint8),
@@ -728,6 +1035,12 @@ def _compose_output(
     order = _sort_order(combined_records["key"])
     combined_records = combined_records[order]
     owner_room_id = owner_room_id[order]
+    geometry_status = np.concatenate(
+        (
+            fixed_geometry_status,
+            retained_status,
+        )
+    )[order]
     if np.any(np.all(combined_records["key"][1:] == combined_records["key"][:-1], axis=1)):
         raise PCFReintegrationError("ownership policy left duplicate output voxels")
 
@@ -788,6 +1101,7 @@ def _compose_output(
         "owner_room_id": owner_room_id,
         "room_contribution_mask": np.where(owner_room_id == 1, 1, 2).astype(np.uint8),
         "room_presence_mask": np.where(owner_room_id == 1, 1, 2).astype(np.uint8),
+        "geometry_status": geometry_status,
         "fixed_observation_count": np.zeros(len(combined_records), dtype=np.uint32),
         "moving_observation_count": np.zeros(len(combined_records), dtype=np.uint32),
         "fixed_view_mask_words": np.zeros(
@@ -838,6 +1152,46 @@ def _compose_output(
         "moving_input_voxel_count": int(len(moving.records)),
         "exact_shared_voxel_count": int(np.count_nonzero(exact_fixed)),
         "moving_suppressed_voxel_count": int(np.count_nonzero(suppressed)),
+        "moving_xz_authority_candidate_count": int(np.count_nonzero(column_owned)),
+        "moving_3d_compatible_voxel_count": int(np.count_nonzero(compatible_3d)),
+        "moving_ray_depth_pose_valid_count": int(np.count_nonzero(moving_ray_valid)),
+        "fixed_ray_depth_pose_valid_count": int(np.count_nonzero(fixed_ray_valid)),
+        "moving_cross_room_unknown_count": int(
+            np.count_nonzero(moving_cross_unknown)
+        ),
+        "moving_cross_room_free_space_contradiction_count": int(
+            np.count_nonzero(moving_cross_free_space)
+        ),
+        "moving_own_view_free_space_contradiction_count": int(
+            np.count_nonzero(moving_own_contradiction)
+        ),
+        "fixed_own_view_free_space_contradiction_count": int(
+            np.count_nonzero(fixed_own_contradiction)
+        ),
+        "moving_own_view_unknown_count": int(np.count_nonzero(moving_own_unknown)),
+        "fixed_own_view_unknown_count": int(np.count_nonzero(fixed_own_unknown)),
+        "moving_suppressed_by_3d_compatibility_count": int(
+            np.count_nonzero(geometry_overlap & ~exact_fixed)
+        ),
+        "moving_complementary_height_retained_count": int(
+            np.count_nonzero(
+                column_owned
+                & ~compatible_3d
+                & ~exact_fixed
+                & ~moving_uncertain
+            )
+        ),
+        "moving_contradictory_geometry_uncertain_count": int(
+            np.count_nonzero(moving_uncertain & ~suppressed)
+        ),
+        "moving_contradictory_geometry_within_conflict_band_count": int(
+            np.count_nonzero(
+                moving_uncertain
+                & np.isfinite(nearest_fixed_distance)
+                & (nearest_fixed_distance > settings.geometry_compatibility_distance_m)
+                & (nearest_fixed_distance <= settings.geometry_conflict_distance_m)
+            )
+        ),
         "moving_retained_voxel_count": int(len(retained_moving)),
         "moving_suppressed_observation_count": int(
             np.sum(moving.records["observation_count"][suppressed], dtype=np.uint64)
@@ -879,7 +1233,9 @@ def _compose_output(
         "suppression_reason_mask": (
             exact_fixed[suppressed].astype(np.uint8)
             | (column_owned[suppressed].astype(np.uint8) << np.uint8(1))
+            | (compatible_3d[suppressed].astype(np.uint8) << np.uint8(2))
         ),
+        "geometry_status": moving_geometry_status[suppressed].astype(np.uint8),
         "voxel_size_m": np.asarray([settings.voxel_size_m], dtype=np.float32),
     }
     return output, suppressed_audit, ownership
@@ -1004,8 +1360,20 @@ def reintegrate(
     per-view corrections.  This function only realizes those corrections.
     """
 
-    if settings.voxel_size_m <= 0.0 or settings.ownership_cell_m <= 0.0:
-        raise PCFReintegrationError("voxel and ownership cells must be positive")
+    if (
+        settings.voxel_size_m <= 0.0
+        or settings.ownership_cell_m <= 0.0
+        or settings.geometry_compatibility_distance_m <= 0.0
+        or settings.geometry_conflict_distance_m
+        < settings.geometry_compatibility_distance_m
+    ):
+        raise PCFReintegrationError(
+            "voxel, ownership, and ordered 3-D overlap distances must be positive"
+        )
+    if not math.isclose(settings.agreement_weight_bonus, 0.0, abs_tol=1e-12):
+        raise PCFReintegrationError(
+            "agreement_weight_bonus is retired; use raw evidence weights"
+        )
     if settings.merge_batch_size < 2:
         raise PCFReintegrationError("merge_batch_size must be at least 2")
     allowed_dispositions = {
@@ -1076,7 +1444,7 @@ def reintegrate(
             "schema": "noesis.pcf.multiroom_reintegration.v1",
             "generated_at": _utc_now(),
             "status": "complete" if accepted_registration else "review_only",
-            "method": "all_accepted_raw_pcf_points_confidence_and_agreement_weighted_2_5cm_voxels",
+            "method": "all_accepted_raw_pcf_points_confidence_weighted_2_5cm_voxels_with_3d_overlap_gating",
             "phone_walk_only": True,
             "static_camera_points_included": False,
             "whole_cloud_icp_used": False,
@@ -1093,7 +1461,14 @@ def reintegrate(
                 "minimum_confidence": float(settings.minimum_confidence),
                 "minimum_depth_m": float(settings.minimum_depth_m),
                 "maximum_depth_m": float(settings.maximum_depth_m),
-                "agreement_weight_bonus": float(settings.agreement_weight_bonus),
+                "agreement_weight_bonus": 0.0,
+                "agreement_weighting": "disabled_correlated_conditioned_models",
+                "geometry_compatibility_distance_m": float(
+                    settings.geometry_compatibility_distance_m
+                ),
+                "geometry_conflict_distance_m": float(
+                    settings.geometry_conflict_distance_m
+                ),
                 "output_voxel_count": int(len(data["points"])),
                 "output_observation_count": int(
                     np.sum(data["observation_count"], dtype=np.uint64)
@@ -1106,7 +1481,7 @@ def reintegrate(
                     / max(1, np.sum(data["observation_count"], dtype=np.uint64))
                 ),
                 "point_sampling": "none_all_accepted_raw_pixels_streamed",
-                "centroid": "confidence_times_consensus_agreement_weighted_mean_per_voxel",
+                "centroid": "confidence_weighted_mean_per_voxel",
             },
             "ownership": ownership,
             "npz_contract": {
@@ -1123,6 +1498,11 @@ def reintegrate(
                 ],
                 "fixed_view_mask_word_count": fixed_fusion.view_mask_words,
                 "moving_view_mask_word_count": moving_fusion.view_mask_words,
+                "geometry_status_values": {
+                    "0": "observed_or_authoritative",
+                    "1": "uncertain_own_or_cross_room_free_space_contradiction",
+                    "2": "occluded_or_unknown_without_own_view_ray_support",
+                },
             },
             "artifacts": artifacts,
         }
@@ -1179,6 +1559,14 @@ def _room_report(
         },
         "selection_counts": fusion.counters,
         "raw_views": fusion.view_files,
+        "visibility_evidence": {
+            "view_count": len(fusion.view_evidence),
+            "depth_field": "depth_z",
+            "mask_field": "mask",
+            "intrinsics_field": "intrinsics",
+            "pose_field": "camera_pose",
+            "projection_check": "positive_z_in_image_masked_depth_with_explicit_tolerance",
+        },
     }
 
 

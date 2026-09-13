@@ -1,14 +1,70 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tools.mapanything_phone_scan.render_phone_heatmap_diagnostics import (
     PhoneCloud,
     _camera_positions,
     _point_splat,
+    _phone_floor_transform,
     _present_camera_ground,
+    _rasterize,
 )
 from noesis_core.coordinate_frames import camera_ground_frame_from_camera_to_world
+
+
+def test_floor_selection_rejects_dominant_wall_and_elevated_counter() -> None:
+    pytest.importorskip("open3d")
+    rng = np.random.default_rng(4)
+    wall = rng.uniform([-1.0, -0.8, 0.0], [-1.0, 1.6, 3.0], (2400, 3))
+    counter = rng.uniform([-0.8, 0.4, 0.0], [1.0, 0.4, 1.5], (1000, 3))
+    floor = rng.uniform([-0.8, 1.6, 0.0], [1.0, 1.6, 3.0], (800, 3))
+    cloud = _cloud()
+    cloud.points = np.concatenate([wall, counter, floor])
+    # An arbitrary world rotation must not turn this into a fixed-Y heuristic.
+    rotation = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    cloud.points = cloud.points @ rotation.T
+    cloud.camera_to_world[0, :3, :3] = rotation
+    original_points = cloud.points.copy()
+    transform, report = _phone_floor_transform(cloud)
+    leveled_floor = cloud.points[-len(floor):] @ transform[:3, :3].T + transform[:3, 3]
+    np.testing.assert_allclose(leveled_floor[:, 1], 0.0, atol=1e-5)
+    assert report["camera_height_m"]["median"] == pytest.approx(1.6, abs=0.01)
+    assert report["selected_candidate_index"] > 0
+    assert "plane_not_aligned_with_camera_up" in report["candidates"][0]["rejection_reasons"]
+    np.testing.assert_array_equal(cloud.points, original_points)
+
+
+def test_floor_selection_rejects_room_without_floor_evidence() -> None:
+    pytest.importorskip("open3d")
+    rng = np.random.default_rng(4)
+    cloud = _cloud()
+    wall = rng.uniform([-1.0, -0.8, 0.0], [-1.0, 1.6, 3.0], (1200, 3))
+    counter = rng.uniform([-0.8, 0.4, 0.0], [1.0, 0.4, 1.5], (800, 3))
+    ceiling = rng.uniform([-0.8, -1.0, 0.0], [1.0, -1.0, 3.0], (600, 3))
+    cloud.points = np.concatenate([wall, counter, ceiling])
+    with pytest.raises(ValueError, match="no supported floor plane"):
+        _phone_floor_transform(cloud)
+
+
+def test_trajectory_preview_preserves_aspect_and_includes_camera_endpoints(tmp_path) -> None:
+    import cv2
+
+    from tools.mapanything_phone_scan.inference import _write_trajectory_preview
+
+    # The dense cloud's percentiles exclude most of this narrow, L-shaped walk.
+    points = np.random.default_rng(2).uniform(-0.1, 0.1, (20_000, 3))
+    cameras = np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 4.0]])
+    output = tmp_path / "trajectory.png"
+    _write_trajectory_preview(output, points, cameras)
+    pixels = cv2.imread(str(output))
+    orange = np.all(pixels == [44, 148, 255], axis=2)
+    green = np.all(pixels == [96, 220, 96], axis=2)
+    rows, columns = np.nonzero(orange | green)
+    assert rows.min() >= 45 and rows.max() <= 1155
+    assert columns.min() >= 45 and columns.max() <= 1155
+    assert np.ptp(columns) / np.ptp(rows) == pytest.approx(0.5, abs=0.02)
 
 
 def _cloud() -> PhoneCloud:
@@ -30,6 +86,26 @@ def _cloud() -> PhoneCloud:
         frame_zero_depth=np.ones((1, 1), dtype=np.float32),
         frame_zero_rgb=np.zeros((1, 1, 3), dtype=np.uint8),
     )
+
+
+def test_static_crop_clips_drawn_path_without_clamping_or_mutating_geometry():
+    cloud = _cloud()
+    cloud.camera_to_world = np.repeat(np.eye(4)[None], 4, axis=0)
+    cloud.camera_to_world[:, :3, 3] = [[-1, 1, -1], [0.5, 1, 0.5], [2, 1, 2], [2, 1, 3]]
+    original_poses, original_points = cloud.camera_to_world.copy(), cloud.points.copy()
+    grids = _rasterize(cloud, (0, 1, 0, 1), 0.05)
+    assert grids["structural"].shape == (20, 20, 3)
+    np.testing.assert_array_equal(cloud.camera_to_world, original_poses)
+    np.testing.assert_array_equal(cloud.points, original_points)
+    # No endpoint marker is invented where either real endpoint is outside.
+    assert not np.any(np.all(grids["structural"] == [255, 90, 90], axis=-1))
+
+
+def test_static_crop_still_rejects_nonfinite_camera_path():
+    cloud = _cloud()
+    cloud.camera_to_world[0, 0, 3] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        _rasterize(cloud, (0, 1, 0, 1), 0.05)
 
 
 def test_point_splat_keeps_highest_confidence_sample_without_averaging() -> None:

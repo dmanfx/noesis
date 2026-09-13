@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101312" />
     <title>Noesis · Phone Room Scan</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.8.1" />
+    <link rel="stylesheet" href="/static/style.css?v=1.9.1" />
     <script type="importmap">
       {
         "imports": {
@@ -37,18 +37,68 @@
             Walk slowly with the rear camera. Keep one lens selected, overlap each view,
             and avoid people moving through the scene.
           </p>
+          <div id="secure-capture-note" class="secure-capture-note hidden" role="note">
+            <b>Camera capture needs HTTPS.</b>
+            <span>Open the secure phone page:</span>
+            <a id="secure-capture-link" target="_blank" rel="noopener"></a>
+            <span>Trust the appliance CA first if prompted.</span>
+            <a id="secure-capture-ca-link" target="_blank" rel="noopener">Download appliance CA</a>
+          </div>
         </div>
         <div class="capture-actions">
           <label class="field-label" for="scan-name">Scan name</label>
           <input id="scan-name" class="text-input" maxlength="80" value="Phone room walk" />
-          <label class="primary-button capture-button" for="camera-video">
+          <button id="record-phone-walk-button" class="primary-button capture-button" type="button">
             <span class="button-icon">●</span> Record phone walk
-          </label>
-          <input id="camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />
+          </button>
           <label class="secondary-button capture-button" for="existing-video">Use an existing video</label>
+          <a class="secondary-button capture-button" href="/static/downloads/install.html">Install RoomWalk Android companion</a>
           <input id="existing-video" class="visually-hidden" type="file" accept="video/*" />
+          <label class="secondary-button capture-button" for="sensor-bundle">Import camera + IMU bundle</label>
+          <input id="sensor-bundle" class="visually-hidden" type="file" accept=".zip,.tar,.tgz,.tar.gz,application/zip,application/x-tar,application/gzip" />
+          <p class="microcopy sensor-microcopy"><b>Phone video + IMU + room camera:</b> use the RoomWalk Android companion to select the static room camera and record all three together. Stop, then upload the saved capture. No separate calibration recording is needed for a room walk.</p>
+          <p id="phone-calibration-note" class="microcopy hidden" role="note"></p>
           <p class="microcopy"><b>Auto-saved:</b> each uploaded walk and every generated asset stay on this Noesis machine. Starting a new walk never overwrites an older one.</p>
         </div>
+        <section id="browser-capture-panel" class="browser-capture-panel hidden" aria-live="polite" aria-label="Browser camera and motion capture">
+          <div class="browser-capture-head">
+            <div><span class="eyebrow">Browser camera + motion</span><h2>Keep the phone still while sensors initialize</h2></div>
+            <button id="browser-close-button" class="ghost-button compact-button" type="button">Close setup</button>
+          </div>
+          <div class="browser-capture-body">
+            <div class="browser-preview-wrap"><video id="browser-preview" autoplay muted playsinline></video><span class="browser-preview-badge">rear camera preview</span></div>
+            <div class="browser-capture-controls">
+              <p id="browser-capture-status" class="browser-capture-status">Camera and motion permission are required.</p>
+              <p id="browser-capture-error" class="error-box hidden"></p>
+              <div class="companion-capture-box">
+                <label class="field-label" for="companion-camera-select">Static room camera</label>
+                <select id="companion-camera-select" class="text-input companion-camera-select" disabled>
+                  <option value="">Loading room cameras…</option>
+                </select>
+                <p id="companion-camera-status" class="microcopy">Choose the physically installed room camera before starting the walk.</p>
+                <p id="companion-capture-status" class="companion-capture-status">Static capture is required before phone recording starts.</p>
+                <p id="companion-heartbeat-status" class="microcopy">No static session yet</p>
+              </div>
+              <div class="browser-counts" aria-label="Live capture counts">
+                <span><b id="browser-accelerometer-count">0</b> accelerometer samples</span>
+                <span><b id="browser-gyroscope-count">0</b> gyroscope samples</span>
+                <span><b id="browser-video-frame-count">0</b> frame callbacks</span>
+                <span><b id="browser-capture-bytes">0 B</b> video bytes</span>
+              </div>
+              <p id="browser-mode-status" class="microcopy">Requests unscaled rear-camera 8K. Synchronized camera/IMU acquisition requires the native recorder and bundle import.</p>
+              <div class="browser-capture-actions">
+                <button id="browser-start-button" class="primary-button" type="button" disabled>Record 8K + motion observations</button>
+                <button id="browser-stop-button" class="danger-button" type="button" disabled>Stop and save</button>
+                <button id="browser-marker-button" class="secondary-button hidden" type="button" disabled>Mark event</button>
+                <button id="browser-marker-retry-button" class="ghost-button hidden" type="button" disabled>Retry pending markers</button>
+                <button id="companion-stop-retry-button" class="ghost-button hidden" type="button" disabled>Retry static finalization</button>
+                <button id="browser-download-button" class="secondary-button hidden" type="button">Download capture</button>
+                <button id="browser-retry-button" class="secondary-button hidden" type="button">Retry upload</button>
+                <button id="browser-discard-button" class="ghost-button hidden" type="button">Discard local bundle</button>
+              </div>
+            </div>
+          </div>
+        </section>
         <div id="upload-panel" class="upload-panel hidden" aria-live="polite">
           <div class="progress-header"><span id="upload-label">Uploading…</span><b id="upload-percent">0%</b></div>
           <div class="progress-track"><span id="upload-bar"></span></div>
@@ -76,6 +126,6 @@
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script type="module" src="/static/app.js?v=1.8.1"></script>
+    <script type="module" src="/static/app.js?v=1.9.9"></script>
   </body>
 </html>

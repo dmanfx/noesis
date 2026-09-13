@@ -25,10 +25,16 @@ from noesis.calibration.manager import (
     create_calibration_manager,
     load_camera_labels,
 )
+from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
+    ScenePriorMetricFrame,
     ScenePriorFloorPlane,
     ScenePriorFrameBinding,
     ScenePriorFrameRef,
+    ScenePriorWorldToScenePresentation,
+    metric_frame_revision_sha256,
+    scene_revision_sha256,
+    world_to_scene_presentation_sha256,
 )
 from noesis_core.coordinate_frames import (
     BACKEND_WORLD_FRAME_ID,
@@ -830,6 +836,129 @@ def test_calibration_manager_rejects_stale_frame_binding() -> None:
             streammux_size=(1920, 1080),
             scene_prior_frame_bindings={"family-room": stale},
         )
+
+
+def test_calibration_bundle_transports_target_owned_presentation_for_v2_binding(
+    manager: CalibrationManager,
+    temp_calibration_dir: Path,
+) -> None:
+    source = manager._identity_frame_contract().source_frame
+    camera_physical = manager._physical_camera_calibration_sha256
+    alignment_physical = manager._physical_world_alignment_sha256
+    provenance = (
+        ArtifactFingerprint(role="camera_calibration_physical", sha256=camera_physical),
+        ArtifactFingerprint(role="world_alignment_physical", sha256=alignment_physical),
+    )
+    target_revision = metric_frame_revision_sha256(
+        BACKEND_WORLD_FRAME_ID,
+        (0.0, 1.0, 0.0),
+        0.0,
+        tuple(item.sha256 for item in provenance),
+    )
+    target = ScenePriorFrameRef(
+        frame_id=BACKEND_WORLD_FRAME_ID,
+        revision=target_revision,
+    )
+    plane = ScenePriorFloorPlane(
+        frame=target,
+        normal=(0.0, 1.0, 0.0),
+        offset_m=0.0,
+    )
+    metric_frame = ScenePriorMetricFrame(
+        contract="noesis.scene_prior.metric_frame",
+        contract_version=1,
+        frame=target,
+        units="meters",
+        floor_plane=plane,
+        physical_provenance=provenance,
+        accepted=True,
+    )
+    identity = tuple(float(value) for value in np.eye(4).flatten(order="F"))
+    edge_digest = revisioned_transform_sha256(source, target, identity)
+    presentation = ScenePriorWorldToScenePresentation(
+        contract="noesis.scene_prior.world_to_scene_presentation",
+        contract_version=1,
+        world_frame=target,
+        render_frame="menon_scene",
+        world_to_scene_col_major=identity,
+        world_to_scene_sha256=world_to_scene_presentation_sha256(
+            target,
+            "menon_scene",
+            identity,
+        ),
+        scene_revision_id=scene_revision_sha256(
+            target,
+            "menon_scene",
+            identity,
+        ),
+        source_transform_sha256s=(edge_digest,),
+        provenance=ArtifactFingerprint(
+            role="world_to_scene_presentation",
+            sha256="c" * 64,
+        ),
+        accepted=True,
+    )
+    binding = ScenePriorFrameBinding(
+        contract="noesis.scene_prior.frame_binding",
+        contract_version=2,
+        source_frame=ScenePriorFrameRef(
+            frame_id=source.frame_id,
+            revision=source.revision,
+        ),
+        target_frame=target,
+        source_camera_calibration_sha256=manager._camera_calibration_sha256,
+        source_world_alignment_sha256=manager._world_alignment_sha256,
+        target_revision_id="target-metadata",
+        target_revision_metadata_sha256="d" * 64,
+        target_from_source_col_major=identity,
+        target_from_source_sha256=edge_digest,
+        source_floor_plane=ScenePriorFloorPlane(
+            frame=ScenePriorFrameRef(
+                frame_id=source.frame_id,
+                revision=source.revision,
+            ),
+            normal=(0.0, 1.0, 0.0),
+            offset_m=0.0,
+        ),
+        target_floor_plane=plane,
+        metric_frame=metric_frame,
+        artifact_revision_id="artifact-revision",
+        source_camera_calibration_physical_sha256=camera_physical,
+        source_world_alignment_physical_sha256=alignment_physical,
+        presentation=presentation,
+    )
+    transported = CalibrationManager(
+        cameras_yaml_path=temp_calibration_dir / "cameras.yaml",
+        camera_calibration_json_path=temp_calibration_dir / "camera_calibration.json",
+        ply_alignment_json_path=temp_calibration_dir / "ply_alignment.json",
+        streammux_size=(1280, 720),
+        raw_audit_dir=temp_calibration_dir / "private_audit-v2",
+        scene_prior_frame_bindings={"test-camera": binding},
+    )
+    transported.set_camera_labels({0: "test-camera"})
+    bundle = transported.calibration_bundle()
+    assert bundle["cameras"]["frame_bindings"]["test-camera"]["contract_version"] == 2
+    assert bundle["world_frame_presentations"][target_revision]["source_transform_sha256s"] == [edge_digest]
+    assert bundle["world_frame_presentations"][target_revision]["world_frame"]["revision"] == target_revision
+
+    # An explicit mapping is valid only for the authored scene revision it
+    # names.  Changing that scene-only dependency while retaining the metric
+    # frame must reject the stale mapping before it reaches Menon.
+    transported._align["scene_similarity"] = {
+        "world_to_scene_col_major": list(identity),
+    }
+    assert transported.world_frame_presentations()[target_revision]["scene_revision_id"] == scene_revision_sha256(
+        target,
+        "menon_scene",
+        identity,
+    )
+    changed_scene = list(identity)
+    changed_scene[12] = 1.0
+    transported._align["scene_similarity"] = {
+        "world_to_scene_col_major": changed_scene,
+    }
+    with pytest.raises(CalibrationValidationError, match="stale for the current authored scene"):
+        transported.world_frame_presentations()
 
 
 def test_camera_anchor_scene_similarity_preserves_binding_and_rejects_bad_fit(

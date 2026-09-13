@@ -11,6 +11,14 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from .calibrated_inference import (
+    add_calibration_summary,
+    calibrated_input_views,
+    calibration_frame_fields,
+    calibration_raw_fields,
+    calibration_specs,
+    rectification_valid_mask,
+)
 from .inference import (
     _prepare_fixed_camera_anchor,
     _write_confidence_preview,
@@ -296,6 +304,10 @@ def run_da3_phone_scan(
     frame_rows = prepared.get("frames")
     if not isinstance(frame_rows, list) or len(frame_rows) < 2:
         raise DA3PhoneScanError("the scan has no prepared multi-view frame set")
+    try:
+        calibrated = calibration_specs(frame_rows, anchor_image=settings.anchor_image)
+    except ValueError as exc:
+        raise DA3PhoneScanError(str(exc)) from exc
     phone_frame_paths = [scan_dir / str(row["frame"]) for row in frame_rows]
     inference_rows = list(frame_rows)
     anchor_view_index: int | None = None
@@ -325,10 +337,17 @@ def run_da3_phone_scan(
     ]
     if any(not path.is_file() for path in frame_paths):
         raise DA3PhoneScanError("one or more prepared phone frames are missing")
+    calibrated_views = None
+    if calibrated is not None:
+        calibrated_views = calibrated_input_views(
+            frame_paths, calibrated, frame_rows=frame_rows, scan_dir=scan_dir
+        )
 
     progress(0.02, "Loading official DA3-BASE any-view model")
     prediction = None
     model = None
+    network_intrinsics = None
+    rectification_masks = None
     started = time.perf_counter()
     try:
         import torch
@@ -340,7 +359,7 @@ def run_da3_phone_scan(
         ).to(settings.device)
         progress(0.10, f"Jointly reconstructing {len(frame_paths)} phone views with DA3")
         prediction = model.inference(
-            [str(path) for path in frame_paths],
+            [view["img"] for view in calibrated_views] if calibrated_views is not None else [str(path) for path in frame_paths],
             process_res=settings.process_res,
             process_res_method="upper_bound_resize",
             ref_view_strategy=settings.ref_view_strategy,
@@ -352,6 +371,31 @@ def run_da3_phone_scan(
         extrinsics = np.asarray(prediction.extrinsics, dtype=np.float64)
         intrinsics = np.asarray(prediction.intrinsics, dtype=np.float64)
         images_rgb = np.asarray(prediction.processed_images, dtype=np.uint8)
+        if calibrated is not None:
+            # DA3-BASE does not consume K without pose inputs. Its learned poses
+            # and depth remain predictions; measured K defines focal scaling and
+            # backprojection on the exact processed image grid below.
+            calibrated_images, _, measured_intrinsics = model.input_processor(
+                [view["img"] for view in calibrated_views],
+                intrinsics=np.stack([view["intrinsics"] for view in calibrated_views]),
+                process_res=settings.process_res,
+                process_res_method="upper_bound_resize",
+                sequential=True,
+                num_workers=1,
+            )
+            if (
+                measured_intrinsics is None
+                or tuple(calibrated_images.shape) != (len(frame_paths), 3, *images_rgb.shape[1:3])
+                or tuple(measured_intrinsics.shape) != (len(frame_paths), 3, 3)
+            ):
+                raise DA3PhoneScanError("calibrated DA3 preprocessing disagrees with the predicted image grid")
+            network_intrinsics = intrinsics.copy()
+            intrinsics = measured_intrinsics.detach().cpu().numpy().astype(np.float64)
+            rectification_masks = np.stack([
+                rectification_valid_mask(spec, intrinsics[index], depth_relative.shape[1:])
+                for index, spec in enumerate(calibrated)
+            ])
+            del calibrated_views, calibrated_images, measured_intrinsics
     finally:
         del model
         gc.collect()
@@ -370,6 +414,8 @@ def run_da3_phone_scan(
         settings.metric_focal_denominator,
         progress,
     )
+    if rectification_masks is not None:
+        non_sky &= rectification_masks
     finite = (
         np.isfinite(depth_relative)
         & (depth_relative > 1e-3)
@@ -430,6 +476,11 @@ def run_da3_phone_scan(
             intrinsics=intrinsics[index].astype(np.float32),
             metric_scaling_factor=np.asarray([scale], dtype=np.float32),
             model_rgb=images_rgb[index],
+            **calibration_raw_fields(
+                row,
+                None if rectification_masks is None else rectification_masks[index],
+                network_intrinsics=None if network_intrinsics is None else network_intrinsics[index],
+            ),
         )
         valid_indices = np.flatnonzero(mask.reshape(-1))
         if valid_indices.size:
@@ -447,6 +498,12 @@ def run_da3_phone_scan(
                     None if row.get("fixed_camera_anchor") else str(row["frame"])
                 ),
                 "fixed_camera_anchor": bool(row.get("fixed_camera_anchor")),
+                **calibration_frame_fields(
+                    row,
+                    None if rectification_masks is None else rectification_masks[index],
+                    network_conditioned=False,
+                    network_intrinsics=None if network_intrinsics is None else network_intrinsics[index],
+                ),
                 "model_rgb": f"outputs/views/{rgb_path.name}",
                 "depth_preview": f"outputs/views/{depth_path.name}",
                 "confidence_preview": f"outputs/views/{confidence_path.name}",
@@ -474,6 +531,8 @@ def run_da3_phone_scan(
                 "schema": "noesis.da3.phone_scan.camera_trajectory.v1",
                 "provider": "da3",
                 "model_id": settings.model_id,
+                "coordinate_frame": "da3_metric_world_unaligned_to_noesis",
+                "pose_convention": "opencv_cam2world_x_right_y_down_z_forward",
                 "camera_to_world": camera_to_world.tolist(),
             },
             indent=2,
@@ -486,11 +545,14 @@ def run_da3_phone_scan(
         camera_poses=camera_to_world.astype(np.float32),
         intrinsics=intrinsics.astype(np.float32),
         metric_scaling_factors=np.full(len(inference_rows), scale, dtype=np.float32),
+        **({"network_intrinsics": network_intrinsics.astype(np.float32)} if network_intrinsics is not None else {}),
     )
     result: dict[str, Any] = {
         "schema": "noesis.phone_scan.outputs.v2",
         "provider": "da3",
         "model_id": settings.model_id,
+        "coordinate_frame": "da3_metric_world_unaligned_to_noesis",
+        "pose_convention": "opencv_cam2world_x_right_y_down_z_forward",
         "mode": "DA3-BASE any-view poses and consistent depth metricized by DA3Metric-Large TensorRT",
         "view_count": len(inference_rows),
         "phone_view_count": len(frame_rows),
@@ -510,6 +572,7 @@ def run_da3_phone_scan(
         },
         "frames": frame_outputs,
     }
+    add_calibration_summary(result, prepared, calibrated, network_conditioned=False)
     manifest_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     result["files"] = _files(output_dir)
     manifest_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

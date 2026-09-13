@@ -20,7 +20,17 @@ from .identity_calibration import (
 )
 from .observation import ObservationEnvelope
 from .scene import SceneRelease
-from .scene_prior import ScenePriorCatalog, ScenePriorRevision
+from .scene_prior import (
+    ScenePriorCatalog,
+    ScenePriorFrameBinding,
+    ScenePriorFrameRef,
+    ScenePriorMetricFrame,
+    ScenePriorRevision,
+    ScenePriorWorldToScenePresentation,
+    metric_frame_revision_sha256,
+    scene_revision_sha256,
+    world_to_scene_presentation_sha256,
+)
 from .world import WorldEvent, WorldSnapshot
 from .world_measurement import (
     MeasurementKind,
@@ -114,7 +124,14 @@ __all__ = [
     "ObservationEnvelope",
     "SceneRelease",
     "ScenePriorCatalog",
+    "ScenePriorFrameBinding",
+    "ScenePriorFrameRef",
+    "ScenePriorMetricFrame",
     "ScenePriorRevision",
+    "ScenePriorWorldToScenePresentation",
+    "metric_frame_revision_sha256",
+    "scene_revision_sha256",
+    "world_to_scene_presentation_sha256",
     "StateBaseline",
     "StateRelease",
     "ShadowIdentityEvidenceRecord",

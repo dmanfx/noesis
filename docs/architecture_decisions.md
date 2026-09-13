@@ -1102,3 +1102,549 @@ image rays meet the room. Preserving a known-bad legacy height or correcting
 only yaw can make the projected forward coordinate asymptote before the person
 reaches the foyer. The revision-bound SE(3) edge fixes that geometry at its
 source while remaining reproducible for future homes.
+
+## ADR-028 — Reconstruction evidence and presentation remain revision-bound
+
+**Accepted:** 2026-09-04
+
+The reconstruction lanes keep physical metric-frame identity, source
+calibration and world-alignment provenance, scene-prior artifact revision,
+target-coordinate revision, and authored world-to-scene presentation identity
+as separate contracts. A validated target-owned presentation is applied once
+at the Noesis-to-Menon boundary, so a fused entity may carry several accepted
+source-edge hashes while rendering through one target mapping. Menon validates
+the mapping digest against its matrix and frame/scene identities at bundle
+ingress; a revision, source hash, or presentation mismatch fails closed. The
+existing v1 binding path remains compatible and the current catalog is not
+relabelled to claim a new common frame.
+
+Phone reconstruction evidence is bounded and provenance-preserving. Sensor
+capture retains exact camera and IMU timing/calibration fields; conventional
+VIO supplies relative same-segment constraints and does not establish the
+Noesis house origin. Trajectory refinement uses explicit visual and
+depth-backed constraints with withheld temporal checks. Conditioned
+MapAnything and DA3 evidence is treated as correlated, so agreement does not
+receive an independence bonus; single-view support is retained as a separate
+review class.
+
+A physical scale change must reach depth, poses, world points and relative
+visual constraints together. Larger changes rerun the existing fixed-scale
+world alignment on the actual refined carrier before PCF conditioning; a
+matrix or passed report for earlier geometry cannot authorize reuse. Candidate
+artifacts remain at stable paths, with acceptance controlling consumption
+instead of a separate promotion lifecycle.
+
+Multi-room PCF assembly remains review-only until its registration and metric
+frame evidence is accepted. X/Z ownership is only an overlap candidate;
+compatibility requires recorded camera pose, full intrinsics, retained mask,
+and depth-ray support in three dimensions. Complementary heights are retained,
+contradictory or unsupported surfaces are marked uncertain or unknown and
+rendered in separate review classes. Rejected connector joins, manual
+extrinsics, authored geometry, and a static model's apparent scale cannot
+promote a reconstruction or place live people.
+
+The implementation and bounded evidence are recorded in
+[`WO-1`](../plans/reconstruction_work_orders/WO-1.md),
+[`WO-2`](../plans/reconstruction_work_orders/WO-2.md),
+[`WO-3`](../plans/reconstruction_work_orders/WO-3.md),
+[`WO-4`](../plans/reconstruction_work_orders/WO-4.md), and
+[`WO-5`](../plans/reconstruction_work_orders/WO-5.md).
+
+**Why:** The five work orders share one authority boundary but produce
+different kinds of evidence. Keeping those identities and evidence classes
+explicit prevents an accepted rendering mapping from becoming an unvalidated
+registration, and prevents review geometry or relative phone motion from
+silently becoming live-world authority.
+
+## ADR-029 — Room Walk uses the Menon-trusted HTTPS origin
+
+**Accepted:** 2026-09-05
+
+The phone-scan launcher keeps its existing LAN HTTP listener on port 8788 for
+known consumers and serves the same FastAPI app through a second HTTPS listener
+on port 8789. The HTTPS listener reuses the existing Menon appliance
+certificate and private key, with paths configurable through
+`NOESIS_PHONE_SCAN_TLS_CERT_FILE` and `NOESIS_PHONE_SCAN_TLS_KEY_FILE`. The
+two Uvicorn servers share one imported app instance and run inside one explicit
+FastAPI lifespan owned by the launcher. Both listener configs disable their own
+lifespan callbacks, so startup recovery and shutdown do not create duplicate
+`PhoneScanService` executors or state-recovery passes. The HTTPS listener is
+exposed only after shared startup recovery completes, and both listeners drain
+before shared shutdown runs.
+
+The current certificate is valid for the DNS name
+`TauntonMainframe.local` and has no LAN-IP SAN. Browser Room Walk access
+therefore uses `https://TauntonMainframe.local:8789`; opening the raw
+`192.168.3.126` address does not satisfy certificate validation. The native
+Android companion routes that hostname directly to the fixed `192.168.3.126`
+LAN address while retaining the hostname for TLS/SNI and HTTP Host. Android Chrome must trust the existing
+Menon local CA certificate before this is a trusted secure origin. When the CA
+is not already trusted, the bounded `GET /api/browser-capture/ca-certificate`
+route on HTTP 8788 serves only the exact configured public CA certificate for
+bootstrap; the launcher prints its DER SHA-256 fingerprint for out-of-band
+verification. A warning page or certificate bypass is not accepted as trust
+evidence, and the CA private key is never exposed through the phone-scan static
+or asset roots.
+
+The browser's in-page camera + IMU recording is the default path for collecting
+raw, uncalibrated observations. Browser callback arrival timestamps are not
+acquisition timestamps and cannot admit metric VIO or establish the Noesis
+world frame. The calibrated native camera + IMU bundle remains the metric-VIO
+path; HTTPS transport changes origin security only and does not change spatial
+authority.
+
+**Timing diagnostic correction, 2026-09-06:** Generic Sensor timestamps do not
+inherit a verified browser clock origin from their API name. Receipt time has
+separate provenance. A declared common origin contradicted by sensor timestamps
+after receipt disables callback-lag statistics while retaining the raw samples.
+The retained Living Room walk exhibits this contradiction. Receipt-time clock
+fits cannot supply camera/IMU acquisition calibration; use the native
+[timing preflight](../tools/mapanything_phone_scan/README.md#native-timing-preflight-before-a-new-room-walk)
+before collecting calibration motion or another metric-VIO candidate.
+
+**Why:** Android Chrome requires a secure, trusted origin for camera and motion
+sensor access. Reusing the already trusted appliance certificate avoids a new
+certificate authority and preserves the existing HTTP consumer while keeping
+one phone-scan service state and one recovery/shutdown lifecycle.
+
+## ADR-030 — Room Walk may retain one bounded static-camera companion session
+
+**Accepted:** 2026-09-05
+
+The Room Walk browser may pair one selected physical static camera with one
+phone capture for evidence. The companion resolves that camera through the
+active native DS9.1 source configuration, records the original encoded stream,
+and observes the selected camera's canonical tracking/world publications. The
+phone side is allowed to start only after both the encoded-video and tracking
+ready gates pass. Start, heartbeat, optional marker, stop, finalization, and
+phone-bundle association are retry-safe; one session is active at a time, its
+duration is capped at 900 seconds, and its renewable lease is capped at 45
+seconds.
+
+The session persists source and calibration/runtime provenance, exact tracking
+and world publication identities, packet timing, bounded browser/server clock
+exchanges, and optional user markers. It retains partial and failed evidence,
+and a failed phone upload does not invalidate finalized static evidence. The
+browser exposes links to the saved artifacts after stop. The original encoded
+video is remuxed without a decoded CPU branch, inference, or re-encoding. The
+companion does not become a second perception authority or add work to canonical
+media callbacks.
+
+The paired static data remains separate from phone-only frame selection and
+provider fusion. Browser callback timing is estimated/unverified: clock probes
+are evidence of request/receipt timing, not synchronized acquisition time. A
+phone camera trajectory is not a person's body or foot trajectory, so paired
+capture does not establish calibration ground truth or change live tracking
+calibration without separate identity, camera-to-body offset, scale, and timing
+evidence.
+
+**Why:** A bounded companion session preserves the fixed-camera video and
+canonical tracking context needed for later comparison while keeping source
+authority, timing uncertainty, and phone-only reconstruction responsibilities
+explicit.
+
+
+## ADR-031 — Phone frame selection preserves gaps and removes adjacent repeats
+
+**Accepted:** 2026-09-06
+
+Phone-only preparation samples existing encoded frames instead of using an FPS
+filter that manufactures repeated images during recording gaps. Native capture
+bundles retain their explicit acquisition timestamp and source-frame mapping;
+browser and ordinary video PTS remain encoded-media timing only.
+
+A bounded pass collapses adjacent repeated-image runs before adaptive selection.
+Exact decoded-content equality is sufficient evidence; near-identical images
+also require spatial feature support and very small displacement. Each comparison
+uses the fixed run anchor, preserving cumulative slow motion. A representative
+retains its original timestamp and candidate identity. Preparation reports the
+removed candidate identities, counts, and repeat spans.
+
+Temporal coverage, endpoint selection, and connectivity repair cannot force
+repeats back into the selected set. Real timestamp gaps may remain after a pause.
+They do not authorize fabricated camera poses, interpolation across missing
+observations, or weaker camera/dense-surface registration gates. A preview stall
+is not proof of a recording stall, and repeated-image evidence alone does not
+establish the cause of a reconstruction failure.
+
+**Why:** Redundant images consume bounded joint-inference capacity without adding
+viewpoint evidence. Preserving recording gaps and distinct views makes brief
+pauses tolerable while retaining the existing reconstruction authority checks.
+
+## ADR-032 — Reviewed image orientation corrections retain source provenance
+
+**Accepted:** 2026-09-06
+
+A capture-specific prepared-image rotation must retain the original encoded
+recording, selected observation indices, and timestamps. Corrected frames record
+their original prepared-frame identity/hash, original dimensions, explicit
+source-to-prepared pixel transform, and new content hash/identity. Rotating RGB
+pixels does not verify camera acquisition timing, rotate raw IMU measurements,
+or establish a camera-to-IMU or Noesis-world frame binding.
+
+For `20260906-050646-107f244c`, visual inspection confirmed sideways pixels with
+no encoded display-rotation metadata. A lossless 90-degree counterclockwise
+correction was applied to the same 256 selected observations. The matched rerun
+passed all existing camera and dense-surface window gates at the same model
+pixel budget. Prior failed preparations and outputs remain available.
+
+This is a reviewed correction of that capture; no automatic orientation rule
+was added. Portrait dimensions alone are not evidence that pixels are sideways.
+Repreparing from the original recording must account for the recorded correction
+before inference. Native calibration or pose/depth priors require their own
+consistent frame transformations if a future workflow rotates their RGB views.
+
+**Why:** Correcting the observed input orientation recovered inference without
+discarding observations or weakening registration checks, while explicit
+provenance keeps the correction separate from calibration and world authority.
+
+## ADR-033 — Paired static recordings supply independent alignment references
+
+**Accepted:** 2026-09-06
+
+A Room Walk with an associated, successfully finalized static recording uses
+that recording to build its alignment reference. Its camera and phone-archive
+association must match. An invalid paired source or failed reference build
+stops the operation. Unpaired walks retain the validated saved-camera route.
+
+Static reconstruction consumes bounded observations from the recorded camera,
+the captured rectification, and the calibration bundle. It does not consume
+phone RGB, depth, or inferred poses. Same-camera depth estimates are fused
+using the existing static depth-agreement rule. Rectified camera rays enter the
+captured target frame through `target_from_calibration * inverse(E)` exactly
+once. No additional floor, yaw, or scale correction is inferred from the phone
+walk, and tracking observations are not calibration authority.
+
+MapAnything receives the known rectified intrinsics as conditioning, but its
+output rays and recovered intrinsics remain predictions. The builder places
+its metric range (`depth_along_ray`) on the captured calibrated rays, converts
+that range to Z depth for static fusion, and retains the predicted intrinsics
+and original model depths as diagnostics. Learned intrinsics cannot replace
+the captured calibration.
+
+The static reference has its own content-bound revision and artifact manifest.
+It preserves the source recording identity, sampled observations, image
+transforms, calibration and frame-binding hashes, and model settings. The
+alignment report retains the captured world-frame revision. Reuse verifies
+the reference artifacts; downstream PCF resolves the same verified reference.
+Neither reconstruction nor a passed alignment promotes geometry into live
+Noesis tracking or rewrites global calibration.
+
+Static inference shares the bounded phone/PCF inference worker lock. Failure
+preserves the original capture and phone reconstruction. Completed static
+reference artifacts remain reviewable even when the unchanged alignment
+quality gates reject the geometric fit.
+
+**Why:** A contemporaneous static recording provides an independent reference
+for the same room state, while explicit source and frame provenance prevents
+older geometry or live tracking estimates from silently entering the fit.
+
+## ADR-034 — Fit only static-camera-visible structure and retain replay diagnostics
+
+**Accepted:** 2026-09-06
+
+Phone-to-static refinement and candidate scoring use the same fixed-camera
+visibility and occlusion model as their validation. Visibility is recomputed
+at each bounded optimizer iteration. Foreground disagreements remain eligible;
+points behind the camera's nearest supported depth do not pull the fit toward
+unobserved geometry. Gravity, fixed scale, transform bounds, and existing
+quality thresholds remain unchanged.
+
+The global point-cloud and structure metrics remain separate diagnostics. The
+report identifies the existing robust wall-gate statistic and additionally
+records untrimmed residuals across comparable points. Relative fit admission
+does not establish surveyed metric accuracy or remove a reference-model bias.
+
+The explicit diagnostic replay command writes outside the saved scan, retains
+failure reasons and optional bounded intermediate arrays, and never updates
+scan state or live-world authority. The room-specific source and target
+identities remain in each report. The working procedure and experiment ledger
+are in [Room reconstruction fitting](room_reconstruction_fitting.md).
+
+**Why:** On matched Living Room inputs, the previous all-structure refinement
+moved an already plausible RGB anchor to a rejected wall fit. Visibility-aware
+refinement reduced the gated residual from 0.122825 m to 0.085703 m without
+relaxing a gate; spatial holdout checks also improved over baseline. The same
+implementation reduced the matched Kitchen result from 0.081716 m to
+0.054205 m. Image-cell balancing was tested and rejected. Family Room's old
+reference/calibration mismatch remains a separate preflight failure.
+
+## ADR-035 — Consensus preserves one RGB projection for visual anchoring
+
+**Accepted:** 2026-09-06
+
+Consensus raw views retain the MapAnything reference RGB image remapped onto
+the existing common camera rays. They do not average RGB images warped using
+different inferred intrinsics. The fusion manifest records the RGB projection
+source and policy. Depth selection, uncertainty, camera poses, metric scale,
+and fusion thresholds remain unchanged.
+
+**Why:** Averaging two different projections of one recorded image duplicates
+edges and weakens the landmarks used by static-camera PnP. On the matched
+256-view Living Room consensus, replacing only RGB restored a passed anchor
+with 31 consensus views and 1,940 inliers; the blended images supported only
+two solved views and 21 inliers. Better visual anchoring does not itself admit
+the room fit: the usual independent static-reference gates still apply.
+
+## ADR-036 — Retained trajectory refinement binds RGB rays and rebuilds fusion support
+
+**Accepted:** 2026-09-06
+
+Visual revisit verification matches the RGB stored on the retained depth and
+intrinsics grid. Prepared frames provide capture identity; their resized pixels
+cannot replace a cropped or remapped raw projection. Refinement preserves the
+input coordinate-frame label and source hashes, requires withheld temporal
+constraints before admission, and rebuilds camera poses and world points
+without forcing endpoint closure.
+
+The joint consensus builder accepts an explicitly passed pose-only refinement
+of the same capture and original consensus. It verifies source and solution
+hashes, original poses, camera rays, scale, and origin gauge, then recomputes
+multiview consistency, depth selection, evidence weights, raw geometry, and
+actual distinct-view surfel support. A previous surfel cloud cannot be reused
+merely by changing its pose metadata. A fresh fixed-scale static alignment is
+required before the rebuilt result is used as a room review surface.
+
+Complete static-camera localization uses the same retained-RGB/depth projection
+contract. Insufficient independent-view support remains a hard rejection and
+now writes bounded per-view diagnostic evidence before raising the failure.
+Its fitted poses and comparison calibration must share the explicitly bound
+world frame. A pose request or a saved failure report cannot admit calibration.
+
+**Why:** The 256-view Living Room consensus has a materially different RGB
+projection from a resized prepared frame. Using the retained projection finds
+two admitted revisit constraints and eight withheld constraints; their p80
+translation residual improves from 0.110095 to 0.098891 m. The static fit is a
+separate check and slightly worsens before fusion is rebuilt. This is a measured
+tradeoff, not evidence of surveyed accuracy or permission to relax either gate.
+
+
+## ADR-037 — Phone intrinsics bind the capture projection and provider geometry
+
+**Accepted:** 2026-09-07
+
+A measured phone calibration is retained with its original archive, verified
+source hashes, native image coordinates, and all five OpenCV distortion
+coefficients. Applying it requires an explicitly associated recorder mode and
+matching native encoded resolution/orientation. Preparation rectifies selected
+images once and binds their final hashes to the measured output K, source K/D,
+resize transform, and calibration profile hash. Existing saved walks retain
+their original preparations and results.
+
+MapAnything consumes calibrated rays through its own coupled image/intrinsics
+preprocessor. DA3-BASE's installed network does not consume K without extrinsic
+inputs, so its inferred poses/depth remain model estimates. Its exact input
+processor places measured K on the output grid for metric focal conversion and
+backprojection; network-estimated K remains separate diagnostic evidence.
+Both providers reject invalid rectification-border rays, preserve calibration
+through window assembly, and retain existing reconstruction acceptance gates.
+
+Consensus also checks the prepared profile fingerprint and both providers'
+per-view calibration and source-processing lineage before fusion. It preserves
+that lineage and the profile's evidence/capture-binding limits in the fused raw
+views and manifests, and recomputes D5 border validity on the common rays.
+Reported sensor metadata applied through an assumed recording crop remains an
+explicit review hypothesis; fusion cannot upgrade it to measured browser
+calibration or metric VIO.
+
+**Why:** The supplied 8K handoff has a nonzero fifth distortion coefficient.
+Truncating it or treating its native K as the camera matrix for the 4K/browser
+recordings would change the projection without evidence. Camera intrinsics
+alone cannot establish synchronized IMU data, camera/IMU extrinsics, surveyed
+room scale, or a static/world camera pose. The operational import and use steps
+are in the [phone reconstruction guide](../tools/mapanything_phone_scan/README.md#measured-phone-camera-calibration).
+
+## 2026-09-07 — Require explicit browser 8K geometry and preserve timing limits
+
+New browser phone captures require exact unscaled rear-camera 8K negotiation,
+returned-settings checks, and an encoded-dimension check on import. The UI
+reports the bounded recording duration and unverified synchronization. Invalid
+Generic Sensor clocks stop capture instead of being corrected using callback
+arrival offsets; raw observations remain evidence. Preview callback phases do
+not become encoded-frame IDs. Legacy imports retain their existing raw-evidence
+semantics. Matching dimensions do not transfer native-camera calibration or
+admit metric VIO. Synchronized acquisition continues through the native bundle
+boundary, with device-specific 8K and timing validation still required.
+
+## 2026-09-08 — Native RoomWalk Android capture companion
+
+RoomWalk keeps its reconstruction service and web review interface. The native
+[Android companion](../tools/mapanything_phone_scan/android_companion/README.md)
+records Camera2 video through a hardware MediaCodec surface and preserves
+separate Android IMU streams. It requires explicit 8K/30 capability checks and
+Android's SENSOR output timestamp base with a REALTIME camera clock. Actual
+encoder PTS must match Camera2 sensor timestamps exactly at encoder precision;
+raw acquisition, encoder and container timing remain separate evidence.
+
+A static Camera2 size-list omission is not sufficient to reject a mode when
+the driver supports an exact configuration query. Positive standard 8K/30
+queries may enable a bounded recording test. Each attempt revalidates the
+prerequisites and queries the actual encoder/preview surfaces before opening
+the camera, then creates the session from that same configuration and request
+parameters. Vendor use cases remain diagnostic-only. Query acceptance alone
+does not enable full walks for a newly found mode or establish native image
+detail, capture cadence or timestamp association; those require recorded evidence.
+
+A completed local ten-second test can qualify the matching OS build, camera,
+encoder/bitrate, preview and standard use cases for full walks. Qualification
+requires exact complete frame associations, IMU coverage, no capture failures
+or dropped metadata, and a sufficient recorded span at nominal 30 FPS, as defined
+in the companion's capture preflight. Each new take rechecks the saved evidence
+and queries its actual surfaces. This permits longer recording without granting
+camera calibration, metric VIO or native resolving-detail authority. Viewfinder
+rotation and aspect correction affect presentation only; encoded coordinates stay
+unchanged.
+
+The native companion's Capture action opens a full-screen viewer with a live
+preview before recording, following the web capture sequence. Its separate
+preview-only camera owner writes no capture artifacts and starts no IMU or
+encoder work. Recording begins only after that owner confirms camera closure;
+the canonical native recorder then opens its independently checked 8K session.
+Setup and transfer menus stay outside the viewer, and Back/close during a take
+uses the existing stop-and-save path. This UI transition does not change video
+coordinates, camera/IMU timing semantics or calibration admission.
+
+The service validates those original rows, decoded frame counts and MP4 timing
+before labeling camera acquisition timestamps verified. A missing or failed
+association leaves RGB preparation available with no acquisition timestamp
+claim. Unknown lens calibration, distortion, camera/IMU extrinsics, measured
+time offset and IMU noise remain unknown; metric VIO stays blocked. Existing
+stock-camera calibration is not transferred by matching 8K dimensions.
+
+Captures stream to phone storage with bounded workers and size/duration limits.
+Backgrounding stops capture; export and explicit HTTPS upload retain local
+recordings. The app preserves certificate and hostname checks, packages no
+private keys, and does not start the static-camera runtime. This first companion
+build uses independently selected static reconstruction for later alignment;
+it does not orchestrate a paired static recording. APK installation/emulator
+checks and importer tests establish software behavior. Physical-phone 8K
+performance, firmware timing and camera calibration remain separate checks.
+
+## 2026-09-10 — Complete native phone calibration inputs without changing authority
+
+Stationary IMU acquisition is separate from 8K video capture. The companion
+uses the same native sensor-selection policy for both paths and retains raw
+accelerometer/gyroscope values, separate clocks, sensor identity and vendor bias
+estimates. Duration, queue, row and storage limits produce explicit partial
+recordings. A dedicated bounded receiver verifies the archive and retains it
+outside room scans; acquisition checks and upload success do not constitute an
+IMU noise fit or metric-VIO admission.
+
+An explicit focus lock uses the actual reported lens setting and applies it
+consistently to preview and video for the selected camera. Calibration remains
+bound to the matching native lens, crop, zoom, focus, encoded geometry and
+stabilization evidence. The existing stock-app camera profile is not admitted
+for native capture by matching dimensions alone. Camera/IMU extrinsics, measured
+time offset and noise still require physical calibration and withheld validation.
+
+The fresh-walk workflow below supersedes a long stationary acquisition or new
+target session as a capture prerequisite. This paragraph describes metric-VIO
+admission, not permission to record and reconstruct a normal walk.
+
+Five-coefficient Brown-Conrady calibration is supported by rectifying dense
+OpenVINS input with the full coefficient vector and unchanged K and dimensions.
+Invalid border pixels are excluded with a hashed static mask supplied to the
+native `CameraData` consumer; the adapter requires the bridge's confirmation.
+Unsupported models remain rejected. Android full-calibration admission is
+recomputed after its exact encoded-frame timestamp associations and actual
+OIS/EIS evidence are verified. This corrects the stale pre-verification
+admission flag without relaxing any missing-calibration or timing requirement.
+
+## 2026-09-10 — One native room walk retains phone video, IMU and static evidence
+
+The native companion coordinates the existing paired-capture service: select
+the room camera, wait for original encoded static video and canonical tracking,
+then acquire Camera2 video and both native IMU streams. Bounded heartbeats and
+clock exchanges accompany the take. Stop closes both captures; the saved phone
+archive carries an immutable session/camera/capture reference so retries cannot
+silently attach another static recording. A failed session remains retained and
+explicitly incomplete. Host correlation probes do not establish cross-device
+acquisition synchronization.
+
+The companion uses IPv4 exclusively for its LAN HTTPS connections. The configured
+`TauntonMainframe.local` appliance origin routes directly to the fixed
+`192.168.3.126` address without DNS; other origins use a cancellable DNS
+A-record query within one second. IPv6 addresses are never attempted. The
+original hostname remains the TLS certificate/SNI and HTTP Host authority and
+the saved server origin. The trusted TLS factory completes a verified handshake
+before Android can replace the hostname with the numeric route. Host-specific
+bindings remain bounded and include the trust-factory identity. An IP route
+cannot admit a certificate for another hostname.
+
+The complete initial health check has a three-second deadline and establishes
+the route before camera inventory or pre-recording clock probes. TCP setup is
+limited to 750 milliseconds. The phone service keeps idle HTTP connections for
+30 seconds, covering the ten-second paired heartbeat cadence. Clock probes and
+capture leases retain their existing authority and bounds; LAN reachability
+does not require a long setup allowance or serial IPv6 failures.
+
+Ordinary frame preparation now consumes the native IMU magnitudes as a bounded
+soft motion preference alongside visual quality and overlap. Exact frame IDs,
+exposure times, raw-evidence hashes, motion values and score adjustments remain
+in the prepared manifest. This use requires verified native acquisition clocks,
+units, axes and covered timing neighborhoods, but needs neither camera/IMU
+extrinsics nor gravity subtraction. It creates no metric pose authority.
+MapAnything + DA3 continue to use the same phone-view set; the paired static
+recording is reconstructed independently for alignment and validation.
+
+Long stationary sensor acquisition and a new target board are not normal capture
+prerequisites. Short sensor diagnostics are optional. Metric VIO retains its
+calibration and timing gates; provisional server-side online-calibration
+experiments remain distinct from admitted poses and do not block a fresh walk.
+
+## 2026-09-12 — Native LAN transfer is separate from capture and import
+
+RoomWalk's main Android interface uses portrait orientation. The camera viewer
+requests landscape before opening its preview and returns to portrait after
+closing. The Activity handles these configuration changes so rotation does not
+destroy the camera coordinator or selected capture. Recording remains a
+foreground-only operation; leaving it still stops and saves the take.
+
+Saved-archive uploads instead belong to a single `dataSync` foreground service,
+with a bounded partial CPU wake lock, finite cancellation/watchdog work and
+durable progress, failure and receipt state. The user can turn off the screen or
+leave the Activity. An interrupted transfer requires an explicit retry of the
+same retained ZIP. TLS still verifies the original hostname; the configured
+static IPv4 route and capture quality/timing contracts remain unchanged.
+
+Native uploads may opt into `Prefer: respond-async` on the existing sensor-bundle
+endpoint. HTTP 202 confirms only that the server has durably stored the complete
+archive, calculated its SHA-256 and checked the bounded manifest and requested
+capture/session/camera identities. The client checks the receipt against the
+actual streamed bytes. It does not interpret this transport receipt as final
+companion association, decoded-frame validation or metric admission.
+
+One server worker performs full import, with at most two pending imports. It
+retains the archive and failure status if import fails or is interrupted. Exact
+archive retries resolve to the same scan; a different archive cannot replace a
+paired capture. The existing decoded-frame, timestamp, calibration and identity
+checks still run before final association and frame preparation. The background
+native decode budget is bounded separately from the LAN request so a valid 8K
+walk is not constrained by the synchronous client's two-minute probe allowance.
+Clients without the preference retain the synchronous response contract.
+
+## 2026-09-12 — Native motion and occupied static evidence remain bounded review inputs
+
+Native gyro magnitude can support an explicitly selected exposure-blur revision
+without supplying calibrated inertial poses. The review selector preserves the
+original capture, rejected rows, parent prepared identities and RGB hashes;
+changed adjacency cannot inherit a removed frame's visual edge. Both DA3 and
+conditioned MapAnything consume the same retained view identities, with the
+existing registration and consistency gates unchanged. The ordinary preparation
+default remains a bounded soft motion preference.
+
+Static-reference selection may name six original decoded observations and
+per-frame foreground exclusions bound to source-video hash, exact PTS, selected
+camera and post-dewarper pixels. A reviewed absence of a person is distinct from
+an absent detection. An explicit keyframe remains one actual recorded image;
+the builder masks excluded depth before temporal fusion and the alignment
+consumer masks excluded RGB features. Foreground/reflection exclusions and
+unobserved regions remain visible provenance, not inpainted reconstruction.
+Separate predeclared observations can evaluate the candidate but cannot be
+silently reused to fit it.
+
+A self-fitted gyro axis transform or effective time shift is diagnostic only.
+It does not satisfy camera/IMU calibration, measured hardware timing or metric
+VIO admission. Static learned depth remains independent reconstruction evidence,
+not surveyed geometric truth. Candidate generation does not bind a Scene Prior,
+change camera calibration or publish a phone trajectory as a person's path.

@@ -3,6 +3,488 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-09-12 — Motion-selected PCF review and explicit static exclusions
+
+- Added an opt-in native exposure-motion revision tool, preserving original
+  recordings, rejected views, RGB hashes and parent prepared identities. It
+  invalidates adjacency across removed frames; ordinary preparation defaults
+  and all reconstruction/alignment gates remain unchanged.
+- The paired static-reference builder accepts exact recorded-frame selection
+  with hashed post-dewarper exclusions. Depth fusion and RGB alignment respect
+  the masks, and the keyframe remains an actual recorded observation.
+- On the new Living Room capture, excluding four severely blurred views
+  retained 127 views and cleared the original final-window registration failure.
+  Selected PCF produced 228,229 retained surfels. Against the older 48-view PCF,
+  common-reference coverage improved, while common-cell static holdout median
+  disagreement worsened slightly and large-error tails improved. This remains
+  offline review evidence, not metric VIO or surveyed accuracy.
+- Fixed diagnostic path rendering for walks outside the static-camera crop:
+  only drawn segments are clipped, without moving cameras or changing geometry.
+  Native GPU inference stages restored their original service state; no live
+  Scene Prior or calibration binding was changed.
+
+## 2026-09-12 — Background RoomWalk uploads and portrait setup
+
+- Companion 0.1.11 uses portrait for setup and saved captures, changes to
+  landscape for the camera viewer, and returns to portrait on close. Rotation
+  preserves the Activity and camera selection. Recording still stops on leaving
+  the app; uploads continue independently with the screen off.
+- A single Android foreground upload service retains progress, rate, receipt
+  and failure state. It supports cancellation and explicit retry of the same
+  archive, releases its bounded wake lock when finished, and leaves a terminal
+  notification. Notification permission denial does not prevent transfer.
+- Native uploads can receive a durable, hash-checked HTTP 202 storage receipt
+  before full 8K decode and import. One server worker performs those existing
+  checks, with at most two pending jobs and a bounded 30-minute decode budget.
+  Original archives and failed/interrupted import states remain retained;
+  final pairing and preparation still require successful validation.
+- Focused server tests passed, including exact retry, queue bounds, restart,
+  persistence failure and native acquisition-timestamp preservation. Android
+  checks exercised screen-off progress, Activity/process loss, cancel/retry,
+  receipt integrity and both orientation transitions. The real HTTPS Android
+  upload to an isolated instance of the application completed with a stored
+  receipt, followed by verified native import of all six fixture frames.
+- Transport measurements distinguish host loopback and Android emulator
+  networking from the physical LAN. The host NIC is 1 Gbps; no phone Wi-Fi
+  throughput claim is made. Socket tuning showed no emulator improvement and
+  was not retained. Real uploads now retain server-observed receive timing and
+  throughput separately from import.
+
+## 2026-09-11 — Fixed RoomWalk appliance address
+
+- Companion 0.1.10 routes `TauntonMainframe.local` directly to the fixed LAN
+  address `192.168.3.126` and skips DNS for that origin. The logical hostname
+  remains the TLS/SNI and HTTP Host authority, so the existing certificate
+  validation is preserved. Other HTTPS origins retain their IPv4-only lookup.
+
+## 2026-09-10 — IPv4-only RoomWalk LAN connections
+
+- Companion 0.1.9 replaces the longer setup allowance with an IPv4-only route:
+  a cancellable one-second DNS A query, 750 ms TCP setup and a three-second
+  complete health-check deadline. The original hostname remains the verified
+  TLS/SNI identity, HTTP Host and saved capture origin.
+- Android validation resolved the real hostname in 3–5 ms. The complete cold
+  health check took 517 ms, loaded all three cameras in 67 ms, and reused the
+  connection after eleven seconds idle. A wire-level HTTPS fixture confirmed
+  IPv4, the original Host/SNI and rejection of a wrong certificate hostname or
+  untrusted certificate before any HTTP request.
+- A bounded Android fixture started the live Living Room recorder, renewed its
+  lease and stopped cleanly over IPv4. It retained five clock probes, 363
+  encoded packet records and 23 tracking records, with no packet-record drops
+  or partial recorder/tracking output. No phone video was recorded by this
+  connection fixture.
+
+## 2026-09-10 — RoomWalk connection timeout repair
+
+- Companion 0.1.8 caps individual TCP address attempts at one second and reuses
+  its verified TLS configuration. Initial connection and pre-recording checks
+  get a bounded setup budget, including one retry for a transient hostname
+  lookup failure. Upload streaming and certificate/hostname verification stay
+  on the existing HTTPS path.
+- The phone service retains idle connections for 30 seconds, spanning the
+  native capture's ten-second heartbeat. Clock and heartbeat operation limits
+  remain short; setup no longer repeatedly consumes their budgets.
+- The Android cold/idle connection check passed eight assertions: initial
+  health completed in 7.53 seconds, all three room cameras loaded in 56 ms, and
+  a direct clock request after eleven seconds idle completed in 2 ms. Six
+  launcher tests and the host's same-socket idle-connection smoke passed.
+- The updated Android coordinator started one live Living Room fixture,
+  renewed its lease, and stopped encoded video and tracking cleanly. Its
+  five retained clock probes included the real heartbeat; the fixture did not
+  record phone video or claim simultaneous physical-phone acquisition.
+
+## 2026-09-10 — Native paired room walks without a separate calibration session
+
+- Companion 0.1.7 starts the selected static room recording and tracking
+  observer before native phone video/IMU, renews a bounded lease, and stops both
+  captures. Exact saved session/camera/phone references survive interrupted
+  finalization, packaging and duplicate uploads. Normal native stops map to the
+  server's clean-stop reason. Sensor-only diagnostics are optional, default to
+  one minute and are capped at five; the former three-hour default is withdrawn.
+- Preparation uses native angular-motion evidence as a bounded view-quality
+  preference and retains per-frame motion, timestamps and source hashes. The
+  existing 623-frame walk supplied motion for all 84 candidates, retaining 38
+  views with all adjacent overlap checks passing. Static imagery remains an
+  independent alignment source, separate from MapAnything + DA3 phone fusion.
+- Live static capture retained 421 decoded 1080p H.264 frames and 28 canonical
+  tracking records with no reported drops or partial status. Its calibration
+  and rectification bindings passed the direct static-reference consumer.
+  The APK packaged and uploaded a retained physical-phone fixture; duplicate
+  upload returned the same scan and exact static-session/archive association.
+  The combined review page shows video, IMU and static evidence together.
+- The provisional online OpenVINS calibration path executed on the saved phone
+  walk and exported calibration/covariance history, but its position estimates
+  drifted grossly. It remains rejected for metric use and is not a fresh-walk
+  prerequisite. No new board or long phone recording is required for capture.
+
+## 2026-09-10 — Native phone calibration acquisition and VIO adapter completion
+
+- Companion 0.1.6 adds a separate three-hour stationary IMU recorder with
+  bounded storage, retained partial recordings, export/upload controls, and
+  explicit persistent focus locking from the preview's measured lens setting.
+- A dedicated service endpoint verifies and retains IMU archives without
+  creating scans or assigning calibration status. Full Android VIO admission
+  is recomputed after exact timing and actual stabilization checks, fixing
+  an admission flag that previously remained false after verification.
+- The OpenVINS adapter rectifies all five Brown-Conrady coefficients without
+  changing K or encoded dimensions, and the rebuilt bridge confirms its
+  required invalid-pixel mask. Seventy-two focused importer/consumer/receiver tests
+  passed. The native public-data mask smoke emitted 313 initialized poses.
+- The existing physical 623-frame recording still passes exact association
+  and OIS/EIS-off verification. These software checks do not establish the
+  missing camera/IMU extrinsics, time offset, native intrinsics or sensor noise;
+  physical calibration recordings and their validation remain required.
+
+## 2026-09-09 — Native phone reconstruction trial and diagnostic corrections
+
+- The 20.79-second native bathroom recording retained 623 exact camera/encoder
+  associations and 39 prepared views. MapAnything, DA3, and consensus completed
+  on those same views. No static recording or calibrated IMU pose was used.
+- Corrected phone diagnostic leveling after this recording exposed a dominant
+  wall being selected as the floor. A bounded plane search now checks upright
+  orientation, support, and camera height; missing floor evidence fails explicitly.
+  Candidate diagnostics remain separate from reconstruction and alignment authority.
+- Trajectory previews preserve equal axis scale, include every camera position,
+  and label the model X/Z projection without assuming MapAnything or a level floor.
+
+## 2026-09-09 — Physical 8K capture validated and RoomWalk viewfinder corrected
+
+- Companion 0.1.5 opens a full-screen live viewer from **Capture**, with Record,
+  short-test and stop/save controls in a narrow strip beside the image. Setup
+  and transfer menus stay on the main screen. The preview closes with explicit
+  camera-owner acknowledgement before the unchanged native 8K/IMU recorder
+  starts; Back and backgrounding close an idle preview or save an active take.
+- The exported SM-F976U short test decoded to 300 HEVC frames at 7680×4320
+  over 10.03 seconds. Independent import verified all 300 camera/encoder timestamp
+  associations and continuous accelerometer/gyroscope coverage. The selected
+  physical camera stayed fixed and reported OIS/EIS off. One startup frame
+  interval was 66.64 ms; subsequent intervals were approximately 33.32 ms.
+- Companion 0.1.4 corrects viewfinder rotation and aspect using actual camera
+  metadata, handles 180-degree display changes, and brings the full viewfinder
+  into view when capture starts. Encoded image coordinates are unchanged.
+- Full walks may use a retained successful short test for the same current
+  camera/encoder configuration, with fresh prerequisite and surface-query checks.
+  Longer recording reliability, native resolving detail and camera/IMU calibration
+  are not established by the short test.
+
+## 2026-09-08 — Installable RoomWalk Android companion
+
+- Version 0.1.3 enables a bounded short recording test when the static stream
+  list omits 8K but a standard session query succeeds. It freshly queries the
+  actual recording surfaces, uses the same configuration for capture, enforces
+  the ten-second limit in the recorder and retains rejected-attempt diagnostics.
+  The target phone accepted standard 8K/30 encoder/preview configurations;
+  actual capture, resolving detail and timestamp association still need testing.
+- Version 0.1.2 adds direct driver queries for exact 8K encoder configurations
+  when the static stream map omits that size. It queries only standard and
+  advertised vendor use cases, retains each answer in the phone report, and
+  does not open a recording or enable a vendor mode. Driver acceptance still
+  requires a recorded test before capture or timing can be established.
+- Version 0.1.1 distinguishes failure to find the companion's standard 8K mode
+  from the phone's proven stock-camera recording capability. Expanded camera
+  reports and an explicit HTTPS phone-report upload expose the device's modes
+  for diagnosis without changing recording or timing acceptance. The installer
+  fetches and verifies APK bytes in the browser before offering a local save.
+- Added a signed native Android APK with Camera2/MediaCodec 8K capability
+  checks, independent IMU streams, exact camera/encoder timing evidence,
+  bounded storage capture, local exports and RoomWalk HTTPS upload. The
+  first version includes a short timing test and retained capture recovery.
+- The native importer verifies original frame associations and MP4 timing.
+  Failed association remains raw RGB evidence with no acquisition-time claim;
+  missing calibration continues to block metric VIO.
+- SDK 36 compilation, signature/alignment verification, Android 16 installation
+  and launch, the permission/unsupported-8K UI, ten timestamp-association
+  checks and 45 directly affected importer/consumer tests passed. The installed
+  APK also packaged two recorded fixtures that imported and prepared RGB with
+  verified/unverified timing kept separate. Actual phone
+  8K acquisition and throughput are not established by these software checks.
+
+## 2026-09-07 — Correct browser phone capture resolution and readiness
+
+- Replaced the 1080p request/4K cap with exact unscaled rear-camera 8K checks,
+  rejecting unsupported modes without a resolution downgrade. Import validates
+  the encoded dimensions of new strict-8K bundles while preserving legacy input.
+- Setup requires preview progress and both sensor streams; invalid Generic
+  Sensor clocks and changed camera geometry stop capture. Preview phases and
+  requested/reported bitrate are preserved with the raw observations.
+- The page states that acquisition synchronization is unverified and shows
+  the roughly 30-second capacity at the requested bitrate. These implementation
+  changes do not establish phone hardware support or synchronized 8K+IMU capture.
+
+## 2026-09-07 — Retained IMU walk replay with reported camera intrinsics
+
+- Reprocessed all 256 views of `20260906-050646-107f244c` in a separate Camera 2
+  sensor-intrinsics candidate. The browser's physical lens, crop, and distortion
+  processing remain unverified; this is not a transfer of the measured 8K
+  calibration. Original source fingerprints and the installed 8K upload profile
+  are unchanged.
+- Both providers pass their window-registration checks. Consensus passes all
+  15 static-fit checks with 406,847 supported surface points. Valid pixels rise
+  from 64.6% to 82.4%, but the gated wall median changes from 7.90 to 8.29 cm
+  and internal depth median from 6.77 to 8.22 cm. The all-comparable wall median
+  improves from 11.35 to 10.96 cm; the denser result is not a uniform quality win.
+- Standalone DA3 remains rejected: its wall median improves from 12.08 to
+  10.91 cm, while source overlap falls below its gate. Failed evidence is retained.
+- Consensus now validates provider frame IDs, hashes, timestamps, calibration
+  lineage, and profile fingerprints. Fused raw views retain D5 and common-ray
+  border validity; manifests preserve the profile's authority limits. Focused
+  calibration/fusion tests and the recorded producer/consumer replay exercise
+  this path. Metric VIO and live-world admission remain unavailable.
+- The separate `imu_walk_calibrated_reprocess_20260907` evidence directory
+  contains source verification, projection assumptions, provider/fusion outputs,
+  passed and rejected static fits, comparison figures, and an aligned consensus
+  GLB with its exact transform and source bindings. The existing walk stays intact.
+
+## 2026-09-07 — Phone calibration import and calibrated reconstruction geometry
+
+- Imported the supplied `roomwalk_phone_video` 8K handoff after checking all
+  12 source-file sizes and SHA-256 values and JSON/NPZ numerical agreement.
+  Preserved the original bundle, quality reports, observations, and D5 values.
+- Added capture-mode and native-image binding, one-time preparation
+  rectification, per-view calibrated K/source provenance, and visible profile
+  status. Unbound or mismatched captures retain the existing RGB workflow with
+  explicit reasons for not applying calibration.
+- MapAnything consumes supplied intrinsics with its coupled preprocessor.
+  DA3 uses measured intrinsics for metric focal scaling and backprojection,
+  retaining network K and explicitly reporting that its pose/depth network is
+  not conditioned on K alone. Both window paths preserve this distinction.
+- The real handoff passes a bounded synthetic 8K video preparation test,
+  producing calibrated 1280×720 selected views with exact profile hashes.
+  This validates the import/preparation path; no compatible household video
+  was reprocessed. Existing 4K uploads and the portrait browser recording do
+  not match the supplied native calibration.
+- The owner confirmed the phone camera app's default rear camera at 8K and
+  1× on the reported Fold 8 Ultra. Bound the installed profile to matching
+  original landscape video uploads. Preserved the supplied six-camera metadata
+  listing and confirmation in a sidecar alongside the unchanged measured
+  profile. Camera 0/physical Camera 5 is a metadata-based identity inference;
+  no sensor K/D was substituted for the measured video calibration.
+- Camera/IMU calibration, timing, metric-VIO admission, and live-world authority
+  remain unchanged. See the [phone reconstruction guide](../tools/mapanything_phone_scan/README.md#measured-phone-camera-calibration)
+  for profile import and capture matching.
+- Thirty-nine focused calibration, preparation, API, provider, and window tests
+  pass. Installed MapAnything/DA3 preprocessing was exercised with the real
+  imported profile and synthetic images; model-forward/metric tests use CPU
+  substitutes and do not establish household reconstruction quality. The
+  reloaded service is healthy and its browser displays the imported 8K profile
+  as available for matching uploaded videos. Direct configuration checks admit
+  the matching 8K upload mode and retain rejection of browser/4K recordings.
+
+## 2026-09-06 — Browser clock reporting preserves unverified timing
+
+- Generic Sensor capture now records sensor and receipt clock provenance
+  separately. Import validation suppresses callback-lag statistics when an
+  older bundle's declared common clock contradicts its timestamps.
+- Replayed the retained Living Room manifest through the corrected importer:
+  all 16,045 accelerometer and 16,053 gyroscope samples retain their numeric
+  values. The roughly 16.4-day origin difference is not a camera/IMU offset.
+  Of 6,736 video callbacks, 1,834 precede the recorder start call; callback
+  indices do not establish encoded-frame identity.
+- Ten Python and five browser-capture tests pass. Added a short native timing
+  preflight procedure. Camera/IMU timing is still uncalibrated and metric VIO
+  remains blocked; the original capture and import report are unchanged.
+
+## 2026-09-06 — Retained-walk trajectory, fusion, surface, and pose checks completed
+
+- Verified-loop refinement now uses the RGB projection stored with each raw
+  depth grid. It preserves source identity and temporal holdouts. The consensus
+  rebuild checks the passed pose-only solution and recomputes depth admission,
+  geometry, evidence weights, and distinct-view surfel support.
+- On the same 256-view Living Room capture, consensus trajectory holdout p80
+  improves from 0.110095 m to 0.098891 m. The rebuilt static fit passes all
+  15 checks at 0.085710 m, but the baseline is better at 0.079048 m and also
+  has lower internal depth error. Baseline remains the preferred room review.
+  Standalone DA3 refinement and an alternate window-overlap experiment fail
+  their existing gates and remain separate diagnostics.
+- Added a source-bound single-room adapter for the existing measured-surface
+  builder. Baseline and refined full-height/cutaway meshes were produced with
+  unchanged ray/support gates. Withheld single-view points remain separate.
+  The current Menon whole-home contract still needs accepted shared-frame
+  geometry and exact scene/calibration/camera bindings.
+- Complete static-camera localization uses retained RGB on the depth grid and
+  writes insufficient-view failure evidence. Its aligned replay yields only
+  three qualifying fitted views against the unchanged minimum of four; no
+  aggregate pose or calibration replacement is admitted. Original
+  Kitchen/Family registration and the separate Living/Kitchen bridge also
+  remain rejected for cross-room use.
+- Forty-three focused tests pass across trajectory, fusion, measured surfaces,
+  and static localization. The retained-data producer/consumer paths, rejected
+  candidates, source hashes, comparison figures, and repeatable commands are
+  recorded in [Room reconstruction fitting](room_reconstruction_fitting.md).
+  The reloaded phone service passes health and retains the existing passing
+  alignment. Independent room measurements and new connector observations
+  remain outstanding; intrinsic and metric-VIO work was explicitly deferred.
+
+## 2026-09-06 — Room fitting uses visible structure and a reusable replay procedure
+
+- Phone-to-static refinement now uses the same camera visibility and occlusion
+  policy as validation. Foreground disagreements stay eligible. Scale, gravity,
+  pose bounds, and quality thresholds are unchanged. Reports keep global and
+  visible metrics separate and expose untrimmed residuals beside the existing
+  robust wall statistic.
+- The real paired Living Room walk now passes all 15 alignment checks in the
+  browser service: wall residual improves from 0.122825 m to 0.085703 m.
+  Error also improves on withheld image regions and on unchanged baseline
+  support. Kitchen's matched replay passes at 0.054205 m, down from 0.081716 m.
+  Family Room's old reference fails its camera-orientation preflight.
+- Added a diagnostic CLI that preserves failed fits, exact input identities,
+  and optional bounded snapshots outside saved scan state. Twenty-seven focused
+  tests pass, including visible/hidden surfaces, rejected diagnostics, source
+  binding, single-projection RGB landmarks, and agreement between saved reports
+  and returned summaries. The
+  live service serves all eight Living Room alignment artifacts.
+- Independent DA3 reconstruction completes the identical 256 prepared views,
+  but its static fit fails at 0.120824 m. Static floor/height checks also reveal
+  unresolved metric provenance: configured height is 2.60 m while the captured
+  transform implies 2.086880 m. No numerical calibration correction or live
+  world promotion was applied.
+- Consensus retains one reference RGB projection on its common camera rays.
+  The previous average of differently warped images blurred landmarks; an
+  RGB-only experiment restored 31 consensus views / 1,940 inliers and all
+  15 fit checks at 0.079614 m, with the same fused geometry and unchanged
+  thresholds. The normal rebuilt producer-to-fitter path then passed all
+  15 checks at 0.079048 m with 30 consensus views / 1,907 inliers. All non-RGB
+  arrays across 256 views, camera solutions, and non-color surfel data match
+  the original fusion exactly. Provider-disagreement diagnostics remain
+  available; the corrected consensus is a separate saved review result.
+- The reusable sequence, experiment decisions, metric-measurement needs, and
+  per-room replay commands are recorded in
+  [Room reconstruction fitting](room_reconstruction_fitting.md).
+
+## 2026-09-06 — Room Walk alignment consumes its paired static recording
+
+- Paired walks now reconstruct their finalized static recording as an
+  independent alignment reference, with a locked camera selection, visible
+  build status, and artifact links. Invalid pairing, calibration, rectification,
+  or artifact provenance fails closed. Unpaired walks retain saved references.
+- Six observations use decoded recording timestamps and captured calibration
+  rays. MapAnything metric range is converted to calibrated Z depth, then fused
+  by the existing static agreement rule. Original model depths and estimated
+  intrinsics remain diagnostic artifacts. The captured frame binding is applied
+  once, and downstream PCF resolves the same verified reference.
+- Eighteen focused tests passed, including the installed MapAnything
+  preprocessing/range contract, pairing rejection, artifact tampering, cache
+  reuse without inference, and downstream alignment/PCF routing. Syntax and
+  documentation checks passed; the restarted service and browser expose the
+  new workflow.
+- The real `Livingroom_imu` recording produced 99,198 static points from six
+  observations over 211 seconds, with 14 hashed artifacts. Alignment consumed
+  that reference and passed visual matching with 29 consensus phone views,
+  but its visible vertical residual was 0.122825 m against the unchanged
+  0.10 m gate. The reference remains reviewable; no accepted alignment or live
+  world promotion was produced, and the phone reconstruction is preserved.
+
+## 2026-09-06 — Living Room phone reconstruction recovered with upright views
+
+- Recovered `Livingroom_imu` (`20260906-050646-107f244c`) after reproducing its
+  cross-window registration failure. The recorded pixels were sideways without
+  encoded display-rotation metadata. A capture-specific, lossless 90-degree
+  counterclockwise correction retained the same 256 selected observations,
+  timestamps, model pixel budget, 80-view limit, and 24-view overlap.
+- Saved original prepared-frame identities/hashes and the explicit pixel
+  transform in the corrected preparation manifest. Preserved the raw video,
+  IMU/static companion data, and previous failed attempts. This was a reviewed
+  data correction, not an automatic rotation rule for later uploads.
+- All five windows completed and all four camera/surface registration gates
+  passed unchanged. The first join's pose-position p80 improved from 1.996 m
+  to 0.085 m and orientation p80 from 61.1 to 1.89 degrees. The run saved
+  332,867 review points in 395.6 seconds.
+- Verified all 1,287 manifest-listed file sizes, finite/proper camera poses,
+  fourteen raw views around window boundaries, seven served artifacts, and the
+  Room Walk 3D view. This remains a phone reconstruction awaiting independent
+  Noesis-world alignment; passing internal checks is not surveyed accuracy.
+
+## 2026-09-06 — Room Walk removes repeated views and preserves recording gaps
+
+- Replaced FPS-filter frame synthesis with bounded selection of existing
+  encoded frames. Ordinary/browser preparation retains encoded PTS, including
+  nonzero origins; native acquisition timestamp and source-frame mapping remain
+  unchanged.
+- Added fixed-anchor adjacent-repeat removal before adaptive selection, with
+  exact decoded-content or conservative feature-supported similarity evidence.
+  Coverage, endpoints, and bridge repair cannot reinsert repeated views. The
+  manifest records removed candidate identities, repeat spans, and counts;
+  reconstruction geometry gates remain unchanged.
+- Focused preparation, browser-import, native VFR, and API tests passed. A live
+  synthetic upload with three four-second holds reduced 48 candidates to three
+  distinct views, removed 45 repeats, retained timestamps 0/4/8 seconds, and
+  served all five checked artifacts. The synthetic scan was then removed.
+- A recorded 208.908-second Living Room walk retained 256 selected views and
+  produced zero repeat removals among 836 candidates. Its failed 54–80 second
+  overlap had distinct images and passing visual connectivity; the maximum
+  encoded timestamp gap was 113 ms. This does not establish a recording freeze
+  as the cause of its existing cross-window alignment failure, and that failed
+  run was preserved.
+
+## 2026-09-05 — Room Walk gets a trusted LAN HTTPS origin
+
+- Kept the existing phone-scan HTTP listener on port 8788 for known consumers
+  and added a second Uvicorn listener on port 8789 using the existing Menon
+  appliance certificate and key.
+- Served both listeners from one imported FastAPI app under one explicit
+  lifespan, with startup recovery before HTTPS exposure and coordinated drains
+  before service shutdown. Missing or mismatched TLS material fails closed.
+- Documented the trusted URL `https://TauntonMainframe.local:8789`, the current
+  DNS-only certificate SAN, Android CA installation requirement, and the rule
+  that a browser certificate bypass is not trust evidence.
+- The in-page browser camera + IMU recorder is the default raw-observation path;
+  browser callback timing remains non-metric. The calibrated native sensor
+  bundle remains the metric-VIO path, and the explicit browser file input stays
+  available for RGB-only uploads.
+
+## 2026-09-05 — Room Walk can retain a bounded static-camera companion
+
+- Added an optional paired session that starts only after the selected physical
+  static camera's original encoded video and canonical tracking stream are both
+  ready. It saves the source-preserving Matroska recording, packet timing,
+  receive-ordered tracking/world cohorts, calibration/runtime provenance,
+  bounded clock exchanges, and optional user markers beside the phone bundle.
+- Kept the lane single-owner and bounded to 900 seconds per session with a
+  renewable 45-second lease. Start, heartbeat, stop, finalization, and phone
+  association are retry-safe; a failed phone upload preserves finalized static
+  evidence, and the static companion remains separate from phone-only provider
+  fusion.
+- A bounded Living Room smoke retained H.264 1920x1080 at 30 fps in Matroska
+  for 13.091766 seconds (391 decoded frames and 392 packet records with zero
+  metadata drops), 26 contiguous tracking publications and 26 world snapshots,
+  11 clock probes, 1 marker, and all four REST/calibration snapshots while the
+  same Noesis run stayed ready. Browser start retry, heartbeat, and stop passed.
+- Synthetic phone-fixture checks reached ready with 15 views; duplicate/manual
+  TAR retry returned 200, an idempotency conflict returned 409 while preserving
+  the scan, and a failed upload preserved static evidence. All 10 artifact links
+  returned 200, and Chrome showed paired links with healthy stopped statuses.
+  These checks do not verify Fold 8 Ultra timing or pose accuracy, do not supply
+  simultaneous phone ground truth, and retain phone-camera versus body/feet
+  identity as unresolved evidence.
+
+## 2026-09-04 — Reconstruction frame, evidence, and review boundaries unified
+
+- Added revision-bound Noesis-to-Menon transport that keeps metric frame,
+  calibration provenance, artifact revision, target coordinate revision, and
+  authored scene presentation identity distinct. Serialized GlobalWorldFusion
+  snapshots with different accepted source edge hashes can render through one
+  validated target-owned mapping; stale or tampered mappings fail at bundle
+  ingress. Existing v1 bindings and the active catalog remain unchanged.
+- Added bounded synchronized sensor import, conventional OpenVINS relative
+  constraints, and depth-backed withheld trajectory refinement. The Fold 8
+  Ultra's own capture/calibration and metric phone evidence remain pending;
+  VI3 remains deferred.
+- Larger inertial scale changes now rerun the existing fixed-scale world
+  alignment on the actual refined depth/pose/cloud carrier before conditioning.
+  Public EuRoC HTTP capture-to-VIO-to-trajectory integration and a recorded
+  rescaled alignment/PCF consumer check passed. Validated static-camera
+  replacement supports exact backups and regeneration of direct dependents;
+  retained household inputs did not justify changing manual extrinsics.
+- Recorded correlated MapAnything/DA3 confidence and distinct-view support,
+  then carried observed, uncertain, and unknown geometry into review-only
+  multi-room reintegration and separately rendered surface classes. The
+  current connector joins remain review-only and cannot place live people.
+- See the implementation records for [`WO-1`](../plans/reconstruction_work_orders/WO-1.md),
+  [`WO-2`](../plans/reconstruction_work_orders/WO-2.md),
+  [`WO-3`](../plans/reconstruction_work_orders/WO-3.md),
+  [`WO-4`](../plans/reconstruction_work_orders/WO-4.md), and
+  [`WO-5`](../plans/reconstruction_work_orders/WO-5.md).
+
 ## 2026-08-31 — Living Room BEV uses its full PCF-derived camera pose
 
 - Added an opt-in full-pose mode to the static-camera PCF localizer and bound

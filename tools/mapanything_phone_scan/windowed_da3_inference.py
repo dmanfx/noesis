@@ -10,6 +10,12 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .calibrated_inference import (
+    add_calibration_summary,
+    calibration_frame_fields,
+    calibration_specs,
+    preserved_calibration_raw_fields,
+)
 from .da3_inference import (
     DA3PhoneScanError,
     DA3PhoneScanSettings,
@@ -66,13 +72,18 @@ def run_windowed_da3_phone_scan(
     if not isinstance(frame_rows, list) or len(frame_rows) < 2:
         raise DA3PhoneScanError("the scan has no valid prepared multi-view frame set")
     try:
+        calibrated = calibration_specs(frame_rows, anchor_image=settings.anchor_image)
         ranges = _window_ranges(
             len(frame_rows), settings.max_joint_views, settings.window_overlap_views
         )
     except Exception as exc:
         raise DA3PhoneScanError(str(exc)) from exc
     if len(ranges) == 1:
-        return window_runner(scan_dir, output_dir, prepared, settings, progress)
+        result = window_runner(scan_dir, output_dir, prepared, settings, progress)
+        if isinstance(prepared.get("trajectory_refinement"), dict):
+            result["trajectory_refinement"] = prepared["trajectory_refinement"]
+        add_calibration_summary(result, prepared, calibrated, network_conditioned=False)
+        return result
     if settings.anchor_image is not None:
         raise DA3PhoneScanError(
             "a fixed-camera anchor cannot be silently repeated across adaptive DA3 windows"
@@ -106,6 +117,10 @@ def run_windowed_da3_phone_scan(
                 "global_end_exclusive": end,
             },
         }
+        if isinstance(prepared.get("trajectory_refinement"), dict):
+            window_prepared["trajectory_refinement"] = prepared["trajectory_refinement"]
+        if isinstance(prepared.get("camera_calibration"), dict):
+            window_prepared["camera_calibration"] = prepared["camera_calibration"]
         progress(
             0.02 + 0.62 * (window_index / len(ranges)),
             f"Running DA3 window {window_index + 1} of {len(ranges)}",
@@ -228,6 +243,7 @@ def run_windowed_da3_phone_scan(
     final_frames: list[dict[str, Any]] = []
     camera_poses: list[np.ndarray] = []
     intrinsics_rows: list[np.ndarray] = []
+    network_intrinsics_rows: list[np.ndarray] = []
     scales: list[float] = []
     point_rows: list[np.ndarray] = []
     color_rows: list[np.ndarray] = []
@@ -243,6 +259,10 @@ def run_windowed_da3_phone_scan(
         rotation = np.asarray(record["rotation"], dtype=np.float64)
         translation = np.asarray(record["translation"], dtype=np.float64)
         raw = _load_raw(Path(record["raw_path"]))
+        if calibrated is not None and any(
+            key not in raw for key in ("camera_intrinsics_json", "rectification_valid_mask", "network_intrinsics")
+        ):
+            raise DA3PhoneScanError("calibrated DA3 window lost its calibration, border-validity, or network-intrinsics evidence")
         world_points = _transform_points(
             raw["world_points"], scale, rotation, translation
         ).astype(np.float32)
@@ -270,6 +290,7 @@ def run_windowed_da3_phone_scan(
             intrinsics=intrinsics,
             metric_scaling_factor=np.asarray([effective_scale], dtype=np.float32),
             model_rgb=model_rgb,
+            **preserved_calibration_raw_fields(raw),
         )
 
         previews: dict[str, str] = {}
@@ -311,6 +332,8 @@ def run_windowed_da3_phone_scan(
 
         camera_poses.append(pose)
         intrinsics_rows.append(intrinsics)
+        if calibrated is not None:
+            network_intrinsics_rows.append(np.asarray(raw["network_intrinsics"], dtype=np.float32))
         scales.append(effective_scale)
         final_frames.append(
             {
@@ -329,6 +352,12 @@ def run_windowed_da3_phone_scan(
                 "camera_pose": pose.tolist(),
                 "intrinsics": intrinsics.tolist(),
                 "metric_scaling_factor": effective_scale,
+                **calibration_frame_fields(
+                    source_row,
+                    raw.get("rectification_valid_mask"),
+                    network_conditioned=False,
+                    network_intrinsics=raw.get("network_intrinsics"),
+                ),
             }
         )
         if global_index % 16 == 0:
@@ -361,6 +390,7 @@ def run_windowed_da3_phone_scan(
         camera_poses=poses_array,
         intrinsics=intrinsics_array,
         metric_scaling_factors=scales_array,
+        **({"network_intrinsics": np.stack(network_intrinsics_rows)} if network_intrinsics_rows else {}),
     )
     np.savez_compressed(
         output_dir / "reconstruction_surfels.npz",
@@ -441,6 +471,9 @@ def run_windowed_da3_phone_scan(
         },
         "frames": final_frames,
     }
+    if isinstance(prepared.get("trajectory_refinement"), dict):
+        summary["trajectory_refinement"] = prepared["trajectory_refinement"]
+    add_calibration_summary(summary, prepared, calibrated, network_conditioned=False)
     manifest_path = output_dir / "scan_outputs_manifest.json"
     summary["files"] = [
         {

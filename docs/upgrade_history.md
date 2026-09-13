@@ -3,6 +3,34 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-09-13 — Walk-derived identity repair and independent trajectory review
+
+- The native baseline now reserves tracking lifecycle identity before StableID
+  assignment and retains a bounded private confirmed binding for eligible
+  returns within 0.35 seconds of source-media time. Public disappearance and
+  tombstones remain immediate. Registry deletion/recycling, epoch/generation
+  changes, competing claims and contradictory appearance invalidate retention.
+  Compact scalar diagnostics make the owner and retention decisions observable.
+- Compact or wide partial-body boxes no longer imply sitting/lying without
+  positive body evidence. Missing or malformed world calibration binding is
+  distinguished from a real digest conflict; rejected geometry stays unavailable.
+- Added reusable native-IMU motion review, heldout handset reprojection and
+  independent-structure checks, and occupied depth-registration qualification
+  review. They preserve input identity, partial coverage and rejected evidence.
+  Single-window DA3 now declares its pose convention and unaligned metric frame.
+- Focused runtime/contracts and phone-review tests passed. The occupied native
+  replay observed a 67 ms same-generation return retaining its ID after an
+  immediate public tombstone, and WebRTC decoded 245 frames. This verifies the
+  changed behavior, not an overall identity-accuracy percentage. Live restoration
+  produced healthy world/BEV on all three cameras and 195 exact channel cohorts.
+- Broader depth-adapter testing retained 14 failures reproduced from pre-task
+  source; they are not counted as a passing suite. The bounded replay needed
+  forced termination after its shutdown deadline; its temporary databases were
+  isolated and live service restoration succeeded.
+- The recorded handset/structure conflict and depth-domain plateau remain
+  explicit. No floor shift, extrinsic correction, replacement depth mapping,
+  metric VIO admission or new live Scene Prior was inferred from the walk.
+
 ## 2026-09-12 — Motion-selected PCF review and explicit static exclusions
 
 - Added an opt-in native exposure-motion revision tool, preserving original

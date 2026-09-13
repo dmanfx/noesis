@@ -6,6 +6,32 @@ from noesis_core.tracking_continuity import (
 )
 
 
+def test_identity_receipt_reserves_generation_without_publishing_presence() -> None:
+    owner = TrackingLifecycleRegistry()
+    first = owner.identity_observation(0, 7, frame_id=1, observed_at_us=1_000_000,
+                                       media_pts_ns=1_000_000_000, bbox=[10, 20, 40, 120])
+    second = owner.identity_observation(0, 8, frame_id=1, observed_at_us=1_000_000,
+                                        media_pts_ns=1_000_000_000, bbox=[110, 20, 40, 120])
+    assert first.disposition == second.disposition == "new"
+    assert first.generation != second.generation
+    assert owner.identity_retention_keys(0, media_pts_ns=1_000_000_000, max_gap_ns=350_000_000) == frozenset()
+    tracks = [_track(7, (10, 20, 40, 120)), _track(8, (110, 20, 40, 120))]
+    update = owner.update_frame(source_id=0, camera_id="kitchen", frame_id=1,
+                                observed_at_us=1_000_000, media_pts_ns=1_000_000_000, tracks=tracks)
+    owner.mark_published(update)
+    assert [t["tracker_lifecycle_generation"] for t in tracks] == [first.generation, second.generation]
+    missing = owner.update_frame(source_id=0, camera_id="kitchen", frame_id=2,
+                                 observed_at_us=1_100_000, media_pts_ns=1_100_000_000, tracks=[])
+    assert len(missing.tombstones) == 2
+    assert owner.identity_retention_keys(0, media_pts_ns=1_100_000_000, max_gap_ns=350_000_000) == frozenset({first.key, second.key})
+    # Missing, repeated and reversed media time cannot renew private absence.
+    for media in (None, 1_000_000_000, 999_999_999):
+        assert not owner.identity_retention_keys(0, media_pts_ns=media, max_gap_ns=350_000_000)
+    assert not owner.identity_retention_keys(0, media_pts_ns=1_350_000_001, max_gap_ns=350_000_000)
+    owner.reset_source(0)
+    assert not owner.identity_retention_keys(0, media_pts_ns=1_100_000_000, max_gap_ns=350_000_000)
+
+
 def _track(
     tracker_id: int,
     bbox: tuple[float, float, float, float] | None = None,

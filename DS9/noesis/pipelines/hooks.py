@@ -88,6 +88,7 @@ from noesis_core.world_service import (
 from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
     TrackingContinuityUpdate,
+    TrackingIdentityObservation,
     TrackingLifecycleRegistry,
     pair_safe_publication_interval_s,
 )
@@ -10187,6 +10188,14 @@ class _AnalyticsTelemetryProcessor:
         for track in tracks:
             if isinstance(track, MutableMapping):
                 track["source_epoch"] = int(continuity.source_epoch)
+        manager = getattr(self.pipeline, "stable_id_mgr", None)
+        prune = getattr(manager, "prune_identity_lifecycles", None)
+        if callable(prune) and not self._tracking_mode_is_mv3dt():
+            retained_keys = self._tracking_lifecycle.identity_retention_keys(
+                source, media_pts_ns=media_pts_ns,
+                max_gap_ns=int(manager.identity_reappearance_grace_ns),
+            )
+            prune(source, retained_keys)
         return continuity
 
     @staticmethod
@@ -11357,6 +11366,12 @@ class _AnalyticsTelemetryProcessor:
                             else:
                                 self._reid_debug_emb_found += 1
 
+                identity_observation = self._tracking_lifecycle.identity_observation(
+                    int(sensor_id), int(track_id), frame_id=int(frame_id),
+                    observed_at_us=int(temporal_contract["observed_at_us"]),
+                    media_pts_ns=temporal_contract.get("media_pts_ns"),
+                    bbox=raw.get("bbox"),
+                )
                 stable_id = None
                 if not identity_v2_authoritative:
                     sid_start_ns = time.perf_counter_ns()
@@ -11368,6 +11383,7 @@ class _AnalyticsTelemetryProcessor:
                         ts=now_ts,
                         frame_bgr=None,
                         embedding=emb,
+                        lifecycle_observation=identity_observation,
                     )
                     _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
@@ -11448,16 +11464,8 @@ class _AnalyticsTelemetryProcessor:
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int if stable_id_int > 0 else None,
                     "tracker_id": tracker_id_int,
-                    # Peek before world augmentation so a reused numeric
-                    # tracker cannot inherit the prior lifecycle's filter.
-                    "tracker_lifecycle_generation": self._tracking_lifecycle.peek_generation(
-                        int(sensor_id),
-                        int(tracker_id_int),
-                        frame_id=int(frame_id),
-                        observed_at_us=int(temporal_contract["observed_at_us"]),
-                        media_pts_ns=temporal_contract.get("media_pts_ns"),
-                        bbox=raw.get("bbox"),
-                    ),
+                    # Identity and world consume the owner's same reservation.
+                    "tracker_lifecycle_generation": identity_observation.generation,
                     "camera_id": camera_id,
                     "source_id": int(source_id),
                     "bbox": raw.get("bbox"),
@@ -11473,6 +11481,12 @@ class _AnalyticsTelemetryProcessor:
                     "dwell_time": dwell,
                     "id_event": id_event,
                     "id_reject_reason": id_reject_reason,
+                    "identity_lifecycle_disposition": identity_observation.disposition,
+                    "identity_lifecycle_media_gap_ms": (
+                        identity_observation.media_gap_ns / 1e6
+                        if identity_observation.media_gap_ns is not None else None
+                    ),
+                    "identity_retention_decision": id_diag.get("identity_retention_decision"),
                     "embedding_present": bool(embedding_present),
                     "pose_present": bool(pose_present),
                     "sid_candidate": sid_candidate,
@@ -11892,6 +11906,12 @@ class _AnalyticsTelemetryProcessor:
                     zone_source = "camera_default" if zone else None
                     zone_authoritative = False
 
+                identity_observation = self._tracking_lifecycle.identity_observation(
+                    int(sensor_id), int(track_id), frame_id=int(frame_id),
+                    observed_at_us=int(temporal_contract["observed_at_us"]),
+                    media_pts_ns=temporal_contract.get("media_pts_ns"),
+                    bbox=raw.get("bbox"),
+                )
                 stable_id = self._maybe_assign_stable_id(
                     sensor_id=sensor_id,
                     track_id=track_id,
@@ -11900,6 +11920,7 @@ class _AnalyticsTelemetryProcessor:
                     ts=now_ts,
                     frame_bgr=None,
                     embedding=None,
+                    lifecycle_observation=identity_observation,
                 )
                 if stable_id is None:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
@@ -11941,14 +11962,7 @@ class _AnalyticsTelemetryProcessor:
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int,
                     "tracker_id": tracker_id_int,
-                    "tracker_lifecycle_generation": self._tracking_lifecycle.peek_generation(
-                        int(sensor_id),
-                        int(tracker_id_int),
-                        frame_id=int(frame_id),
-                        observed_at_us=int(temporal_contract["observed_at_us"]),
-                        media_pts_ns=temporal_contract.get("media_pts_ns"),
-                        bbox=raw.get("bbox"),
-                    ),
+                    "tracker_lifecycle_generation": identity_observation.generation,
                     "camera_id": camera_id,
                     "source_id": int(source_id),
                     "bbox": raw.get("bbox"),
@@ -18888,7 +18902,7 @@ class _AnalyticsTelemetryProcessor:
             return False
         return bool(
             height_px / image_height_px >= 48.0 / 1080.0
-            and width_px / height_px <= 0.85
+            and width_px / height_px < 0.85
         )
 
     def _refine_seeded_world_with_ground_state(
@@ -23894,6 +23908,7 @@ class _AnalyticsTelemetryProcessor:
         ts: float,
         frame_bgr: Optional[np.ndarray],
         embedding: Optional[np.ndarray] = None,
+        lifecycle_observation: Optional[TrackingIdentityObservation] = None,
     ) -> Optional[int]:
         """Return a positive stable_id for a tracked person from StableIDManager."""
         if track_id < 0:
@@ -23924,6 +23939,11 @@ class _AnalyticsTelemetryProcessor:
                     zone=str(zone) if zone else None,
                     frame_bgr=frame_bgr,
                     embedding=embedding,
+                    **(
+                        {"lifecycle_observation": lifecycle_observation}
+                        if lifecycle_observation is not None and not self._tracking_mode_is_mv3dt()
+                        else {}
+                    ),
                 )
                 stable_id_int = int(stable_id)
                 if stable_id_int > 0:

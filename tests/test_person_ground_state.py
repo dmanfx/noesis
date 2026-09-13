@@ -148,7 +148,74 @@ def test_phase3_classify_posture_sitting_and_standing() -> None:
         "unknown",
     )
     assert classify_posture(kpts_abs=_kpts_sitting(), bbox=[0, 0, 90, 110], height_ref_scene=1.8, config=cfg) == "sitting"
-    assert classify_posture(kpts_abs=None, bbox=[0, 0, 200, 80], height_ref_scene=None, config=cfg) == "lying"
+
+
+@pytest.mark.parametrize("height_ref_scene", (None, 1.8))
+@pytest.mark.parametrize(
+    "bbox",
+    (
+        [354.75, 556.5, 800.25, 421.5],
+        [0.0, 0.0, 100.0, 110.0],
+        [0.0, 0.0, 200.0, 80.0],
+    ),
+)
+def test_compact_bbox_without_body_evidence_has_unknown_posture(
+    bbox: list[float], height_ref_scene: float | None
+) -> None:
+    # First bbox is the saved roomwalk frame 470025: a standing phone holder's
+    # partial upper body. Shape alone proves neither posture nor clipping.
+    cfg = HumanGroundConfig()
+    assert classify_posture(
+        kpts_abs=None,
+        bbox=bbox,
+        height_ref_scene=height_ref_scene,
+        config=cfg,
+    ) == "unknown"
+
+
+def test_partial_upper_body_does_not_establish_posture_or_floor_contact() -> None:
+    cfg = HumanGroundConfig()
+    keypoints = _kpts_standing()
+    keypoints[11:17, 2] = 0.0
+
+    posture = classify_posture(
+        kpts_abs=keypoints,
+        bbox=[354.75, 556.5, 800.25, 421.5],
+        height_ref_scene=None,
+        config=cfg,
+    )
+
+    assert posture == "unknown"
+    assert resolve_pose_floor_anchor(keypoints, posture=posture, config=cfg) is None
+
+
+def test_wide_bbox_does_not_override_observed_seated_pose() -> None:
+    cfg = HumanGroundConfig()
+    assert classify_posture(
+        kpts_abs=_kpts_sitting(),
+        bbox=[0.0, 0.0, 200.0, 80.0],
+        height_ref_scene=None,
+        config=cfg,
+    ) == "sitting"
+
+
+@pytest.mark.parametrize("body_slope", (0.0, 0.1))
+@pytest.mark.parametrize("height_ref_scene", (None, 1.8))
+def test_observed_horizontal_body_is_lying(
+    body_slope: float, height_ref_scene: float | None
+) -> None:
+    cfg = HumanGroundConfig()
+    keypoints = _kpts_standing()
+    # Rotate a complete observed body to horizontal, with optional slight tilt.
+    keypoints[:, :2] = keypoints[:, [1, 0]]
+    keypoints[:, 1] += body_slope * keypoints[:, 0]
+
+    assert classify_posture(
+        kpts_abs=keypoints,
+        bbox=[80.0, 80.0, 240.0, 80.0],
+        height_ref_scene=height_ref_scene,
+        config=cfg,
+    ) == "lying"
 
 
 @pytest.mark.parametrize(

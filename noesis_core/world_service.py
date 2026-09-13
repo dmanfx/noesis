@@ -1318,17 +1318,52 @@ class CanonicalWorldService:
         camera_calibration_binding_required = bool(
             raw_camera_calibration_sha256 is not None
         )
+        camera_calibration_rejection_reason = None
         if camera_calibration_binding_required:
             expected_camera_calibration_sha256 = self._sha256_text(
                 raw_camera_calibration_sha256
             )
+            raw_measurement_calibration_sha256 = track.get(
+                "world_calibration_sha256"
+            )
+            measurement_calibration_sha256 = self._sha256_text(
+                raw_measurement_calibration_sha256
+            )
             camera_calibration_matches = bool(
                 expected_camera_calibration_sha256 is not None
-                and self._sha256_text(
-                    track.get("world_calibration_sha256")
-                )
+                and measurement_calibration_sha256
                 == expected_camera_calibration_sha256
             )
+            if not camera_calibration_matches:
+                if expected_camera_calibration_sha256 is None:
+                    camera_calibration_rejection_reason = (
+                        "camera_calibration_authority_invalid"
+                    )
+                elif raw_measurement_calibration_sha256 is None or (
+                    isinstance(raw_measurement_calibration_sha256, str)
+                    and not raw_measurement_calibration_sha256.strip()
+                ):
+                    # Unavailable geometry often has no measurement binding.
+                    # Preserve its producer rejection without presenting that
+                    # absence as a conflicting calibration. Unbound numeric
+                    # candidates remain quarantined below.
+                    camera_calibration_rejection_reason = (
+                        self._world_first_divergence_reason(
+                            track,
+                            world_observation=None,
+                            expected_continuity_origin=expected_image_motion_origin,
+                        )
+                        if track.get("world_valid") is not True
+                        else "camera_calibration_sha256_missing"
+                    )
+                elif measurement_calibration_sha256 is None:
+                    camera_calibration_rejection_reason = (
+                        "camera_calibration_sha256_invalid"
+                    )
+                else:
+                    camera_calibration_rejection_reason = (
+                        "camera_calibration_sha256_mismatch"
+                    )
         else:
             camera_calibration_matches = True
         world_observation = (
@@ -1348,9 +1383,7 @@ class CanonicalWorldService:
             )
             if camera_calibration_matches
             else WorldObservationDiagnostics(
-                first_divergence_reason=(
-                    "camera_calibration_sha256_mismatch"
-                )
+                first_divergence_reason=camera_calibration_rejection_reason
             )
         )
         coordinate_frame = "backend_world_m" if world_observation is not None else "image_px"

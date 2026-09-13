@@ -2,7 +2,7 @@ import threading
 import time
 import math
 import logging
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from typing import Deque, Dict, List, Mapping, Optional, Set, Tuple, Any, Iterable
 import heapq
 import os
@@ -11,6 +11,7 @@ import json
 import numpy as np
 
 from noesis_core.strict_json import strict_json_loads
+from noesis_core.tracking_continuity import TrackingIdentityObservation
 
 from .assignment import (
     FrameAssignmentState,
@@ -194,6 +195,7 @@ class StableIDManager:
         suggest_pose_sim_low: float = 0.70,
         suggest_pose_sim_high: float = 0.90,
         alias_history_max: int = 1000,
+        identity_reappearance_grace_s: float = 0.35,
     ) -> None:
         self._lock = threading.RLock()
         self._use_extractor = bool(use_extractor)
@@ -354,6 +356,16 @@ class StableIDManager:
 
         # Active tracks: (sensor_id, ds_obj_id) -> record
         self.active_tracks: Dict[Tuple[int, int], Dict] = {}
+        grace = float(identity_reappearance_grace_s)
+        if not math.isfinite(grace) or not 0.0 <= grace <= 0.75:
+            raise ValueError("identity reappearance grace must be within 0..0.75 s")
+        self.identity_reappearance_grace_ns = int(round(grace * 1_000_000_000))
+        # Dormant bindings are never active presence, zone occupancy or a new
+        # gallery. Reuse existing per-track evidence with a strict finite cap.
+        self._retained_identity_tracks: OrderedDict[
+            Tuple[int, int, int, int], Dict[str, Any]
+        ] = OrderedDict()
+        self._retained_identity_max = 256
 
         # Ghosts by camera: sensor_id -> deque of ghost records
         self.ghosts: Dict[int, Deque[Dict]] = defaultdict(lambda: deque(maxlen=ghost_queue_max))
@@ -973,6 +985,12 @@ class StableIDManager:
         new_int = int(new_sid)
         identity_kind = str(kind) if kind is not None else None
 
+        # Enrollment/remapping invalidates a dormant snapshot of the old
+        # identity. Reappearance must resolve against the new registry state.
+        for lifecycle_key, retained in list(self._retained_identity_tracks.items()):
+            if int(retained.get("stable_id", -1)) == old_int:
+                self._retained_identity_tracks.pop(lifecycle_key, None)
+
         if old_int == new_int:
             if identity_kind is not None:
                 for track in self.active_tracks.values():
@@ -1249,6 +1267,9 @@ class StableIDManager:
                 raise RuntimeError("household mode not enabled")
             rec = self._resident_registry.delete(str(resident_uuid))
             old_sid = int(rec.stable_id)
+            for lifecycle_key, retained in list(self._retained_identity_tracks.items()):
+                if int(retained.get("stable_id", -1)) == old_sid:
+                    self._retained_identity_tracks.pop(lifecycle_key, None)
             now = float(time.time())
             has_live_ref = False
             for track in self.active_tracks.values():
@@ -1456,6 +1477,9 @@ class StableIDManager:
             sid = int(sid)
         except Exception:
             return
+        for lifecycle_key, retained in list(self._retained_identity_tracks.items()):
+            if int(retained.get("stable_id", -1)) == sid:
+                self._retained_identity_tracks.pop(lifecycle_key, None)
         try:
             self.gallery.pop(sid, None)
             self.sid_centroid.pop(sid, None)
@@ -3966,6 +3990,90 @@ class StableIDManager:
                 results = results[: int(limit)]
             return results
 
+    def prune_identity_lifecycles(
+        self, sensor_id: int, retained_keys: frozenset[Tuple[int, int, int, int]],
+    ) -> None:
+        """Consume the lifecycle owner's post-frame expiry/reset disposition."""
+        with self._lock:
+            for key in list(self._retained_identity_tracks):
+                if key[0] == int(sensor_id) and key not in retained_keys:
+                    self._retained_identity_tracks.pop(key, None)
+
+    def _resume_identity_lifecycle(
+        self, observation: TrackingIdentityObservation,
+        embedding: Optional[np.ndarray],
+    ) -> str:
+        """Reuse only a confirmed, uncontested owner-admitted short return."""
+        rec = self._retained_identity_tracks.pop(observation.key, None)
+        if rec is None:
+            return "no_retained_binding"
+        if observation.disposition != "reappeared":
+            return "owner_not_reappeared"
+        gap = observation.media_gap_ns
+        prior = rec.get("_identity_lifecycle")
+        if gap is None or gap > self.identity_reappearance_grace_ns:
+            return "media_gap_ineligible"
+        if (
+            not isinstance(prior, TrackingIdentityObservation)
+            or prior.key != observation.key
+            or prior.media_pts_ns != observation.previous_media_pts_ns
+            or prior.frame_id >= observation.frame_id
+        ):
+            return "receipt_mismatch"
+        sid = int(rec["stable_id"])
+        if self.aliases_enabled and self.canonical_sid(sid) != sid:
+            return "identity_registry_changed"
+        kind = str(rec.get("identity_kind") or self._household_identity_kind(sid))
+        if kind not in {"resident", "visitor"} or self._household_is_provisional_sid(sid):
+            return "unconfirmed_identity"
+        if self.household_mode and (
+            self._household_identity_kind(sid) != kind
+            or (kind == "resident" and self._resident_registry is not None and (
+                rec.get("resident_uuid") != self._resident_registry.uuid_for(sid)
+            ))
+            or (kind == "visitor" and self._visitor_pool is not None and (
+                sid not in self._visitor_pool.used_sids()
+                or rec.get("visitor_generation") != self._visitor_pool.generation_for(sid)
+            ))
+        ):
+            return "identity_registry_changed"
+        # A dormant binding cannot take an identity already claimed elsewhere,
+        # including another camera. General matching still owns overlap permits.
+        for active in self.active_tracks.values():
+            other_sid = int(active.get("stable_id", -1))
+            other_sid = self.canonical_sid(other_sid) if self.aliases_enabled else other_sid
+            if other_sid == sid:
+                return "conflicting_active_claim"
+        if embedding is not None:
+            current = np.asarray(embedding, dtype=np.float32).reshape(-1)
+            saved = rec.get("emb")
+            if saved is None:
+                return "appearance_unavailable"
+            previous = np.asarray(saved, dtype=np.float32).reshape(-1)
+            if (
+                current.shape != previous.shape or current.size == 0
+                or not np.isfinite(current).all() or not np.isfinite(previous).all()
+            ):
+                return "appearance_invalid"
+            denom = float(np.linalg.norm(current) * np.linalg.norm(previous))
+            if denom <= 1e-12 or float(np.dot(current, previous)) / denom < self.cos_sim_threshold:
+                return "appearance_mismatch"
+        rec["stable_id"] = sid
+        if self.household_mode:
+            self._household_apply_identity_meta(rec, sid=sid, kind=kind)
+        key = (observation.source_id, observation.tracker_id)
+        self.active_tracks[key] = rec
+        self.active_zones[sid].add((observation.source_id, rec.get("zone", "default")))
+        self._household_emb_counts[key] = int(rec.get("_identity_support_count", 0))
+        # The restored private record replaces this exact disappearance ghost.
+        ghosts = self.ghosts.get(observation.source_id)
+        if ghosts is not None:
+            self.ghosts[observation.source_id] = deque(
+                (g for g in ghosts if g.get("identity_lifecycle_key") != observation.key),
+                maxlen=ghosts.maxlen,
+            )
+        return "retained"
+
     def update(
         self,
         sensor_id: int,
@@ -3979,6 +4087,76 @@ class StableIDManager:
         pose_quality: Optional[Dict[str, float]] = None,
         world_xy: Optional[Tuple[float, float]] = None,
         world_valid: bool = False,
+        lifecycle_observation: Optional[TrackingIdentityObservation] = None,
+    ) -> int:
+        """Resolve identity after the source owner reserves its generation.
+
+        Legacy non-runtime callers without a receipt retain their established
+        API. A receipt-bearing caller never falls through to the old unbound
+        numeric-tracker ghost-continuity shortcut.
+        """
+        key = (int(sensor_id), int(ds_obj_id))
+        observation = lifecycle_observation
+        if observation is not None and (
+            not isinstance(observation, TrackingIdentityObservation)
+            or observation.source_id != key[0] or observation.tracker_id != key[1]
+        ):
+            raise ValueError("identity lifecycle observation does not match track")
+        with self._lock:
+            resumed = False
+            retention_decision = "active_binding"
+            if observation is not None:
+                rec = self.active_tracks.get(key)
+                prior = rec.get("_identity_lifecycle") if rec is not None else None
+                if rec is not None and (
+                    not isinstance(prior, TrackingIdentityObservation)
+                    or prior.key != observation.key
+                ):
+                    # A reused numeric tracker/source epoch must not inherit an
+                    # active record. Fresh appearance matching remains possible.
+                    self.remove_missing_tracks(
+                        key[0], [k[1] for k in self.active_tracks if k[0] == key[0] and k != key], ts,
+                    )
+                for retained_key in list(self._retained_identity_tracks):
+                    if retained_key[0] == key[0] and (
+                        retained_key[1] != observation.source_epoch
+                        or (retained_key[2] == key[1] and retained_key != observation.key)
+                    ):
+                        self._retained_identity_tracks.pop(retained_key, None)
+                if key not in self.active_tracks:
+                    retention_decision = self._resume_identity_lifecycle(observation, embedding)
+                    resumed = retention_decision == "retained"
+            sid = self._update_identity(
+                sensor_id, ds_obj_id, bbox_ltrbwh, ts, zone, frame_bgr, embedding,
+                pose_features, pose_quality, world_xy, world_valid,
+                allow_unbound_continuity=observation is None,
+                lifecycle_resumed=resumed,
+            )
+            rec = self.active_tracks.get(key)
+            if rec is not None and observation is not None:
+                rec["_identity_lifecycle"] = observation
+                rec["_identity_support_count"] = int(self._household_emb_counts.get(key, 0))
+                diag = rec.get("id_diag")
+                if isinstance(diag, dict):
+                    diag["identity_retention_decision"] = retention_decision
+            return sid
+
+    def _update_identity(
+        self,
+        sensor_id: int,
+        ds_obj_id: int,
+        bbox_ltrbwh: BBox,
+        ts: float,
+        zone: Optional[str],
+        frame_bgr: Optional[np.ndarray] = None,
+        embedding: Optional[np.ndarray] = None,
+        pose_features: Optional[Dict[str, float]] = None,
+        pose_quality: Optional[Dict[str, float]] = None,
+        world_xy: Optional[Tuple[float, float]] = None,
+        world_valid: bool = False,
+        *,
+        allow_unbound_continuity: bool = True,
+        lifecycle_resumed: bool = False,
     ) -> int:
         """Update or create stable_id for a DS track.
 
@@ -3989,7 +4167,7 @@ class StableIDManager:
         with self._lock:
             rec = self.active_tracks.get(key)
             is_new = rec is None
-            diag_event = "new_alloc" if is_new else "reuse_active"
+            diag_event = "new_alloc" if is_new else "reuse_lifecycle" if lifecycle_resumed else "reuse_active"
             diag_reject_reason: Optional[str] = None
             diag_sid_candidate: Optional[int] = None
             diag_reid_confidence: Optional[float] = None
@@ -4083,7 +4261,7 @@ class StableIDManager:
             curr_brightness: Optional[float] = None
             curr_color: Optional[np.ndarray] = None
             need_embed = False
-            if is_new:
+            if is_new or (lifecycle_resumed and embedding is not None):
                 need_embed = True
             else:
                 last_emb_ts = rec.get("last_emb_ts", 0.0)
@@ -4153,7 +4331,7 @@ class StableIDManager:
                 # lifecycle gap when the current frame has no fresh embedding.
                 # The strict same-tracker/bbox gate prevents this from becoming
                 # a general appearance-free identity assignment.
-                if emb is None and not pose_valid:
+                if allow_unbound_continuity and emb is None and not pose_valid:
                     continuity_ghost = self._match_ghost_continuity(
                         sensor_id=int(sensor_id),
                         ds_obj_id=int(ds_obj_id),
@@ -5056,6 +5234,19 @@ class StableIDManager:
                 if rec is None:
                     continue
                 sid = int(rec["stable_id"])
+                observation = rec.get("_identity_lifecycle")
+                kind = str(rec.get("identity_kind") or "")
+                if (
+                    isinstance(observation, TrackingIdentityObservation)
+                    and observation.media_pts_ns is not None
+                    and kind in {"resident", "visitor"}
+                    and not self._household_is_provisional_sid(sid)
+                    and self.identity_reappearance_grace_ns > 0
+                ):
+                    self._retained_identity_tracks[observation.key] = rec
+                    self._retained_identity_tracks.move_to_end(observation.key)
+                    while len(self._retained_identity_tracks) > self._retained_identity_max:
+                        self._retained_identity_tracks.popitem(last=False)
                 zone = rec.get("zone", "default")
                 # Update active zones
                 if (int(sensor_id), zone) in self.active_zones.get(sid, set()):
@@ -5081,6 +5272,8 @@ class StableIDManager:
                         "last_emb_ts": rec.get("last_emb_ts", float(ts)),
                         "identity_kind": rec.get("identity_kind"),
                     }
+                    if isinstance(observation, TrackingIdentityObservation):
+                        ghost_rec["identity_lifecycle_key"] = observation.key
                     if emb_val is not None:
                         ghost_rec["emb"] = emb_val
                     if pose_val is not None:

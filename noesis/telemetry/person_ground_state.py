@@ -2636,7 +2636,13 @@ def classify_posture(
     height_ref_scene: Optional[float],
     config: HumanGroundConfig,
 ) -> Posture:
-    """Heuristic posture from bbox aspect/height and optional pose geometry."""
+    """Classify non-upright posture only from observed body geometry.
+
+    A compact or wide detector box may describe a partial standing body. Its
+    shape does not establish sitting, lying, or even clipping; without the
+    relevant body joints, that posture remains unknown. Floor-contact
+    admission is a separate decision and is not implied by this result.
+    """
     bbox_w = bbox_h = None
     if bbox is not None and len(bbox) >= 4:
         try:
@@ -2644,25 +2650,6 @@ def classify_posture(
             bbox_h = float(bbox[3])
         except Exception:
             bbox_w = bbox_h = None
-
-    if bbox_w is not None and bbox_h is not None and bbox_h > 1.0:
-        aspect = float(bbox_w) / float(bbox_h)
-        if aspect >= float(config.lie_bbox_aspect):
-            # A short/wide box can also be lower-body occlusion of a standing person.
-            # Only commit to "lying" from bbox alone when we have no standing height lock.
-            if height_ref_scene is None:
-                return "lying"
-
-    if (
-        bbox_h is not None
-        and height_ref_scene is not None
-        and float(height_ref_scene) > 1e-3
-        and bbox_h > 1.0
-    ):
-        # Relative pixel height vs standing reference is only available after
-        # a height lock; still useful once established.
-        # Without camera scale we use a softer threshold on aspect alone below.
-        pass
 
     if kpts_abs is not None and isinstance(kpts_abs, np.ndarray) and kpts_abs.shape[0] >= 17:
         thr = float(config.kpt_conf_threshold)
@@ -2679,7 +2666,7 @@ def classify_posture(
             torso_v = abs(float(hip[1]) - float(shoulder[1]))
             body_v = abs(float(ankle[1]) - float(shoulder[1]))
             body_h = abs(float(ankle[0]) - float(shoulder[0]))
-            if body_v > 1e-3 and (body_h / body_v) >= float(config.lie_bbox_aspect):
+            if body_h > 1e-3 and body_h >= float(config.lie_bbox_aspect) * body_v:
                 return "lying"
             if body_v > 1e-3 and torso_v > 1e-3:
                 leg_v = abs(float(ankle[1]) - float(hip[1]))
@@ -2692,31 +2679,12 @@ def classify_posture(
         if legs_are_bent(kpts_abs, config=config):
             return "sitting"
 
-        if (
-            height_ref_scene is None
-            and bbox_w is not None
-            and bbox_h is not None
-            and bbox_h > 1.0
-        ):
-            if (
-                float(bbox_w) / float(bbox_h)
-                >= float(config.lie_bbox_aspect) * 0.92
-            ):
-                return "lying"
-
     if bbox_w is not None and bbox_h is not None and bbox_h > 1.0:
         aspect = float(bbox_w) / float(bbox_h)
-        # Tall thin boxes are standing. Once an upright height lock exists, a
-        # short detector box is ambiguous with lower-body occlusion and must not
-        # become a bbox-only sitting decision.
+        # Preserve the coarse upright silhouette classification. Compact and
+        # wide boxes have no equivalent positive non-upright evidence.
         if aspect < 0.55 and bbox_h >= 90.0:
             return "standing"
-        if (
-            height_ref_scene is None
-            and aspect >= 0.85
-            and aspect < float(config.lie_bbox_aspect)
-        ):
-            return "sitting"
 
     return "unknown"
 

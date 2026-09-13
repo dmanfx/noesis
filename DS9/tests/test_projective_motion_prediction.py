@@ -615,6 +615,11 @@ def test_bbox_floor_candidate_size_gate_is_resolution_normalized(
         image_size=image_size,
     ) is False
     assert gate(
+        bbox_width_px=threshold_height * 0.85,
+        bbox_height_px=threshold_height,
+        image_size=image_size,
+    ) is False
+    assert gate(
         bbox_width_px=threshold_height * 0.90,
         bbox_height_px=threshold_height,
         image_size=image_size,

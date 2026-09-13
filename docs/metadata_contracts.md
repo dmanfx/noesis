@@ -383,6 +383,30 @@ cadenced by `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (2 Hz default). Canonical world
 state removes that producer/source evidence while retaining its sequence
 watermark so absence cannot be confused with replay or telemetry stall.
 
+Native baseline identity resolution consumes the lifecycle owner's generation
+reservation before assignment. A bounded private confirmed binding may survive
+a compatible same-source/epoch/tracker/generation return within 0.35 seconds of
+source-media time; it never retains public presence through the absence.
+`identity_lifecycle_disposition`, `identity_lifecycle_media_gap_ms`, and
+`identity_retention_decision` are optional scalar tracking diagnostics defined
+in the [WebSocket identity contract](api_contracts_ws.md). Missing media time,
+conflicting active ownership, changed registry identity or contradictory fresh
+appearance cannot authorize that private continuity.
+
+Compact or wide bbox shape alone does not establish sitting or lying. Without
+the required observed body geometry, `posture="unknown"` remains explicit.
+This does not admit a floor anchor or extend the posture-dependent hold cap.
+The bbox floor-silhouette gate still requires upright geometry; the compact
+aspect boundary of 0.85 is excluded.
+
+When calibration binding is required, world diagnostics distinguish
+`camera_calibration_sha256_missing`, `camera_calibration_sha256_invalid`,
+`camera_calibration_sha256_mismatch`, and
+`camera_calibration_authority_invalid`. An unavailable unstamped world row
+retains its actual producer rejection when one exists. Only two populated
+valid digests that differ produce the mismatch diagnosis; missing or malformed
+binding still prevents canonical measurement admission.
+
 - `track_id` remains an internal tracker identifier and must not be emitted to clients.
 - `tracker_id` is the bounded camera/run-local association key used by strict
   observation joins. It may be emitted for diagnostics but is not a durable or

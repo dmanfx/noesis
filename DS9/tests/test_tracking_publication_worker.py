@@ -1748,3 +1748,74 @@ def test_handler_shadow_stable_id_none_dispatches_off_callback_without_blocking(
     assert outbound[0]["stable_id"] is None
     assert "identity_v2" not in outbound[0]
     assert "embedding" not in outbound[0]
+
+
+def test_handler_reserves_identity_lifecycle_before_assignment_and_keeps_absence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+    from noesis.pipelines import hooks
+    from noesis_core.runtime_publication import RuntimePublicationGate
+    from reid.stable_id_manager import StableIDManager
+
+    manager = StableIDManager(
+        use_extractor=False, household_mode=True,
+        residents_file=str(tmp_path / "residents.json"),
+        visitor_pool_file=str(tmp_path / "visitors.json"),
+        gallery_persist_file=str(tmp_path / "gallery.npz"),
+        household_confirm_embeddings=1, new_id_hysteresis_frames=1,
+        auto_merge_enabled=False,
+    )
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(config={"models": {"reid": {"gie_id": 3}}},
+                                 stable_id_mgr=manager),
+        tracking_pub=SimpleNamespace(), camera_labels={0: "living-room"},
+        sensor_id_map={}, publication_gate=RuntimePublicationGate(),
+    )
+    monkeypatch.setattr(processor, "_build_track_dict_servicemaker", lambda obj, _: obj.row)
+    monkeypatch.setattr(processor, "_extract_reid_embedding_servicemaker", lambda obj: obj.embedding)
+    for method in (
+        "_extract_pose_keypoints_for_anchor", "_extract_object_depth_result",
+        "_augment_track_with_world", "_apply_scene_prior_shadow", "_apply_public_depth_fields",
+        "_stamp_osd_label_servicemaker", "_apply_instance_mask_color_servicemaker",
+        "_footpoint_from_track", "_publish_occupancy", "_log_diag_session_start",
+    ):
+        monkeypatch.setattr(processor, method, lambda *_args, **_kwargs: None)
+    published = []
+
+    def enqueue(**kwargs):
+        published.append(kwargs)
+        processor._tracking_lifecycle.mark_published(kwargs["continuity"])
+        return True
+
+    monkeypatch.setattr(processor, "_enqueue_tracking_publication", enqueue)
+    clock = [10.0]
+    monkeypatch.setattr(hooks.time, "time", lambda: clock[0])
+    row = {"track_id": 7, "bbox": [10.0, 20.0, 40.0, 120.0],
+           "center": [30.0, 80.0], "class_id": 0, "confidence": 0.95,
+           "tracker_confidence": 0.9, "analytics": {}, "zone": "living-room"}
+    for index, (media, present, embedding) in enumerate((
+        (1_000_000_000, True, np.array([1.0, 0.0], dtype=np.float32)),
+        (1_100_000_000, False, None),
+        (1_200_000_000, True, None),
+    ), 1):
+        clock[0] += 0.1
+        obj = SimpleNamespace(object_id=7, class_id=0, row=dict(row), embedding=embedding)
+        processor.handle_servicemaker_frame(SimpleNamespace(
+            source_id=0, frame_number=index, frame_width=1920, frame_height=1080,
+            buf_pts=media, object_items=(obj,) if present else (),
+        ))
+        assert processor._stable_id_enabled is True
+        if not present:
+            assert manager.active_tracks == {}
+    processor.shutdown(wait=True, timeout_s=2.0)
+    first, absent, returned = published
+    assert absent["tracks"] == []
+    assert len(absent["continuity"].tombstones) == 1
+    initial_track, returned_track = first["tracks"][0], returned["tracks"][0]
+    assert initial_track["tracker_lifecycle_generation"] == returned_track["tracker_lifecycle_generation"]
+    assert initial_track["stable_id"] == returned_track["stable_id"]
+    assert returned_track["identity_lifecycle_disposition"] == "reappeared"
+    assert returned_track["identity_lifecycle_media_gap_ms"] == 200.0
+    assert returned_track["identity_retention_decision"] == "retained"
+    assert returned_track["id_event"] == "reuse_lifecycle"

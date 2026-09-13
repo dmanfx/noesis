@@ -94,6 +94,37 @@ class _ActiveTrackLifecycle:
 
 
 @dataclass(frozen=True)
+class TrackingIdentityObservation:
+    """Owner-issued identity context for one processed tracker observation.
+
+    This is private in-process evidence, not a public presence or identity
+    assignment. Only ``reappeared`` with advancing source media time permits
+    short-gap identity retention; host timestamps never supply that permission.
+    """
+
+    source_id: int
+    source_epoch: int
+    tracker_id: int
+    generation: int
+    frame_id: int
+    observed_at_us: int
+    media_pts_ns: int | None
+    disposition: str
+    previous_media_pts_ns: int | None = None
+
+    @property
+    def key(self) -> tuple[int, int, int, int]:
+        return (self.source_id, self.source_epoch, self.tracker_id, self.generation)
+
+    @property
+    def media_gap_ns(self) -> int | None:
+        if self.media_pts_ns is None or self.previous_media_pts_ns is None:
+            return None
+        gap = self.media_pts_ns - self.previous_media_pts_ns
+        return gap if gap > 0 else None
+
+
+@dataclass(frozen=True)
 class TrackingContinuityUpdate:
     source_id: int
     frame_id: int
@@ -377,6 +408,84 @@ class TrackingLifecycleRegistry:
                 return int(reserved)
             return int(self._next_generation_by_source.get(source, 1))
 
+    def identity_observation(
+        self,
+        source_id: int,
+        tracker_id: int,
+        *,
+        frame_id: int,
+        observed_at_us: int,
+        media_pts_ns: object = None,
+        bbox: object = None,
+    ) -> TrackingIdentityObservation:
+        """Reserve the exact generation before the adapter resolves identity."""
+
+        source = _exact_nonnegative_int(source_id, "source_id")
+        tracker = _exact_nonnegative_int(tracker_id, "tracker_id")
+        frame = _exact_nonnegative_int(frame_id, "frame_id")
+        observed = _exact_nonnegative_int(observed_at_us, "observed_at_us")
+        if observed <= 0:
+            raise ValueError("observed_at_us must be positive")
+        media = _media_pts_ns(media_pts_ns)
+        with self._lock:
+            generation = self.peek_generation(
+                source, tracker, frame_id=frame, observed_at_us=observed,
+                media_pts_ns=media, bbox=bbox,
+            )
+            active = self._active_by_source.get(source, {}).get(tracker)
+            retired = self._retired_by_source.get(source, {}).get(tracker)
+            prior = active or retired
+            disposition = "new"
+            if active is not None and active.generation == generation:
+                disposition = "continuous"
+            elif (
+                retired is not None and retired.generation == generation
+                and self._retired_is_reusable_locked(
+                    retired, observed_at_us=observed, media_pts_ns=media,
+                    bbox=_track_bbox(bbox),
+                )
+            ):
+                disposition = "reappeared"
+            return TrackingIdentityObservation(
+                source_id=source,
+                source_epoch=int(self._source_epoch_by_source.get(source, 0)),
+                tracker_id=tracker, generation=generation, frame_id=frame,
+                observed_at_us=observed, media_pts_ns=media,
+                disposition=disposition,
+                previous_media_pts_ns=(
+                    prior.last_seen_media_pts_ns if prior is not None else None
+                ),
+            )
+
+    def identity_retention_keys(
+        self, source_id: int, *, media_pts_ns: object, max_gap_ns: int,
+    ) -> frozenset[tuple[int, int, int, int]]:
+        """Return still-owned private bindings after an exact frame update.
+
+        Expiry, eviction and source reset remove keys at the lifecycle owner.
+        The identity consumer may choose a shorter grace but cannot prolong it.
+        Missing/repeated media time never renews an absent binding.
+        """
+
+        source = _exact_nonnegative_int(source_id, "source_id")
+        limit = min(
+            _exact_nonnegative_int(max_gap_ns, "max_gap_ns"),
+            self._reappearance_grace_ns,
+        )
+        media = _media_pts_ns(media_pts_ns)
+        with self._lock:
+            epoch = int(self._source_epoch_by_source.get(source, 0))
+            keys = {
+                (source, epoch, item.tracker_id, item.generation)
+                for item in self._active_by_source.get(source, {}).values()
+            }
+            if media is not None:
+                for item in self._retired_by_source.get(source, {}).values():
+                    previous = item.last_seen_media_pts_ns
+                    if previous is not None and 0 < media - previous <= limit:
+                        keys.add((source, epoch, item.tracker_id, item.generation))
+            return frozenset(keys)
+
     def update_frame(
         self,
         *,
@@ -631,6 +740,7 @@ __all__ = [
     "TRACKING_CONTINUITY_CONTRACT",
     "TRACKING_CONTINUITY_CONTRACT_VERSION",
     "TrackingContinuityUpdate",
+    "TrackingIdentityObservation",
     "TrackingLifecycleRegistry",
     "pair_safe_publication_interval_s",
 ]

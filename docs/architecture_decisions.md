@@ -1648,3 +1648,44 @@ It does not satisfy camera/IMU calibration, measured hardware timing or metric
 VIO admission. Static learned depth remains independent reconstruction evidence,
 not surveyed geometric truth. Candidate generation does not bind a Scene Prior,
 change camera calibration or publish a phone trajectory as a person's path.
+
+## 2026-09-13 — Private identity continuity and independent walk review
+
+The tracking lifecycle owner reserves source epoch and generation before
+StableID assignment. The baseline manager may retain at most 256 confirmed
+private bindings across compatible owner-admitted returns within 0.35 seconds
+of the last observed source-media PTS. Disappearance still removes active
+presence immediately and publishes its exact tombstone. Owner expiry/reset,
+registry incarnation changes, competing active claims and contradictory fresh
+appearance invalidate this continuity. General appearance matching owns other
+returns. Source-media absence is never measured with the host processing clock;
+MV3DT's distinct batch-global key is unchanged.
+
+Cold compact or wide detector boxes no longer imply sitting/lying without
+positive body geometry. Unknown posture cannot grant floor-contact or longer
+hold authority. World-service diagnostics distinguish missing and invalid
+calibration bindings from actual digest conflicts while preserving unavailable
+geometry and the producer's explicit rejection.
+
+Reusable offline [motion review](../tools/mapanything_phone_scan/trajectory_motion_review.py)
+checks exact prepared/native frame identities, same-window gyro/visual rotation
+and heldout activity. [Depth registration review](../noesis/calibration/depth_registration_review.py)
+separates occupied usability from independently qualified same-anchor labels,
+and reports heldout range/time coverage, residuals and observable mapping slope.
+Neither command admits calibration or supplies person coordinates. A camera
+optical center is not a person's ground point or torso range label.
+
+The [handset reference reviewer](../tools/mapanything_phone_scan/trajectory_reference_review.py)
+adds explicitly bound blind image annotations and heldout reprojection checks.
+A translation-only trial fits training annotations and is evaluated against
+both heldout pixels and fixed original comparable geometry/references, retaining
+visibility losses. Improving image agreement by losing structural support
+cannot pass this review, and a passing diagnostic still admits no calibration.
+
+The September 12 walk exposes disagreement between handset reprojections and
+learned static structure. A translation that helps handset pixels worsens wall
+residuals and coverage; a smooth static floor above Y=0 does not establish a
+surveyed height. No numerical floor/extrinsic correction or replacement depth
+mapping follows from those observations. Qualified independent controls and
+heldout agreement remain prerequisites for those changes. Partial provider
+outputs, failed windows and missing coverage remain explicit review evidence.

@@ -1937,6 +1937,93 @@ def test_world_observation_requires_exact_raw_camera_calibration_digest() -> Non
     assert service._canonical_track_outputs == {}
 
 
+@pytest.mark.parametrize(
+    ("measurement_digest", "world_valid", "expected_reason"),
+    (
+        (None, False, "no_valid_measurement_or_process_continuation"),
+        ("", False, "no_valid_measurement_or_process_continuation"),
+        (None, True, "camera_calibration_sha256_missing"),
+        ("   ", True, "camera_calibration_sha256_missing"),
+        ("not-a-digest", True, "camera_calibration_sha256_invalid"),
+        ("a" * 64, False, "camera_calibration_sha256_mismatch"),
+    ),
+)
+def test_world_calibration_diagnostics_distinguish_absence_from_conflict(
+    measurement_digest: str | None,
+    world_valid: bool,
+    expected_reason: str,
+) -> None:
+    baseline = _artifacts()
+    service = CanonicalWorldService(
+        producer=_producer(),
+        artifacts=WorldArtifacts(
+            calibration=baseline.calibration,
+            model=baseline.model,
+            config=baseline.config,
+            camera_calibration_sha256="b" * 64,
+        ),
+        clock_us=lambda: 2_000_000,
+    )
+    track = _track(
+        camera_id="kitchen", tracker_id=7, frame_id=1,
+        observed_at_us=1_900_000, x=1.0,
+    )
+    track.update({
+        "world_valid": world_valid,
+        "world_calibration_sha256": measurement_digest,
+        "world_quality_reason": "no_valid_measurement_or_process_continuation",
+        "world_floor_candidate": [99.0, 0.0, 99.0],
+    })
+
+    publication = service.publish(0, [track], metadata={})
+
+    observation = publication.observations[0]
+    assert observation.payload.world is None
+    diagnostics = observation.payload.world_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.first_divergence_reason == expected_reason
+    # Missing and conflicting bindings both quarantine numeric geometry.
+    assert diagnostics.floor_candidate_m is None
+    assert publication.snapshot.entities == ()
+    assert service._canonical_track_outputs == {}
+
+
+@pytest.mark.parametrize("world_valid", (True, False))
+def test_matching_calibration_binding_preserves_world_admission(
+    world_valid: bool,
+) -> None:
+    baseline = _artifacts()
+    service = CanonicalWorldService(
+        producer=_producer(),
+        artifacts=WorldArtifacts(
+            calibration=baseline.calibration,
+            model=baseline.model,
+            config=baseline.config,
+            camera_calibration_sha256="b" * 64,
+        ),
+        clock_us=lambda: 2_000_000,
+    )
+    track = _track(
+        camera_id="kitchen", tracker_id=7, frame_id=1,
+        observed_at_us=1_900_000, x=1.0,
+    )
+    track["world_valid"] = world_valid
+    track["world_calibration_sha256"] = "b" * 64
+    if not world_valid:
+        track["world_rejection_reason"] = "no_ground_contact"
+
+    publication = service.publish(0, [track], metadata={})
+
+    observation = publication.observations[0]
+    assert (observation.payload.world is not None) is world_valid
+    assert bool(publication.snapshot.entities) is world_valid
+    if not world_valid:
+        assert observation.payload.world_diagnostics is not None
+        assert observation.payload.world_diagnostics.first_divergence_reason == (
+            "no_ground_contact"
+        )
+
+
 def test_prepared_world_commit_rejects_camera_calibration_provider_switch() -> None:
     calibration_sha256 = {"value": "a" * 64}
 

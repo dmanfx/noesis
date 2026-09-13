@@ -956,6 +956,9 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       } | null,
       "id_event": "<string|null>",
       "id_reject_reason": "<string|null>",
+      "identity_lifecycle_disposition": "new"|"continuous"|"reappeared"|null,
+      "identity_lifecycle_media_gap_ms": <number|null>,
+      "identity_retention_decision": "<string|null>",
       "embedding_present": <bool|null>,
       "embedding_sequence": <int|null>,
       "embedding_model_sha256": "<lowercase sha256|null>",
@@ -1336,6 +1339,10 @@ Human pathing fields (producer-owned):
 
 - `motion_mode`: locomotion class from the stationary lock (`walk` / `idle` / `sit` / `lie` / `unknown`).
 - `posture`: geometric posture guess (`standing` / `sitting` / `lying` / `unknown`).
+  Sitting and lying require positive body evidence. A compact or wide bbox-only
+  observation remains `unknown`; this does not grant floor contact or a longer
+  hold. The [metadata contract](metadata_contracts.md) also distinguishes
+  unavailable calibration binding from an actual digest conflict.
 - Typed stationary hold evidence is stamped from that public tracking
   `posture`. Strict ingestion falls back to resolver-diagnostic
   `world_posture` only when `posture` is absent; `world_posture` cannot
@@ -1442,17 +1449,35 @@ Validation diagnostics:
   - `resident_uuid` / `display_name`: enrollment metadata (Phase 3; may be null in Phase 0).
   - `visitor_generation`: non-repeating generation for a recycled compatibility visitor SID.
   - `id_event` / `id_reject_reason`: assignment lifecycle and reject diagnostics.
+    `reuse_lifecycle` identifies a confirmed private binding retained on an
+    owner-admitted short return; it does not assert correct biometric identity.
   - `embedding_present` / `pose_present`: whether ReID/pose evidence was available on the frame.
   - `embedding_sequence` / `embedding_model_sha256` /
     `embedding_dimension`: optional persisted-evidence provenance, present only
     as the complete triad described above.
   - `sid_candidate`: provisional candidate SID before confirmation (when applicable).
-- A sub-second metadata gap may retain a settled StableID without a fresh
-  embedding only for the same camera and tracker-local ID, within 0.75 seconds,
-  and only when strict bbox overlap, center-motion, and area-ratio gates all
-  pass. The carried embedding remains internal and the current row reports no
-  fresh embedding evidence. This continuity aid cannot claim an ID already
-  active in the same frame and is not cross-camera ReID.
+- The native baseline reserves `(source_id, source_epoch, tracker_id,
+  tracker_lifecycle_generation)` with the tracking lifecycle owner before
+  resolving identity. `identity_lifecycle_disposition` reports `new`,
+  `continuous`, or `reappeared`. `identity_lifecycle_media_gap_ms` is the
+  positive source-media interval since that lifecycle's previous observation,
+  or null when unavailable; a continuous row's interval is not an absence.
+  A confirmed private binding may survive an owner-admitted compatible return
+  within 0.35 seconds of the last observed source-media PTS. The private cache
+  holds at most 256 records; it creates no active-zone claim, public presence,
+  world point, or delayed tombstone during absence. Reset, owner eviction,
+  expiry, changed generation, identity deletion/recycling, conflicting active
+  claims on any camera, and contradictory fresh appearance veto retention.
+  Missing media time cannot be replaced by host time. Fresh appearance
+  matching remains responsible for returns that do not qualify.
+- `identity_retention_decision` describes this private decision, separately
+  from the final matcher result: `active_binding`, `retained`,
+  `no_retained_binding`, `owner_not_reappeared`, `media_gap_ineligible`,
+  `receipt_mismatch`, `unconfirmed_identity`, `identity_registry_changed`,
+  `conflicting_active_claim`, `appearance_unavailable`, `appearance_invalid`,
+  or `appearance_mismatch`. A veto does not prohibit independently supported
+  appearance matching. These additive scalar diagnostics expose no embeddings
+  and do not enable MV3DT or change its existing batch-global identity key.
 - Identity-v2 runs one joint resolver call after a complete source-frame
   primitive batch is detached from SDK metadata. In default `shadow` mode,
   canonical tracking/world/BEV is admitted first and never waits for or accepts

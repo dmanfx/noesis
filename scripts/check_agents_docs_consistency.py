@@ -15,6 +15,9 @@ ACTIVE_AGENTS_FILES = (
     Path("docs/AGENTS.md"),
     Path("DS9/AGENTS.md"),
     Path("noesis/AGENTS.md"),
+    Path("noesis_core/AGENTS.md"),
+    Path("reid/AGENTS.md"),
+    Path("tools/mapanything_phone_scan/AGENTS.md"),
     Path("plans/AGENTS.md"),
     Path("plans/household_identity/AGENTS.md"),
     Path("plans/noesis_menon_validation/AGENTS.md"),
@@ -41,6 +44,9 @@ REQUIRED_REFERENCES = (
     Path("DS9/docs/deepstream_9_1_agent_skills.md"),
     Path(".agents/skills/deepstream-dev/SKILL.md"),
     Path(".agents/skills/deepstream-profile-pipeline/SKILL.md"),
+    Path(".agents/skills/deepstream-import-vision-model/SKILL.md"),
+    Path(".agents/skills/deepstream-generate-pipeline/SKILL.md"),
+    Path(".agents/skills/deepstream-generate-pipeline/references/requirement-extraction.md"),
     Path(".agents/skills/deepstream-run-mv3dt/SKILL.md"),
     Path("DS9/docs/runtime_ownership.yaml"),
     Path("DS9/asset_manifest.yaml"),
@@ -63,6 +69,14 @@ CURRENT_DOC_ROOTS = (
 )
 
 CURRENT_STANDALONE_DOCS = (
+    Path(".agents/skills/deepstream-dev/references/native_host_setup.md"),
+    Path(".agents/skills/deepstream-generate-pipeline/references/output-format.md"),
+    Path(".agents/skills/deepstream-import-vision-model/references/engine-build.md"),
+    Path(".agents/skills/deepstream-import-vision-model/references/pipeline-run.md"),
+    Path(".agents/skills/deepstream-import-vision-model/references/detection-validation.md"),
+    Path(".agents/skills/deepstream-profile-pipeline/references/new-pipeline-construction.md"),
+    Path(".agents/skills/deepstream-profile-pipeline/references/config-derivation-rules.md"),
+    Path("plans/reconstruction_work_orders/WO-2.md"),
     Path("README.md"),
     Path("AGENTS.md"),
     Path("DS9/README.md"),
@@ -80,6 +94,9 @@ CURRENT_STANDALONE_DOCS = (
     Path("utils/onnx2trt/README.md"),
     Path(".agents/skills/deepstream-dev/SKILL.md"),
     Path(".agents/skills/deepstream-profile-pipeline/SKILL.md"),
+    Path(".agents/skills/deepstream-import-vision-model/SKILL.md"),
+    Path(".agents/skills/deepstream-generate-pipeline/SKILL.md"),
+    Path(".agents/skills/deepstream-generate-pipeline/references/requirement-extraction.md"),
     Path(".agents/skills/deepstream-run-mv3dt/SKILL.md"),
     Path("DS9/csrc/nvdsroiexclude/README.md"),
     Path("DS9/gst-plugins/noesiseos/README.md"),
@@ -110,7 +127,7 @@ MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 
 
 def _active_markdown_files() -> list[Path]:
-    found = set(CURRENT_STANDALONE_DOCS)
+    found = set(CURRENT_STANDALONE_DOCS) | set(ACTIVE_AGENTS_FILES)
     for root in CURRENT_DOC_ROOTS:
         absolute = REPO_ROOT / root
         if not absolute.exists():

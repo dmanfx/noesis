@@ -5,59 +5,32 @@ for the canonical native DeepStream 9.1 application.
 
 ## Policy precedence
 
-- Root `AGENTS.md` and `plans/AGENTS.md` apply.
-- Historical DS8 implementation notes were moved to
-  `plans/archive/completed/household_identity_ds8_implementation/` and are not
-  runtime instructions.
-- `work_order.md` is the active checklist; `decisions.md` and `contracts.md`
-  define the current product behavior.
+[Root policy](../../AGENTS.md) and [plan policy](../AGENTS.md) apply.
+[work_order.md](work_order.md) tracks remaining acceptance work;
+[contracts.md](contracts.md) and [decisions.md](decisions.md) define identity
+behavior. Implementation constraints are routed from [reid/AGENTS.md](../../reid/AGENTS.md).
 
-## Required reading
+## Read by task
 
-1. `README.md`
-2. `work_order.md`
-3. `decisions.md` and `contracts.md`
-4. `camera_topology.md` for overlap or exclusivity work
-5. `performance.md` before changing embedding or per-frame budgets
-6. `validation.md` before claiming identity authority or acceptance
-7. `docs/api_contracts_ws.md`, `docs/api_contracts_rest.md`, and
-   `docs/testing_guide.md` for current application boundaries
-
-## Product rules
-
-- Residents use a bounded, enrolled identity space; visitors are ephemeral.
-- Provisional evidence does not mint a permanent public identity.
-- A stable identity may be co-visible only across an accepted overlap edge and
-  only when fresh geometry and appearance evidence support the same person.
-- No pressure-driven auto-merge or hidden identity fallback is allowed.
-- Use Swin ReID tensor metadata from the canonical DS9.1 SGIE/native bridge.
-  Do not add CPU crop-to-TorchReID extraction or raise embedding budgets without
-  measuring the live three-camera path.
-- Preserve `stable_id` as the public identity; tracker IDs remain process-local.
-
-## Canonical implementation boundary
-
-- Identity engine: `reid/stable_id_manager.py`
-- Runtime construction: `DS9/noesis/ds9_runtime_core.py`
-- Per-frame integration: `DS9/noesis/pipelines/hooks.py`
-- REST service: `noesis/server/reid_api.py`
-- ReID config: `DS9/pipelines/config_infer_secondary_reid_swin.ini`
-- Pipeline selection: `DS9/config/infer.yaml`
-- Camera topology: `config/camera_topology.yaml`
-
-MV3DT is not the baseline identity path. The accepted Kitchen/Family Room lane
-is a separate explicit runtime opt-in; do not use an MV3DT remap as an identity
-solution or enable cross-camera overlap outside the geometry boundary recorded
-in `camera_topology.md`.
+| Task | Read before changing or claiming the behavior |
+| --- | --- |
+| Orientation or locating a work item | [README.md](README.md) |
+| Identity assignment, resident/visitor policy, or persistence | [contracts.md](contracts.md) and [decisions.md](decisions.md) |
+| Overlap or exclusivity | [camera_topology.md](camera_topology.md) |
+| Embedding or per-frame budgets | [performance.md](performance.md) |
+| Enrollment, scorer, or authority acceptance | [work_order.md](work_order.md), [calibration_and_enrollment.md](calibration_and_enrollment.md), and [validation.md](validation.md) |
+| Public wire fields | The affected [WebSocket](../../docs/api_contracts_ws.md), [REST](../../docs/api_contracts_rest.md), or [metadata](../../docs/metadata_contracts.md) contract |
+| Selecting verification | [testing guide](../../docs/testing_guide.md) and the affected contract's tests |
 
 ## Work and validation
 
-- Change the smallest producer/contract/consumer surface.
-- Run focused identity tests and one bounded recorded or live identity smoke
-  when runtime behavior changes.
-- Do not stage releases, build candidates, or run broad suites for ordinary
-  identity work.
-- Update `work_order.md` only when an item is actually complete. Record durable
-  design changes in both `decisions.md` and `docs/architecture_decisions.md`.
-- After documentation changes, run
-  `./scripts/check_agents_docs_consistency.py` and `git diff --check`.
+- Use the implementation paths and product constraints in the identity guidance;
+  acceptance checklists do not authorize enabling identity authority.
+- Update only the completed work-order item, after its actual implementation and
+  focused validation. Keep outstanding evidence requirements explicit.
+- Record an identity-specific decision in [decisions.md](decisions.md), and link
+  that decision from [architecture_decisions.md](../../docs/architecture_decisions.md)
+  when it affects repository architecture; avoid two competing copies.
+- Use the root documentation checks for documentation-only changes. Runtime
+  behavior changes use focused identity tests and one bounded recorded or live
+  consumer smoke when practical; preserve the separate authority-acceptance gates.

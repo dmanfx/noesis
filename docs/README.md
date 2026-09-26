@@ -23,10 +23,11 @@ document and live source/config win.
 | WebSocket contract | [`api_contracts_ws.md`](api_contracts_ws.md) |
 | REST contract | [`api_contracts_rest.md`](api_contracts_rest.md) |
 | Metadata contracts | [`metadata_contracts.md`](metadata_contracts.md) |
-| Pose-assisted StableID behavior | [`pose_stable_id_integration.md`](pose_stable_id_integration.md) |
+| Pose metadata and StableID routing | [`pose_stable_id_integration.md`](pose_stable_id_integration.md) |
 | Architecture decisions | [`architecture_decisions.md`](architecture_decisions.md) |
 | Upgrade/change history | [`upgrade_history.md`](upgrade_history.md) |
 | Agent skill routing | [`../DS9/docs/deepstream_9_1_agent_skills.md`](../DS9/docs/deepstream_9_1_agent_skills.md) |
+| Agent instructions by implementation area | [`../AGENTS.md`](../AGENTS.md#implementation-guidance) |
 
 ## Product and data guides
 

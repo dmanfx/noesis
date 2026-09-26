@@ -16,7 +16,36 @@ are native-host only and must not require Docker.
 - This file is the repository-wide baseline.
 - A nearer `AGENTS.md` may add narrower rules for its subtree.
 - Historical documents never override current guidance.
-- Current architecture and operating facts are indexed by `docs/README.md`.
+- Current architecture and operating facts are indexed by [docs/README.md](docs/README.md).
+
+## Task scope and collaboration
+
+For audits and proposals, inspect and report; implement only when requested.
+For implementation requests, complete the authorized changes and focused
+validation under the existing runtime and branch rules.
+
+Before editing a subtree, read its applicable `AGENTS.md`.
+
+## Implementation guidance
+
+Resolve guidance along each target file's directory ancestry. For changes that
+cross implementation boundaries, also read the relevant product entrypoint:
+
+| Change | Additional guidance |
+| --- | --- |
+| World/frame authority, core contracts, or their consumers | [Core contract guidance](noesis_core/AGENTS.md) |
+| StableID, ReID, or identity integration | [Identity guidance](reid/AGENTS.md) |
+| Phone capture, reconstruction, fusion, or alignment | [Phone-walk guidance](tools/mapanything_phone_scan/AGENTS.md) |
+
+Use the task-specific references each entrypoint selects. A plan's location does
+not make its sibling implementation rules discoverable automatically.
+
+## Delegation
+
+Use up to two subagents for independent investigations when useful work can
+continue in the primary agent. Assign bounded scopes and require evidence
+references. Keep edits to shared files and runtime operations with one owner.
+Do not make a separate reviewer or approval stage mandatory.
 
 ## Git branch authority
 
@@ -31,11 +60,13 @@ are native-host only and must not require Docker.
 ## Required DeepStream route
 
 Before SDK-facing work, read the matching skill under `.agents/skills/` and the
-references it routes to. Use `DS9/docs/deepstream_9_1_agent_skills.md` to choose:
+references it routes to. Use [DS9/docs/deepstream_9_1_agent_skills.md](DS9/docs/deepstream_9_1_agent_skills.md) to choose:
 
 - `deepstream-dev` for Service Maker, GStreamer, runtime, and SDK work;
 - `deepstream-generate-pipeline` for a new graph or generated config;
-- `deepstream-import-vision-model` for model and TensorRT work;
+- `deepstream-import-vision-model` for new object-detector imports;
+- `deepstream-dev` plus canonical host maintenance for existing engines and
+  non-detector models;
 - `deepstream-profile-pipeline` for FPS, latency, or utilization work;
 - `deepstream-run-mv3dt` only for an explicitly approved MV3DT task.
 
@@ -52,18 +83,18 @@ overlap evidence for that exact pair.
 
 ## Canonical implementation boundary
 
-- Runtime entrypoint: `DS9/noesis/ds9_runtime.py`.
-- Runtime orchestration and product wiring: `DS9/noesis/ds9_runtime_core.py`.
-- Pipeline implementation: `DS9/noesis/pipelines/`.
-- Canonical pipeline config: `DS9/config/infer.yaml`.
-- Native host supervisor: `DS9/scripts/run_canonical_runtime_host.py`.
+- Runtime entrypoint: [DS9/noesis/ds9_runtime.py](DS9/noesis/ds9_runtime.py).
+- Runtime orchestration and product wiring: [DS9/noesis/ds9_runtime_core.py](DS9/noesis/ds9_runtime_core.py).
+- Pipeline implementation: [DS9/noesis/pipelines/](DS9/noesis/pipelines/).
+- Canonical pipeline config: [DS9/config/infer.yaml](DS9/config/infer.yaml).
+- Native host supervisor: [DS9/scripts/run_canonical_runtime_host.py](DS9/scripts/run_canonical_runtime_host.py).
 - Native build and maintenance scripts: `DS9/scripts/*_host*` and
-  `DS9/scripts/build_all_native_ds9.sh`.
+  [DS9/scripts/build_all_native_ds9.sh](DS9/scripts/build_all_native_ds9.sh).
 - Shared contracts/services: `noesis/` and `noesis_core/`.
 
 Some shared or mirrored modules retain `ds8` in a filename for source-history
 reasons. A filename is not runtime authority: the canonical copy is the one
-loaded by the DS9.1 entrypoint and documented in `DS9/docs/runtime_ownership.yaml`.
+loaded by the DS9.1 entrypoint and documented in [DS9/docs/runtime_ownership.yaml](DS9/docs/runtime_ownership.yaml).
 Do not rename these interfaces casually or use the old runtime to test them.
 
 Do not introduce DeepStream 8/9.0 compatibility paths, container fallbacks,
@@ -88,7 +119,7 @@ user approval. A canonical-path failure must be surfaced and fixed or reported.
 ## Hot-path and performance invariants
 
 The accepted runtime behavior is defined in
-`docs/performance_invariants.md`. Preserve it for pipeline, native bridge,
+[docs/performance_invariants.md](docs/performance_invariants.md). Preserve it for pipeline, native bridge,
 tracking, identity, telemetry, persistence, dashboard, and media changes.
 
 - The always-on media path must not wait for optional depth, evidence,
@@ -153,13 +184,13 @@ release proof are exceptional, not implicit completion criteria.
 
 ## Application contracts and product rules
 
-- WebSocket contract: `docs/api_contracts_ws.md`.
-- REST contract: `docs/api_contracts_rest.md`.
-- Metadata contract: `docs/metadata_contracts.md`.
-- Runtime and pipeline baseline: `docs/runtime_baseline.md` and
-  `DS9/PIPELINE_GRAPH.md`.
-- Testing guidance: `docs/testing_guide.md`.
-- Architecture decisions: `docs/architecture_decisions.md`.
+- WebSocket contract: [docs/api_contracts_ws.md](docs/api_contracts_ws.md).
+- REST contract: [docs/api_contracts_rest.md](docs/api_contracts_rest.md).
+- Metadata contract: [docs/metadata_contracts.md](docs/metadata_contracts.md).
+- Runtime and pipeline baseline: [docs/runtime_baseline.md](docs/runtime_baseline.md) and
+  [DS9/PIPELINE_GRAPH.md](DS9/PIPELINE_GRAPH.md).
+- Testing guidance: [docs/testing_guide.md](docs/testing_guide.md).
+- Architecture decisions: [docs/architecture_decisions.md](docs/architecture_decisions.md).
 
 `stable_id` is the user-visible person identity. Tracker IDs are process-local
 diagnostic values. World and BEV outputs must preserve explicit coordinate
@@ -177,9 +208,9 @@ tracking/world authority.
   commits coherent.
 - Use portable repo-relative paths or environment variables; do not add
   machine-specific `/home/...` paths to code or docs.
-- Record non-trivial current decisions in `docs/architecture_decisions.md`.
+- Record non-trivial current decisions in [docs/architecture_decisions.md](docs/architecture_decisions.md).
 - Record completed upgrades and behavioral milestones in
-  `docs/upgrade_history.md`.
+  [docs/upgrade_history.md](docs/upgrade_history.md).
 - Put superseded implementation material under `docs/history/` or
   `plans/archive/` with a clear historical status; do not keep stale guidance in
   the active index.

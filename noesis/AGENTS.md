@@ -5,11 +5,8 @@ canonical DS9.1 runtime. It is not an independently runnable DS8 stack.
 
 ## Policy precedence
 
-- Root `AGENTS.md` applies.
-- A nearer `AGENTS.md` may add narrower rules.
-- Historical DS8 descriptions under `docs/history/` are non-normative.
-- Work in this subtree belongs on the repository `DS9` branch. Treat
-  `feature_DS8` as read-only and verify the branch before committing.
+[Root policy](../AGENTS.md) owns shared runtime, branch, and validation rules.
+This file adds service and publication constraints.
 
 ## Scope
 
@@ -32,14 +29,16 @@ those labels do not confer runtime authority.
    not perform unbounded work or durable/network I/O on the media callback.
    Use bounded workers and reuse already-extracted compact metadata rather than
    repeating tensor, NumPy, or JSON conversion.
-4. No hidden fallback algorithms, alternate metadata sources, or legacy runtime
-   routes.
-5. Maintain canonical publication ordering and lifecycle barriers for tracking,
-   world, BEV, depth, and WebSocket output.
+4. Preserve the exact ordered `tracking`, `world_snapshot`, `world_event`, and
+   `bev-frame` cohort and its lifecycle barriers. Apply each other publication's
+   explicit contract; optional depth and diagnostics may use bounded latest-only
+   handling where authorized by [performance invariants](../docs/performance_invariants.md).
+5. For identity changes, use the [identity guidance](../reid/AGENTS.md).
+   For world/frame authority, use the [core contract guidance](../noesis_core/AGENTS.md).
 6. For mirrored files, modify the DS9.1-owned copy required by
-   `DS9/docs/runtime_ownership.yaml`; update the shared copy only when the
+   [runtime ownership map](../DS9/docs/runtime_ownership.yaml); update the shared copy only when the
    contract is intentionally shared.
 7. Validate ordinary changes with focused tests and the affected direct
-   consumer. Do not invoke appliance staging or promotion.
+   consumer using the [testing guide](../docs/testing_guide.md).
 8. Use portable paths and private-file/environment authorities for runtime
    state and credentials.

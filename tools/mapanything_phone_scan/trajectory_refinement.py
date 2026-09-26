@@ -840,6 +840,7 @@ def run_trajectory_refinement(
     *,
     vio_constraints: Path | None = None,
     revalidate_scaled_carrier: Callable[[Path, Path, Path, float], Mapping[str, Any]] | None = None,
+    prepared_indices: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Run bounded visual revisit verification and optional raw materialization."""
     settings = settings or TrajectoryRefinementSettings()
@@ -850,6 +851,17 @@ def run_trajectory_refinement(
         raise TrajectoryRefinementError(f"trajectory-refinement directory is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_rows = _load_prepared_frames(scan_dir)
+    parent_frame_count = len(frame_rows)
+    if prepared_indices is not None:
+        # A reviewed partial provider keeps original frame IDs/timestamps. It
+        # must not be made to look contiguous by rewriting the prepared scan.
+        from .trajectory_motion_review import _load_provider
+
+        selected_source = _load_provider(scan_dir, da3_raw.parent / "scan_outputs_manifest.json", allow_partial=True)
+        if (any(type(index) is not int for index in prepared_indices)
+                or list(prepared_indices) != selected_source["selected"]):
+            raise TrajectoryRefinementError("partial refinement indexes differ from exact provider/prepared identities")
+        frame_rows = [frame_rows[index] for index in prepared_indices]
     if any(not (0 <= start < end <= len(frame_rows)) for start, end in settings.withheld_ranges):
         raise TrajectoryRefinementError("withheld ranges must be nonempty intervals within the prepared views")
     source_identity = _source_identity(da3_raw, len(frame_rows))
@@ -1370,6 +1382,8 @@ def run_trajectory_refinement(
             "source_identity": "prepared_capture_identity_plus_retained_raw_rgb_depth_and_poses",
             "matching_image_projection": "raw_model_rgb_on_retained_depth_and_intrinsics_grid",
             "prepared_manifest_sha256": _sha256(scan_dir / "prepared_frames_manifest.json"),
+            "parent_prepared_frame_count": parent_frame_count,
+            "included_prepared_indices": list(prepared_indices) if prepared_indices is not None else list(range(parent_frame_count)),
             "raw_view_sha256": [
                 {"index": index, "sha256": _sha256(row["path"])}
                 for index, row in enumerate(raw_views)

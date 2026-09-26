@@ -74,11 +74,15 @@ test('drawer autoload requests the canonical PCF payload without depth inference
 });
 
 test('renderer decodes lossless compact masks used by full-extent PCF payloads', async () => {
-  const renderer = await source('./renderUtils.ts');
-  assert.match(renderer, /base64\.startsWith\('bit:'\)/);
+  const renderer = await source('./rasterEncoding.ts');
+  assert.match(renderer, /encoded\.startsWith\('bit:'\)/);
   assert.match(renderer, /Math\.ceil\(count \/ 8\)/);
   assert.match(renderer, /7 - \(index & 7\)/);
-  assert.match(renderer, /base64\.startsWith\('u8:'\)/);
+  assert.match(renderer, /encoded\.startsWith\('u8:'\)/);
+  const drawer = await source('../components/DepthDrawer.tsx');
+  const bev = await source('../components/BevView.tsx');
+  assert.match(drawer, /pcfRasterCompatibilityError\(cameraFloorplan\)/);
+  assert.match(bev, /pcfRasterCompatibilityError\(displayFloorplan\)/);
 });
 
 test('every standard room raster aliases the scene-prior diagnostic contract', async () => {

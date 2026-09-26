@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CameraKey, cameraLabel, colorIdForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
 import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor } from '../lib/renderUtils';
+import { pcfRasterCompatibilityError } from '../lib/rasterEncoding';
 import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
 import { isCameraLocalFrame, isWorldFrame } from '../lib/coordTransforms';
 import {
@@ -642,6 +643,10 @@ export const BevView: React.FC<BevViewProps> = ({
   const displayFloorplan = (floorplanHasRenderableGrid(floorplan) && !floorplan?.error)
     ? floorplan
     : (retainedFloorplanRef.current ?? floorplan);
+  const rasterCompatibilityError = useMemo(
+    () => pcfRasterCompatibilityError(displayFloorplan),
+    [displayFloorplan],
+  );
   const coverageEnvelopeContractKey = JSON.stringify(meta?.coverageEnvelope ?? null);
   const coverageEnvelope = useMemo(
     () => parseCoverageEnvelope(meta),
@@ -2405,9 +2410,9 @@ export const BevView: React.FC<BevViewProps> = ({
     </div>
   ) : null;
 
-  const canvasContent = meta?.error ? (
+  const canvasContent = meta?.error || rasterCompatibilityError ? (
     <div className={variant === 'drawer' ? 'td-placeholder' : 'bev-inline-placeholder'}>
-      BEV Error: {meta.error}{meta.details ? ` — ${meta.details}` : ''}
+      BEV Error: {rasterCompatibilityError || meta?.error}{meta?.error && meta.details ? ` — ${meta.details}` : ''}
     </div>
   ) : (
     <canvas

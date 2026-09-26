@@ -46,6 +46,7 @@ from noesis_core.scene_prior import (
     _calibrated_raster_geometry,
     _decode_float32_layer,
     _derive_preview_diagnostics,
+    _encoded_layer,
     _encoded_mask_layer,
     _encoded_uint8_layer,
 )
@@ -261,12 +262,37 @@ def test_compact_mask_and_uint8_layers_round_trip_without_geometry_loss() -> Non
     mask = np.asarray([[0, 1, 1, 0, 1], [1, 0, 0, 1, 0]], dtype=np.float32)
     encoded_mask = _encoded_mask_layer(mask)
     assert str(encoded_mask["grid_b64"]).startswith(f"bit:{mask.size}:")
+    assert encoded_mask["grid_encoding"] == "bitpack-msb-base64"
     np.testing.assert_array_equal(_decode(encoded_mask), mask)
 
     source = np.asarray([[0, 1, 2], [2, 1, 0]], dtype=np.float32)
     encoded_source = _encoded_uint8_layer(source, value_min=0.0, value_max=2.0)
     assert str(encoded_source["grid_b64"]).startswith("u8:")
+    assert encoded_source["grid_encoding"] == "u8-base64"
     np.testing.assert_array_equal(_decode(encoded_source), source)
+
+
+def test_pcf_raster_encoding_fixture_matches_producer() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures/pcf_raster_encoding_v1.json").read_text())
+    heights = np.array([[0, 0.5, 1.25], [2, -0.5, np.nan]], dtype=np.float32)
+    mask = np.array([[0, 1, 1], [1, 0, 1]], dtype=np.float32)
+    category = np.array([[0, 1, 2], [2, 1, 0]], dtype=np.float32)
+    assert {
+        key: value
+        for key, value in _encoded_layer(heights, value_min=-0.5, value_max=2).items()
+        if key in ("grid_b64", "grid_encoding")
+    } == fixture["float16"]
+    assert {
+        key: value
+        for key, value in _encoded_mask_layer(mask).items()
+        if key in ("grid_b64", "grid_encoding")
+    } == fixture["mask"]
+    assert {
+        key: value
+        for key, value in _encoded_uint8_layer(category, value_min=0, value_max=2).items()
+        if key in ("grid_b64", "grid_encoding")
+    } == fixture["category"]
+    np.testing.assert_allclose(_decode(_encoded_layer(heights, value_min=-0.5, value_max=2)), heights)
 
 
 def test_scene_prior_load_evaluate_and_live_wins_composition(tmp_path: Path) -> None:
@@ -379,6 +405,9 @@ def test_scene_prior_only_floorplan_is_canonical_pcf_presentation(tmp_path: Path
     )
     assert len(result["scene_prior_meta"]["revision_manifest_sha256"]) == 64
     assert result["scene_prior_diagnostic_meta"]["source"] == "map-anything"
+    assert result["scene_prior_diagnostic_meta"]["raster_encoding_version"] == 1
+    assert result["scene_prior_diagnostic_height_agl"]["grid_encoding"] == "f16-le-base64"
+    assert result["scene_prior_diagnostic_observed"]["grid_encoding"] == "bitpack-msb-base64"
     assert result["scene_prior_diagnostic_meta"]["derivation"] == (
         "prior_conditioned_fusion_points_and_grid"
     )

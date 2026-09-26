@@ -54,6 +54,7 @@ type DiagnosticsEntry = {
 
 export type FloorplanLayer = {
   grid_b64?: string;
+  grid_encoding?: string;
   grid_shape?: [number, number];
   value_min?: number;
   value_max?: number;
@@ -61,8 +62,10 @@ export type FloorplanLayer = {
 
 export type FloorplanRgbLayer = {
   rgb_b64?: string;
+  rgb_encoding?: string;
   rgb_shape?: [number, number, number];
   observed_b64?: string;
+  observed_encoding?: string;
 };
 
 export type SceneFusionPoints = {
@@ -164,6 +167,7 @@ export type FloorplanResponse = {
   scene_prior_diagnostic_meta?: {
     contract?: string;
     contract_version?: number;
+    raster_encoding_version?: number;
     source?: string;
     bounds?: FloorplanResponse['bounds'];
     grid_shape?: [number, number];
@@ -308,6 +312,7 @@ import {
   turboColor,
   viridisColor
 } from '../lib/renderUtils';
+import { pcfRasterCompatibilityError } from '../lib/rasterEncoding';
 import {
   chooseDepthRange,
   computeMaskedRange,
@@ -501,7 +506,13 @@ const DepthDrawer = memo(function DepthDrawer({
   const refreshError = selectedRefreshPhase === 'error'
     ? selectedRefresh.error || 'unknown_refresh_error'
     : '';
+  const rasterCompatibilityError = useMemo(
+    () => pcfRasterCompatibilityError(cameraFloorplan),
+    [cameraFloorplan],
+  );
   const hasCanonicalPcf = Boolean(
+    !rasterCompatibilityError
+    &&
     cameraFloorplan?.scene_prior_only === true
     && cameraFloorplan?.display_source === 'pcf'
   );
@@ -703,6 +714,7 @@ const DepthDrawer = memo(function DepthDrawer({
     if (selectedRefreshPhase === 'requesting-floorplan') {
       return 'Capturing a static comparison snapshot; canonical PCF remains visible.';
     }
+    if (rasterCompatibilityError) return rasterCompatibilityError;
     if (floorplanError) return `Floorplan error: ${floorplanError}`;
     if (hasCanonicalPcf) {
       return `Showing canonical PCF room reconstruction${scenePriorMeta?.prior_id ? ` · ${scenePriorMeta.prior_id}` : ''}.`;
@@ -713,10 +725,13 @@ const DepthDrawer = memo(function DepthDrawer({
     activeTab,
     selectedRefreshPhase,
     floorplanError,
+    rasterCompatibilityError,
     hasCanonicalPcf,
     scenePriorMeta?.prior_id,
   ]);
-  const panelErrorText = refreshError
+  const panelErrorText = rasterCompatibilityError
+    ? rasterCompatibilityError
+    : refreshError
     ? `Refresh failed: ${refreshError}`
     : floorplanError
         ? `Floorplan error: ${floorplanError}`
@@ -1798,6 +1813,9 @@ const DepthDrawer = memo(function DepthDrawer({
           <button className={activeTab === 'metrics' ? 'active' : ''} onClick={() => setActiveTab('metrics')}>Metrics</button>
         </div>
         <div className="content">
+          {rasterCompatibilityError && activeTab !== 'heatmap' && (
+            <p className="floorplan-error" role="alert">{rasterCompatibilityError}</p>
+          )}
           {!cameras.length && activeTab !== 'semantic' && <p>No room cameras are available yet.</p>}
           {cameras.length > 0 && activeTab !== 'semantic' && (
             <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') ? 'drawer-toolbar--heatmap' : ''}`}>

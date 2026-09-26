@@ -190,12 +190,16 @@ For a bound camera:
   viewport extent. `scene_prior_diagnostic_reconstruction_extent` carries that
   shared display mask. `scene_prior_diagnostic_room_footprint` remains the
   authored semantic overlay and is never a reconstruction crop boundary.
-- PCF presentation grids use an explicit `f16:` prefix on `grid_b64` (and on
-  the RGB surface layer's `observed_b64`) followed by base64-encoded row-major
-  IEEE 754 binary16 values. Consumers continue to accept the legacy unprefixed
-  float32 form. Binary masks remain exact, metric display precision remains
-  finer than the 2.5 cm cells, and the complete diagnostics cross the bounded
-  WebSocket transport without omitting any layer or reconstruction cell.
+- PCF presentation rasters declare `raster_encoding_version=1` in the
+  diagnostic metadata and their own `grid_encoding`. Continuous grids use
+  `f16:` plus row-major little-endian binary16 base64; exact masks use
+  `bit:<cell-count>:` plus MSB-first packed-bit base64; categorical source
+  grids use `u8:` plus uint8 base64. Surface RGB remains interleaved uint8
+  base64 and its observation mask is bit-packed. Consumers still accept legacy
+  unprefixed float32 base64 layers, but reject unknown typed encodings visibly.
+  Binary16 precision is for presentation only: immutable PCF evidence and
+  canonical measurements retain their source precision. This packing keeps the
+  complete diagnostics within the bounded WebSocket transport.
 - The Depth drawer keeps its four established 3D representations: Obstacles,
   Heightfield, Point cloud, and Visible floor. It does not add source-specific
   duplicate modes. PCF is the canonical and sole reconstruction source for

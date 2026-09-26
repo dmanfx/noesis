@@ -3,6 +3,24 @@ _Status: canonical native-host observation/world/depth/PCF contract, updated 202
 
 The WebSocket server (`noesis.server.websocket.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
+## Find the relevant contract
+
+| Task or field family | Section |
+| --- | --- |
+| Browser/internal authentication | [Authentication boundary](#authentication-boundary) |
+| Envelope, sender admission, exact ordering | [Common envelope](#1-common-envelope), [admission and ordering](#sender-admission-and-ordering) |
+| Runtime stats and performance signals | [Stats](#2-stats-type-stats) |
+| Encoded/browser video | [Mosaic WebRTC](#3-mosaic-video-webrtc) |
+| World/BEV frame authority and trails | [BEV frames](#4-bev-frames) |
+| Depth result messages | [Depth telemetry](#5-depth-telemetry-type-depth_result) |
+| Tracks, identity and world fields | [Tracking telemetry](#6-tracking-telemetry-type-tracking) |
+| Requests, responses and errors | [Control/RPC](#7-control--rpc-message-types), [depth/floorplan errors](#depthfloorplan-error-codes) |
+| Calibration payload conventions | [Calibration](#8-calibration-data-conventions) |
+
+These sections define the wire contract. An implemented message or configured
+capability is not evidence that a particular live process emitted it; attach
+runtime observations separately when diagnosing a consumer.
+
 ## Authentication boundary
 
 The runtime WebSocket is an internal native-host transport. Its HTTP upgrade must
@@ -1805,12 +1823,12 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   "depth_burst_fresh": <bool optional>,
   "capture_event_evidence_sha256": "<lowercase digest; optional exact fresh capture>",
   "capture_event": { /* same compact controller evidence as ma_depth_response; request_kind=floorplan */ },
-  "scene_static_height_agl": {"grid_b64": "<base64 float32>", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
-  "scene_static_observed": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
-  "scene_static_confidence": {"grid_b64": "<float32 0..1>", "grid_shape": [<H>,<W>]},
-  "scene_composite_height_agl": {"grid_b64": "<base64 float32>", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
-  "scene_composite_observed": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
-  "scene_composite_source": {"grid_b64": "<float32 0|1|2>", "grid_shape": [<H>,<W>]},
+  "scene_static_height_agl": {"grid_b64": "f16:<base64 binary16>", "grid_encoding": "f16-le-base64", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
+  "scene_static_observed": {"grid_b64": "bit:<H*W>:<base64 packed mask>", "grid_encoding": "bitpack-msb-base64", "grid_shape": [<H>,<W>]},
+  "scene_static_confidence": {"grid_b64": "f16:<base64 binary16>", "grid_encoding": "f16-le-base64", "grid_shape": [<H>,<W>]},
+  "scene_composite_height_agl": {"grid_b64": "f16:<base64 binary16>", "grid_encoding": "f16-le-base64", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
+  "scene_composite_observed": {"grid_b64": "bit:<H*W>:<base64 packed mask>", "grid_encoding": "bitpack-msb-base64", "grid_shape": [<H>,<W>]},
+  "scene_composite_source": {"grid_b64": "u8:<base64 uint8>", "grid_encoding": "u8-base64", "grid_shape": [<H>,<W>]},
   "scene_prior_meta": {
     "contract": "noesis.scene_prior.floorplan_composite",
     "contract_version": 1,
@@ -1824,12 +1842,12 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
     "composite_observed_cells": <int>
   },
   "scene_prior_error": "<explicit shadow-composition error; optional>",
-  "scene_prior_diagnostic_height_agl": {"grid_b64": "<base64 float32>", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
-  "scene_prior_diagnostic_observed": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
-  "scene_prior_diagnostic_unknown": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
-  "scene_prior_diagnostic_reconstruction_extent": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
-  "scene_prior_diagnostic_surface_rgb": {"rgb_b64": "<base64 uint8 RGB>", "rgb_shape": [<H>,<W>,3]},
-  "scene_prior_diagnostic_meta": {"source": "<manifest source model>", "derivation": "prior_conditioned_fusion_points_and_grid", "prior_id": "<immutable prior id>"},
+  "scene_prior_diagnostic_height_agl": {"grid_b64": "f16:<base64 binary16>", "grid_encoding": "f16-le-base64", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
+  "scene_prior_diagnostic_observed": {"grid_b64": "bit:<H*W>:<base64 packed mask>", "grid_encoding": "bitpack-msb-base64", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_unknown": {"grid_b64": "bit:<H*W>:<base64 packed mask>", "grid_encoding": "bitpack-msb-base64", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_reconstruction_extent": {"grid_b64": "bit:<H*W>:<base64 packed mask>", "grid_encoding": "bitpack-msb-base64", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_surface_rgb": {"rgb_b64": "<base64 uint8 RGB>", "rgb_encoding": "rgb-u8-base64", "rgb_shape": [<H>,<W>,3], "observed_b64": "bit:<H*W>:<base64 packed mask>", "observed_encoding": "bitpack-msb-base64"},
+  "scene_prior_diagnostic_meta": {"raster_encoding_version": 1, "source": "<manifest source model>", "derivation": "prior_conditioned_fusion_points_and_grid", "prior_id": "<immutable prior id>"},
   "error": "<string optional>"
 }
 ```
@@ -1851,6 +1869,21 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   `camera_local_ground_m` bounds and orientation.
   In `scene_prior_only` mode this family is authoritative, so the response
   omits the redundant `scene_static_*` and `scene_composite_*` raster copies.
+- Scene Prior raster encoding version 1 is independent of
+  `floorplan_contract_version=10`, which fixes coordinate/orientation semantics.
+  `scene_prior_diagnostic_meta.raster_encoding_version=1` and each packed layer's
+  `grid_encoding` declare the byte format. Continuous visualization grids use
+  row-major little-endian IEEE 754 binary16 (`f16:`); binary masks use
+  most-significant-bit-first packed bits (`bit:<cell-count>:`); categorical
+  grids use uint8 (`u8:`). Each suffix remains base64 inside JSON. The RGB
+  surface is raw interleaved uint8 base64; its observation mask is bit-packed.
+  Legacy unprefixed `grid_b64` layers are row-major little-endian float32 and
+  remain readable. Transitional packed producers may omit the new declaration;
+  consumers infer the known prefix and verify the shape in that case. Consumers
+  must reject unknown versions, unsupported prefixes,
+  and declared/payload mismatches visibly rather than presenting an empty grid.
+  Binary16 is presentation precision only; retained PCF evidence and canonical
+  world measurements are not quantized by this response format.
 - `cache_only=true` returns only a contract- and calibration-valid memory/disk
   floorplan cache entry. On a miss it returns
   `error:"no_cached_floorplan"` before snapshot access, floorplan generation,

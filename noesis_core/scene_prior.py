@@ -538,6 +538,7 @@ def _encoded_layer(values: np.ndarray, *, value_min: float, value_max: float) ->
     grid = np.asarray(values, dtype=np.float16)
     return {
         "grid_b64": "f16:" + base64.b64encode(grid.tobytes(order="C")).decode("ascii"),
+        "grid_encoding": "f16-le-base64",
         "grid_shape": [int(grid.shape[0]), int(grid.shape[1])],
         "value_min": float(value_min),
         "value_max": float(value_max),
@@ -552,6 +553,7 @@ def _encoded_mask_layer(values: np.ndarray) -> dict[str, Any]:
             f"bit:{mask.size}:"
             + base64.b64encode(packed.tobytes(order="C")).decode("ascii")
         ),
+        "grid_encoding": "bitpack-msb-base64",
         "grid_shape": [int(mask.shape[0]), int(mask.shape[1])],
         "value_min": 0.0,
         "value_max": 1.0,
@@ -567,6 +569,7 @@ def _encoded_uint8_layer(
     grid = np.ascontiguousarray(values, dtype=np.uint8)
     return {
         "grid_b64": "u8:" + base64.b64encode(grid.tobytes(order="C")).decode("ascii"),
+        "grid_encoding": "u8-base64",
         "grid_shape": [int(grid.shape[0]), int(grid.shape[1])],
         "value_min": float(value_min),
         "value_max": float(value_max),
@@ -579,11 +582,13 @@ def _encoded_rgb_layer(rgb: np.ndarray, observed: np.ndarray) -> dict[str, Any]:
     packed_mask = np.packbits(mask.reshape(-1), bitorder="big")
     return {
         "rgb_b64": base64.b64encode(colors.tobytes()).decode("ascii"),
+        "rgb_encoding": "rgb-u8-base64",
         "rgb_shape": [int(colors.shape[0]), int(colors.shape[1]), 3],
         "observed_b64": (
             f"bit:{mask.size}:"
             + base64.b64encode(packed_mask.tobytes()).decode("ascii")
         ),
+        "observed_encoding": "bitpack-msb-base64",
     }
 
 
@@ -1111,6 +1116,7 @@ def _scene_prior_diagnostic_payload(
         "scene_prior_diagnostic_meta": {
             "contract": "noesis.scene_prior.diagnostic_layers",
             "contract_version": 1,
+            "raster_encoding_version": 1,
             "source": revision.manifest.source.model,
             "derivation": "prior_conditioned_fusion_points_and_grid",
             "derived_at_catalog_load": False,

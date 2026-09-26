@@ -4,6 +4,9 @@ import {
   buildDetailedFloorplanOverlay,
 } from './depthPanelRendering';
 import { derivePlanarFloorMask } from './planarFloor.mjs';
+import { decodeFloat32 } from './rasterEncoding';
+
+export { decodeFloat32, decodeFloat16 } from './rasterEncoding';
 
 export type FloorplanRgbLayer = {
   rgb_b64?: string;
@@ -75,85 +78,6 @@ export function turboColor(t: number): [number, number, number] {
   const b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (115.67994485 + x * (-87.60200647 + x * 26.70740952))));
   const clamp = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
   return [clamp(r), clamp(g), clamp(b)];
-}
-
-export function decodeFloat32(base64?: string): Float32Array | null {
-  if (!base64) return null;
-  if (base64.startsWith('f16:')) {
-    return decodeFloat16(base64.slice(4));
-  }
-  try {
-    if (base64.startsWith('bit:')) {
-      const countSeparator = base64.indexOf(':', 4);
-      if (countSeparator < 0) throw new Error('Packed mask is missing its cell count');
-      const count = Number(base64.slice(4, countSeparator));
-      if (!Number.isSafeInteger(count) || count < 0) {
-        throw new Error('Packed mask has an invalid cell count');
-      }
-      const binary = atob(base64.slice(countSeparator + 1));
-      if (binary.length !== Math.ceil(count / 8)) {
-        throw new Error('Packed mask byte length does not match its cell count');
-      }
-      const values = new Float32Array(count);
-      for (let index = 0; index < count; index += 1) {
-        values[index] = (binary.charCodeAt(index >> 3) >> (7 - (index & 7))) & 1;
-      }
-      return values;
-    }
-    if (base64.startsWith('u8:')) {
-      const binary = atob(base64.slice(3));
-      const values = new Float32Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        values[index] = binary.charCodeAt(index);
-      }
-      return values;
-    }
-    const binary = atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new Float32Array(bytes.buffer);
-  } catch (err) {
-    console.error('Failed to decode float32 payload', err);
-    return null;
-  }
-}
-
-const halfToFloat = (value: number): number => {
-  const sign = (value & 0x8000) ? -1 : 1;
-  const exponent = (value >> 10) & 0x1f;
-  const fraction = value & 0x03ff;
-  if (exponent === 0) {
-    if (fraction === 0) return sign * 0;
-    return sign * Math.pow(2, -14) * (fraction / 1024);
-  }
-  if (exponent === 31) {
-    return fraction === 0 ? sign * Infinity : NaN;
-  }
-  return sign * Math.pow(2, exponent - 15) * (1 + fraction / 1024);
-};
-
-export function decodeFloat16(base64?: string): Float32Array | null {
-  if (!base64) return null;
-  try {
-    const binary = atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const view = new Uint16Array(bytes.buffer);
-    const out = new Float32Array(view.length);
-    for (let i = 0; i < view.length; i += 1) {
-      out[i] = halfToFloat(view[i]);
-    }
-    return out;
-  } catch (err) {
-    console.error('Failed to decode float16 payload', err);
-    return null;
-  }
 }
 
 export function decodeUint8(base64?: string): Uint8Array | null {

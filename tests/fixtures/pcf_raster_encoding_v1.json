@@ -1,0 +1,18 @@
+{
+  "shape": [2, 3],
+  "float16": {
+    "grid_b64": "f16:AAAAOAA9AEAAuAB+",
+    "grid_encoding": "f16-le-base64"
+  },
+  "mask": {
+    "grid_b64": "bit:6:dA==",
+    "grid_encoding": "bitpack-msb-base64"
+  },
+  "category": {
+    "grid_b64": "u8:AAECAgEA",
+    "grid_encoding": "u8-base64"
+  },
+  "legacy_float32": {
+    "grid_b64": "AAAAAAAAAD8AAKA/AAAAQAAAAL8AAIBA"
+  }
+}

@@ -943,6 +943,120 @@ def test_phase1_idle_deadzone_absorbs_jitter() -> None:
     assert out[2] == pytest.approx(0.0, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("posture", "motion_mode", "contact_basis"),
+    (
+        ("sitting", "sit", "pose:seated_torso_plane"),
+        ("sitting", "sit", "depth:torso_core"),
+        ("lying", "lie", "depth:pose_torso_support"),
+    ),
+)
+def test_non_upright_body_measurement_closes_stale_floor_residual(
+    posture: str,
+    motion_mode: str,
+    contact_basis: str,
+) -> None:
+    cfg = HumanGroundConfig(
+        idle_deadzone_m=0.28,
+        idle_deadzone_sit_m=0.40,
+        non_upright_body_deadzone_m=0.10,
+        non_upright_body_alpha=0.30,
+    )
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        vel_world_x=0.0,
+        vel_world_z=0.0,
+        filtered_ts=0.0,
+        motion_mode=motion_mode,
+        locked_world=(0.0, 0.0),
+        posture=posture,
+    )
+
+    output = update_human_cv_filter(
+        state,
+        measurement=np.array([0.30, 0.0, 0.0], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.1,
+        quality="estimated",
+        config=cfg,
+        contact_basis=contact_basis,
+        verified_reacquire_support=True,
+    )
+
+    assert state.measurement_accepted is True
+    assert output[0] == pytest.approx(0.09)
+    assert output[2] == pytest.approx(0.0)
+
+
+def test_non_upright_body_measurement_retains_tight_jitter_deadzone() -> None:
+    cfg = HumanGroundConfig(non_upright_body_deadzone_m=0.10)
+    state = PersonGroundState(
+        world_x=1.0,
+        world_z=2.0,
+        filtered_ts=0.0,
+        motion_mode="sit",
+        locked_world=(1.0, 2.0),
+        posture="sitting",
+    )
+
+    output = update_human_cv_filter(
+        state,
+        measurement=np.array([1.06, 0.0, 2.04], dtype=np.float64),
+        floor_y=0.0,
+        now_ts=0.1,
+        quality="estimated",
+        config=cfg,
+        contact_basis="pose:seated_torso_plane",
+        verified_reacquire_support=True,
+    )
+
+    assert output == pytest.approx([1.0, 0.0, 2.0])
+
+
+def test_non_upright_depth_and_measured_pose_rows_share_reanchor_consensus() -> None:
+    cfg = HumanGroundConfig(max_speed_mps=4.0, max_jump_m=0.75)
+    state = PersonGroundState(
+        world_x=0.0,
+        world_z=0.0,
+        filtered_ts=0.0,
+        last_good_world=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        last_good_ts=0.0,
+        motion_mode="sit",
+        locked_world=(0.0, 0.0),
+        posture="sitting",
+    )
+
+    samples = (
+        (0.10, "depth:pose_torso_support"),
+        (0.20, "pose:seated_torso_plane"),
+        (0.30, "depth:pose_torso_support"),
+    )
+    for index, (now_ts, basis) in enumerate(samples):
+        output = update_human_cv_filter(
+            state,
+            measurement=np.array([1.5, 0.0, 0.0], dtype=np.float64),
+            floor_y=0.0,
+            now_ts=now_ts,
+            quality="estimated",
+            config=cfg,
+            contact_basis=basis,
+            verified_reacquire_support=True,
+        )
+        if index < len(samples) - 1:
+            mark_world_measurement_unavailable(
+                state,
+                reason="depth_measurement_not_current",
+                now_ts=now_ts + 0.05,
+                config=cfg,
+            )
+
+    assert state.measurement_accepted is True
+    assert state.reacquired is True
+    assert state.trail_break_required is True
+    assert output == pytest.approx([1.5, 0.0, 0.0])
+
+
 def test_phase4_cv_filter_rejects_impossible_innovation_without_moving() -> None:
     cfg = HumanGroundConfig(max_speed_mps=2.0, max_jump_m=0.5, alpha_good=0.5, process_noise_walk=0.8, meas_noise_good=0.05)
     state = PersonGroundState()

@@ -674,7 +674,20 @@ def test_pose_torso_motion_anchor_is_current_anatomy_not_floor() -> None:
     assert anchor.v == pytest.approx(171.2)
     assert processor._anchor_is_verified_ground_contact(anchor) is False
 
+    # A single missing joint is reconstructed only as an image-motion point;
+    # it remains ineligible as floor contact or learned-height evidence.
     keypoints[hooks._POSE_KPT_INDEX["right_hip"], 2] = 0.0
+    partial = processor._resolve_pose_torso_motion_anchor(
+        keypoints, bbox=(100.0, 100.0, 100.0, 200.0),
+    )
+    assert partial is not None
+    assert partial.u == pytest.approx(154.8)
+    assert partial.v == pytest.approx(171.2)
+    assert partial.height_lock_eligible is False
+    assert processor._anchor_is_verified_ground_contact(partial) is False
+
+    # Two joints cannot establish both anatomical bands with a complete pair.
+    keypoints[hooks._POSE_KPT_INDEX["left_hip"], 2] = 0.0
     assert (
         processor._resolve_pose_torso_motion_anchor(
             keypoints,
@@ -1047,6 +1060,7 @@ def test_universal_resolver_stale_depth_does_not_clear_pose_reacquire(
             "frame_id": frame_id,
             "source_id": 0,
             "observed_at_us": current_ts_us,
+            "media_pts_ns": current_ts_us * 1_000,
             "confidence": 0.94,
             "bbox": bbox,
             "image_size": list(calibration.image_size),
@@ -1065,6 +1079,10 @@ def test_universal_resolver_stale_depth_does_not_clear_pose_reacquire(
         seed = run_frame(frame_id, at_s, 6.0, stale_depth=False)
     assert seed["world_valid"] is True, seed
     state = processor._world_state_by_track[(0, 941)]
+    _prime_metric_output_watermark(
+        processor, calibration, state, tracker_id=941,
+        media_pts_ns=100_200_000_000, filter_ts=100.2,
+    )
     accepted_world = tuple(state.last_good_world or ())
     # This test isolates independent floor-vs-stale-depth cohort behavior;
     # disable the separately tested learned-height gravity hypothesis so a
@@ -1307,8 +1325,10 @@ def test_no_ground_contact_drops_leg_extension_anchor_even_when_posture_unknown(
     "depth_status",
     ("no_ground_contact", "depth_not_ready", "error"),
 )
+@pytest.mark.parametrize("foot_z", (4.0, 6.0), ids=("adequate_incidence", "shallow_ray"))
 def test_unposed_noncontact_depth_status_gets_bounded_bbox_floor_candidate(
     depth_status: str,
+    foot_z: float,
 ) -> None:
     calibration = _anchor_calibration()
     calibration.world_frame_id = "backend_world_m"
@@ -1339,7 +1359,7 @@ def test_unposed_noncontact_depth_status_gets_bounded_bbox_floor_candidate(
             snapshot=lambda _sensor_id, _camera_id: calibration
         ),
     )
-    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=foot_z)
     depth_result = ObjectDepthResult(
         source_id=0,
         frame_id=1,
@@ -1380,6 +1400,21 @@ def test_unposed_noncontact_depth_status_gets_bounded_bbox_floor_candidate(
         )
         tracks.append(track)
 
+    if foot_z == 6.0:
+        # At 12 m horizontal range the 2.2 m camera yields incidence < 0.20.
+        # Even repeatable detector bottoms cannot bootstrap this shallow ray.
+        assert all(track["world_floor_incidence_sin"] < 0.20 for track in tracks)
+        assert all(track["world_valid"] is False for track in tracks)
+        assert all(track.get("world") is None for track in tracks)
+        assert all(
+            track["world_rejection_reason"]
+            == "cold_floor_ray_incidence_below_minimum"
+            for track in tracks
+        )
+        assert processor._world_state_by_track[(0, 80)].reacquire_count == 0
+        return
+
+    assert all(track["world_floor_incidence_sin"] >= 0.20 for track in tracks)
     assert [track["world_valid"] for track in tracks] == [False, False, True]
     assert tracks[-1]["world_source"] == "person_anchor_floor_only"
     assert tracks[-1]["world_resolver_selected_id"] == "floor_ray"
@@ -1419,7 +1454,7 @@ def test_torso_depth_does_not_suppress_independent_bbox_floor_hypothesis() -> No
         ),
     )
     processor.set_world_resolver_diagnostics_enabled(True)
-    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    _unused_pose, bbox = _world_pose_and_bbox(calibration, foot_z=4.0)
     depth_result = ObjectDepthResult(
         source_id=0,
         frame_id=1,
@@ -1469,7 +1504,12 @@ def test_torso_depth_does_not_suppress_independent_bbox_floor_hypothesis() -> No
     diagnostics = track["world_resolver"]
     candidate_ids = {candidate["id"] for candidate in diagnostics["candidates"]}
     assert "floor_ray" in candidate_ids
-    assert "registered_depth" in candidate_ids
+    # Unknown posture without trusted occlusion has no typed torso footprint.
+    # That range is excluded independently, without suppressing floor contact.
+    assert "registered_depth" not in candidate_ids
+    assert track["depth_registered_m"] is None
+    assert track["depth_used_m"] is None
+    assert track["world_floor_depth_corroborated"] is False
     floor_candidate = next(
         candidate
         for candidate in diagnostics["candidates"]
@@ -1512,7 +1552,7 @@ def test_observed_pose_keeps_pose_floor_contact_without_bbox_substitution() -> N
         ),
     )
     processor.set_world_resolver_diagnostics_enabled(True)
-    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
+    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=4.0)
     track = {
         "tracker_id": 85,
         "frame_id": 1,
@@ -1699,6 +1739,11 @@ def test_tracker_confidence_continues_trusted_bbox_floor_when_detector_is_sentin
         last_good_ts=0.9,
     )
 
+    _prime_metric_output_watermark(
+        processor, calibration, processor._world_state_by_track[(0, 83)],
+        tracker_id=83, media_pts_ns=900_000_000, filter_ts=0.9,
+    )
+
     processor._augment_track_with_world(
         0,
         "cam0",
@@ -1786,7 +1831,14 @@ def test_cold_low_detector_high_tracker_artifact_never_gets_bbox_world() -> None
     assert all(track["world_valid"] is False for track in tracks)
     state = processor._world_state_by_track[(0, 830)]
     assert state.last_good_world is None
-    assert state.reacquire_count == 6
+    # Semantic rejection precedes temporal consensus; tracker association
+    # confidence cannot accumulate evidence that the object is a person.
+    assert state.reacquire_count == 0
+    assert all(
+        track["world_rejection_reason"]
+        == "cold_floor_semantic_confidence_below_minimum"
+        for track in tracks
+    )
 
 
 def test_partial_pose_without_contact_gets_bbox_floor_candidate_for_confident_upright_box() -> None:
@@ -1819,9 +1871,12 @@ def test_partial_pose_without_contact_gets_bbox_floor_candidate_for_confident_up
             snapshot=lambda _sensor_id, _camera_id: calibration
         ),
     )
-    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=6.0)
-    # Keep pose data present while removing both ankle contacts.  The narrow
-    # upright detector box supplies the only current, generic contact cue.
+    keypoints, bbox = _world_pose_and_bbox(calibration, foot_z=4.0)
+    # Keep shoulder/knee pose data while removing hips and ankle contacts.
+    # Four complete shoulder/hip planes now supply an independent body solve;
+    # this fixture isolates the generic upright detector-bottom candidate.
+    keypoints[hooks._POSE_KPT_INDEX["left_hip"], 2] = 0.0
+    keypoints[hooks._POSE_KPT_INDEX["right_hip"], 2] = 0.0
     keypoints[hooks._POSE_KPT_INDEX["left_ankle"], 2] = 0.0
     keypoints[hooks._POSE_KPT_INDEX["right_ankle"], 2] = 0.0
     left, top, width, height = bbox
@@ -1951,6 +2006,10 @@ def test_post_occlusion_reacquire_requires_verified_metric_support(
         post_occlusion_reacquire_support_required=True,
     )
     processor._world_state_by_track[(0, 812)] = state
+    _prime_metric_output_watermark(
+        processor, calibration, state, tracker_id=812,
+        media_pts_ns=900_000_000, filter_ts=0.9,
+    )
     depth_result = ObjectDepthResult(
         source_id=0,
         frame_id=1,
@@ -1973,7 +2032,8 @@ def test_post_occlusion_reacquire_requires_verified_metric_support(
             "tracker_lifecycle_generation": 1,
             "frame_id": frame_id,
             "source_id": 0,
-            "observed_at_us": frame_id * 100_000,
+            "observed_at_us": 900_000 + frame_id * 100_000,
+            "media_pts_ns": 900_000_000 + frame_id * 100_000_000,
             "bbox": list(bbox),
             "image_size": list(calibration.image_size),
             "confidence": 0.90,
@@ -2376,6 +2436,12 @@ def test_established_standing_occlusion_uses_gravity_as_bounded_process_only(
         "_resolve_bbox_floor_anchor",
         lambda *_args, **_kwargs: None,
     )
+    # A current body-plane solve supersedes the correlated learned-height
+    # candidate. Isolate this test's bounded learned-height process path.
+    monkeypatch.setattr(
+        processor, "_upright_pose_ground_projection",
+        lambda *_args, **_kwargs: None,
+    )
     track = {
         "tracker_id": 81,
         "frame_id": 30,
@@ -2582,6 +2648,12 @@ def test_established_coherent_torso_motion_bridges_rejected_floor_contact(
         _coherent_torso_motion,
     )
     monkeypatch.setattr(hooks, "classify_posture", lambda *_args, **_kwargs: "standing")
+    # A current body-plane solve supersedes the correlated learned-height
+    # candidate. Isolate this test's bounded learned-height process path.
+    monkeypatch.setattr(
+        processor, "_upright_pose_ground_projection",
+        lambda *_args, **_kwargs: None,
+    )
     track = {
         "tracker_id": 82,
         "frame_id": 30,

@@ -51,6 +51,7 @@ def _hypothesis(
     pcf: WorldPriorEvidence | None = None,
     anchor: str = "lower_body_contact",
     support_state: str = "floor",
+    posture: str = "unknown",
     valid: bool = True,
     rejection_reason: str | None = None,
 ) -> WorldMeasurementHypothesis:
@@ -62,6 +63,7 @@ def _hypothesis(
         covariance=covariance or _covariance(),
         anchor=anchor,
         support_state=support_state,  # type: ignore[arg-type]
+        posture=posture,  # type: ignore[arg-type]
         confidence=confidence,
         correlation_group=correlation_group,
         pcf=pcf,
@@ -273,6 +275,109 @@ def test_compatible_precise_unknown_body_range_cannot_pull_floor_result() -> Non
     assert torso_diagnostic.rejection_reason == (
         "support_state_not_equivalent_to_selected"
     )
+
+
+def test_seated_body_footprint_outranks_observed_ankle_floor_ray() -> None:
+    cohort = _cohort()
+    ankle_floor = _hypothesis(
+        cohort,
+        "ankle-floor",
+        "floor_ray",
+        (0.0, 0.0, 5.0),
+        confidence=0.99,
+        anchor="pose_ankle_floor",
+        support_state="floor",
+        posture="sitting",
+    )
+    seated_body = _hypothesis(
+        cohort,
+        "seated-body",
+        "pose_scale",
+        (0.0, 0.0, 3.8),
+        covariance=_covariance(0.40, 0.04, 0.40),
+        confidence=0.70,
+        anchor="seated_torso_plane",
+        support_state="seat",
+        posture="sitting",
+    )
+
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(ankle_floor, seated_body))
+    )
+
+    assert result.selected_candidate_id == "seated-body"
+    assert result.support_state == "seat"
+    assert result.position == seated_body.position
+    assert result.fused is False
+    ankle_diagnostic = next(
+        row for row in result.diagnostics if row.candidate_id == "ankle-floor"
+    )
+    assert ankle_diagnostic.rejection_reason == (
+        "support_state_not_equivalent_to_selected"
+    )
+
+
+def test_lying_registered_body_footprint_outranks_floor_ray() -> None:
+    cohort = _cohort()
+    floor = _hypothesis(
+        cohort,
+        "floor-contact",
+        "floor_ray",
+        (2.0, 0.0, 5.0),
+        confidence=0.99,
+        anchor="pose_single_ankle_floor",
+        support_state="floor",
+        posture="lying",
+    )
+    lying_body = _hypothesis(
+        cohort,
+        "lying-body",
+        "registered_depth",
+        (2.0, 0.0, 3.9),
+        covariance=_covariance(0.30, 0.04, 0.30),
+        confidence=0.72,
+        anchor="person_body_projection",
+        support_state="couch",
+        posture="lying",
+    )
+
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(floor, lying_body))
+    )
+
+    assert result.selected_candidate_id == "lying-body"
+    assert result.support_state == "couch"
+    assert result.position == lying_body.position
+
+
+def test_untyped_non_upright_body_range_does_not_displace_floor_support() -> None:
+    cohort = _cohort()
+    floor = _hypothesis(
+        cohort,
+        "floor-contact",
+        "floor_ray",
+        (1.0, 0.0, 5.0),
+        confidence=0.75,
+        support_state="floor",
+        posture="sitting",
+    )
+    untyped_body = _hypothesis(
+        cohort,
+        "untyped-body",
+        "registered_depth",
+        (1.0, 0.0, 3.0),
+        confidence=0.99,
+        anchor="torso_core",
+        support_state="unknown",
+        posture="sitting",
+    )
+
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(floor, untyped_body))
+    )
+
+    assert result.selected_candidate_id == "floor-contact"
+    assert result.support_state == "floor"
 
 
 def test_large_metric_disagreement_never_fuses_even_with_broad_covariance() -> None:

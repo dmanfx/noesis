@@ -97,8 +97,13 @@ The DS9 analytics hook constructs each candidate independently:
   evidence cannot form this proof. For an established relocation, moderate
   rows may accumulate same-basis trajectory evidence, but only a current
   verified five-plane row may finalize the reanchor. A seated solve projects
-  the observed torso to the support footprint with broad height covariance and
-  never relabels the pelvis itself as the ground point.
+  the observed torso to the support footprint only after the same tracker
+  lifecycle has measured that exact torso anchor from registered depth. It
+  never derives the plane from the prior standing footprint, uses a
+  population-average body height, or relabels the pelvis itself as the ground
+  point. Exact-current
+  registered torso depth supplies the corresponding typed body footprint for
+  sitting (`seat`) or lying (`couch`) posture; lying has no pose-only plane.
 - `gravity_reconstruction`: a deliberately weak upright-height reconstruction
   used only when the existing PersonGroundState evidence permits it.  It is not
   a seated/lying floor contact.
@@ -131,7 +136,10 @@ one of three fixed quality buckets:
 
 The resolver ranks valid hypotheses using their direct evidence, covariance,
 posture/support compatibility, motion consistency, and conservative PCF
-likelihood.  No camera or room identifier participates in the ranking.
+likelihood. Floor support remains first for standing/unknown posture. For a
+person explicitly classified as sitting or lying, a typed current `seat` or
+`couch` body footprint ranks ahead of an ankle/floor ray; untyped body range
+does not. No camera or room identifier participates in the ranking.
 
 Two candidates contribute mathematically only when both their Mahalanobis
 agreement and absolute metric separation pass the universal compatibility

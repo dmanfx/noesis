@@ -687,6 +687,234 @@ def test_torso_depth_remains_registered_depth_with_unknown_support() -> None:
     assert candidates[0]["support_state"] == "unknown"
 
 
+@pytest.mark.parametrize(
+    ("posture", "expected_support_state"),
+    (("sitting", "seat"), ("lying", "couch")),
+)
+def test_current_body_depth_gets_typed_non_upright_support(
+    posture: str,
+    expected_support_state: str,
+) -> None:
+    processor = object.__new__(hooks._AnalyticsTelemetryProcessor)
+    processor.scene_priors = None
+    processor._depth_candidate_covariance = lambda *_args, **_kwargs: Matrix3(  # type: ignore[method-assign]
+        values=(
+            0.04,
+            0.0,
+            0.0,
+            0.0,
+            0.04,
+            0.0,
+            0.0,
+            0.0,
+            0.04,
+        )
+    )
+    body_anchor = hooks._PoseAnchorCandidate(
+        u=100.0,
+        v=200.0,
+        source="person_body_projection",
+        contact_basis="depth:torso_core",
+        quality="estimated",
+    )
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=7,
+        class_id=0,
+        bbox=(0.0, 0.0, 10.0, 20.0),
+        score=0.9,
+        sampling_mode="instance_mask",
+        status="ok",
+        unit="m",
+        is_metric=True,
+        sample_count=64,
+        valid_fraction=0.9,
+        anchor_source="torso_core",
+        anchor_depth_m=5.0,
+        anchor_sample_count=64,
+        anchor_valid_fraction=0.9,
+    )
+    candidates: list[dict[str, object]] = []
+
+    processor._append_universal_world_candidates(
+        candidates,
+        sensor_id=0,
+        track={"tracker_id": 7, "world_floor_incidence_sin": 0.8},
+        camera_id="cam0",
+        calib=SimpleNamespace(floor_y=0.0),
+        floor_candidate=None,
+        floor_ray_admitted=False,
+        anchor_candidate=None,
+        pose_uv=None,
+        contact_basis="depth:torso_core",
+        posture=posture,
+        occlusion_fraction=0.75,
+        image_motion_supported=False,
+        depth_obs=np.asarray([1.0, 1.0, 2.0], dtype=np.float64),
+        depth_weight=0.8,
+        depth_observation=hooks._DepthObservationResult(
+            np.asarray([1.0, 1.0, 2.0], dtype=np.float64),
+            0.8,
+            "ok",
+            registered_depth_m=5.0,
+            registration_status="raw_passthrough",
+        ),
+        depth_result=depth_result,
+        person_anchor=body_anchor,
+        reject_current_geometry=False,
+        flip_u=False,
+        flip_v=False,
+    )
+
+    assert [item["kind"] for item in candidates] == ["registered_depth"]
+    assert candidates[0]["support_state"] == expected_support_state
+    assert candidates[0]["anchor"] == "person_body_projection"
+
+
+def test_seated_pose_projection_requires_lifecycle_measured_height() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    state = hooks._WorldAnchorState()
+    torso_world = np.asarray([0.35, 0.64, 5.2], dtype=np.float64)
+    torso_uv = project_world_to_image(
+        torso_world,
+        calibration.intrinsics,
+        calibration.extrinsics_col_major,
+        calibration.image_size,
+        unit_scale=1.0,
+    )
+    assert torso_uv is not None
+
+    assert (
+        processor._seated_pose_ground_projection(
+            calibration,
+            torso_uv=torso_uv,
+            state=state,
+            flip_u=False,
+            flip_v=False,
+        )
+        is None
+    )
+
+    assert processor._record_seated_torso_height_reference(
+        state,
+        height_scene=0.64,
+        uncertainty_scene=0.03,
+        basis="registered_pose_torso_depth",
+    )
+    projection = processor._seated_pose_ground_projection(
+        calibration,
+        torso_uv=torso_uv,
+        state=state,
+        flip_u=False,
+        flip_v=False,
+    )
+
+    assert projection is not None
+    point, _covariance, height_m = projection
+    assert point == pytest.approx([0.35, 0.0, 5.2], abs=1e-6)
+    assert height_m == pytest.approx(0.64)
+
+
+def test_registered_pose_torso_depth_measures_seated_projection_plane() -> None:
+    processor = _processor()
+    calibration = _upright_projection_calibration()
+    state = hooks._WorldAnchorState()
+    torso_world = np.asarray([-0.45, 0.71, 4.6], dtype=np.float64)
+    torso_uv = project_world_to_image(
+        torso_world,
+        calibration.intrinsics,
+        calibration.extrinsics_col_major,
+        calibration.image_size,
+        unit_scale=1.0,
+    )
+    assert torso_uv is not None
+    extrinsics = np.asarray(
+        calibration.extrinsics_col_major,
+        dtype=np.float64,
+    ).reshape((4, 4), order="F")
+    camera_point = extrinsics[:3, :3] @ torso_world + extrinsics[:3, 3]
+    registered_depth_m = float(camera_point[2])
+    depth_result = ObjectDepthResult(
+        source_id=0,
+        frame_id=1,
+        object_id=7,
+        class_id=0,
+        bbox=(0.0, 0.0, 10.0, 20.0),
+        score=0.9,
+        sampling_mode="pose_capsule_native",
+        status="ok",
+        unit="m",
+        is_metric=True,
+        sample_count=64,
+        valid_fraction=0.9,
+        anchor_uv=tuple(float(value) for value in torso_uv),
+        anchor_source="pose_torso_support",
+        anchor_depth_m=registered_depth_m,
+        anchor_sample_count=64,
+        anchor_valid_fraction=0.9,
+        anchor_depth_spread_m=0.04,
+    )
+    depth_observation = hooks._DepthObservationResult(
+        torso_world,
+        0.8,
+        "ok",
+        registered_depth_m=registered_depth_m,
+        registration_status="raw_passthrough",
+    )
+
+    measured = processor._seated_torso_height_from_registered_depth(
+        calibration,
+        torso_uv=torso_uv,
+        depth_observation=depth_observation,
+        depth_result=depth_result,
+        flip_u=False,
+        flip_v=False,
+    )
+
+    assert measured is not None
+    assert measured[0] == pytest.approx(0.71, abs=1e-6)
+    assert measured[1] > 0.0
+    assert processor._record_seated_torso_height_reference(
+        state,
+        height_scene=measured[0],
+        uncertainty_scene=measured[1],
+        basis="registered_pose_torso_depth",
+    )
+    projection = processor._seated_pose_ground_projection(
+        calibration,
+        torso_uv=torso_uv,
+        state=state,
+        flip_u=False,
+        flip_v=False,
+    )
+    assert projection is not None
+    assert projection[0] == pytest.approx([-0.45, 0.0, 4.6], abs=1e-6)
+
+
+def test_seated_height_rejects_non_depth_basis() -> None:
+    processor = _processor()
+    state = hooks._WorldAnchorState()
+    assert not processor._record_seated_torso_height_reference(
+        state,
+        height_scene=0.88,
+        uncertainty_scene=0.0,
+        basis="published_ground_transition",
+    )
+    assert processor._record_seated_torso_height_reference(
+        state,
+        height_scene=0.63,
+        uncertainty_scene=0.02,
+        basis="registered_pose_torso_depth",
+    )
+
+    assert state.seated_torso_height_scene == pytest.approx(0.63)
+    assert state.seated_torso_height_uncertainty_scene == pytest.approx(0.02)
+    assert state.seated_torso_height_basis == "registered_pose_torso_depth"
+    assert list(state.seated_torso_height_samples_scene) == [(0.63, 0.02)]
+
+
 def test_moving_upright_lateral_truncation_excludes_interior_seating() -> None:
     processor = _processor()
     state = hooks._WorldAnchorState(
@@ -846,6 +1074,13 @@ def test_complete_side_profile_torso_does_not_require_apparent_pair_width() -> N
             "person_body_projection",
             "seat",
             "sitting",
+            True,
+        ),
+        (
+            "registered_depth",
+            "person_body_projection",
+            "couch",
+            "lying",
             True,
         ),
         (

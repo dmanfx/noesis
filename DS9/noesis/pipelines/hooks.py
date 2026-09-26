@@ -16578,18 +16578,14 @@ class _AnalyticsTelemetryProcessor:
         flip_u: bool,
         flip_v: bool,
     ) -> Optional[Tuple[np.ndarray, Matrix3, float]]:
-        """Project an exact seated torso observation to its floor footprint.
+        """Project a seated torso using this lifecycle's measured plane.
 
-        A seated person's feet are commonly hidden by furniture, but gravity
-        still constrains the person's horizontal location. Intersect the
-        current torso ray with a bounded human seated-torso plane and then
-        drop that point vertically to the calibrated floor. This is not a
-        claimed foot contact: callers publish it with ``support_state=seat``.
-
-        The prior is camera- and room-independent. A lifecycle-specific
-        standing height refines the plane when available; otherwise the broad
-        adult prior is deliberately paired with conservative height/UV
-        covariance and the ordinary multi-sample physical bootstrap.
+        A seated person's feet are commonly hidden by furniture, but the
+        current torso ray can still carry a previously measured
+        torso-anchor height through a depth gap.  No generic human height is
+        permitted: without a lifecycle-local reference this candidate is
+        unavailable and the resolver uses independent metric/floor evidence or
+        ordinary bounded continuation.
         """
 
         try:
@@ -16604,21 +16600,15 @@ class _AnalyticsTelemetryProcessor:
         ):
             return None
 
-        seated_torso_height_m = 0.82
-        if state is not None and state.height_ref_scene is not None:
-            try:
-                standing_height_m = (
-                    float(state.height_ref_scene) / scene_per_meter
-                )
-            except (TypeError, ValueError, OverflowError):
-                standing_height_m = math.nan
-            if math.isfinite(standing_height_m) and standing_height_m > 0.0:
-                seated_torso_height_m = 0.44 * standing_height_m
-        seated_torso_height_m = max(
-            0.68,
-            min(0.96, float(seated_torso_height_m)),
-        )
-        plane_height_scene = seated_torso_height_m * scene_per_meter
+        if state is None or state.seated_torso_height_scene is None:
+            return None
+        try:
+            plane_height_scene = float(state.seated_torso_height_scene)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(plane_height_scene) or plane_height_scene <= 0.0:
+            return None
+        seated_torso_height_m = plane_height_scene / scene_per_meter
         candidate = self._reference_plane_floor_world(
             calib,
             u,
@@ -16637,8 +16627,14 @@ class _AnalyticsTelemetryProcessor:
             return None
         width, height = image_size
         sigma_px = max(2.0, min(8.0, 0.003 * float(max(width, height))))
-        sigma_height_m = 0.18
-        sigma_height_scene = sigma_height_m * scene_per_meter
+        try:
+            sigma_height_scene = float(
+                state.seated_torso_height_uncertainty_scene
+            )
+        except (TypeError, ValueError, OverflowError):
+            sigma_height_scene = 0.0
+        if not math.isfinite(sigma_height_scene) or sigma_height_scene < 0.0:
+            sigma_height_scene = 0.0
 
         def _project(
             du: float,
@@ -16656,16 +16652,20 @@ class _AnalyticsTelemetryProcessor:
                 flip_v=flip_v,
             )
 
-        covariance = self._covariance_matrix_from_projection(
-            candidate,
-            (
-                (sigma_px, _project(sigma_px, 0.0)),
-                (sigma_px, _project(0.0, sigma_px)),
+        perturbations: List[Tuple[float, Optional[np.ndarray]]] = [
+            (sigma_px, _project(sigma_px, 0.0)),
+            (sigma_px, _project(0.0, sigma_px)),
+        ]
+        if sigma_height_scene > 0.0:
+            perturbations.append(
                 (
                     sigma_height_scene,
                     _project(0.0, 0.0, sigma_height_scene),
-                ),
-            ),
+                )
+            )
+        covariance = self._covariance_matrix_from_projection(
+            candidate,
+            tuple(perturbations),
             floor_y_variance=0.09,
         )
         if covariance is None:
@@ -16675,6 +16675,140 @@ class _AnalyticsTelemetryProcessor:
             covariance,
             float(seated_torso_height_m),
         )
+
+    @staticmethod
+    def _clear_seated_torso_height_reference(state: _WorldAnchorState) -> None:
+        state.seated_torso_height_scene = None
+        state.seated_torso_height_uncertainty_scene = 0.0
+        state.seated_torso_height_basis = None
+        state.seated_torso_height_samples_scene.clear()
+
+    @staticmethod
+    def _record_seated_torso_height_reference(
+        state: _WorldAnchorState,
+        *,
+        height_scene: float,
+        uncertainty_scene: float,
+        basis: str,
+    ) -> bool:
+        """Record bounded lifecycle-local geometry without seeding a prior."""
+
+        try:
+            measured_height = float(height_scene)
+            measured_uncertainty = float(uncertainty_scene)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            not math.isfinite(measured_height)
+            or measured_height <= 0.0
+            or not math.isfinite(measured_uncertainty)
+            or measured_uncertainty < 0.0
+        ):
+            return False
+
+        normalized_basis = str(basis or "").strip()
+        if normalized_basis != "registered_pose_torso_depth":
+            return False
+        if str(state.seated_torso_height_basis or "") != normalized_basis:
+            state.seated_torso_height_samples_scene.clear()
+
+        state.seated_torso_height_samples_scene.append(
+            (measured_height, measured_uncertainty)
+        )
+        heights = np.asarray(
+            [sample[0] for sample in state.seated_torso_height_samples_scene],
+            dtype=np.float64,
+        )
+        uncertainties = np.asarray(
+            [sample[1] for sample in state.seated_torso_height_samples_scene],
+            dtype=np.float64,
+        )
+        center = float(np.median(heights))
+        sample_spread = float(
+            np.sqrt(np.mean(np.square(heights - center)))
+        )
+        measured_spread = float(np.median(uncertainties))
+        state.seated_torso_height_scene = center
+        state.seated_torso_height_uncertainty_scene = max(
+            sample_spread,
+            measured_spread,
+        )
+        state.seated_torso_height_basis = normalized_basis
+        return True
+
+    def _seated_torso_height_from_registered_depth(
+        self,
+        calib: Any,
+        *,
+        torso_uv: Sequence[float],
+        depth_observation: _DepthObservationResult,
+        depth_result: Optional[ObjectDepthResult],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Tuple[float, float]]:
+        """Measure the pose torso-anchor plane from exact registered range."""
+
+        if (
+            depth_result is None
+            or str(depth_result.anchor_source or "") != "pose_torso_support"
+            or depth_observation.world_point is None
+            or depth_observation.registered_depth_m is None
+            or str(depth_observation.registration_status or "")
+            not in ("ok", "raw_passthrough")
+        ):
+            return None
+        try:
+            u = float(torso_uv[0])
+            v = float(torso_uv[1])
+            registered_depth_m = float(depth_observation.registered_depth_m)
+            observed_spread_m = float(depth_result.anchor_depth_spread_m or 0.0)
+            floor_y = self._localization_projection_floor_y(calib)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (
+                    u,
+                    v,
+                    registered_depth_m,
+                    observed_spread_m,
+                    floor_y,
+                )
+            )
+            or registered_depth_m <= 0.0
+            or observed_spread_m < 0.0
+        ):
+            return None
+        source_point = self._project_pixel_to_localization_observation(
+            calib,
+            u,
+            v,
+            depth_m=registered_depth_m,
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+        if source_point is None:
+            return None
+        height_scene = float(source_point[1]) - floor_y
+        if not math.isfinite(height_scene) or height_scene <= 0.0:
+            return None
+
+        uncertainty_scene = 0.0
+        if observed_spread_m > 0.0:
+            spread_point = self._project_pixel_to_localization_observation(
+                calib,
+                u,
+                v,
+                depth_m=registered_depth_m + observed_spread_m,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if spread_point is not None:
+                uncertainty_scene = abs(
+                    float(spread_point[1]) - float(source_point[1])
+                )
+        return float(height_scene), float(uncertainty_scene)
 
     def _upright_pose_ground_projection(
         self,
@@ -17137,7 +17271,7 @@ class _AnalyticsTelemetryProcessor:
             ):
                 depth_support_state = "floor"
             elif (
-                str(posture) == "sitting"
+                str(posture) in ("sitting", "lying")
                 and depth_registration_supported
                 and depth_anchor_source
                 in ("torso_core", "pose_torso_support")
@@ -17145,9 +17279,13 @@ class _AnalyticsTelemetryProcessor:
                 == "person_body_projection"
             ):
                 # The exact metric body point has been projected vertically
-                # to the calibrated floor. It localizes the seated person's
-                # floor footprint without claiming visible foot contact.
-                depth_support_state = "seat"
+                # to the calibrated floor. It localizes a non-upright person's
+                # footprint without claiming visible foot contact. Keep lying
+                # support distinct because its body-to-support geometry is not
+                # equivalent to the seated torso plane.
+                depth_support_state = (
+                    "seat" if str(posture) == "sitting" else "couch"
+                )
             candidates.append(
                 {
                     "candidate_id": "registered_depth",
@@ -18025,18 +18163,21 @@ class _AnalyticsTelemetryProcessor:
             and anchor == "upright_body_plane"
         ):
             return True
-        if (
-            support_state != "seat"
-            or str(getattr(candidate, "posture", "") or "") != "sitting"
-        ):
-            return False
-        return bool(
-            (kind == "pose_scale" and anchor == "seated_torso_plane")
-            or (
+        posture = str(getattr(candidate, "posture", "") or "")
+        if support_state == "seat" and posture == "sitting":
+            return bool(
+                (kind == "pose_scale" and anchor == "seated_torso_plane")
+                or (
+                    kind == "registered_depth"
+                    and anchor == "person_body_projection"
+                )
+            )
+        if support_state == "couch" and posture == "lying":
+            return bool(
                 kind == "registered_depth"
                 and anchor == "person_body_projection"
             )
-        )
+        return False
 
     def _weak_resolver_measurement_is_ground_supported(
         self,
@@ -19984,8 +20125,7 @@ class _AnalyticsTelemetryProcessor:
                 else None
             )
             torso_reference_supported = bool(
-                posture != "lying"
-                and self._person_admission_confidence(
+                self._person_admission_confidence(
                     track,
                     trusted_lifecycle=trusted_metric_lifecycle,
                 )
@@ -19999,7 +20139,7 @@ class _AnalyticsTelemetryProcessor:
                 if pose_kpts_abs is not None and torso_reference_supported
                 else None
             )
-            # Every confident non-lying row may use the exact current torso as
+            # Every confident row may use the exact current torso as
             # independent image-motion corroboration. If current floor evidence
             # is missing/rejected, the same reference may consume only the
             # fixed, accepted pose-to-foot bundle below; silhouette, anatomy,
@@ -20017,6 +20157,9 @@ class _AnalyticsTelemetryProcessor:
                     float(reference_u),
                     float(reference_v),
                 )
+            if state is not None:
+                if posture != "sitting":
+                    self._clear_seated_torso_height_reference(state)
             person_anchor = self._resolve_person_depth_anchor(depth_result)
             if (
                 person_anchor is not None
@@ -20033,8 +20176,8 @@ class _AnalyticsTelemetryProcessor:
                 # filter along a body-range ray. Keep the range branch exact-
                 # cohort, confidence-gated, lifecycle-backed, and limited to
                 # seated or explicitly lower-body-occluded observations.
-                exact_current_seated_torso = bool(
-                    posture == "sitting"
+                exact_current_non_upright_torso = bool(
+                    posture in ("sitting", "lying")
                     and pose_torso_reference_anchor is not None
                     and self._depth_measurement_is_current(
                         depth_result,
@@ -20047,13 +20190,12 @@ class _AnalyticsTelemetryProcessor:
                         state.last_good_world is not None
                         or state.height_ref_scene is not None
                     )
-                    or exact_current_seated_torso
+                    or exact_current_non_upright_torso
                 )
                 torso_context_supported = bool(
-                    posture == "sitting"
+                    posture in ("sitting", "lying")
                     or (
-                        posture != "lying"
-                        and occlusion_assessment is not None
+                        occlusion_assessment is not None
                         and occlusion_assessment.active
                     )
                 )
@@ -20849,6 +20991,31 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     hit = None
 
+            if (
+                state is not None
+                and posture == "sitting"
+                and pose_torso_reference_uv_calib is not None
+                and depth_obs is not None
+                and not reject_current_geometry
+            ):
+                measured_seated_height = (
+                    self._seated_torso_height_from_registered_depth(
+                        calib,
+                        torso_uv=pose_torso_reference_uv_calib,
+                        depth_observation=depth_observation,
+                        depth_result=depth_result,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                    )
+                )
+                if measured_seated_height is not None:
+                    self._record_seated_torso_height_reference(
+                        state,
+                        height_scene=float(measured_seated_height[0]),
+                        uncertainty_scene=float(measured_seated_height[1]),
+                        basis="registered_pose_torso_depth",
+                    )
+
             if self._world_resolver_enabled:
                 self._append_universal_world_candidates(
                     universal_candidates,
@@ -20972,9 +21139,21 @@ class _AnalyticsTelemetryProcessor:
                 track["world_seated_registered_depth_available"] = bool(
                     seated_registered_depth_available
                 )
+                if state is not None and state.seated_torso_height_scene is not None:
+                    track["world_seated_torso_height_m"] = float(
+                        state.seated_torso_height_scene
+                    ) / float(self._scene_per_meter(calib))
+                    track["world_seated_torso_height_basis"] = str(
+                        state.seated_torso_height_basis or ""
+                    )
+                    track["world_seated_torso_height_sample_count"] = len(
+                        state.seated_torso_height_samples_scene
+                    )
                 seated_pose_semantic_ready = bool(
                     posture == "sitting"
                     and pose_torso_reference_uv_calib is not None
+                    and state is not None
+                    and state.seated_torso_height_scene is not None
                     and not seated_registered_depth_available
                     and current_detector_semantic_confidence
                     >= (
@@ -21548,19 +21727,27 @@ class _AnalyticsTelemetryProcessor:
                     )
                 )
                 verified_reacquire_support = any(
-                    str(candidate.support_state) == "floor"
-                    and (
-                        self._person_ground_consensus_contact_basis(
-                            resolver_contact_basis_by_candidate.get(
-                                str(candidate.candidate_id),
-                                str(candidate.anchor),
+                    (
+                        str(candidate.support_state) == "floor"
+                        and (
+                            self._person_ground_consensus_contact_basis(
+                                resolver_contact_basis_by_candidate.get(
+                                    str(candidate.candidate_id),
+                                    str(candidate.anchor),
+                                )
                             )
+                            in {
+                                "pose_ankle_floor",
+                                "pose_single_ankle_floor",
+                            }
+                            or str(candidate.kind) == "registered_depth"
                         )
-                        in {
-                            "pose_ankle_floor",
-                            "pose_single_ankle_floor",
-                        }
-                        or str(candidate.kind) == "registered_depth"
+                    )
+                    or (
+                        str(candidate.support_state) in {"seat", "couch"}
+                        and self._resolver_candidate_is_ground_footprint_supported(
+                            candidate
+                        )
                     )
                     for candidate in resolved_support_candidates
                 )
@@ -21788,7 +21975,7 @@ class _AnalyticsTelemetryProcessor:
                     else:
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
                     filter_quality = str(resolved.quality)
-                    selected_seated_projection = bool(
+                    selected_non_upright_projection = bool(
                         selected_resolver_candidate is not None
                         and self._resolver_candidate_is_ground_footprint_supported(
                             selected_resolver_candidate
@@ -21796,10 +21983,10 @@ class _AnalyticsTelemetryProcessor:
                         and str(
                             selected_resolver_candidate.support_state
                         )
-                        == "seat"
+                        in {"seat", "couch"}
                     )
                     selected_seated_pose_projection = bool(
-                        selected_seated_projection
+                        selected_non_upright_projection
                         and str(selected_resolver_candidate.kind) == "pose_scale"
                     )
                     selected_upright_pose_projection = bool(
@@ -21941,7 +22128,7 @@ class _AnalyticsTelemetryProcessor:
                         posture=str(posture),
                     )
                     if (
-                        selected_seated_projection
+                        selected_non_upright_projection
                         and state is not None
                         and output_reference_at_entry is not None
                     ):
@@ -21970,7 +22157,7 @@ class _AnalyticsTelemetryProcessor:
                                 # Rate-suppressed callbacks can leave a
                                 # speculative walking posterior ahead of the
                                 # point the tracking/world/BEV queue actually
-                                # exposed. A seated measurement must begin at
+                                # exposed. A non-upright measurement must begin at
                                 # that immutable visible point with no inherited
                                 # walking velocity; the current body observation
                                 # then moves it through the ordinary physical
@@ -21981,7 +22168,7 @@ class _AnalyticsTelemetryProcessor:
                                 state.vel_world_x = 0.0
                                 state.vel_world_z = 0.0
                                 state.locked_world = None
-                                track["world_seated_filter_rebased"] = True
+                                track["world_non_upright_filter_rebased"] = True
                     hit = self._update_track_world_state(
                         track,
                         state,
@@ -22024,21 +22211,23 @@ class _AnalyticsTelemetryProcessor:
                         display_output=display_recovery_reference_at_entry,
                     )
                     if (
-                        selected_seated_projection
+                        selected_non_upright_projection
                         and state is not None
                         and bool(state.measurement_accepted)
                     ):
                         state.vel_world_x = 0.0
                         state.vel_world_z = 0.0
-                        track["world_seated_velocity_reset"] = True
+                        track["world_non_upright_velocity_reset"] = True
                         if bbox_stationary_supported:
-                            state.motion_mode = "sit"
+                            state.motion_mode = (
+                                "lie" if posture == "lying" else "sit"
+                            )
                             state.locked_world = (
                                 float(hit[0]),
                                 float(hit[2]),
                             )
                             state.trail_append_allowed = False
-                            track["world_seated_stationary_lock"] = True
+                            track["world_non_upright_stationary_lock"] = True
                     if (
                         selected_upright_pose_projection
                         and state is not None
@@ -22068,9 +22257,11 @@ class _AnalyticsTelemetryProcessor:
                         quality_reason = (
                             f"{quality_reason},weak_ground_temporal_consensus"
                         )
-                    if selected_seated_projection:
+                    if selected_non_upright_projection:
                         quality_reason = (
-                            f"{quality_reason},seated_ground_projection"
+                            f"{quality_reason},"
+                            f"{'lying' if posture == 'lying' else 'seated'}_"
+                            "ground_projection"
                         )
                     if selected_upright_pose_projection:
                         quality_reason = (

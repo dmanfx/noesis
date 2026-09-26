@@ -59,6 +59,8 @@ class HumanGroundConfig:
     static_exit_frames: int = 3
     idle_deadzone_m: float = 0.28
     idle_deadzone_sit_m: float = 0.40
+    non_upright_body_deadzone_m: float = 0.10
+    non_upright_body_alpha: float = 0.30
     residual_window: int = 12
 
     # Phase 2 — source hysteresis
@@ -126,6 +128,16 @@ class HumanGroundConfig:
         object.__setattr__(self, "static_exit_frames", max(1, int(self.static_exit_frames)))
         object.__setattr__(self, "idle_deadzone_m", max(0.0, float(self.idle_deadzone_m)))
         object.__setattr__(self, "idle_deadzone_sit_m", max(0.0, float(self.idle_deadzone_sit_m)))
+        object.__setattr__(
+            self,
+            "non_upright_body_deadzone_m",
+            max(0.0, float(self.non_upright_body_deadzone_m)),
+        )
+        object.__setattr__(
+            self,
+            "non_upright_body_alpha",
+            min(1.0, max(0.0, float(self.non_upright_body_alpha))),
+        )
         object.__setattr__(self, "residual_window", max(3, int(self.residual_window)))
         object.__setattr__(self, "source_hold_frames", max(1, int(self.source_hold_frames)))
         object.__setattr__(self, "source_replacement_frames", max(1, int(self.source_replacement_frames)))
@@ -453,6 +465,17 @@ class PersonGroundState:
     # Learned calibrated heights for visible upper-body reference points.
     # Values are fractions of the track's standing height and stay process-local.
     body_plane_height_fractions: Dict[str, float] = field(default_factory=dict)
+    # Seated pose projection is permitted only after this exact tracker
+    # lifecycle has supplied a metric/calculated height for the same torso
+    # anchor.  The bounded sample window contains source-calibration-frame
+    # heights and their measured spreads; no population body-height prior is
+    # seeded here.
+    seated_torso_height_scene: Optional[float] = None
+    seated_torso_height_uncertainty_scene: float = 0.0
+    seated_torso_height_basis: Optional[str] = None
+    seated_torso_height_samples_scene: Deque[Tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=5)
+    )
     # Exact-current learned-height geometry is useful during a standing
     # lower-body occlusion, but only after its absolute bias has been bound to
     # the last queue-visible metric/process output.  This immutable origin is
@@ -780,6 +803,16 @@ def _reacquire_basis_family(contact_basis: Optional[str]) -> str:
     """Collapse exact support subtypes into their trajectory family."""
 
     basis = str(contact_basis or "").strip()
+    if basis in {
+        "pose:seated_torso_plane",
+        "depth:torso_core",
+        "depth:pose_torso_support",
+    }:
+        # Pose-only seating is available only after exact registered depth
+        # measured this lifecycle's torso plane. Treat those intermittent
+        # depth rows and their measured-plane interpolation as one relocation
+        # trajectory instead of resetting consensus on every DAv2 cadence gap.
+        return "non_upright_body_projection"
     if basis in {"pose_single_ankle_floor", "pose_ankle_floor"}:
         return "pose_floor"
     if basis == "pose:upright_body_planes:four_plane":
@@ -1288,10 +1321,13 @@ def mark_world_measurement_unavailable(
         and int(state.reacquire_count) > 0
         and int(state.reacquire_unavailable_rows) == 0
     )
-    preserve_bounded_upright_body_gap = False
+    preserve_bounded_body_gap = False
     if (
         str(state.reacquire_candidate_basis or "")
-        == "pose:upright_body_planes"
+        in {
+            "pose:upright_body_planes",
+            "non_upright_body_projection",
+        }
         and int(state.reacquire_count) > 0
         and now_ts is not None
         and config is not None
@@ -1302,18 +1338,18 @@ def mark_world_measurement_unavailable(
             )
         except (TypeError, ValueError, OverflowError):
             candidate_age_s = math.nan
-        preserve_bounded_upright_body_gap = bool(
+        preserve_bounded_body_gap = bool(
             math.isfinite(candidate_age_s)
             and 0.0 <= candidate_age_s
             <= float(config.reacquire_max_gap_s)
         )
     if preserve_one_observed_pose_floor_gap:
         state.reacquire_unavailable_rows = 1
-    elif preserve_bounded_upright_body_gap:
-        # Pose cadence can be lower than detector cadence while furniture
-        # hides the lower body. Keep the last actual body solve as the
-        # non-renewing evidence root; elapsed media time, not callback count,
-        # bounds this exception.
+    elif preserve_bounded_body_gap:
+        # Pose and exact DAv2 cadence can be lower than detector cadence while
+        # furniture hides the lower body. Keep the last actual body solve as
+        # the non-renewing evidence root; elapsed media time, not callback
+        # count, bounds this exception.
         state.reacquire_unavailable_rows = min(
             1_000_000,
             int(state.reacquire_unavailable_rows) + 1,
@@ -4620,6 +4656,15 @@ def update_human_cv_filter(
 
     posture = str(state.posture or "unknown")
     mode = str(state.motion_mode or "unknown")
+    non_upright_body_measurement = bool(
+        posture in ("sitting", "lying")
+        and str(contact_basis or "").strip()
+        in {
+            "pose:seated_torso_plane",
+            "depth:torso_core",
+            "depth:pose_torso_support",
+        }
+    )
 
     # Adaptive gains from posture / mode / quality (Phase 4).
     if mode in ("idle", "sit", "lie") or posture in ("sitting", "lying"):
@@ -4635,6 +4680,12 @@ def update_human_cv_filter(
     # P≈q, K = P/(P+R)
     kalman = q / max(1e-9, q + r)
     alpha = float(min(1.0, max(0.0, 0.55 * alpha + 0.45 * kalman)))
+    if non_upright_body_measurement:
+        # A typed current body projection is the preferred metric authority
+        # for sitting/lying people. Let it close a stale foot-ray residual
+        # promptly; the existing innovation, output-speed, and three-sample
+        # reanchor gates still reject an impossible relocation.
+        alpha = max(alpha, float(config.non_upright_body_alpha))
     if position_gain_override is not None:
         try:
             requested_gain = float(position_gain_override)
@@ -4699,6 +4750,11 @@ def update_human_cv_filter(
     deadzone = float(config.idle_deadzone_m)
     if posture in ("sitting", "lying"):
         deadzone = max(deadzone, float(config.idle_deadzone_sit_m))
+    if non_upright_body_measurement:
+        # The broader seated deadzone is for pose jitter after a lock. It must
+        # not preserve a visibly wrong foot-derived coordinate when a current
+        # body projection repeatedly identifies the chair/sofa footprint.
+        deadzone = min(deadzone, float(config.non_upright_body_deadzone_m))
     if mode in ("idle", "sit", "lie") and (not force_accept) and innov_dist <= deadzone:
         # Hold position; gently decay velocity.
         state.vel_world_x *= 0.50

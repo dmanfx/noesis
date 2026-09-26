@@ -418,13 +418,46 @@ class UniversalWorldMeasurementResolver:
         self,
         scored: _ScoredHypothesis,
     ) -> tuple[int, float, float, str]:
-        # Explicit floor support is semantic authority for this resolver, not
-        # a probabilistic score hint. Candidate id is the deterministic final
-        # tie-breaker. No room or camera name enters the ordering.
+        # Support semantics are authority, not merely another score hint. For
+        # an upright person, observed/registered floor support remains first.
+        # For a non-upright person, however, a typed current body projection is
+        # the person's footprint; an ankle ray may land on the sofa edge, a
+        # tucked leg, or another person. Candidate id is the deterministic
+        # final tie-breaker. No room or camera name enters the ordering.
         candidate = scored.hypothesis
-        floor_authority_rank = 0 if candidate.support_state == "floor" else 1
+        posture = str(candidate.posture or "unknown")
+        kind = str(candidate.kind or "")
+        anchor = str(candidate.anchor or "")
+        support_state = str(candidate.support_state or "unknown")
+        typed_non_upright_body = bool(
+            (
+                posture == "sitting"
+                and support_state == "seat"
+                and (
+                    (kind == "pose_scale" and anchor == "seated_torso_plane")
+                    or (
+                        kind == "registered_depth"
+                        and anchor == "person_body_projection"
+                    )
+                )
+            )
+            or (
+                posture == "lying"
+                and support_state == "couch"
+                and kind == "registered_depth"
+                and anchor == "person_body_projection"
+            )
+        )
+        if posture in ("sitting", "lying"):
+            support_authority_rank = (
+                0
+                if typed_non_upright_body
+                else (1 if support_state == "floor" else 2)
+            )
+        else:
+            support_authority_rank = 0 if support_state == "floor" else 1
         return (
-            floor_authority_rank,
+            support_authority_rank,
             -scored.score,
             -candidate.confidence,
             candidate.candidate_id,

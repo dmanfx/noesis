@@ -3,6 +3,22 @@ _Status: canonical native-host metadata contract, updated 2026-08-23._
 
 This document summarizes the key metadata structures used by the DS9.1 pipeline, both on-frame (user meta) and in downstream telemetry.
 
+## Find the relevant metadata boundary
+
+| Producer/consumer concern | Section |
+| --- | --- |
+| Calibration and depth registration | [Intrinsics](#1-intrinsics-calibration-bundle--optional-per-frame-meta), [registration artifact](#11-depth-registration-artifact) |
+| Depth storage and JSON consumers | [Depth result](#2-depth-result), [normals](#21-depth-normals-mapanything) |
+| Analytics object/frame metadata | [Analytics metadata](#3-analytics-object--frame-meta) |
+| Tracks, world coordinates, identity and occupancy | [Track dictionary](#track-dictionary), [occupancy](#occupancy-state) |
+| Native user-meta ownership/copy/release | [Lifecycle](#5-custom-user-meta-lifecycle-ds91--deepstream) |
+| Pose feature and object-depth consumers | [Pose features](#6-pose-feature-user-meta-object-level), [object depth](#7-object-depth-user-meta-object-level) |
+| OSD keypoints and geometry | [Pose OSD](#8-pose-keypoint-visualization-osd), [geometry](#9-calibration--geometry) |
+
+Metadata availability, consumer wiring and selected runtime authority are
+separate facts. For pose/identity wiring, use the
+[pose integration status](pose_stable_id_integration.md) alongside this schema.
+
 ## 1. Intrinsics (Calibration Bundle + optional per-frame meta)
 
 **Primary producer:** the calibration provider in
@@ -276,6 +292,8 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_upright_body_reacquire_support": <bool|null>,
   "world_seated_pose_candidate": [<float x>, <float y>, <float z>]|null,
   "world_seated_torso_height_m": <float|null>,
+  "world_seated_torso_height_basis": "registered_pose_torso_depth"|null,
+  "world_seated_torso_height_sample_count": <int|null>,
   "world_seated_stationary_lock": <bool|null>,
   "world_floor_candidate": [<float x>, <float y>, <float z>]|null,
   "world_floor_range_m": <float|null>,

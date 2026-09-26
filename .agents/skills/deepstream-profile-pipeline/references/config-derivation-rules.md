@@ -1,211 +1,97 @@
-# Config Derivation Rules
+# Configuration candidates from measured evidence
 
-Stage 4 closed-form rules. Inputs come from Stages 2 (HW) and 3 (inference plateau). Every
-knob below is derived, not tuned.
+Use with [new-pipeline construction](new-pipeline-construction.md), after resolving
+the selected consumer's quality, output and latency requirements. These are
+questions to test within that contract, not closed-form settings to apply to
+every pipeline. Existing-runtime diagnosis changes only a demonstrated culprit.
 
 ## Inputs
 
-- `plateau_batch` — from Stage 3 micro-benchmark (smallest batch where doubling B yields
-  < 5% FPS gain).
-- `N_streams` — user-requested stream count.
-- `source_res = (W, H)` — e.g. (1920, 1080).
-- `source_fps` — per stream, e.g. 30.
-- `model_dims = (Wm, Hm)` — read from the model's nvinfer config (`infer-dims=3;H;W`).
-  Works for detection / classification / segmentation models alike.
-- `has_int8_calib` — bool; true if an `int8-calib-file` is present on disk.
-- `hw_nvdec_count`, `hw_sm_count`, `hw_tops_int8`, `hw_bw_gb_s` — from Stage 2.
+Record source count/cadence/resolution, model input/profile/precision, tracker
+configuration, required outputs, the target latency/FPS, and matched component
+and application observations. Separate theoretical hardware limits from measured
+results. Set finite batch, run, rebuild, time and resource bounds before a sweep.
 
-**Derived:**
+## R1 — Streammux
 
-```
-final_batch = min(plateau_batch, N_streams)
-```
+Derive mux batch and timeout from actual source batching and latency requirements.
+A measured inference plateau is evidence for a candidate batch, not proof that
+all sources can meet their deadline. Keep mux dimensions and padding consistent
+with the product geometry/output contract. Read memory-type semantics in the
+installed plugin; a numeric flag alone does not prove zero-copy behavior.
 
-## Rules
+## R2 — Inference
 
-### R1 — nvstreammux
+Use the exact selected engine and its supported shapes. Verify the relation
+between mux and inference batches for this graph rather than forcing a universal
+equality. Keep model precision, input resolution, preprocessing and inference
+cadence fixed. Calibration-file presence alone does not authorize INT8, and a
+performance request does not authorize changing FP32/FP16 or skipping inference.
+Verify model-specific dynamic-input configuration with the installed SDK.
 
-| Key | Value | Why |
-|---|---|---|
-| `batch-size` | `final_batch` | Matches what inference can consume in one tick. |
-| `width` | `min(source_res.W, model_dims.Wm)` | No point upscaling before inference. |
-| `height` | `min(source_res.H, model_dims.Hm)` | Same. |
-| `batched-push-timeout` | `round(1e6 / source_fps)` µs | One full frame interval; waits long enough to fill a batch without starving at live sources. |
-| `nvbuf-memory-type` | `0` | NVMM zero-copy. Anything else kills throughput. |
-| `live-source` | `1` if RTSP/camera, else `0` | RTSP needs live-source behavior. |
-| `enable-padding` | `0` | Padding wastes GPU time when input already matches model dims. |
+A missing or incompatible engine is a build prerequisite. Route it to the
+native maintenance/import workflow; do not trigger a cold engine build in a
+profile run or guess a `fakesrc` graph to create it.
 
-### R2 — nvinfer (primary)
+## R3 — Decoder
 
-In `pgie_config.yml` / `config_infer_primary.txt`:
+Keep the native device-memory path and source resolution. Size additional
+surfaces from measured pressure, bounded memory and latency. Verify each property
+on the element that actually owns it; source-bin and decoder properties are not
+interchangeable. File looping is useful only for an authorized isolated benchmark
+and must not disguise a missing live-source or temporal validation check.
 
-| Key | Value | Why |
-|---|---|---|
-| `batch-size` | `final_batch` | Must match streammux; mismatch silently caps FPS. |
-| `network-mode` | `1` if `has_int8_calib` else `2` | INT8 is ~2× FP16 TOPS on Ampere/Ada/Hopper. FP16 as fallback; never FP32. |
-| `interval` | `0` | Every frame. Only use `1` if user explicitly asked to skip frames. |
-| `infer-dims` | `3;Hm;Wm` | Required for dynamic-shape ONNX; harmless for static. |
-| `model-engine-file` | path to pre-built `.engine` | Do not rebuild during measurement — `trtBuilder*` would dominate the profile. |
-| `int8-calib-file` | path | Only if `network-mode=1`. |
+## R4 — Tracker
 
-In the outer nvinfer element properties (when set via `pipeline.add(...)` or `gst-launch`):
-just `config-file-path=<path-to-pgie_config.yml>`. Do not duplicate keys in both places.
+Preserve the selected tracker algorithm, dimensions, library and configuration.
+Profile representative occupied scenes, including motion and occlusion, before
+attributing costs. A smaller tracker resolution or performance preset is a
+quality tradeoff requiring explicit approval and matched tracking evidence.
 
-### R3 — Decoder (`nvurisrcbin` / `nvmultiurisrcbin` / `nvv4l2decoder`)
+### R4a — Inference interval with tracking
 
-| Key | Value | Why |
-|---|---|---|
-| `num-extra-surfaces` | `min(final_batch, 5)` | Buffer pool sized for the batch; 5 is a safe cap that doesn't waste GPU memory. |
-| `cudadec-memtype` | `0` | NVMM device memory; matches `nvstreammux.nvbuf-memory-type=0`. |
-| `file-loop` | `1` when using file sources for benchmarking | Keeps the pipeline saturated past the first file playthrough. |
-| `max-batch-size` | `final_batch` | On `nvmultiurisrcbin` only; must equal streammux batch. |
+Tracker-ID retention alone does not establish detection recall, StableID
+correctness, motion accuracy, or safe gaps in inference. Keep the selected
+interval. If a tradeoff experiment is explicitly authorized, define its fixture,
+quality metrics, limits and acceptance thresholds first; assess all affected
+consumers. Do not step the interval upward until an arbitrary retention
+percentage holds or use tracker-local IDs as product-identity proof.
 
-### R4 — Tracker (if present)
+## R5 — Queues
 
-In the outer `nvtracker` element properties:
+Assign each queue a finite capacity from work rate, service time, memory and
+freshness needs. Optional display/persistence/network work must not stall the
+always-on media path. Verify bounded worker behavior at the actual boundary;
+one generic queue-size multiplier does not establish this.
 
-| Key | Value | Why |
-|---|---|---|
-| `enable-batch-process` | `1` (in the linked YAML) | Batches track updates across streams. |
-| `tracker-width` | `480` | Matches NVIDIA's max-perf reference config. |
-| `tracker-height` | `288` | Same. |
-| `ll-config-file` | `/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_max_perf.yml` | NVIDIA-tuned perf preset (DS 9.0). |
-| `ll-lib-file` | `/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so` | Standard tracker lib. |
+Canonical tracking/world/BEV publications remain one exact ordered cohort and
+cannot be made leaky or coalesced. Optional consumers may degrade their own
+freshness according to the documented product boundary. Do not apply a generic
+Kafka or file-sink leaky/nonleaky policy to all outputs.
 
-#### R4a — `nvinfer.interval` when a tracker is present
+## R6 — OSD, tiler and visible sinks
 
-A tracker can carry object IDs across frames where inference did not run, so
-when a tracker is in the pipeline you may safely raise `nvinfer.interval` from
-`0` (every frame) to `1`, `2`, `…` (skip 1, 2, … frames between inferences),
-multiplying inference capacity proportionally. Whether this is safe depends on
-**whether the tracker actually keeps IDs alive across the gap** — that's a
-property of the workload (object motion, occlusion frequency, frame rate),
-not something a closed-form rule can pick.
+Preserve required outputs, even when the performance request does not restate
+them. An isolated fakesink variant can measure one component, but its throughput
+cannot establish full-graph performance. Exercise the requested media output
+and direct consumer in the final bounded check.
 
-The right signal is **tracker ID retention rate** measured at the tracker's
-output:
+## R7 — Capacity and bottleneck reporting
 
-```
-retention(N→N+1) = |IDs in frame N+1 ∩ IDs in frame N| / |IDs in frame N|
-```
+An inference-only frames/s divided by target FPS is a sizing estimate. Hardware
+decode/bandwidth formulas are theoretical estimates. Their minimum does not
+establish the application's maximum stream count.
 
-Capture it by attaching a `BatchMetadataOperator` probe at the tracker's src
-pad and tallying object IDs per frame across a steady-state window. Practical
-thresholds:
+Claim measured capacity only for the source count, input occupancy, model,
+configuration and outputs actually exercised. Each source must meet the target;
+check encoded cadence/drops and WebRTC decoded frames separately when relevant.
+If instrumentation cannot attribute the bottleneck, state the uncertainty and
+choose the next bounded measurement. Do not recommend an algorithm, resolution,
+precision or output reduction merely because a theoretical ceiling is low.
 
-| Retention | Interpretation | Recommendation |
-|---|---|---|
-| **≥ 99 %** | Tracker keeps virtually every object across consecutive frames; gaps are safe to fill in. | Try `interval=1` (halves inference compute), re-measure retention at the new interval. Step up to 2/3/… while retention holds ≥ 99 %. |
-| 90 – 99 % | Some objects flicker or are reacquired with new IDs, but most persist. | `interval=1` is borderline; acceptable for many use cases but expect a few duplicate / re-issued IDs. Don't go higher. |
-| **< 90 %** | A noticeable fraction of objects come out with new IDs each frame — tracker can't bridge the gaps reliably. | **Force `interval=0`.** Skipping frames will compound the ID churn; per-frame inference is required. |
+## Before the application measurement
 
-Quick visual check without writing a probe: turn on `display-tracking-id=1`
-on the tracker, render the OSD-overlaid output for ~5 seconds, and watch
-whether the IDs labelled on objects stay stable or constantly change. Lots of
-new IDs ⇒ retention is poor ⇒ keep `interval=0`.
-
-This rule applies *only when a tracker is present*. Without a tracker,
-`interval > 0` produces literal detection holes (no metadata between
-inferences) and should never be used.
-
-### R5 — Queues (only when present)
-
-A queue between `source` and `pgie`:
-
-| Key | Value | Why |
-|---|---|---|
-| `max-size-buffers` | `final_batch × 4` | Decode-side depth; keeps GPU fed when decode is bursty. |
-| `max-size-bytes` | `0` (default) | Let buffer count rule. |
-| `max-size-time` | `0` | Let buffer count rule. |
-
-A queue feeding a Kafka/message branch:
-
-| Key | Value | Why |
-|---|---|---|
-| `max-size-buffers` | `2` | Tiny. |
-| `leaky` | `2` (downstream) | Drop oldest when broker is slow; never back-pressure the main chain. |
-
-A queue feeding a file-sink / encoder branch:
-
-| Key | Value | Why |
-|---|---|---|
-| `max-size-buffers` | `final_batch` | One-batch slack, no more (disk back-pressure is a real signal). |
-| `leaky` | `0` | Don't drop; if the disk is slow we want to see it as a stall. |
-
-### R6 — OSD / tiler / visible sinks
-
-If the user asked for on-screen display or on-disk MP4: leave OSD and tiler enabled; they are
-a known perf cost the user accepted. Do not re-tune their knobs in the MVP.
-
-If the user did NOT ask for visible output: omit OSD + tiler entirely; use `fakesink
-sync=False` as the only branch. This is the largest single perf delta available.
-
-### R7 — Capacity report (max output)
-
-After Stage 5 (E2E profile), compute the closed-form max-stream capacity for the user's
-target FPS. Report this in plain English.
-
-**Inputs:**
-- `peak_per_frame_fps` — from the microbench plateau (Stage 3)
-- `nvdec_decode_ceiling` — from the Stage 2 HW ceiling lookup
-  (`NVDEC_count × per_unit_fps_for_codec_res`, table in `hw-ceiling-formulas.md`)
-- `target_fps` — what the user wants per stream (default 30)
-- `aggregate_bw_ceiling_gbps`, `bw_per_stream_gbps` — only relevant if Stage 5 flagged
-  MEMORY_BW_BOUND
-
-**Formula:**
-
-```
-max_streams_compute  = peak_per_frame_fps / target_fps
-max_streams_decode   = nvdec_decode_ceiling / target_fps
-max_streams_bw       = aggregate_bw_ceiling_gbps / bw_per_stream_gbps   # only if BW-bound
-max_streams_overall  = min(max_streams_compute, max_streams_decode, max_streams_bw)
-```
-
-**The reported number is `max_streams_overall`** — the lowest of the three ceilings, since
-that is the actual bottleneck. The skill should also state *which* ceiling is dominating, so
-the user knows what to upgrade if they need more.
-
-**Output template (skill should produce a block in this shape):**
-
-```
-Capacity (this hardware, this model, <precision>):
-  Compute ceiling : <peak_per_frame_fps> fps / <target_fps> fps = <N_compute> streams
-  Decode  ceiling : <nvdec_decode_ceiling> fps / <target_fps> fps = <N_decode> streams
-  Memory  ceiling : (not bound)  OR  <N_bw> streams
-  → Max output:    min(...) = <N_overall> streams  (<dominant>-limited)
-```
-
-**Bottleneck → remediation mapping** (the skill must include this section in the report,
-keyed off which ceiling dominated):
-
-| Dominant ceiling | What "more streams" requires |
-|---|---|
-| **COMPUTE_BOUND** | A larger / faster GPU (more SMs, higher clock, or newer architecture with higher TC throughput). Lowering precision (FP16→INT8) is the cheapest first move IF not already INT8. Shrinking the model or using `nvinfer.interval` to skip frames also unlocks capacity at the cost of accuracy / temporal resolution. |
-| **DECODE_BOUND** | A GPU with more NVDEC engines (counts vary widely — datacenter cards usually have more). Lowering input resolution or switching codec (H265 is slightly cheaper to decode than its H264 equivalent on most hardware) also helps. Pre-decoding to disk is an option for offline workloads. |
-| **MEMORY_BW_BOUND** | A GPU with higher memory bandwidth (HBM-class cards). INT8 weights help (halve weight bytes). Smaller model or lower input resolution shrinks the working set. |
-| **TRACKER_BOUND** | Switch to the perf-tuned tracker preset (R4). If already on max-perf preset and still bound, drop tracker resolution further or swap tracker algorithm (NvDCF→IOU). |
-| **SYNC_BOUND** | Investigate threading / blocking-sync; rarely fixed by hardware change. |
-
-**The skill must explicitly say which ceiling is dominating** so the user knows whether
-upgrading to a larger compute GPU or one with more NVDECs is the right purchase. The skill
-cannot run on a hypothetical larger GPU itself — its job is to identify the bottleneck and
-project the remediation.
-
-## Sanity checks the skill must run after applying R1–R5
-
-Before launching Stage 5:
-
-1. `nvstreammux.batch-size == nvinfer.batch-size` — else BATCH_MISMATCH; fix.
-2. `nvinfer.model-engine-file` exists on disk — else the first run will rebuild and pollute
-   the profile. Pre-build:
-
-   ```bash
-   # Trigger engine build once outside profiling
-   gst-launch-1.0 fakesrc num-buffers=10 ! nvinfer config-file-path=<path> ! fakesink
-   ```
-3. `nvbuf-memory-type == 0` everywhere it applies — else memcpy dominates.
-4. If `network-mode=1`, the calibration file exists and matches the model architecture.
-5. All queue `leaky` values match the rules above.
-
-If any check fails, fix and re-run before profiling.
+Verify the selected artifacts and supported shapes, required output branches,
+queue ordering/bounds, and native plugin/library origins. Separate startup/build
+time from steady-state evidence without hiding startup failures. Stop on a
+failed prerequisite and report it; do not rewrite the graph to bypass it.

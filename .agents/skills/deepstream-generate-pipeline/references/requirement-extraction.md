@@ -3,11 +3,11 @@
 Detailed lookup tables, the full `AskUserQuestion` question bank, and the
 extraction/question-reduction examples for **Step 1 — Collect Pipeline
 Requirements** of the DeepStream Pipeline Builder skill. SKILL.md instructs the
-agent to read this file before performing Step 1; apply everything here exactly.
+agent to read this file before performing Step 1; apply the task and repository scope before these examples.
 
 ---
 
-**First, extract what you already know from the user's query.** Parse the original request for any parameters that are obvious — do NOT re-ask what's already clear. Be aggressive about inferring from context: if the user says "infer on 3 videos and display" you already know input type (video), num sources (3), inference (primary), and sink (display) — that's 4 out of 7 parameters resolved without asking.
+**First, resolve what is known from the request, checkout/configuration, and installed environment.** Parse the original request for any parameters that are obvious — do NOT re-ask what's already clear. Be aggressive about inferring from context: if the user says "infer on 3 videos and display" you already know input type (video), num sources (3), inference (primary), and sink (display) — that's 4 out of 7 parameters resolved without asking.
 
 | If the query mentions... | You already know |
 | --- | --- |
@@ -43,13 +43,21 @@ agent to read this file before performing Step 1; apply everything here exactly.
 > - *"rotate 90 clockwise, infer on 2 videos and display"* → Input = video, Num = 2, Inference = primary, Sink = display, Extras = rotate flip-method=3 (placed after muxer, before infer)
 > - *"infer on video and flip horizontally"* → Input = video, Num = 1, Inference = primary, Extras = rotate flip-method=4 (placed after muxer, before infer)
 
-Use `AskUserQuestion` to ask **only the remaining unknown parameters** in a single call. **Never re-ask a parameter that can be inferred from the query.** Skip any question whose answer is already clear.
+Use the available clarification tool for consequential unknowns only, respecting
+its question count and option limits. Skip questions answered by the task,
+configuration, or environment. The bank below supplies terminology; its first
+option is not evidence or automatic authorization. Do not assume an available
+tool named `AskUserQuestion`.
 
-> **Important:** Ask all unknown questions in one call. Do NOT ask one at a time. If every parameter is already inferable from the query, skip the question call entirely and jump to Step 2. For most user queries, you should be able to resolve 3–5 parameters automatically, leaving only 2–3 questions.
->
-> **Default-first ordering convention:** the first `option` in every question's `options` array is the **safe default** for that parameter (e.g. `Local video file` for input, `1` for num sources, `No tracker` for tracker, `Display on screen` for sink, `dGPU` for platform, `None` for extras). Most prompt UIs render the first option as the highlighted/initial selection, so a user who just hits Enter lands on a sensible choice. **Do not reorder** the options in the question bank below — preserving "default first" is part of the contract.
->
-> **Critical — never get stuck asking.** If the user rejects/dismisses the `AskUserQuestion` call (e.g. "Tool use rejected"), or replies *"just generate"* / *"use defaults"* / *"go ahead"* / *"skip"* / no answer, **immediately fall through to Step 2** using the **first option** of each unknown question as the parameter value. Do NOT re-ask the same questions in chat — that creates a loop and frustrates the user. The user can always refine afterwards by saying *"change to NvDCF"*, *"save as mp4"*, etc., once they see the generated pipeline. The flow is **ask once, then generate** — never ask twice.
+A dismissed question or no answer does not supply required source/model evidence.
+Continue independent work and state optional assumptions; keep dependent execution
+pending if required evidence is missing. If the user explicitly delegates an
+optional choice, choose within repository constraints and state the choice.
+
+The inference table and question-reduction examples below illustrate requests
+without checkout evidence. Preserve existing sinks, tracking, and other selected
+capabilities: mentioning performance does not authorize replacing output with a
+fakesink. Use fakesink only for a scoped isolated benchmark or requested new graph.
 
 Below is the **full question bank** — include only the questions you actually need:
 

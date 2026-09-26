@@ -132,14 +132,15 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
    **Symptom of mismatch**: If `cluster-mode: 2` is used with a post-NMS `[N, 6]` output, bounding boxes appear shifted by 45° or 135° from the actual objects (DeepStream's NMS incorrectly re-processes already-final coordinates).
    If you see tilted or rotated boxes, also check the OBB / `rotation_angle` note in `references/nvinfer_config.md`: for non-OBB models, value-initialize `NvDsInferObjectDetectionInfo` with `obj{}` and keep `rotation_angle = 0`; plain `NvDsInferObjectDetectionInfo obj;` leaves fields uninitialized.
 
-14. **Virtual Environment Must Include pyservicemaker**: `pyservicemaker` is installed system-wide but is NOT accessible from a standard Python virtual environment. When a task requires a venv (e.g., for model download/conversion pip dependencies), **always install `pyservicemaker` and `pyyaml` inside the venv**; do not rewrite pyservicemaker pipeline code into non-pyservicemaker code to work around a missing import. The venv setup in generated code and README must always include:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install /opt/nvidia/deepstream/deepstream-9.1/service-maker/python/pyservicemaker*.whl pyyaml
-    pip install -r DS9/requirements-runtime.txt
-    ```
-    **Symptom if missing**: `ModuleNotFoundError: No module named 'pyservicemaker'` when running the app inside the venv.
+14. **Use the task's selected environment**: Reuse the configured native runtime
+    environment for SDK execution and verify its interpreter and import origins
+    before repairing dependencies. A download or model-conversion utility needs
+    only its own dependencies; it does not require Service Maker or the entire
+    runtime requirements set unless it also executes SDK/runtime code. If the
+    selected SDK environment lacks `pyservicemaker`, install the matching native
+    DS9.1 wheel there within the authorized setup scope. Do not rewrite pipeline
+    code to another API merely to bypass a missing import. See
+    [native setup](references/native_host_setup.md#python-virtual-environment).
 
 ## Key Paths
 

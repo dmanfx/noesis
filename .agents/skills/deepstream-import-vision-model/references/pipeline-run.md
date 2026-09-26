@@ -1,85 +1,36 @@
+# DeepStream integration and optional benchmark — Steps 6–7
 
-# DS Run Pipeline -- Steps 6-7
+Use the selected engine to validate the requested detector integration. Engine
+capacity exploration and full reports are independent optional phases.
 
-Integrate a TensorRT model into DeepStream with parser, validation, and multi-stream benchmarks.
+## Preflight: explicit artifacts and supported shapes
 
-The model directory is: `$ARGUMENTS`
+Read the build result and consumer configuration. Resolve `MODEL_NAME`,
+`MODEL_FILENAME`, the exact `ONNX_FILE` and `ENGINE`, input dimensions `H`/`W`,
+labels/`NUM_LABELS`, parser names, and model preprocessing. Do not pick the first
+wildcard engine or infer a shape contract solely from its filename. No trtexec
+capacity log or `PEAK_GPU_STREAMS` value is required for Step 6.
 
-## Pre-flight: Extract Variables
+Use the native host build environment and CUDA 13.2; verify the installed stack
+with the repository's host scripts. Do not auto-select the newest CUDA directory
+or fall back to another release. Reuse the selected Python environment for the
+inspection's actual dependencies.
 
-```bash
-[ -z "$ARGUMENTS" ] && { echo "ERROR: No model directory provided. Usage: /deepstream-import-vision-model models/<model_name>/"; exit 1; }
-MODEL_DIR="${ARGUMENTS%/}"
-MODEL_NAME=$(basename "$MODEL_DIR")
+Select `VIDEO` from the task and its expected detection behavior. When no source
+is supplied, the vendor sample is
+`/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4`; verify its
+presence and relevant target content before treating it as a positive fixture.
+Keep negative frames as valid input. Choose a bounded duration/frame range and
+fresh output directory so older files cannot satisfy a check.
 
-# Find ONNX file (exclude _dynamic variants created during export)
-ONNX_FILE=$(ls models/$MODEL_NAME/model/*.onnx 2>/dev/null | grep -v '_dynamic' | head -1)
-[ -z "$ONNX_FILE" ] && { echo "ERROR: No ONNX file found in models/$MODEL_NAME/model/ — run Steps 1-3 first (references/model-acquire.md)"; exit 1; }
-MODEL_FILENAME=$(basename "$ONNX_FILE" .onnx)
+Set `SMOKE_BS` from the verified engine and consumer contract. The single-stream
+vendor helpers require batch 1; if the engine does not support it, use a bounded
+consumer at a supported batch without changing the engine to suit a helper.
 
-# Find TRT engine from nv-engine-build
-ENGINE=$(ls models/$MODEL_NAME/benchmarks/engines/*_dynamic_b*.engine 2>/dev/null | head -1)
-[ -z "$ENGINE" ] && { echo "ERROR: No engine found in models/$MODEL_NAME/benchmarks/engines/ — run Steps 4-5 first (references/engine-build.md)"; exit 1; }
-MAX_BS=$(echo "$ENGINE" | grep -oP '_b\K[0-9]+(?=\.engine)')
-
-# Read PEAK_GPU_STREAMS from trtexec Step 5b log — fixed filename, no timestamp, no wildcard
-TRTEXEC_LOG="models/$MODEL_NAME/benchmarks/b${MAX_BS}/trtexec_b${MAX_BS}.log"
-[ -f "$TRTEXEC_LOG" ] || { echo "ERROR: trtexec log not found at $TRTEXEC_LOG — run Steps 4-5 first (references/engine-build.md)"; exit 1; }
-QPS_BS_MAX=$(grep -oP 'Throughput:\s*\K[0-9.]+' "$TRTEXEC_LOG" | tail -1)
-read IMGS_PER_SEC PEAK_GPU_STREAMS < <(python3 -c "
-import math
-imgs = float('$QPS_BS_MAX') * $MAX_BS
-print(round(imgs, 2), int(math.floor(imgs / 30)))
-")
-
-# Read spatial dimensions from ONNX inspection
-INSPECT_OUT=$(python3 skills/deepstream-import-vision-model/scripts/model/inspect-onnx.py "$ONNX_FILE")
-INPUT_NAME=$(echo "$INSPECT_OUT" | grep -oP 'input_name:\s*\K\S+')
-H=$(echo "$INSPECT_OUT"          | grep -oP 'height:\s*\K[0-9]+')
-W=$(echo "$INSPECT_OUT"          | grep -oP 'width:\s*\K[0-9]+')
-[ -z "$INPUT_NAME" ] && { echo "ERROR: could not parse INPUT_NAME from inspect output"; exit 1; }
-[ -z "$H" ]          && { echo "ERROR: could not parse H — dynamic spatial dims? Set H manually"; exit 1; }
-[ -z "$W" ]          && { echo "ERROR: could not parse W — dynamic spatial dims? Set W manually"; exit 1; }
-
-# Detect installed CUDA version for parser compilation
-CUDA_VER=$(ls /usr/local/ 2>/dev/null | grep -oP '^cuda-\K[0-9]+\.[0-9]+$' | sort -V | tail -1)
-[ -z "$CUDA_VER" ] && CUDA_VER=12.8
-echo "CUDA_VER=$CUDA_VER"
-
-# Count labels
-[ -f "models/$MODEL_NAME/config/labels.txt" ] || { echo "ERROR: labels.txt not found — run Steps 1-3 first (references/model-acquire.md)"; exit 1; }
-NUM_LABELS=$(wc -l < models/$MODEL_NAME/config/labels.txt)
-
-# Parser function suffix: PascalCase of MODEL_NAME, sanitized for C++ identifiers
-# e.g. yolov8n→Yolov8n  rtdetr-l→RtdetrL  grounding-dino-base→GroundingDinoBase
-PARSER_FUNC_SUFFIX=$(python3 -c "
-import re
-parts = re.sub(r'[^a-zA-Z0-9]', ' ', '$MODEL_NAME').split()
-print(''.join(p.capitalize() for p in parts))
-")
-# Sanitize MODEL_NAME for use in C++ source/library filenames — mirrors PARSER_FUNC_SUFFIX logic.
-# e.g. rtdetr-l → rtdetr_l  grounding-dino-base → grounding_dino_base
-MODEL_NAME_SAFE=$(echo "$MODEL_NAME" | tr -c 'A-Za-z0-9' '_')
-
-# Video source — default is sample_720p.mp4 (MANDATORY). Never autonomously substitute
-# sample_1080p_h264.mp4 or any other file. DS_VIDEO may only be set when the user explicitly
-# provides a custom video path; it is not a licence to pick a different resolution.
-VIDEO="${DS_VIDEO:-/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4}"
-[ -f "$VIDEO" ] || {
-  echo "ERROR: Video file not found: $VIDEO"
-  echo "  Fix 1: Set DS_VIDEO=/path/to/sample_720p.mp4 before running"
-  echo "  Fix 2: Install DeepStream samples"
-  exit 1
-}
-
-echo "Model:            $MODEL_NAME"
-echo "ONNX:             $ONNX_FILE  (input=$INPUT_NAME, ${H}x${W})"
-echo "Engine:           $ENGINE  (MAX_BS=$MAX_BS)"
-echo "PEAK_GPU_STREAMS: $PEAK_GPU_STREAMS  (floor($IMGS_PER_SEC img/s / 30))"
-echo "Labels:           $NUM_LABELS classes"
-```
-
-> All subsequent commands use these variables — never hardcoded paths or template placeholders.
+The parser/config examples below are starting points. Verify model-specific
+activation, decoding, normalization, output shape and class semantics against
+its exporter and real fixture tensors; model-family names or random inputs alone
+do not establish correctness.
 
 ## Step 6: DeepStream Integration
 
@@ -170,7 +121,7 @@ model = '$MODEL_NAME'
 model_safe = '$MODEL_NAME_SAFE'
 content = (
     "DEEPSTREAM_DIR ?= /opt/nvidia/deepstream/deepstream\n"
-    "CUDA_VER ?= 12.8\n"
+    "CUDA_VER ?= 13.2\n"
     "CC := g++\n"
     "CFLAGS := -Wall -std=c++11 -shared -fPIC\n"
     "CFLAGS += -I\$(DEEPSTREAM_DIR)/sources/includes -I/usr/local/cuda-\$(CUDA_VER)/include\n"
@@ -211,10 +162,10 @@ gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
 onnx-file=../model/${MODEL_FILENAME}.onnx
-model-engine-file=../benchmarks/engines/${MODEL_FILENAME}_dynamic_b${MAX_BS}.engine
+model-engine-file=${ENGINE_FROM_CONFIG}
 labelfile-path=labels.txt
-batch-size=1
-network-mode=2
+batch-size=${SMOKE_BS}
+network-mode=${NETWORK_MODE}
 num-detected-classes=${NUM_LABELS}
 process-mode=1
 interval=0
@@ -235,6 +186,9 @@ EOF
 ```
 
 > **Path note**: All paths are relative to the `config/` directory where this file lives.
+> `ENGINE_FROM_CONFIG` is the exact selected engine path relative to that directory;
+> `SMOKE_BS` is supported by both engine and smoke consumer. `NETWORK_MODE` matches
+> the selected engine precision. Resolve these before writing the config.
 > `net-scale-factor` defaults to `1/255` — update to `1.0` if the model expects 0–255 input (verify via Step 6a).
 
 Verify label count matches:
@@ -242,288 +196,61 @@ Verify label count matches:
 echo "labels.txt: $NUM_LABELS classes -> num-detected-classes=$NUM_LABELS"
 ```
 
-### 6f: Single-Stream Visual Validation
+### 6f: Bounded visual and metadata validation
 
-> **ENCODER RULE:**
-> Primary encoder is `nvv4l2h264enc` (NVENC via V4L2) → `.mp4`. `x264enc` and `openh264enc` are **prohibited**.
-> On systems where `/dev/v4l2-nvenc` is unavailable, the approved fallback is `theoraenc + oggmux`
-> (LGPL; both ship in gst-plugins-base) → `.ogv`. If `theoraenc`/`oggmux` are absent, video creation is skipped.
-> Use `skills/deepstream-import-vision-model/scripts/deepstream/ds-single-stream.sh` which handles this automatically
-> and emits a `DS_SINGLE_STREAM_MODE=` marker the report parser reads.
+Run the configured producer and its direct metadata/media consumer with the
+selected fixture. Inspect the vendor helper before using it: only its canonical
+NVENC path is allowed on Noesis. No `theoraenc`, `x264enc`, or `openh264enc`
+fallback is authorized. Missing NVENC is a canonical-path failure; report the
+affected check as failed/incomplete and retain independently valid metadata
+checks. Do not silently substitute a different validation pipeline after a crash.
 
-**Primary (NVENC available):**
+Confirm source/frame progress and the run's exit status. Extract a bounded
+sample of the **exact output from this run**, including known positive and
+negative frames. Check labels, finite confidence/coordinates, frame geometry,
+and class/box placement through the direct consumer.
 
-```bash
-mkdir -p models/$MODEL_NAME/samples
+### 6g: Detection validity and fixture expectations
 
-GST_DEBUG=1 gst-launch-1.0 \
-  filesrc location=$VIDEO ! \
-  qtdemux ! queue leaky=downstream ! h264parse ! queue ! nvv4l2decoder ! queue ! \
-  m.sink_0 nvstreammux name=m batch-size=1 width=1280 height=720 ! queue ! \
-  nvinfer config-file-path=models/$MODEL_NAME/config/config_infer_primary_${MODEL_NAME}.txt ! queue ! \
-  nvvideoconvert ! 'video/x-raw(memory:NVMM),format=RGBA' ! \
-  nvdsosd ! nvvideoconvert ! 'video/x-raw(memory:NVMM),format=NV12' ! \
-  nvv4l2h264enc ! h264parse ! mp4mux ! \
-  filesink location=models/$MODEL_NAME/samples/${MODEL_NAME}_output.mp4 sync=0
-```
+Follow [detection-validation.md](detection-validation.md). A detection-bearing
+frame fraction is descriptive; there is no universal 90% occupancy gate.
+Positive fixture behavior must still be demonstrated before declaring the new
+detector integration validated.
 
-**Fallback (NVENC unavailable — `/dev/v4l2-nvenc` missing, `theoraenc`/`oggmux` present):**
+`gie-kitti-output-dir` belongs in the `deepstream-app` `[application]` section,
+not an `nvinfer` config. The skill's `scripts/deepstream/ds-kitti-dump.sh` helper
+creates that application config. Inspect its run/timeout behavior and verify
+frame progress independently: output-file count is not a substitute for a
+successful run or processed-frame coverage. Use a fresh output directory and a
+source range whose expected target presence is established.
 
-Output extension switches from `.mp4` to `.ogv` (Ogg/Theora container). `theoraenc` consumes planar `I420`, not `NV12`.
+Missing files require inspection of application progress, writer configuration,
+and writer semantics. Empty files can represent valid negative frames. A
+known-positive mismatch requires investigation of source/preprocessing, tensor
+semantics, thresholds, parser and downstream writer evidence; it does not by
+itself identify a broken parser. Keep the integration incomplete until the
+expected behavior is demonstrated, without guessing a repair.
 
-```bash
-GST_DEBUG=1 gst-launch-1.0 \
-  filesrc location=$VIDEO ! \
-  qtdemux ! queue leaky=downstream ! h264parse ! queue ! nvv4l2decoder ! queue ! \
-  m.sink_0 nvstreammux name=m batch-size=1 width=1280 height=720 ! queue ! \
-  nvinfer config-file-path=models/$MODEL_NAME/config/config_infer_primary_${MODEL_NAME}.txt ! queue ! \
-  nvvideoconvert ! nvdsosd ! nvvideoconvert ! \
-  "video/x-raw, format=I420" ! theoraenc quality=48 ! oggmux ! \
-  filesink location=models/$MODEL_NAME/samples/${MODEL_NAME}_output.ogv sync=0
-```
+## Step 7: Optional application benchmark
 
-Extract a frame to visually confirm bounding boxes — auto-detect which output file exists:
+Only run when requested. Route to
+[the profiling skill](../../deepstream-profile-pipeline/SKILL.md) and the bounds in
+[engine-build.md](engine-build.md#step-5--optional-bounded-benchmark). Start from
+the actual consumer/source configuration and preserve enabled outputs and
+quality settings. Record finite run counts, duration, stream/batch ceilings,
+rebuild and resource budgets before any sweep. Do not equate stream count with
+engine maximum batch or infer capacity from one aggregate FPS value.
 
-```bash
-SAMPLE_OUT=$(ls models/$MODEL_NAME/samples/${MODEL_NAME}_output.{mp4,ogv} 2>/dev/null | head -1)
+Legacy benchmark helpers may strip output stages or assume batch equals source
+count. Inspect those assumptions before use; an isolated run measures only that
+variant. Report end-to-end per-source progress, encoded cadence/drops, and WebRTC
+decoded frames separately where those paths are in scope. Every claimed source
+must meet the requested FPS with the expected detections and outputs.
 
-case "$SAMPLE_OUT" in
-  *.mp4)
-    gst-launch-1.0 \
-      filesrc location="$SAMPLE_OUT" ! \
-      qtdemux ! h264parse ! nvv4l2decoder ! videoconvert ! "video/x-raw,format=RGB" ! \
-      jpegenc quality=95 ! \
-      multifilesink location=models/$MODEL_NAME/samples/frame_%04d.jpg max-files=3
-    ;;
-  *.ogv)
-    gst-launch-1.0 \
-      filesrc location="$SAMPLE_OUT" ! \
-      oggdemux ! theoradec ! videoconvert ! "video/x-raw,format=RGB" ! \
-      jpegenc quality=95 ! \
-      multifilesink location=models/$MODEL_NAME/samples/frame_%04d.jpg max-files=3
-    ;;
-esac
-```
+## Delivery
 
-If **no detections appear**, the most common cause is wrong `net-scale-factor` — update the config and re-run.
-
-### 6g: KITTI Dump — Verify Detections Programmatically
-
-Run a KITTI dump to confirm detections exist before multi-stream benchmarks.
-
-> **Note:** `gie-kitti-output-dir` is a `deepstream-app` `[application]`
-> property — it is **not** read by `nvinfer` directly. Appending it to the
-> nvinfer config and running a `gst-launch-1.0 ... nvinfer ...` pipeline
-> silently produces zero KITTI files. Use the `ds-kitti-dump.sh` helper,
-> which wraps `deepstream-app` with the correct `[application]` section.
-
-```bash
-mkdir -p models/$MODEL_NAME/samples/kitti_output
-
-bash skills/deepstream-import-vision-model/scripts/deepstream/ds-kitti-dump.sh \
-  models/$MODEL_NAME/config/config_infer_primary_${MODEL_NAME}.txt \
-  models/$MODEL_NAME/samples/kitti_output \
-  100 \
-  "$VIDEO"
-
-# Summarise detection results
-KITTI_FILES=$(ls models/$MODEL_NAME/samples/kitti_output/*.txt 2>/dev/null | wc -l)
-echo "KITTI frames written: $KITTI_FILES"
-echo "Top detected classes:"
-cat models/$MODEL_NAME/samples/kitti_output/*.txt 2>/dev/null \
-  | awk '{print $1}' | sort | uniq -c | sort -rn | head -10
-```
-
-**Validation gate**: If `KITTI_FILES == 0` or all files are empty, detections are broken. Do NOT proceed to Step 7.
-
-```bash
-# MANDATORY hard stop — do not comment out or remove this check
-if [ "$KITTI_FILES" -eq 0 ]; then
-  echo "ERROR: KITTI validation FAILED — zero detection files written."
-  echo "Fix net-scale-factor, parser output format, or config before retrying."
-  echo "Do NOT proceed to Step 7 benchmarks with broken detections."
-  exit 1
-fi
-FRAMES_WITH_DETECTIONS=$(grep -rl '.' models/$MODEL_NAME/samples/kitti_output/ 2>/dev/null | wc -l)
-DETECTION_RATE=$(python3 -c "print(round($FRAMES_WITH_DETECTIONS/$KITTI_FILES*100,1))")
-echo "Detection rate: $FRAMES_WITH_DETECTIONS / $KITTI_FILES frames = ${DETECTION_RATE}%"
-if python3 -c "exit(0 if $FRAMES_WITH_DETECTIONS/$KITTI_FILES >= 0.9 else 1)"; then
-  echo "KITTI validation PASSED (>= 90% frames with detections)"
-else
-  echo "ERROR: Detection rate ${DETECTION_RATE}% < 90% threshold. Fix parser before proceeding."
-  exit 1
-fi
-```
-
-```bash
-STEP6_END=$(date +%s.%N)
-STEP6_DURATION=$(echo "$STEP6_END - $STEP6_START" | bc)
-echo "[Step 6] completed in ${STEP6_DURATION}s"
-```
-
-### DeepStream Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| Zero detections | Wrong `net-scale-factor` — check model family table in Step 6a |
-| Engine rebuilds every run | `model-engine-file` path wrong — verify relative path from `config/` |
-| Parser crash | Output tensor shape mismatch — re-check Step 6a output shapes |
-| Wrong bounding box positions | Grid/stride decoding mismatch — verify model architecture docs |
-| `"layers num: 0"` | Harmless for dynamic-shape engines — do not debug |
-| deepstream-app segfaults | Use `gst-launch-1.0` instead (transformer models) |
-
-## Step 7: Multi-Stream DeepStream Benchmark
-
-### 7b: Create DS Benchmark Config
-
-Create one nvinfer config for all DS benchmark runs. `batch-size` is overridden at runtime via the nvinfer GStreamer element property:
-
-```bash
-mkdir -p models/$MODEL_NAME/benchmarks/ds
-
-cat > models/$MODEL_NAME/benchmarks/ds/config_infer_ds_${MODEL_NAME}.txt << EOF
-[property]
-gpu-id=0
-net-scale-factor=0.00392156862745098
-model-color-format=0
-onnx-file=../../model/${MODEL_FILENAME}.onnx
-model-engine-file=../engines/${MODEL_FILENAME}_dynamic_b${MAX_BS}.engine
-labelfile-path=../../config/labels.txt
-batch-size=${MAX_BS}
-network-mode=2
-num-detected-classes=${NUM_LABELS}
-process-mode=1
-interval=0
-gie-unique-id=1
-network-type=0
-custom-lib-path=../../parser/libnvdsinfer_${MODEL_NAME_SAFE}_parser.so
-parse-bbox-func-name=NvDsInferParseCustom${PARSER_FUNC_SUFFIX}
-# 2=DeepStream NMS (dense heads: YOLO, SSD). Use 4 if engine has fused NMS output
-cluster-mode=2
-infer-dims=3;${H};${W}
-maintain-aspect-ratio=1
-
-[class-attrs-all]
-topk=200
-nms-iou-threshold=0.45
-pre-cluster-threshold=0.25
-EOF
-```
-
-> **Path note**: Paths are relative to `benchmarks/ds/` where this config lives.
-
-### Queue Placement Rules (MANDATORY)
-
-Every pipeline stage must be separated by `queue` elements. Use `leaky=downstream` after `qtdemux` to drop excess frames under GPU saturation; all other queues use no leaky setting (threading only). Always set `batched-push-timeout=-1` on `nvstreammux`. **Never include** `nvmultistreamtiler`, `nvdsosd`, or extra `nvvideoconvert` in benchmark runs — only use for single-stream visual validation (Step 6f).
-
-### 7c: Two-Run DS Benchmark
-
-Only **2 DS pipeline runs** characterise DS overhead vs trtexec.
-
-Both runs go through `deepstream-app` with `[application] enable-perf-measurement=1` (wrapped by `skills/deepstream-import-vision-model/scripts/deepstream/ds-perf-run.sh`). FPS is parsed from the canonical `**PERF:` lines DeepStream emits at the configured measurement interval. This replaces the older `gst-launch-1.0 ... ! fpsdisplaysink` path so the runtime no longer depends on `gstreamer1.0-plugins-bad`.
-
-> **PERF line format**: `**PERF: <fps_run> (<fps_avg>)` — one float per active source. The helper script averages the per-stream instantaneous FPS across the last few measurement windows; the parser below mirrors that contract.
-
-**DS Run 1 — Calibration at PEAK_GPU_STREAMS streams:**
-
-> **CRITICAL**: Use `$PEAK_GPU_STREAMS` directly. Do NOT pre-apply any efficiency discount (no ×0.6, ×0.7, etc.). Run 1 *measures* the real overhead — do not guess it.
-
-> Log filenames are **fixed** — no timestamp variation. Always `ds_s${N}_run1.log` and `ds_s${N}_run2.log` in `benchmarks/ds/`. The nv-import-vision-model-report skill reads these exact paths.
-
-```bash
-# Hard constraint: num_streams <= engine max batch size — always
-N=$(python3 -c "print(min($PEAK_GPU_STREAMS, $MAX_BS))")
-LOG_RUN1="models/$MODEL_NAME/benchmarks/ds/ds_s${N}_run1.log"
-
-STEP7_RUN1_START=$(date +%s.%N)
-bash skills/deepstream-import-vision-model/scripts/deepstream/ds-perf-run.sh \
-  models/$MODEL_NAME/benchmarks/ds/config_infer_ds_${MODEL_NAME}.txt \
-  "$N" \
-  "$LOG_RUN1" \
-  "$VIDEO"
-
-FPS_RUN1=$(grep -oP '\*\*PERF:\s*\K[0-9.]+' "$LOG_RUN1" | tail -10 | python3 -c "
-import sys; vals=[float(l) for l in sys.stdin if l.strip()]; print(round(sum(vals)/len(vals),2) if vals else 0)")
-python3 -c "exit(0 if float('$FPS_RUN1') > 0 else 1)" || \
-  { echo "ERROR: FPS parsing failed for Run 1 — check $LOG_RUN1"; exit 1; }
-
-TOTAL_FPS_RUN1=$(python3 -c "print(round(float('$FPS_RUN1') * $N, 2))")
-RT_STREAMS=$(python3 -c "import math; print(min(int(math.floor(float('$TOTAL_FPS_RUN1') / 30)), $MAX_BS))")
-echo "DS Run 1: $N streams | FPS/stream=$FPS_RUN1 | total=$TOTAL_FPS_RUN1 img/s | RT_STREAMS=$RT_STREAMS"
-STEP7_RUN1_END=$(date +%s.%N)
-STEP7_RUN1_DURATION=$(echo "$STEP7_RUN1_END - $STEP7_RUN1_START" | bc)
-echo "[Step 7 Run 1] completed in ${STEP7_RUN1_DURATION}s"
-```
-
-**DS Run 2 — Validation at RT_STREAMS:**
-```bash
-N=$RT_STREAMS
-LOG_RUN2="models/$MODEL_NAME/benchmarks/ds/ds_s${N}_run2.log"
-
-STEP7_RUN2_START=$(date +%s.%N)
-bash skills/deepstream-import-vision-model/scripts/deepstream/ds-perf-run.sh \
-  models/$MODEL_NAME/benchmarks/ds/config_infer_ds_${MODEL_NAME}.txt \
-  "$N" \
-  "$LOG_RUN2" \
-  "$VIDEO"
-
-FPS_RUN2=$(grep -oP '\*\*PERF:\s*\K[0-9.]+' "$LOG_RUN2" | tail -10 | python3 -c "
-import sys; vals=[float(l) for l in sys.stdin if l.strip()]; print(round(sum(vals)/len(vals),2) if vals else 0)")
-python3 -c "exit(0 if float('$FPS_RUN2') > 0 else 1)" || \
-  { echo "ERROR: FPS parsing failed for Run 2 — check $LOG_RUN2"; exit 1; }
-
-TOTAL_FPS_RUN2=$(python3 -c "print(round(float('$FPS_RUN2') * $N, 2))")
-RT_CONFIRMED=$(python3 -c "print('YES' if float('$FPS_RUN2') >= 30 else 'NO')")
-echo "DS Run 2: $N streams | FPS/stream=$FPS_RUN2 | total=$TOTAL_FPS_RUN2 img/s | Real-time: $RT_CONFIRMED"
-STEP7_RUN2_END=$(date +%s.%N)
-STEP7_RUN2_DURATION=$(echo "$STEP7_RUN2_END - $STEP7_RUN2_START" | bc)
-echo "[Step 7 Run 2] completed in ${STEP7_RUN2_DURATION}s"
-```
-
-> **NVDEC saturation on fast nano models**: very fast models (YOLO-nano family, etc.) can saturate NVDEC before GPU. Symptom: DS aggregate FPS plateaus at the same value regardless of stream count (e.g., 6,976 at 128 streams, 7,060 at 200 streams). In this case, `PEAK_GPU_STREAMS` from trtexec is an overestimate — Run 1 at that count will show fps/stream well below 30. The `RT_STREAMS = floor(TOTAL_FPS_RUN1 / 30)` formula above produces the correct NVDEC-limited ceiling. Do not pre-apply an efficiency factor to `PEAK_GPU_STREAMS` to compensate — the 2-run method measures overhead, it does not guess it.
-
-**If Run 2 is still not real-time** (FPS/stream < 30): halve RT_STREAMS and retry once:
-```bash
-if [ "$RT_CONFIRMED" = "NO" ]; then
-  RT_STREAMS=$(python3 -c "import math; print(max(1, int(math.floor($RT_STREAMS / 2))))")
-  echo "Run 2 not real-time — retrying at $RT_STREAMS streams"
-  N=$RT_STREAMS
-  LOG_RUN2="models/$MODEL_NAME/benchmarks/ds/ds_s${N}_run2.log"
-  bash skills/deepstream-import-vision-model/scripts/deepstream/ds-perf-run.sh \
-    models/$MODEL_NAME/benchmarks/ds/config_infer_ds_${MODEL_NAME}.txt \
-    "$N" \
-    "$LOG_RUN2" \
-    "$VIDEO"
-  FPS_RUN2=$(grep -oP '\*\*PERF:\s*\K[0-9.]+' "$LOG_RUN2" | tail -10 | python3 -c "
-import sys; vals=[float(l) for l in sys.stdin if l.strip()]; print(round(sum(vals)/len(vals),2) if vals else 0)")
-  TOTAL_FPS_RUN2=$(python3 -c "print(round(float('$FPS_RUN2') * $N, 2))")
-  RT_CONFIRMED=$(python3 -c "print('YES' if float('$FPS_RUN2') >= 30 else 'NO')")
-  echo "Retry: $N streams | FPS/stream=$FPS_RUN2 | Real-time: $RT_CONFIRMED"
-fi
-```
-
-**CONSTRAINT**: `num_streams <= engine_max_bs` always. Already enforced above via `min(RT_STREAMS, MAX_BS)`.
-
-```bash
-TRTEXEC_QPS=$(grep -oP 'Throughput:\s*\K[0-9.]+' "$TRTEXEC_LOG" | tail -1)
-TRTEXEC_IMGS=$(python3 -c "print(round(float('$TRTEXEC_QPS') * $MAX_BS, 2))")
-DS_EFF_RUN1=$(python3 -c "print(round(float('$TOTAL_FPS_RUN1') / float('$TRTEXEC_IMGS') * 100, 1))")
-DS_EFF_RUN2=$(python3 -c "print(round(float('$TOTAL_FPS_RUN2') / float('$TRTEXEC_IMGS') * 100, 1))")
-```
-
-## Timing and Output Summary
-
-```bash
-TOTAL_67_DURATION=$(echo "$STEP6_DURATION + $STEP7_RUN1_DURATION + $STEP7_RUN2_DURATION" | bc)
-```
-
-When complete, print:
-```
-=== DeepStream Integration Complete ===
-Model: $MODEL_NAME | Engine: $ENGINE
-trtexec: $TRTEXEC_IMGS img/s @ BS=$MAX_BS
-DS Run 1 (PEAK): $PEAK_GPU_STREAMS streams | $FPS_RUN1 fps/s | eff $DS_EFF_RUN1%
-DS Run 2 (RT):   $RT_STREAMS streams | $FPS_RUN2 fps/s | RT: $RT_CONFIRMED | eff $DS_EFF_RUN2%
-Timing: Step6=${STEP6_DURATION}s Run1=${STEP7_RUN1_DURATION}s Run2=${STEP7_RUN2_DURATION}s Total=${TOTAL_67_DURATION}s
-Ready for: Step 8 — read references/report-generation.md models/$MODEL_NAME/
-```
+Report the exact engine/parser/config, fixture and frame range, checks completed,
+remaining failures and unmeasured phases. Benchmark/report generation is not a
+prerequisite for successful scoped integration. Conversely, throughput or an
+output file alone cannot establish detector correctness. Continue to the report
+reference only if a report was requested; populate it with measured facts.

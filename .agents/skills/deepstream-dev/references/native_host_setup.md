@@ -20,8 +20,15 @@ DeepStream release.
 
 ## Python virtual environment
 
-When a task needs an isolated environment, install the repository runtime
-requirements and the Service Maker wheel from the native SDK:
+First reuse the environment selected by the native supervisor or the task's
+build/conversion configuration. Verify `sys.executable` and the imported module
+origin in that interpreter. Do not create a second environment to repair an
+unverified import failure.
+
+Download/conversion utilities install only the dependencies needed by that
+utility. Service Maker and the full runtime requirements are needed only when
+the environment executes SDK/runtime code. If a new runtime environment is
+required within the task's scope, its setup includes:
 
 ```bash
 python3 -m venv venv
@@ -61,7 +68,8 @@ smoke.
 
 ## Common setup failure
 
-If a virtual environment reports `No module named 'pyservicemaker'`, install
-the wildcard wheel from the DeepStream 9.1 Service Maker directory shown
-above. Do not rewrite the pipeline to a different API to bypass the missing
-wheel.
+If SDK execution reports `No module named 'pyservicemaker'`, first confirm that
+the command uses the selected native runtime interpreter. If that environment
+lacks the module, install its matching wheel from the native DeepStream 9.1
+Service Maker directory shown above. Verify the import origin afterward. Do not
+rewrite the pipeline to a different API to bypass the missing wheel.

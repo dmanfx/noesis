@@ -75,7 +75,7 @@ def _bundle(
     video: Path, *, acquisition_mapping: bool = True, tamper: str | None = None,
     paired: bool = False, calibrated: bool = False,
     stabilization_modes: tuple[Any, Any] = (0, 0),
-    motion_evidence: bool = False,
+    motion_evidence: bool = False, physical_output: bool = False,
 ) -> bytes:
     manifest = _manifest(acquisition_mapping=acquisition_mapping)
     if calibrated:
@@ -126,6 +126,14 @@ def _bundle(
          "ois_mode": stabilization_modes[0], "eis_mode": stabilization_modes[1]}
         for index, timestamp in enumerate(times)
     ]
+    if physical_output:
+        manifest["camera"]["id"] = "5"
+        result["camera"].update(id="5", logical_camera_id="0")
+        for row in camera_rows:
+            row.update(result_camera_id="5", active_physical_camera_id="5",
+                       output_physical_camera_id="5", metadata_source="physical_output_capture_result",
+                       logical_active_physical_camera_id="2",
+                       logical_capture_result={"result_camera_id": "0", "sensor_timestamp_ns": row["sensor_timestamp_ns"] + 100_000})
     if motion_evidence:
         for row in camera_rows:
             row["exposure_time_ns"] = 10_000_000
@@ -199,6 +207,20 @@ def test_android_calibrated_admission_uses_verified_timing_and_actual_modes(
     assert original["clocks"]["timestamp_source"] == "unverified"
 
 
+def test_physical_output_import_uses_exact_output_timestamps_and_retains_logical_evidence(tmp_path, encoded_video):
+    archive = tmp_path / "physical-output.zip"
+    archive.write_bytes(_bundle(encoded_video, physical_output=True))
+    report = import_capture_bundle(archive, tmp_path / "scan")
+    assert report["android_capture"]["camera_acquisition_timestamp_verified"] is True
+    assert report["manifest"]["camera"]["id"] == "5"
+    assert report["metric_vio_allowed"] is False
+    raw = tmp_path / "scan/capture"
+    assert json.loads((raw / "video_timestamps_ns.json").read_text()) == FRAME_TIMES
+    rows = [json.loads(line) for line in (raw / "camera_results.jsonl").read_text().splitlines()]
+    assert all(row["result_camera_id"] == "5" for row in rows)
+    assert rows[0]["logical_capture_result"]["sensor_timestamp_ns"] == FRAME_TIMES[0] + 100_000
+
+
 def test_unknown_android_calibration_remains_unknown() -> None:
     normalized = validate_capture_manifest(_manifest())
     assert normalized["camera"]["intrinsics"] is None
@@ -213,6 +235,47 @@ def test_unknown_android_calibration_remains_unknown() -> None:
     manifest["camera"]["distortion"] = [0.1]
     with pytest.raises(CaptureImportError, match="calibrated model"):
         validate_capture_manifest(manifest)
+
+
+def test_calibration_intent_is_retained_but_never_becomes_numeric_admission() -> None:
+    manifest = _manifest()
+    request = {"schema": "roomwalk.calibration_request.v1", "mode": "imu", "board": {"squares_x": 10}, "capture_id": CAPTURE_ID}
+    manifest["calibration_request"] = request
+    normalized = validate_capture_manifest(manifest)
+    assert normalized["calibration_request"] == request
+    assert normalized["calibration"]["complete_for_metric_vio"] is False
+    manifest["calibration_request"] = {**request, "capture_id": "another-device-take"}
+    with pytest.raises(CaptureImportError, match="different capture"):
+        validate_capture_manifest(manifest)
+
+
+def test_calibration_capture_skips_reconstruction_and_preserves_same_native_evidence(tmp_path, encoded_video):
+    from .roomwalk_calibration import DEFAULT_BOARD
+    request = {"schema": "roomwalk.calibration_request.v1", "mode": "camera", "board": DEFAULT_BOARD, "capture_id": CAPTURE_ID}
+    payload = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(_bundle(encoded_video))) as source, zipfile.ZipFile(payload, "w") as destination:
+        for item in source.infolist():
+            value = source.read(item)
+            if item.filename == "capture_manifest.json":
+                manifest = json.loads(value)
+                manifest["calibration_request"] = request
+                value = json.dumps(manifest).encode()
+            destination.writestr(item, value)
+        destination.writestr("calibration_request.json", json.dumps(request))
+    calls = []
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings, frame_processor=lambda *args: calls.append(args))) as client:
+        response = client.post("/api/scans/sensor-bundle", content=payload.getvalue(), headers={"Content-Type": "application/zip", "X-File-Name": "calibration.zip"})
+        assert response.status_code == 201, response.text
+        scan = response.json()
+        assert scan["status"] == "calibration_ready"
+        assert scan["capture"]["calibration_request"] == request
+        assert scan["capture"]["camera_acquisition_timestamp_verified"] is True
+        assert scan["capture"]["metric_vio_allowed"] is False
+    assert calls == []
+    capture = settings.storage_root / scan["id"] / "capture"
+    assert (capture / "camera.mp4").read_bytes() == encoded_video.read_bytes()
+    assert json.loads((capture / "calibration_request.json").read_text()) == request
 
 
 @pytest.mark.parametrize(

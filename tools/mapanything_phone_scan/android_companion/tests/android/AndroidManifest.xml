@@ -4,4 +4,7 @@
   <application android:label="RoomWalk pairing tests" android:debuggable="true" />
   <instrumentation android:name="org.noesis.roomwalk.PairedCaptureInstrumentation" android:targetPackage="org.noesis.roomwalk" android:functionalTest="true" />
   <instrumentation android:name="org.noesis.roomwalk.OrientationInstrumentation" android:targetPackage="org.noesis.roomwalk" android:functionalTest="true" />
+  <instrumentation android:name="org.noesis.roomwalk.WebShellInstrumentation" android:targetPackage="org.noesis.roomwalk" android:functionalTest="true" />
+  <instrumentation android:name="org.noesis.roomwalk.FocusRoutingInstrumentation" android:targetPackage="org.noesis.roomwalk" android:functionalTest="true" />
+  <instrumentation android:name="org.noesis.roomwalk.WalkModeInstrumentation" android:targetPackage="org.noesis.roomwalk" android:functionalTest="true" />
 </manifest>

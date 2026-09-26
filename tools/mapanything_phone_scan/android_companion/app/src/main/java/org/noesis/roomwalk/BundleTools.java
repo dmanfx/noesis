@@ -60,6 +60,10 @@ public final class BundleTools {
             JSONObject reference=readJson(paired);
             validatePairing(reference,dir.getName());manifest.put("companion_capture",reference);
         }
+        File calibration=new File(dir,"calibration_request.json");
+        if(calibration.isFile())manifest.put("calibration_request",readJson(calibration));
+        File walkIntent=new File(dir,"walk_intent.json");
+        if(walkIntent.isFile())manifest.put("walk_intent",WalkIntent.validate(readJson(walkIntent)));
         writeJson(new File(dir,"capture_manifest.json"),manifest);
     }
     private static String readText(InputStream in, int maximum) throws Exception {
@@ -78,7 +82,7 @@ public final class BundleTools {
         File manifest = new File(dir, "capture_manifest.json");
         File video = new File(dir, "camera.mp4");
         if (!manifest.isFile() || !video.isFile() || video.length() == 0) throw new IOException("No finished video bundle. Raw diagnostics remain on this phone.");
-        String[] names = {"capture_manifest.json","camera.mp4","accel.csv","gyro.csv","timestamps.csv","encoder_pts.csv","camera_results.jsonl","capture_result.json","capabilities.json",PairedCapture.FILE};
+        String[] names = {"capture_manifest.json","camera.mp4","accel.csv","gyro.csv","timestamps.csv","encoder_pts.csv","camera_results.jsonl","capture_result.json","capabilities.json","calibration_request.json","walk_intent.json",PairedCapture.FILE};
         long total=0;
         for (String name:names) total+=new File(dir,name).length();
         if (total > 7L*1024*1024*1024) throw new IOException("Capture exceeds the upload bundle limit; raw files are retained.");
@@ -165,6 +169,9 @@ public final class BundleTools {
     private static HttpsURLConnection connection(Context context, URL url) throws Exception {
         HttpsURLConnection conn=connection(context,url,SystemClock.elapsedRealtime()+SETUP_TIMEOUT_MS);
         conn.setReadTimeout(180000);return conn;
+    }
+    static HttpsURLConnection downloadConnection(Context context,URL url)throws Exception {
+        HttpsURLConnection connection=connection(context,url);connection.setInstanceFollowRedirects(false);connection.setReadTimeout(30000);return connection;
     }
     private static HttpsURLConnection connection(Context context, URL url,long deadline) throws Exception {
         return LanIpv4Https.open(url,tlsFactory(context),deadline);

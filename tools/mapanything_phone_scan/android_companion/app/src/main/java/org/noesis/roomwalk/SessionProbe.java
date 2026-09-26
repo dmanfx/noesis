@@ -173,7 +173,8 @@ public final class SessionProbe {
             put(result, "planned_query_count", selected.size() * 2);
 
             stage = "session_parameters";
-            CaptureRequest parameters = sessionParameters(context,cameraId,setup, characteristics, result);
+            FocusSettings.Lock focus=FocusSettings.read(context,cameraId);
+            CaptureRequest parameters = sessionParameters(cameraId,setup, characteristics, result,focus);
             stage = "encoder_allocation";
             JSONObject encoder = target.optJSONObject("encoder");
             String codecName = requiredString(encoder, "name", 256);
@@ -229,8 +230,8 @@ public final class SessionProbe {
                     String queryStage = "output_configuration";
                     try {
                         List<OutputConfiguration> outputs = new ArrayList<>();
-                        outputs.add(output(encoderSurface, encoderUseCase));
-                        if (includePreview) outputs.add(output(previewSurface, previewUseCase));
+                        outputs.add(output(encoderSurface, encoderUseCase,focus));
+                        if (includePreview) outputs.add(output(previewSurface, previewUseCase,focus));
                         SessionConfiguration session = new SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
                                 outputs, Runnable::run, new CameraCaptureSession.StateCallback() {
                                     @Override public void onConfigured(CameraCaptureSession capture) {}
@@ -285,11 +286,10 @@ public final class SessionProbe {
         return result;
     }
 
-    private static CaptureRequest sessionParameters(Context context,String cameraId,CameraDevice.CameraDeviceSetup setup,
-            CameraCharacteristics characteristics, JSONObject result) throws Exception {
+    private static CaptureRequest sessionParameters(String cameraId,CameraDevice.CameraDeviceSetup setup,
+            CameraCharacteristics characteristics, JSONObject result,FocusSettings.Lock focus) throws Exception {
         CaptureRequest.Builder request = setup.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
         applyRequestSettings(request, characteristics, result);
-        FocusSettings.Lock focus=FocusSettings.read(context,cameraId);
         FocusSettings.apply(request,characteristics,cameraId,focus);
         put(result,"focus_control",FocusSettings.metadata(focus));
         return request.build();
@@ -343,6 +343,12 @@ public final class SessionProbe {
         output.setStreamUseCase(useCase);
         output.setTimestampBase(OutputConfiguration.TIMESTAMP_BASE_SENSOR);
         if (Build.VERSION.SDK_INT >= 34) output.setReadoutTimestampEnabled(false);
+        return output;
+    }
+
+    static OutputConfiguration output(Surface surface,long useCase,FocusSettings.Lock focus) {
+        OutputConfiguration output=output(surface,useCase);
+        FocusSettings.bindOutput(output,focus);
         return output;
     }
 

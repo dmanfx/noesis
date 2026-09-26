@@ -40,6 +40,9 @@ from .windowed_da3_inference import run_adaptive_da3_phone_scan
 from .pcf import run_pcf_review_candidate
 from .processing import FramePreparationSettings, prepare_video_frames
 from .phone_calibration import calibration_summary
+from .calibration_jobs import CalibrationJobs, CalibrationJobBusy, CalibrationJobError, MAX_REQUEST_BYTES, _write as _write_calibration_json
+from .calibrated_walk import CameraSelection
+from .motion_profile import MotionSelection
 from .imu_calibration import MAX_BUNDLE_BYTES as MAX_IMU_BUNDLE_BYTES, ImuCalibrationError, retain_imu_bundle
 from .prepared_frame_identity import prepared_frame_identity
 from .capture import CaptureImportLimits, CaptureImportError, import_capture_bundle, validate_capture_manifest
@@ -50,6 +53,9 @@ from .capture_upload import (
     CaptureUploadQueue,
 )
 from .browser_capture import BROWSER_CAPTURE_SCHEMA
+from .walk_intent import effective_walk_intent, validate_walk_intent
+from .path_review import build_path_review
+from .path_reference import PcfPathReferences
 from .companion_capture import (
     COMPANION_SESSION_PATTERN,
     CompanionCaptureBusy,
@@ -100,6 +106,25 @@ MAX_CA_CERT_BYTES = 256 * 1024
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _motion_profile_capability(settings: VIOSettings) -> tuple[bool, str | None]:
+    """Configuration availability only; never start a native estimator here."""
+    if settings.estimator != "openvins":
+        return False, "Motion-profile validation requires the configured OpenVINS estimator."
+    if settings.executable is None or not settings.executable.is_file() or not os.access(settings.executable, os.X_OK):
+        return False, "OpenVINS executable is missing or not executable. Configure NOESIS_PHONE_SCAN_VIO_EXECUTABLE; retained short recordings need not be repeated."
+    if settings.config is None or not settings.config.is_file() or not os.access(settings.config, os.R_OK):
+        return False, "OpenVINS base configuration is missing or unreadable. Configure NOESIS_PHONE_SCAN_VIO_CONFIG, then retry with the retained jobs."
+    # CalibrationJobs/MotionSelection resolve the environment; the normal-walk
+    # worker holds startup settings. Those must name the same native consumer.
+    try:
+        current = VIOSettings.from_env()
+        if current.estimator != settings.estimator or current.executable is None or current.config is None or current.executable.resolve() != settings.executable.resolve() or current.config.resolve() != settings.config.resolve():
+            return False, "The motion-profile backend and room-walk worker have different OpenVINS settings. Restore one matching executable and base configuration before retrying the retained jobs."
+    except (OSError, ValueError) as exc:
+        return False, f"OpenVINS configuration could not be verified: {exc}"
+    return True, None
 
 
 def _sha256_file(path: Path) -> str:
@@ -376,6 +401,7 @@ class PhoneScanSettings:
     alignment_release_id: str | None = None
     pcf_storage_root: Path | None = None
     pcf_pause_appliance: bool = False
+    scene_prior_catalog: Path | None = None
     capture_limits: CaptureImportLimits = CaptureImportLimits()
     vio: VIOSettings = VIOSettings()
     companion_limits: CompanionCaptureLimits = CompanionCaptureLimits()
@@ -554,6 +580,10 @@ class PhoneScanSettings:
             pcf_pause_appliance=_env_bool(
                 "NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE", False
             ),
+            scene_prior_catalog=_resolve_root(
+                os.environ.get("NOESIS_PHONE_SCAN_SCENE_PRIOR_CATALOG"),
+                REPO_ROOT / "data" / "scene_priors" / "catalog.json",
+            ),
             capture_limits=CaptureImportLimits(
                 max_archive_bytes=_env_int(
                     "NOESIS_PHONE_SCAN_MAX_CAPTURE_BYTES", 8 * 1024 * 1024 * 1024, minimum=1024 * 1024
@@ -672,6 +702,13 @@ def _default_vio_runner(
         replace(settings, config=generated_config),
         progress,
     )
+    # Reconstruction consumes selected-view poses, while a reference walk needs
+    # the full camera-time trajectory. Retain both without changing either clock
+    # or assigning a phone pose to a person's ground point.
+    dense = validate_vio_result(result)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dense_path = output_dir / "dense_camera_trajectory.json"
+    dense_path.write_text(json.dumps(dense, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     dense_pose_count = len(result.get("poses") or [])
     prepared_by_time = {
         int(row["capture_time_ns"]): row
@@ -771,6 +808,7 @@ class PhoneScanService:
         companion_manager: CompanionCaptureManager | None = None,
     ) -> None:
         self.settings = settings
+        self.path_references = PcfPathReferences(settings.scene_prior_catalog)
         self.frame_processor = frame_processor
         self.inference_runner = inference_runner
         self.da3_inference_runner = da3_inference_runner
@@ -806,16 +844,21 @@ class PhoneScanService:
             raise ValueError("phone-scan alignment requires at least one camera target")
         self._locks_guard = threading.Lock()
         self._scan_locks: dict[str, threading.RLock] = {}
+        self._path_review_slots = threading.BoundedSemaphore(2)
         self._inference_lock = threading.Lock()
         self._alignment_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PhoneScan")
         self.capture_uploads = CaptureUploadQueue(self.settings.storage_root)
+        self.calibration_jobs = CalibrationJobs(self.settings.storage_root)
+        self.camera_selection = CameraSelection(self.calibration_jobs)
+        self.motion_selection = MotionSelection(self.calibration_jobs, self.camera_selection)
         self.companion_capture = companion_manager or CompanionCaptureManager(
             self.settings.storage_root,
             limits=self.settings.companion_limits,
         )
 
     def shutdown(self) -> None:
+        self.calibration_jobs.close()
         self.capture_uploads.shutdown()
         self.companion_capture.shutdown()
         self._executor.shutdown(wait=False, cancel_futures=False)
@@ -944,6 +987,43 @@ class PhoneScanService:
             self._write_state_unlocked(scan_id, state)
             return state
 
+    def set_walk_intent(self, scan_id: str, value: Any) -> dict[str, Any]:
+        """Attach a review declaration without rewriting a retained recording."""
+        try:
+            intent = validate_walk_intent(value)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        target_id = intent["target_scan_id"]
+        if target_id == scan_id:
+            raise HTTPException(status.HTTP_409_CONFLICT, "A walk cannot target itself")
+        if target_id is not None:
+            target = self.read_state(target_id)
+            if target.get("status") != "complete" or not isinstance(target.get("outputs"), dict):
+                raise HTTPException(status.HTTP_409_CONFLICT, "The reference reconstruction is not complete")
+            if (target.get("walk_intent") or {}).get("mode") == "path_refinement":
+                raise HTTPException(status.HTTP_409_CONFLICT, "Choose a reconstruction, not another path walk")
+            if intent.get("target_reference") is not None:
+                try:
+                    self.path_references.resolve(target_id, intent["target_reference"])
+                except (ValueError, OSError) as exc:
+                    raise HTTPException(status.HTTP_409_CONFLICT, f"PCF reference is unavailable: {exc}") from exc
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            capture = state.get("capture") or {}
+            if capture.get("calibration_request") or state.get("status") == "calibration_ready":
+                raise HTTPException(status.HTTP_409_CONFLICT, "Calibration recordings remain calibration evidence")
+            recorded = capture.get("walk_intent")
+            if recorded is not None and recorded != intent:
+                raise HTTPException(status.HTTP_409_CONFLICT, "The recorder's retained walk purpose cannot be relabeled")
+            if state.get("status") in {"uploading", "importing_capture"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Wait for the recording import to finish")
+            if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Wait for path review to finish")
+            state["walk_intent"] = intent
+            state["walk_intent_source"] = "capture_manifest" if recorded else "explicit_review_declaration"
+            self._write_state_unlocked(scan_id, state)
+            return state
+
     @staticmethod
     def _supplement_index(state: dict[str, Any], supplement_id: str) -> int:
         supplements = state.get("supplements")
@@ -957,6 +1037,8 @@ class PhoneScanService:
     def add_supplement(self, scan_id: str, supplement: dict[str, Any]) -> dict[str, Any]:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
+            if (state.get("walk_intent") or {}).get("mode") == "path_refinement":
+                raise HTTPException(status.HTTP_409_CONFLICT, "Add room views to the reference reconstruction, not a path walk")
             if state.get("status") != "complete" or not isinstance(state.get("outputs"), dict):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -982,6 +1064,73 @@ class PhoneScanService:
             state["supplements"] = supplements
             self._write_state_unlocked(scan_id, state)
             return state
+
+    def add_retained_capture(self, scan_id: str, source_scan_id: str) -> dict[str, Any]:
+        """Reuse a saved capture as added views without consuming its raw evidence."""
+        if scan_id == source_scan_id:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Choose a different capture to add")
+        source = self.read_state(source_scan_id)
+        intent = effective_walk_intent(source)
+        if (source.get("capture") or {}).get("calibration_request") or source.get("status") == "calibration_ready":
+            raise HTTPException(status.HTTP_409_CONFLICT, "Calibration takes are not room-coverage captures")
+        if intent and intent["mode"] != "reconstruction":
+            raise HTTPException(status.HTTP_409_CONFLICT, "Path walks do not automatically change room geometry")
+        if intent and intent["target_scan_id"] not in (None, scan_id):
+            raise HTTPException(status.HTTP_409_CONFLICT, "The capture names a different reconstruction")
+        if source.get("status") not in {"ready", "complete", "ma_failed", "da3_failed"}:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Wait for the saved capture's frame preparation")
+        with self._lock(scan_id):
+            target = self._read_state_unlocked(scan_id)
+            for prior in target.get("supplements") or []:
+                if (prior.get("source_capture") or {}).get("scan_id") == source_scan_id:
+                    return target
+            if (target.get("walk_intent") or {}).get("mode") == "path_refinement":
+                raise HTTPException(status.HTTP_409_CONFLICT, "Added views require a reconstruction target")
+            source_root = self.scan_dir(source_scan_id)
+            relative = (source.get("video") or {}).get("path")
+            if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                raise HTTPException(status.HTTP_409_CONFLICT, "The retained capture has no safe video path")
+            source_video = source_root / relative
+            if source_video.is_symlink() or not source_video.resolve().is_relative_to(source_root) or not source_video.is_file():
+                raise HTTPException(status.HTTP_409_CONFLICT, "The retained video is unavailable")
+            supplement_id = f"add-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            output = self.supplement_dir(scan_id, supplement_id)
+            output.mkdir(parents=True, exist_ok=False)
+            added = False
+            try:
+                # Hard links preserve the raw bytes even if either library entry
+                # is later removed, without copying multi-gigabyte recordings.
+                linked_video = output / f"additional_walk{source_video.suffix}"
+                os.link(source_video, linked_video)
+                capture_root = source_root / "capture"
+                if capture_root.is_dir() and (capture_root / "capture_import.json").is_file():
+                    members = list(capture_root.iterdir())
+                    if len(members) > 512 or any(p.is_symlink() or not p.is_file() for p in members):
+                        raise HTTPException(status.HTTP_409_CONFLICT, "Retained capture layout cannot be safely reused; its originals are unchanged")
+                    retained = output / "capture"
+                    retained.mkdir()
+                    for member in members:
+                        os.link(member, retained / member.name)
+                now = _utc_now()
+                row = {"schema": "noesis.phone_scan.supplement.state.v1", "id": supplement_id,
+                       "created_at": now, "updated_at": now, "status": "processing_frames", "progress": 0.0,
+                       "message": "Preparing additional views from the retained capture", "error": None,
+                       "source_capture": {"scan_id": source_scan_id, "capture_id": (source.get("capture") or {}).get("capture_id"),
+                                          "archive_sha256": (source.get("upload_receipt") or {}).get("sha256"),
+                                          "raw_streams_preserved": True},
+                       "video": {"path": linked_video.relative_to(self.scan_dir(scan_id)).as_posix(),
+                                 "original_name": source_video.name, "content_type": (source.get("video") or {}).get("content_type"),
+                                 "size_bytes": source_video.stat().st_size}}
+                # Inline admission under this same lock; add_supplement uses an
+                # RLock and preserves the existing reconstruction/job guards.
+                target = self.add_supplement(scan_id, row)
+                added = True
+            except Exception:
+                if not added:
+                    shutil.rmtree(output)
+                raise
+        self.submit_supplement_preparation(scan_id, supplement_id)
+        return target
 
     def update_supplement(
         self,
@@ -1074,6 +1223,11 @@ class PhoneScanService:
                         "error": "The sensor bundle and RGB reconstruction are preserved; retry OpenVINS.",
                     },
                 )
+            path_review = state.get("path_review")
+            if isinstance(path_review, dict) and path_review.get("status") in {"queued", "running"}:
+                self.update_state(scan_id, path_review={**path_review, "status": "failed", "progress": 0.0,
+                                                       "message": "Path review was interrupted; original evidence is retained",
+                                                       "error": "Run Review path again to create a new report"})
             alignment = state.get("alignment")
             if isinstance(alignment, dict) and alignment.get("status") in {
                 "queued",
@@ -1211,8 +1365,136 @@ class PhoneScanService:
         states.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return states
 
+    def public_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        public = _public_state(state)
+        if state.get("status") == "complete" and isinstance(state.get("outputs"), dict):
+            reference = self.path_references.for_scan(state["id"])
+            if reference is not None:
+                public["path_reference"] = reference
+        return public
+
+    def _selected_path_reference(self, state: dict[str, Any], target_id: str) -> dict[str, Any] | None:
+        intent = effective_walk_intent(state) or {}
+        selection = intent.get("target_reference")
+        if selection is None:
+            # Older captures retain their original raw-reference semantics.
+            # Only a recorder's explicit PCF selection selects this branch.
+            return None
+        reference = self.path_references.resolve(target_id, selection)
+        camera_id = (state.get("companion_capture") or {}).get("camera_id")
+        if camera_id is not None and camera_id != selection["camera_id"]:
+            raise ValueError("The paired camera differs from the selected PCF reference camera")
+        return reference
+
     def submit_frame_preparation(self, scan_id: str) -> None:
         self._executor.submit(self._prepare_worker, scan_id)
+
+    def _new_capture_profile_selection(self, manifest: Any) -> dict[str, Any]:
+        """Snapshot once at upload admission, before an asynchronous import waits."""
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("android_capture"), dict) or manifest.get("calibration_request"):
+            return {}
+        try:
+            motion = deepcopy(self.motion_selection.get())
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # A broken optional profile must not discard an otherwise valid RGB
+            # recording or silently substitute the unrelated global camera fit.
+            return {"motion_calibration_selection": None, "camera_calibration_selection": None,
+                    "motion_selection_error": f"Motion selection could not be read: {exc}"[:2000]}
+        camera = (deepcopy(motion.get("camera_selection")) if isinstance(motion, dict) else None) if motion is not None else deepcopy(self.camera_selection.get())
+        return {"motion_calibration_selection": motion, "camera_calibration_selection": camera}
+
+    @staticmethod
+    def _has_motion_selection(capture: dict[str, Any]) -> bool:
+        return capture.get("motion_calibration_selection") is not None or bool(capture.get("motion_selection_error"))
+
+    def _derive_motion_capture(
+        self, scan_id: str, capture: dict[str, Any], camera_preparation: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Reverify the import's snapshot from raw evidence; never read our cache.
+
+        Failure blocks only metric VIO. Original capture_import.json, raw sensor
+        data and prepared frame identities are never rewritten by this method.
+        """
+        capture_dir = self.scan_dir(scan_id) / "capture"
+        raw_path = capture_dir / "capture_import.json"
+        derived_path = capture_dir / "motion_profile_import.json"
+        updated = deepcopy(capture)
+        selection = capture.get("motion_calibration_selection")
+        raw: dict[str, Any] = {}
+        source_sha256 = None
+        try:
+            if raw_path.is_symlink():
+                raise ValueError("Raw capture import report cannot be a symbolic link")
+            raw = _read_json_object(raw_path, label="Raw capture import report")
+            source_sha256 = _sha256_file(raw_path)
+            if capture.get("capture_kind") != "android_camera_imu" or capture.get("calibration_request"):
+                raise ValueError("A selected motion profile applies only to an ordinary native Android room walk")
+            if capture.get("motion_selection_error"):
+                raise ValueError(capture["motion_selection_error"])
+            if not isinstance(selection, dict) or not isinstance(selection.get("camera_selection"), dict):
+                raise ValueError("Selected motion profile has no associated camera-selection snapshot")
+            if selection["camera_selection"] != capture.get("camera_calibration_selection"):
+                raise ValueError("Motion and frame-preparation camera selections differ; do not reuse these prepared views for VIO")
+            available, reason = _motion_profile_capability(self.settings.vio)
+            if not available:
+                raise ValueError(reason)
+            # The owner revalidates job/profile hashes and capture binding using
+            # this immutable snapshot, not the current global selector.
+            derived = self.motion_selection.derived_report(capture_dir, deepcopy(raw), deepcopy(selection))
+            if not isinstance(derived, dict) or not isinstance(derived.get("calibration"), dict):
+                raise ValueError("Motion profile returned an invalid derived capture report")
+            if not isinstance(camera_preparation, dict) or camera_preparation.get("status") != "applied":
+                raise ValueError("The associated camera profile was not applied to frame preparation. Review its binding reasons and record a new matching walk.")
+            derived = deepcopy(derived)
+            summary = dict(derived.get("motion_profile") or {})
+            allowed = derived.get("metric_vio_allowed") is True
+            summary.update({"status": "applied" if allowed else "not_applied",
+                            "motion_calibration_id": selection.get("motion_calibration_id"),
+                            "profile_id": selection.get("profile_id"),
+                            "metric_vio_allowed": allowed})
+            if not allowed:
+                summary.setdefault("reason_codes", ["motion_profile_binding_not_admitted"])
+                summary.setdefault("message", "Selected motion profile did not admit this capture. Check the report and phone configuration; RGB reconstruction remains available.")
+            else:
+                summary["message"] = "Profile reverified and bound to this walk. Run OpenVINS and review the first normal walk; a profile match is not a room-accuracy certificate."
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            derived = deepcopy(raw)
+            allowed = False
+            summary = {"status": "not_applied", "metric_vio_allowed": False,
+                       "motion_calibration_id": selection.get("motion_calibration_id") if isinstance(selection, dict) else None,
+                       "profile_id": selection.get("profile_id") if isinstance(selection, dict) else None,
+                       "reason_codes": ["motion_profile_verification_failed"],
+                       "message": f"Motion profile not applied: {exc}"[:2000],
+                       "next_action": "Check the selected profile and exact phone/lens/locked-focus configuration. Restore missing profile artifacts and retry OpenVINS to reverify, or capture a new matching walk. RGB reconstruction and the original recording are retained."}
+            derived["calibration"] = {**dict(raw.get("calibration") or {}), "complete_for_metric_vio": False}
+        derived["metric_vio_allowed"] = allowed
+        if not allowed:
+            derived["calibration"]["complete_for_metric_vio"] = False
+        derived["motion_profile"] = summary
+        derived["motion_profile_source"] = {"import_report": "capture/capture_import.json", "sha256": source_sha256}
+        # This is a derived cache/report only. Every VIO request and worker run
+        # derives it again from the raw report and verified selected artifacts.
+        try:
+            _write_calibration_json(derived_path, derived)
+            updated["motion_profile_import"] = "capture/motion_profile_import.json"
+        except (OSError, ValueError, TypeError) as exc:
+            allowed = False
+            derived["metric_vio_allowed"] = False
+            derived["calibration"]["complete_for_metric_vio"] = False
+            summary.update(status="not_applied", metric_vio_allowed=False,
+                           reason_codes=["motion_profile_report_write_failed"],
+                           message=f"Could not retain the derived motion report: {exc}. Restore writable scan storage and retry OpenVINS; RGB preparation remains available."[:2000])
+            updated.pop("motion_profile_import", None)
+        updated.update(metric_vio_allowed=allowed, calibration=deepcopy(derived["calibration"]),
+                       motion_profile=summary)
+        return derived, updated
+
+    def initiate_calibration(self, scan_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            if (state.get("capture") or {}).get("capture_kind") != "android_camera_imu":
+                raise CalibrationJobError("Calibration requires the native RoomWalk camera and IMU evidence")
+            return self.calibration_jobs.submit(scan_id, self.scan_dir(scan_id) / "capture", payload)
 
     def _progress(self, scan_id: str, fraction: float, message: str) -> None:
         try:
@@ -1227,6 +1509,8 @@ class PhoneScanService:
     def initiate_vio(self, scan_id: str) -> dict[str, Any]:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
+            if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Path refinement already owns this walk's sensor processing")
             capture = state.get("capture")
             if not isinstance(capture, dict):
                 raise HTTPException(
@@ -1246,10 +1530,14 @@ class PhoneScanService:
                     status.HTTP_409_CONFLICT,
                     "OpenVINS is blocked for browser camera + IMU captures; browser callback timestamps are not native acquisition timestamps",
                 )
+            if self._has_motion_selection(capture):
+                _, capture = self._derive_motion_capture(scan_id, capture, state.get("camera_calibration_selection"))
+                state["capture"] = capture
+                self._write_state_unlocked(scan_id, state)
             if capture.get("metric_vio_allowed") is not True:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
-                    "Metric OpenVINS is blocked because capture calibration or timing is incomplete",
+                    (capture.get("motion_profile") or {}).get("message") or "Metric OpenVINS is blocked because capture calibration or timing is incomplete",
                 )
             vio = {
                 "schema": "noesis.phone_capture.vio_job.v1",
@@ -1263,6 +1551,110 @@ class PhoneScanService:
             self._write_state_unlocked(scan_id, state)
         self._executor.submit(self._vio_worker, scan_id)
         return state
+
+    def initiate_path_review(self, scan_id: str, target_scan_id: str | None = None) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            if state.get("status") != "complete" or not isinstance(state.get("outputs"), dict):
+                raise HTTPException(status.HTTP_409_CONFLICT, "Run the visual model first so the walk has a camera trajectory")
+            if (state.get("capture") or {}).get("calibration_request"):
+                raise HTTPException(status.HTTP_409_CONFLICT, "A calibration take is not a path-reference walk")
+            if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Path review is already running")
+            if any((state.get(key) or {}).get("status") in {"queued", "running"} for key in ("vio", "alignment", "pcf")):
+                raise HTTPException(status.HTTP_409_CONFLICT, "Wait for this walk's active processing before refining its path")
+            intent = effective_walk_intent(state)
+            bound_target = (intent or {}).get("target_scan_id")
+            if target_scan_id is not None and bound_target and target_scan_id != bound_target:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Review target differs from the recorded room")
+            target_id = target_scan_id or bound_target or scan_id
+        # Avoid holding locks on two different scans at once.
+        target = self.read_state(target_id)
+        if target.get("status") != "complete" or not isinstance(target.get("outputs"), dict):
+            raise HTTPException(status.HTTP_409_CONFLICT, "The reference reconstruction is unavailable")
+        if (target.get("alignment") or {}).get("status") in {"queued", "running"}:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Wait for the reference room alignment to finish")
+        if target_id != scan_id and (target.get("walk_intent") or {}).get("mode") == "path_refinement":
+            raise HTTPException(status.HTTP_409_CONFLICT, "Choose the room reconstruction as the reference")
+        try:
+            self._selected_path_reference(state, target_id)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"PCF reference needs attention: {exc}") from exc
+        if not self._path_review_slots.acquire(blocking=False):
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Two path reviews are already queued or running; retry when one finishes")
+        try:
+            with self._lock(scan_id):
+                state = self._read_state_unlocked(scan_id)
+                if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                    raise HTTPException(status.HTTP_409_CONFLICT, "Path review is already running")
+                if any((state.get(key) or {}).get("status") in {"queued", "running"} for key in ("vio", "alignment", "pcf")):
+                    raise HTTPException(status.HTTP_409_CONFLICT, "This walk's processing changed; wait and retry path refinement")
+                state["path_review"] = {"status": "queued", "progress": 0.0, "target_scan_id": target_id,
+                                        "message": "Queued trajectory refinement and paired Noesis comparison", "error": None}
+                self._write_state_unlocked(scan_id, state)
+            try:
+                self._executor.submit(self._path_review_worker, scan_id, target_id)
+            except Exception as exc:
+                self.update_state(scan_id, path_review={**state["path_review"], "status": "failed",
+                    "message": "Path review could not be queued; retry when the service is available",
+                    "error": f"{type(exc).__name__}: {exc}"[:2000]})
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                    "Path review could not be queued; original recordings are unchanged") from exc
+        except BaseException:
+            self._path_review_slots.release()
+            raise
+        return state
+
+    def _path_review_worker(self, scan_id: str, target_scan_id: str) -> None:
+        relative = f"path_review/run-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        try:
+            state, target = self.read_state(scan_id), self.read_state(target_scan_id)
+            reference = self._selected_path_reference(state, target_scan_id)
+            self.update_state(scan_id, path_review={**state["path_review"], "status": "running", "progress": 0.1,
+                                                   "message": "Refining visual constraints and registering the paired path"})
+            if (state.get("capture") or {}).get("metric_vio_allowed") is True and (state.get("vio") or {}).get("status") != "complete":
+                self.update_state(scan_id, vio={"schema": "noesis.phone_capture.vio_job.v1", "estimator": "openvins",
+                    "status": "queued", "progress": 0.0, "message": "Path refinement requested the qualified visual-inertial estimator", "error": None})
+                self._vio_worker(scan_id)
+                state = self.read_state(scan_id)
+            session_id = (state.get("companion_capture") or {}).get("session_id")
+            companion_dir = self.companion_capture.session_root / session_id if isinstance(session_id, str) and COMPANION_SESSION_PATTERN.fullmatch(session_id) else None
+
+            def revalidate_scaled_carrier(candidate_raw: Path, candidate_manifest: Path,
+                                          revalidation_dir: Path, scale_factor: float) -> dict[str, Any]:
+                # A qualified VIO scale correction must register its changed
+                # geometry independently. It cannot reuse the original transform
+                # or fit itself to the Noesis person being evaluated.
+                saved_target = self._saved_alignment_target(scan_id, state.get("alignment") or {})
+                revalidation_dir.mkdir(parents=True, exist_ok=False)
+                candidate = json.loads(candidate_manifest.read_text(encoding="utf-8"))
+                with self._alignment_lock:
+                    result = run_noesis_alignment(self.scan_dir(scan_id), revalidation_dir, candidate, saved_target,
+                        lambda _fraction, _message: None, source_raw_root=candidate_raw,
+                        source_output_manifest=candidate_manifest)
+                return {**result, "transform_path": str(revalidation_dir / "phone_ma_to_noesis_world.json"),
+                        "source_raw": str(candidate_raw), "source_manifest": str(candidate_manifest),
+                        "scale_factor": float(scale_factor)}
+
+            report = build_path_review(self.scan_dir(scan_id), state, self.scan_dir(target_scan_id), target,
+                                       self.scan_dir(scan_id) / relative, companion_dir=companion_dir,
+                                       target_reference=reference,
+                                       revalidate_scaled_carrier=revalidate_scaled_carrier)
+            results = {key: report[key] for key in ("schema", "status", "review_only", "visual_path", "imu_consistency",
+                                                    "path_refinement", "path_comparison", "reference_reconstruction", "sensor_refined_path", "accuracy", "body_ground_reference", "paired_noesis", "limitations")}
+            results["artifact"] = f"{relative}/path_review.json"
+            results["artifacts"] = {key: f"{relative}/{value}" for key, value in report["artifacts"].items()}
+            self.update_state(scan_id, path_review={"status": "complete", "progress": 1.0, "target_scan_id": target_scan_id,
+                                                   "message": ("Registered phone/Noesis comparison is ready; separation is not certified accuracy"
+                                                               if report["path_comparison"]["status"] == "comparison_ready" else
+                                                               "Path processing finished; inspect the reported missing comparison evidence"),
+                                                   "error": None, "results": results})
+        except Exception as exc:
+            self.update_state(scan_id, path_review={"status": "failed", "progress": 0.0, "target_scan_id": target_scan_id,
+                                                   "message": "Path review needs attention; original recordings are unchanged",
+                                                   "error": f"{type(exc).__name__}: {exc}"[:2000]})
+        finally:
+            self._path_review_slots.release()
 
     def _vio_progress(self, scan_id: str, fraction: float, message: str) -> None:
         try:
@@ -1286,8 +1678,14 @@ class PhoneScanService:
             prepared = state.get("prepared")
             if not isinstance(capture, dict) or not isinstance(prepared, dict):
                 raise VIOError("timestamped capture or prepared views are missing")
-            report_path = self.scan_dir(scan_id) / str(capture.get("import_report") or "capture/capture_import.json")
-            capture_report = json.loads(report_path.read_text(encoding="utf-8"))
+            if self._has_motion_selection(capture):
+                capture_report, capture = self._derive_motion_capture(scan_id, capture, state.get("camera_calibration_selection"))
+                self.update_state(scan_id, capture=capture)
+                if capture_report.get("metric_vio_allowed") is not True:
+                    raise VIOError(capture["motion_profile"]["message"])
+            else:
+                report_path = self.scan_dir(scan_id) / str(capture.get("import_report") or "capture/capture_import.json")
+                capture_report = json.loads(report_path.read_text(encoding="utf-8"))
             self.update_state(scan_id, vio={**dict(state.get("vio") or {}), "status": "running", "message": "Starting OpenVINS"})
             result = self.vio_runner(
                 self.scan_dir(scan_id) / "capture",
@@ -1298,6 +1696,8 @@ class PhoneScanService:
                 lambda fraction, message: self._vio_progress(scan_id, fraction, message),
             )
             result["artifact"] = f"vio/{run_id}/vio_result.json"
+            if (output_dir / "dense_camera_trajectory.json").is_file():
+                result["dense_artifact"] = f"vio/{run_id}/dense_camera_trajectory.json"
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "vio_result.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
             self.update_state(
@@ -1331,10 +1731,34 @@ class PhoneScanService:
             state = self.read_state(scan_id)
             scan_dir = self.scan_dir(scan_id)
             video_path = scan_dir / str(state["video"]["path"])
+            capture = state.get("capture") or {}
+            motion_selected = self._has_motion_selection(capture)
+            # New native walk modes use their recorded camera configuration.
+            # A global uploaded-video calibration must not leak into autofocus
+            # captures; a separately selected, verified native profile may apply.
+            frame_defaults = self.settings.frame
+            if state.get("walk_intent"):
+                frame_defaults = replace(frame_defaults, phone_camera_calibration=None, phone_camera_capture_mode="unbound")
+            try:
+                if motion_selected and not isinstance(capture.get("camera_calibration_selection"), dict):
+                    raise ValueError("Motion profile has no verified associated camera selection")
+                frame_settings, selected_calibration = self.camera_selection.frame_settings(
+                    scan_dir, capture.get("camera_calibration_selection"), frame_defaults
+                )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                if not motion_selected and not state.get("walk_intent"):
+                    raise
+                frame_settings = replace(frame_defaults, phone_camera_calibration=None, phone_camera_capture_mode="unbound")
+                selected_calibration = {"status": "not_applied", "reason_codes": ["motion_camera_profile_verification_failed"], "message": str(exc)[:2000], "accepted_for_metric_vio": False}
+            if selected_calibration:
+                self.update_state(scan_id, camera_calibration_selection=selected_calibration)
+            if motion_selected:
+                _, capture = self._derive_motion_capture(scan_id, capture, selected_calibration)
+                self.update_state(scan_id, capture=capture)
             prepared = self.frame_processor(
                 video_path,
                 scan_dir,
-                self.settings.frame,
+                frame_settings,
                 lambda fraction, message: self._progress(scan_id, fraction, message),
             )
             self.update_state(
@@ -1386,6 +1810,11 @@ class PhoneScanService:
                 self.settings.frame,
                 max_selected_frames=self.supplement_settings.new_view_limit,
             )
+            if supplement.get("source_capture"):
+                # Do not reinterpret native added views as an uploaded-video
+                # calibration mode. Their native timing and IMU files are linked
+                # alongside this revision and remain independently readable.
+                frame_settings = replace(frame_settings, phone_camera_calibration=None, phone_camera_capture_mode="unbound")
             prepared_local = self.frame_processor(
                 video_path,
                 supplement_dir,
@@ -1715,6 +2144,8 @@ class PhoneScanService:
             )
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
+            if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Wait for path refinement before changing its registration")
             if state.get("status") != "complete" or not isinstance(state.get("outputs"), dict):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -1912,6 +2343,8 @@ class PhoneScanService:
     def initiate_pcf(self, scan_id: str) -> dict[str, Any]:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
+            if (state.get("path_review") or {}).get("status") in {"queued", "running"}:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Wait for path refinement before starting PCF")
             if state.get("status") != "complete" or not isinstance(
                 state.get("outputs"), dict
             ):
@@ -2222,6 +2655,9 @@ class PhoneScanService:
     def delete_scan(self, scan_id: str) -> None:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
+            if any(job["scan_id"] == scan_id and job["status"] in {"queued", "running", "cancelling"}
+                   for job in self.calibration_jobs.list()):
+                raise HTTPException(409, "Cancel or finish calibration before deleting its source capture")
             if state.get("status") in RUNNING_STATUSES:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -2337,6 +2773,7 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     if isinstance(capture, dict):
         for key in (
             "import_report",
+            "motion_profile_import",
             "manifest",
             "video_timestamps",
             "imu_normalized",
@@ -2402,6 +2839,14 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         results = vio.get("results")
         if isinstance(results, dict) and isinstance(results.get("artifact"), str):
             results["artifact_url"] = _asset_url(scan_id, results["artifact"])
+        if isinstance(results, dict) and isinstance(results.get("dense_artifact"), str):
+            results["dense_artifact_url"] = _asset_url(scan_id, results["dense_artifact"])
+    path_review = public.get("path_review")
+    if isinstance(path_review, dict) and isinstance(path_review.get("results"), dict):
+        results = path_review["results"]
+        if isinstance(results.get("artifact"), str):
+            results["artifact_url"] = _asset_url(scan_id, results["artifact"])
+        results["artifact_urls"] = {key: _asset_url(scan_id, value) for key, value in (results.get("artifacts") or {}).items() if isinstance(value, str)}
     alignment = public.get("alignment")
     if isinstance(alignment, dict):
         reference = alignment.get("static_reference")
@@ -2872,12 +3317,13 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         service.recover_interrupted_states()
+        service.calibration_jobs.recover()
         yield
         service.shutdown()
 
     app = FastAPI(
         title="Noesis Multi-View Phone Scan",
-        version="1.8.1",
+        version="1.13.0",
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
@@ -2885,6 +3331,181 @@ def create_app(
     imu_upload_lock = asyncio.Lock()
     capture_upload_admission_lock = asyncio.Lock()
     capture_upload_acceptances: set[asyncio.Task[Any]] = set()
+
+    @app.get("/api/calibration/jobs")
+    async def list_calibration_jobs() -> dict[str, Any]:
+        return {"jobs": await asyncio.to_thread(service.calibration_jobs.list)}
+
+    @app.get("/api/calibration/camera-selection")
+    async def get_camera_selection() -> dict[str, Any]:
+        return {"selection": await asyncio.to_thread(service.camera_selection.get)}
+
+    async def _motion_json_body(request: Request) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 1024:
+                        raise HTTPException(413, "Motion-profile request exceeds 1 KiB")
+                    body.extend(chunk)
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a motion-profile request object")
+            return payload
+        except TimeoutError as exc:
+            raise HTTPException(408, "Motion-profile request timed out") from exc
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/calibration/motion-profile-jobs", status_code=status.HTTP_202_ACCEPTED)
+    async def create_motion_profile_job(request: Request) -> dict[str, Any]:
+        payload = await _motion_json_body(request)
+        fields = {"camera_calibration_id", "imu_calibration_id", "noise_calibration_id"}
+        if set(payload) != fields or any(not isinstance(payload[key], str) or not payload[key].strip() or len(payload[key]) > 160 for key in fields):
+            raise HTTPException(422, "Choose the three completed camera, camera–IMU and noise job IDs")
+        available, reason = _motion_profile_capability(configured.vio)
+        if not available:
+            raise HTTPException(503, reason)
+        try:
+            return await asyncio.to_thread(service.calibration_jobs.submit_motion_profile, payload)
+        except CalibrationJobBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/calibration/motion-selection")
+    async def get_motion_selection() -> dict[str, Any]:
+        try:
+            return {"selection": await asyncio.to_thread(service.motion_selection.get)}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(422, f"Motion selection could not be verified: {exc}") from exc
+
+    @app.post("/api/calibration/motion-selection")
+    async def select_motion_calibration(request: Request) -> dict[str, Any]:
+        payload = await _motion_json_body(request)
+        if set(payload) != {"motion_calibration_id"} or (payload["motion_calibration_id"] is not None and (not isinstance(payload["motion_calibration_id"], str) or not payload["motion_calibration_id"].strip() or len(payload["motion_calibration_id"]) > 160)):
+            raise HTTPException(422, "Expected motion_calibration_id or null to clear")
+        try:
+            return {"selection": await asyncio.to_thread(service.motion_selection.select, payload["motion_calibration_id"])}
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/calibration/camera-selection")
+    async def select_camera_calibration(request: Request) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 1024:
+                        raise HTTPException(413, "Camera selection exceeds 1 KiB")
+                    body.extend(chunk)
+            payload = json.loads(body)
+            if not isinstance(payload, dict) or set(payload) != {"camera_calibration_id"}:
+                raise ValueError("Expected camera_calibration_id or null to clear")
+            selection = await asyncio.to_thread(service.camera_selection.select, payload["camera_calibration_id"])
+            return {"selection": selection}
+        except TimeoutError as exc:
+            raise HTTPException(408, "Camera selection timed out") from exc
+        except (OSError, ValueError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/calibration/imu-recordings")
+    async def list_imu_recordings() -> dict[str, Any]:
+        return {"recordings": await asyncio.to_thread(service.calibration_jobs.list_imu_recordings)}
+
+    @app.post("/api/calibration/noise-jobs", status_code=status.HTTP_202_ACCEPTED)
+    async def create_noise_job(request: Request) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 1024:
+                        raise HTTPException(413, "Stationary noise request exceeds 1 KiB")
+                    body.extend(chunk)
+        except TimeoutError as exc:
+            raise HTTPException(408, "Stationary noise request timed out") from exc
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a stationary capture ID")
+            return await asyncio.to_thread(service.calibration_jobs.submit_noise, payload.get("imu_capture_id"))
+        except CalibrationJobBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/calibration/jobs", status_code=status.HTTP_202_ACCEPTED)
+    async def create_calibration_job(request: Request) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+                        raise HTTPException(413, "Calibration request exceeds 64 KiB")
+                    body.extend(chunk)
+        except TimeoutError as exc:
+            raise HTTPException(408, "Calibration request timed out") from exc
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected an object")
+            scan_id = payload.get("scan_id")
+            if not isinstance(scan_id, str) or not SCAN_ID_PATTERN.fullmatch(scan_id):
+                raise ValueError("Select an imported native RoomWalk capture")
+            return await asyncio.to_thread(service.initiate_calibration, scan_id, payload)
+        except CalibrationJobBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "The referenced calibration was not found") from exc
+        except (ValueError, TypeError, KeyError, RecursionError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/calibration/jobs/{job_id}")
+    async def get_calibration_job(job_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(service.calibration_jobs.get, job_id)
+        except (CalibrationJobError, FileNotFoundError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/calibration/jobs/{job_id}/cancel")
+    async def cancel_calibration_job(job_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(service.calibration_jobs.cancel, job_id)
+        except (CalibrationJobError, FileNotFoundError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/calibration/jobs/{job_id}/files/{name:path}")
+    async def calibration_artifact(job_id: str, name: str) -> FileResponse:
+        try:
+            path = await asyncio.to_thread(service.calibration_jobs.artifact, job_id, name)
+            return FileResponse(path, headers={"X-Content-Type-Options": "nosniff"})
+        except (CalibrationJobError, FileNotFoundError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/calibration/jobs/{job_id}/log")
+    async def calibration_log(job_id: str) -> FileResponse:
+        try:
+            await asyncio.to_thread(service.calibration_jobs.get, job_id)
+            path = service.calibration_jobs.root / job_id / "worker.log"
+            if not path.is_file() or path.is_symlink():
+                raise FileNotFoundError("The job has no processing log yet")
+            return FileResponse(path, media_type="text/plain", headers={"X-Content-Type-Options": "nosniff"})
+        except (CalibrationJobError, FileNotFoundError) as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/phone-calibration/imu-bundle", status_code=status.HTTP_201_CREATED)
     async def upload_imu_calibration(request: Request) -> dict[str, Any]:
@@ -2990,6 +3611,7 @@ def create_app(
     async def health() -> dict[str, Any]:
         usage = shutil.disk_usage(configured.storage_root)
         pcf_usage = shutil.disk_usage(service.pcf_storage_root)
+        motion_available, motion_unavailable_reason = _motion_profile_capability(configured.vio)
         return {
             "status": "ok",
             "version": app.version,
@@ -3024,6 +3646,16 @@ def create_app(
             "alignment_targets": service.public_alignment_targets(),
             "paired_static_alignment_available": True,
             "phone_camera_calibration": phone_camera_calibration,
+            "calibration": {
+                "schema": "roomwalk.calibration_capabilities.v1",
+                "camera_processing": True,
+                "stationary_noise_processing": True,
+                "camera_imu_solver_configured": bool(os.environ.get("NOESIS_PHONE_SCAN_CALIBRATION_SOLVER", "").strip()),
+                "motion_profile_validation_available": motion_available,
+                "motion_profile_unavailable_reason": motion_unavailable_reason,
+                "camera_selection_scope": "future_exactly_matching_native_imports",
+                "automatic_metric_vio_admission": False,
+            },
             "secure_capture_url": _phone_scan_secure_url(),
             "ca_certificate_url": "/api/browser-capture/ca-certificate",
             "sensor_capture": {
@@ -3244,11 +3876,11 @@ def create_app(
 
     @app.get("/api/scans")
     async def list_scans() -> list[dict[str, Any]]:
-        return [_public_state(state) for state in service.list_states()]
+        return [service.public_state(state) for state in service.list_states()]
 
     @app.get("/api/scans/{scan_id}")
     async def get_scan(scan_id: str) -> dict[str, Any]:
-        return _public_state(service.read_state(scan_id))
+        return service.public_state(service.read_state(scan_id))
 
     @app.patch("/api/scans/{scan_id}")
     async def rename_scan(
@@ -3256,6 +3888,19 @@ def create_app(
         name: str = Query(min_length=1, max_length=MAX_SCAN_NAME_LENGTH),
     ) -> dict[str, Any]:
         return _public_state(service.rename_scan(scan_id, name))
+
+    @app.post("/api/scans/{scan_id}/walk-intent")
+    async def set_scan_walk_intent(scan_id: str, request: Request) -> dict[str, Any]:
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > 4096:
+                raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Walk intent exceeds its 4 KiB limit")
+            raw.extend(chunk)
+        try:
+            value = json.loads(raw)
+        except (ValueError, UnicodeError) as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Walk intent must be JSON") from exc
+        return _public_state(service.set_walk_intent(scan_id, value))
 
     @app.post("/api/scans", status_code=status.HTTP_201_CREATED)
     async def create_scan_from_video(
@@ -3595,6 +4240,7 @@ def create_app(
                             "message": "Receiving timestamped camera and IMU bundle",
                             "error": None,
                             "input_mode": "sensor_bundle",
+                            "capture_profile_selection": service._new_capture_profile_selection(manifest),
                         }
                         service._write_state_unlocked(scan_id, state_payload)
 
@@ -3675,6 +4321,8 @@ def create_app(
                             "coverage": report["coverage"],
                         }
                         state_message = "Sensor bundle saved; preparing timestamped reconstruction views"
+                        if isinstance(report_manifest.get("calibration_request"), dict):
+                            capture_state["calibration_request"] = report_manifest["calibration_request"]
                         android_timing = report.get("android_capture")
                         if isinstance(android_timing, dict):
                             capture_state.update(
@@ -3690,6 +4338,14 @@ def create_app(
                             if not capture_state["camera_acquisition_timestamp_verified"]:
                                 state_message = "Android camera + IMU saved; preparing RGB views from encoded video timestamps"
                         video_content_type = content_type
+                    if capture_state.get("capture_kind") == "android_camera_imu" and not capture_state.get("calibration_request"):
+                        saved_selection = state_payload.get("capture_profile_selection")
+                        if isinstance(saved_selection, dict):
+                            capture_state.update(deepcopy(saved_selection))
+                        else:
+                            # A pre-existing queued import is not a new import:
+                            # never attach a newly selected motion profile to it.
+                            capture_state["camera_calibration_selection"] = service.camera_selection.get()
                     state_payload.update(
                         {
                             "status": "processing_frames",
@@ -3705,6 +4361,18 @@ def create_app(
                             "bundle": {"original_name": filename, "size_bytes": received},
                         }
                     )
+                    if report_manifest.get("walk_intent") is not None:
+                        intent = validate_walk_intent(report_manifest["walk_intent"])
+                        capture_state["walk_intent"] = intent
+                        state_payload["walk_intent"] = intent
+                        state_payload["walk_intent_source"] = "capture_manifest"
+                        # Purpose is retained even if its referenced room is no
+                        # longer available. A review checks the live binding;
+                        # import must not discard an otherwise useful recording.
+                        if intent["mode"] == "path_refinement":
+                            state_payload["message"] = "Path walk retained; preparing views for trajectory review"
+                    if capture_state.get("calibration_request"):
+                        state_payload.update(status="calibration_ready", message="Calibration capture retained. Open Calibration to process the board and motion evidence.")
                     if companion_session_id and companion_capture_id:
                         try:
                             service.companion_capture.associate_phone_bundle(
@@ -3726,7 +4394,8 @@ def create_app(
                         source_archive.unlink(missing_ok=True)
                     else:
                         service.capture_uploads.sync_state(scan_dir)
-                    service.submit_frame_preparation(scan_id)
+                    if not capture_state.get("calibration_request"):
+                        service.submit_frame_preparation(scan_id)
                     return JSONResponse(
                         _public_state(state_payload),
                         status_code=status.HTTP_201_CREATED,
@@ -3828,6 +4497,11 @@ def create_app(
                         },
                         "bundle": {"original_name": filename, "size_bytes": received},
                     }
+                    if existing is None:
+                        state_payload["capture_profile_selection"] = service._new_capture_profile_selection(normalized_manifest)
+                    if normalized_manifest.get("walk_intent") is not None:
+                        state_payload["walk_intent"] = normalized_manifest["walk_intent"]
+                        state_payload["walk_intent_source"] = "capture_manifest_pending_validation"
                     try:
                         # Only derived extraction is reset on an explicit exact-
                         # archive retry. The durable original archive is retained.
@@ -3891,6 +4565,11 @@ def create_app(
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
+
+    @app.post("/api/scans/{scan_id}/supplements/from-scan", status_code=status.HTTP_201_CREATED)
+    async def add_retained_video_to_scan(scan_id: str, source_scan_id: str = Query()) -> JSONResponse:
+        state_payload = await asyncio.to_thread(service.add_retained_capture, scan_id, source_scan_id)
+        return JSONResponse(_public_state(state_payload), status_code=status.HTTP_201_CREATED)
 
     @app.post(
         "/api/scans/{scan_id}/supplements",
@@ -4019,9 +4698,13 @@ def create_app(
     @app.post("/api/scans/{scan_id}/initiate-vio", status_code=status.HTTP_202_ACCEPTED)
     async def initiate_vio(scan_id: str) -> JSONResponse:
         return JSONResponse(
-            _public_state(service.initiate_vio(scan_id)),
+            _public_state(await asyncio.to_thread(service.initiate_vio, scan_id)),
             status_code=status.HTTP_202_ACCEPTED,
         )
+
+    @app.post("/api/scans/{scan_id}/path-review", status_code=status.HTTP_202_ACCEPTED)
+    async def initiate_path_review(scan_id: str, target_scan_id: str | None = Query(default=None)) -> JSONResponse:
+        return JSONResponse(_public_state(service.initiate_path_review(scan_id, target_scan_id)), status_code=status.HTTP_202_ACCEPTED)
 
     @app.post("/api/scans/{scan_id}/initiate-inference", status_code=status.HTTP_202_ACCEPTED)
     async def initiate_inference(

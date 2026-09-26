@@ -12,6 +12,10 @@ public final class CapturePreflight {
     private CapturePreflight() {}
 
     public static JSONObject find(File captureRoot, JSONObject candidate, String buildFingerprint) {
+        return find(captureRoot, candidate, buildFingerprint, true);
+    }
+
+    public static JSONObject find(File captureRoot, JSONObject candidate, String buildFingerprint, boolean requireFocusBinding) {
         File[] directories = captureRoot.listFiles(file -> file.isDirectory()
                 && file.getName().matches("\\d{8}-\\d{6}-[0-9a-f]{8}"));
         if (directories == null) return null;
@@ -21,7 +25,7 @@ public final class CapturePreflight {
             if (!result.isFile()) continue;
             try {
                 JSONObject recorded = BundleTools.readJson(result);
-                if (matches(recorded, candidate, buildFingerprint)) return reference(directories[i].getName(), recorded);
+                if (matches(recorded, candidate, buildFingerprint, requireFocusBinding)) return reference(directories[i].getName(), recorded);
             } catch (Exception ignored) {
                 // An unreadable or incomplete take cannot qualify a camera mode.
             }
@@ -38,15 +42,25 @@ public final class CapturePreflight {
     }
 
     public static boolean qualifiesWalk(JSONObject candidate, long encoderUseCase) {
+        return qualifiesWalk(candidate, encoderUseCase, true);
+    }
+
+    public static boolean qualifiesWalk(JSONObject candidate, long encoderUseCase, boolean requireFocusBinding) {
         if (candidate == null || !candidate.optBoolean("direct_session_test_eligible")) return false;
-        JSONObject recorded = candidate.optJSONObject("recorded_preflight");
-        return recorded != null && FocusSettings.sameConfiguration(candidate.optJSONObject("focus_control"),recorded.optJSONObject("focus_control")) && !recorded.optString("capture_id").isEmpty()
+        JSONObject recorded = !requireFocusBinding && candidate.has("automatic_recorded_preflight")
+                ? candidate.optJSONObject("automatic_recorded_preflight") : candidate.optJSONObject("recorded_preflight");
+        JSONObject expectedFocus = requireFocusBinding ? candidate.optJSONObject("focus_control") : null;
+        return recorded != null && FocusSettings.sameConfiguration(expectedFocus,recorded.optJSONObject("focus_control")) && !recorded.optString("capture_id").isEmpty()
                 && (encoderUseCase == 0 || encoderUseCase == 3)
                 && recorded.optLong("encoder_use_case", -1) == encoderUseCase
                 && recorded.optLong("preview_use_case", -1) == candidate.optLong("standard_preview_use_case", -2);
     }
 
     public static boolean matches(JSONObject result, JSONObject candidate, String buildFingerprint) {
+        return matches(result, candidate, buildFingerprint, true);
+    }
+
+    public static boolean matches(JSONObject result, JSONObject candidate, String buildFingerprint, boolean requireFocusBinding) {
         if (result == null || candidate == null || buildFingerprint == null || buildFingerprint.isEmpty()) return false;
         JSONObject device = result.optJSONObject("device"), camera = result.optJSONObject("camera"),
                 encoder = result.optJSONObject("encoder"), expectedEncoder = candidate.optJSONObject("encoder"),
@@ -62,7 +76,8 @@ public final class CapturePreflight {
                 || !bounds.optBoolean("short_test") || bounds.optLong("max_duration_ms") != 10_000
                 || !"short_test_duration_limit_10_seconds".equals(result.optString("stop_reason"))) return false;
         if (!candidate.optBoolean("direct_session_test_eligible")
-                || !camera.optString("id").equals(candidate.optString("id"))
+                || !camera.optString("id").equals(requireFocusBinding ? FocusSettings.outputCameraId(candidate.optString("id"),candidate.optJSONObject("focus_control")) : candidate.optString("id"))
+                || !camera.optString("logical_camera_id",camera.optString("id")).equals(candidate.optString("id"))
                 || camera.optInt("width") != CaptureEngine.WIDTH || camera.optInt("height") != CaptureEngine.HEIGHT
                 || camera.optInt("fps") != CaptureEngine.FPS
                 || !"REALTIME".equals(camera.optString("timestamp_source"))
@@ -70,8 +85,11 @@ public final class CapturePreflight {
                 || camera.optInt("sensor_orientation_degrees", -1) != candidate.optInt("sensor_orientation_degrees", -2)
                 || !"OFF".equals(camera.optString("ois_requested")) || !"OFF".equals(camera.optString("eis_requested"))) return false;
         JSONObject focus=camera.optJSONObject("focus_control");
-        if(!FocusSettings.sameConfiguration(candidate.optJSONObject("focus_control"),focus))return false;
-        if(focus!=null&&"manual_locked".equals(focus.optString("mode"))&&(focus.optLong("confirmed_frame_count")<=0||focus.optLong("unconfirmed_frame_count",-1)!=0))return false;
+        if(!requireFocusBinding&&!FocusSettings.sameConfiguration(null,focus))return false;
+        if(requireFocusBinding){
+            if(!FocusSettings.sameConfiguration(candidate.optJSONObject("focus_control"),focus))return false;
+            if(focus!=null&&"manual_locked".equals(focus.optString("mode"))&&(focus.optLong("confirmed_frame_count")<=0||focus.optLong("unconfirmed_frame_count",-1)!=0))return false;
+        }
         JSONObject session = camera.optJSONObject("recording_session");
         if (session == null || !session.optBoolean("query_called") || !session.optBoolean("supported")
                 || !candidate.optString("id").equals(session.optString("camera_id"))

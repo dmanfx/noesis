@@ -14,29 +14,32 @@
 </head>
 <body><main>
   <div class="brand">ROOMWALK</div>
-  <h1>Install the Android companion</h1>
-  <p>Record native phone video and motion together with the matching room-camera recording and tracking evidence, then upload the linked capture to RoomWalk.</p>
+  <h1>Install RoomWalk for Android</h1>
+  <p>Two capture modes: room reconstruction with additional views, and a body-held path walk paired with Noesis. Both retain native video and IMU data.</p>
   <button id="prepare" class="button" type="button">Prepare APK in browser</button>
-  <a id="save" class="button" download="roomwalk-companion-0.1.11.apk" hidden>Save APK to phone</a>
-  <p class="small">Version 0.1.11 · 279.1 kB · Android 13 or newer for recording</p>
+  <a id="save" class="button" download="roomwalk-companion-0.4.2.apk" hidden>Save APK to phone</a>
+  <p class="small">Version 0.4.2 · 894.9 kB · Android 13 or newer for recording</p>
   <p id="download-status" class="note" role="status">Tap Prepare APK in browser, then Save APK to phone. Keep this page open until Chrome finishes saving the file.</p>
   <ol>
     <li>Open this page in your phone’s regular browser. Tap <b>Prepare APK in browser</b>, wait for the file check, then tap <b>Save APK to phone</b>.</li>
     <li>After the browser finishes saving the APK, open it from Downloads. Android may ask to allow installation from that browser or file manager.</li>
-    <li>Open RoomWalk, allow camera access, tap <b>Check phone</b>, and select the matching room camera. Tap <b>Capture</b> to open the viewer. Run the <b>10-second test</b> before your first walk.</li>
+    <li>Open RoomWalk, allow camera access, and tap <b>Check phone</b>. Choose <b>Reconstruction</b> or <b>Path refinement</b>. Open the camera and complete its <b>10-second recording check</b> if requested.</li>
   </ol>
-  <p>Use <b>Record</b>, walk slowly, and tap <b>Stop &amp; save</b>. Keep RoomWalk open while recording. <b>Upload</b> sends the phone video and IMU with the exact room recording attached; originals remain saved. No separate noise recording or printed calibration board is needed for a normal walk.</p>
-  <p class="small">Version 0.1.11 keeps the main app in portrait and opens Capture in landscape. Upload continues with the screen off and shows progress in a notification. Once RoomWalk has saved the archive, video and timing validation continue on the server. The fixed LAN address is preserved.</p>
-  <p class="small">The app checks actual native 8K support on your phone. Timing and camera/IMU calibration remain separate checks.</p>
-  <footer><a href="/">Return to RoomWalk</a> · <a href="./roomwalk-companion-0.1.11.apk.sha256">APK checksum</a><p class="small"><a href="./roomwalk-companion-0.1.11.apk" download="roomwalk-companion-0.1.11.apk">Direct APK download</a></p></footer>
+  <p><b>Reconstruction:</b> capture many sharp, overlapping views. Optionally select an existing reconstruction, then explicitly add the new capture’s views from Library. A paired room camera is optional.</p>
+  <p><b>Path refinement:</b> choose the reconstruction marked <b>Noesis PCF</b> to use its exact retained fused version. For the Living Room, choose <b>living room walk · Noesis PCF</b> and the Living Room camera. The selected revision stays with the recording; it cannot silently fall back to the original raw reconstruction.</p>
+  <p>Hold the phone against your own torso with elbows tucked; turn and move your whole body with the phone. Stop, save and upload from Library. Process the path with DA3, align the new walk to its paired static camera, then run path review. The selected PCF room already has its verified registration. An ordinary raw reference still needs its own matching alignment. Review shows the phone path beside the paired Noesis track, with a time slider and downloads. Rejected corrections leave the original path intact; the desired 10 cm accuracy is not yet validated.</p>
+  <p class="note"><b>Install over the existing app. Do not uninstall or clear its data.</b> The same signing key preserves saved captures and settings. Original video, IMU streams, calibration evidence and older recordings remain available.</p>
+  <p class="small">Full calibration is optional under <b>Setup</b>. Ordinary capture uses automatic focus without requiring a board calibration. Recording-mode/timestamp checks still apply; a locked-focus calibration test does not qualify a different automatic recording mode.</p>
+  <p class="small">Native recording opens in landscape; uploads continue with the screen off. Use RoomWalk server 1.13.0 or newer. Native 8K support must still be checked on the physical phone; emulator validation is not an 8K recording test.</p>
+  <footer><a href="/">Return to RoomWalk</a> · <a href="./roomwalk-companion-0.4.2.apk.sha256">APK checksum</a><p class="small"><a href="./roomwalk-companion-0.4.2.apk" download="roomwalk-companion-0.4.2.apk">Direct APK download</a></p></footer>
 </main>
 <script>
   const prepare = document.querySelector('#prepare');
   const save = document.querySelector('#save');
   const status = document.querySelector('#download-status');
-  const apkName = 'roomwalk-companion-0.1.11.apk';
-  const apkBytes = 279137;
-  const apkSha256 = 'd0a80fdfe005b5d7d6bd4028116989d295fd2701a4d5b7b610fe2717ffe9fc44';
+  const apkName = 'roomwalk-companion-0.4.2.apk';
+  const apkBytes = 894931;
+  const apkSha256 = '734872e65c4e7661587f8b2d4e4447b35f072eb5d2ae4b975fb9c28eebca2806';
   let preparedUrl;
   prepare.addEventListener('click', async () => {
     prepare.disabled = true;

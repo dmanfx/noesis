@@ -5,8 +5,6 @@ import android.content.Intent;
 import android.content.res.Configuration;
 import android.os.Bundle;
 import android.os.SystemClock;
-import android.widget.ArrayAdapter;
-import android.widget.Spinner;
 import java.io.File;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -31,15 +29,37 @@ public final class OrientationInstrumentation extends Instrumentation {
             final int selection=found;
             runOnMainSync(()->{try{
                 Field values=MainActivity.class.getDeclaredField("cameras");values.setAccessible(true);values.set(activity,cameras);
-                Spinner camera=(Spinner)field("camera");String[] labels=new String[cameras.length()];
-                for(int i=0;i<labels.length;i++)labels[i]="Camera "+cameras.getJSONObject(i).getString("id");
-                camera.setAdapter(new ArrayAdapter<>(activity,android.R.layout.simple_spinner_dropdown_item,labels));camera.setSelection(selection);
+                Object camera=field("camera");Method size=camera.getClass().getDeclaredMethod("setSize",int.class);size.setAccessible(true);size.invoke(camera,cameras.length());
+                Method select=camera.getClass().getDeclaredMethod("setSelection",int.class);select.setAccessible(true);select.invoke(camera,selection);
                 call("updateButtons");
             }catch(Exception error){throw new RuntimeException(error);}});
             for(int cycle=0;cycle<2;cycle++){
                 invoke("openCaptureViewer");
                 waitFor(()->{JSONObject s=state();return s.getInt("orientation")==Configuration.ORIENTATION_LANDSCAPE&&s.getBoolean("viewer")&&s.getBoolean("preview_ready");},"Capture opens a live preview in landscape");
                 require(!state().getBoolean("destroyed"),"Orientation change preserves the Activity and selected camera");
+                if(cycle==0){
+                    Object originalViewer=field("captureDialog");
+                    CameraPreview controller=(CameraPreview)field("previewController");
+                    Field current=CameraPreview.class.getDeclaredField("current");current.setAccessible(true);
+                    Object session=current.get(controller);
+                    Field control=CameraPreview.class.getDeclaredField("control");control.setAccessible(true);
+                    Method fail=CameraPreview.class.getDeclaredMethod("fail",session.getClass(),String.class);fail.setAccessible(true);
+                    ((android.os.Handler)control.get(controller)).post(()->{try{fail.invoke(controller,session,"Injected lens/focus interruption");}catch(Exception error){throw new RuntimeException(error);}});
+                    waitFor(()->!state().getBoolean("preview_ready"),"Actual preview error clears ready state");
+                    android.widget.Button retry=(android.widget.Button)field("previewRetryButton");
+                    require(retry.isEnabled()&&retry.getVisibility()==android.view.View.VISIBLE,"Preview error exposes an enabled in-place restart action");
+                    screenshot("preview-recovery.png");
+                    runOnMainSync(()->retry.performClick());
+                    waitFor(()->state().getBoolean("preview_ready"),"Restart reopens a live camera after confirmed release");
+                    require(field("captureDialog")==originalViewer,"Recovery does not require leaving the viewer or reloading the app");
+                    Object restored=current.get(controller);
+                    Field captureField=restored.getClass().getDeclaredField("capture");captureField.setAccessible(true);
+                    ((android.os.Handler)control.get(controller)).post(()->{try{((android.hardware.camera2.CameraCaptureSession)captureField.get(restored)).stopRepeating();}catch(Exception error){throw new RuntimeException(error);}});
+                    waitFor(()->!state().getBoolean("preview_ready"),"A real mid-preview frame stall stops within the bounded watchdog");
+                    require(field("captureDialog")==originalViewer&&retry.isEnabled(),"A stalled preview remains recoverable without an app reload");
+                    runOnMainSync(()->retry.performClick());
+                    waitFor(()->state().getBoolean("preview_ready"),"Preview can restart after a frame stall");
+                }
                 observations.put(state());if(cycle==0)screenshot("orientation-landscape-preview.png");invoke("requestCloseCaptureViewer");
                 waitFor(()->{JSONObject s=state();return s.getInt("orientation")==Configuration.ORIENTATION_PORTRAIT&&!s.getBoolean("viewer");},"Closing capture returns to portrait");
                 observations.put(state());if(cycle==0)screenshot("orientation-portrait-return.png");

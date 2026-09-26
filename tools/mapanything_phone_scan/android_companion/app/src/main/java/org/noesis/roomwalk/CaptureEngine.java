@@ -52,6 +52,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -191,12 +192,17 @@ public final class CaptureEngine implements AutoCloseable {
     }
 
     public void start(File sessionDir, Surface previewSurface, String cameraId, boolean shortTest, long standardUseCase) {
+        start(sessionDir, previewSurface, cameraId, shortTest, standardUseCase, true);
+    }
+
+    /** Start a capture, optionally binding the saved measured focus used by calibration takes. */
+    public void start(File sessionDir, Surface previewSurface, String cameraId, boolean shortTest, long standardUseCase, boolean useCalibrationFocus) {
         control.post(() -> {
             if (closing || current != null) {
                 error("Recorder is already active or closed", object("state", "busy"));
                 return;
             }
-            Session session = new Session(sessionDir, previewSurface, shortTest, standardUseCase);
+            Session session = new Session(sessionDir, previewSurface, shortTest, standardUseCase, useCalibrationFocus);
             current = session;
             state("starting", object("session_dir", sessionDir.getAbsolutePath()));
             try {
@@ -222,6 +228,10 @@ public final class CaptureEngine implements AutoCloseable {
     }
 
     private Candidate candidate(String id) throws Exception {
+        return candidate(id, true);
+    }
+
+    private Candidate candidate(String id, boolean requireCalibrationFocus) throws Exception {
         CameraCharacteristics characteristics = cameras.getCameraCharacteristics(id);
         Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
         Integer source = characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
@@ -269,14 +279,20 @@ public final class CaptureEngine implements AutoCloseable {
             put(json, "physical_camera_ids_truncated", ids.size() > PROBE_MAX_LIST_VALUES);
             return boundedStrings(ids);
         });
-        diagnosticField(json,"focus_control",()->FocusSettings.metadata(FocusSettings.read(context,id)));
+        diagnosticField(json,"focus_control",()->FocusSettings.metadata(requireCalibrationFocus?FocusSettings.read(context,id):null));
         if (directTestEligible) {
             long previewUseCase = 0;
             long[] useCases = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES);
             if (useCases != null) for (long value : useCases) if (value == 1) previewUseCase = 1;
             put(json, "standard_preview_use_case", previewUseCase);
-            JSONObject recorded = CapturePreflight.find(new File(context.getExternalFilesDir(null), "captures"), json, Build.FINGERPRINT);
+            JSONObject recorded = CapturePreflight.find(new File(context.getExternalFilesDir(null), "captures"), json, Build.FINGERPRINT, requireCalibrationFocus);
             if (recorded != null) put(json, "recorded_preflight", recorded);
+            // Keep automatic walk-mode proof distinct from a saved board-focus
+            // proof so changing the capture purpose cannot reuse another route.
+            if (requireCalibrationFocus) {
+                JSONObject automatic = CapturePreflight.find(new File(context.getExternalFilesDir(null), "captures"), json, Build.FINGERPRINT, false);
+                if (automatic != null) put(json, "automatic_recorded_preflight", automatic);
+            }
         }
         return new Candidate(id, characteristics, encoder, json, reasons.length() == 0, directTestEligible);
     }
@@ -525,9 +541,18 @@ public final class CaptureEngine implements AutoCloseable {
 
     private void prepare(Session session, String cameraId) throws Exception {
         if (Build.VERSION.SDK_INT < 33) throw new IOException("Recording requires Android 13/API 33 or newer");
-        session.candidate = candidate(cameraId);
-        session.focus = FocusSettings.read(context,cameraId);
-        FocusSettings.validate(session.candidate.characteristics,cameraId,session.focus);
+        session.candidate = candidate(cameraId, session.useCalibrationFocus);
+        session.focus = session.useCalibrationFocus ? FocusSettings.read(context,cameraId) : null;
+        if (session.useCalibrationFocus) FocusSettings.validate(session.candidate.characteristics,cameraId,session.focus);
+        session.outputCharacteristics=session.candidate.characteristics;
+        if(session.focus!=null&&session.focus.physicalId!=null){
+            CameraCharacteristics physical=cameras.getCameraCharacteristics(session.focus.physicalId);
+            session.outputCharacteristics=physical;
+            if(!Integer.valueOf(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME).equals(physical.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)))
+                throw new IOException("The locked lens does not report a REALTIME acquisition clock");
+            if(!Objects.equals(physical.get(CameraCharacteristics.SENSOR_ORIENTATION),session.candidate.characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)))
+                throw new IOException("The locked lens orientation differs from the selected camera");
+        }
         if (!session.dir.isDirectory() && !session.dir.mkdirs()) throw new IOException("Cannot create session directory");
         for (String name : new String[]{"camera.mp4", "accel.csv", "gyro.csv", "camera_results.jsonl",
                 "encoder_pts.csv", "timestamps.csv", "capture_result.json", "capabilities.json"}) {
@@ -547,7 +572,7 @@ public final class CaptureEngine implements AutoCloseable {
         writeJson(new File(session.dir, "capabilities.json"), session.capabilityReport);
         if (!session.candidate.supported) {
             if (!session.candidate.directTestEligible) throw new IOException(session.candidate.json.optString("reason"));
-            if ((!session.shortTest && !CapturePreflight.qualifiesWalk(session.candidate.json, session.encoderUseCase))
+            if ((!session.shortTest && !CapturePreflight.qualifiesWalk(session.candidate.json, session.encoderUseCase, session.useCalibrationFocus))
                     || (session.encoderUseCase != 0 && session.encoderUseCase != 3))
                 throw new IOException("This camera requires a successful short recording test for the same configuration before a full walk");
             put(session.sessionSupport, "recorded_preflight", session.candidate.json.opt("recorded_preflight"));
@@ -656,8 +681,8 @@ public final class CaptureEngine implements AutoCloseable {
         long encoderUseCase = session.candidate.supported ? 0 : session.encoderUseCase;
         long previewUseCase = !session.candidate.supported && previewAdvertised ? 1 : 0;
         List<OutputConfiguration> outputs = new ArrayList<>();
-        outputs.add(SessionProbe.output(session.encoderSurface, encoderUseCase));
-        outputs.add(SessionProbe.output(session.preview, previewUseCase));
+        outputs.add(SessionProbe.output(session.encoderSurface, encoderUseCase,session.focus));
+        outputs.add(SessionProbe.output(session.preview, previewUseCase,session.focus));
         session.timestampBaseConfigured = true;
         put(session.sessionSupport, "encoder_use_case", encoderUseCase);
         put(session.sessionSupport, "preview_use_case", previewUseCase);
@@ -706,9 +731,12 @@ public final class CaptureEngine implements AutoCloseable {
         return new CameraCaptureSession.CaptureCallback() {
             @Override public void onCaptureCompleted(CameraCaptureSession capture, CaptureRequest request, TotalCaptureResult result) {
                 if (!session.acceptRecords) return;
-                FrameRecord record = new FrameRecord(result, SystemClock.elapsedRealtimeNanos());
+                final FrameRecord record;
+                try{record=new FrameRecord(result,session.candidate.id,SystemClock.elapsedRealtimeNanos(),session.focus);}
+                catch(IOException missing){fail(session,"locked_lens_metadata_missing",missing);return;}
                 offer(session, record);
                 session.captureCallbacks.incrementAndGet();
+                session.lastCameraReceivedNs=record.receivedNs;
                 if(session.focus!=null) {
                     if(FocusSettings.matches(session.focus,result))session.focusConfirmedFrames++;
                     else{session.focusUnconfirmedFrames++;if(session.focusConfirmedFrames>0||SystemClock.elapsedRealtimeNanos()-session.recordingStartedNs>3_000_000_000L)fail(session,"manual_focus_not_confirmed",null);}
@@ -761,6 +789,8 @@ public final class CaptureEngine implements AutoCloseable {
             if (elapsedMs >= 10000 && session.encodedFrameCount.get() == 0) {
                 fail(session, "no_encoded_frames_timeout", null); return;
             }
+            String stalled=mediaStallReason(now,session.lastCameraReceivedNs,session.lastEncodedReceivedNs);
+            if(stalled!=null){fail(session,stalled,null);return;}
             if (elapsedMs >= SENSOR_START_TIMEOUT_MS) {
                 if (session.accelStats.count < 2 || session.gyroStats.count < 2) {
                     fail(session, "imu_stream_start_timeout", null); return;
@@ -784,6 +814,12 @@ public final class CaptureEngine implements AutoCloseable {
             }
         } catch (RuntimeException failure) { fail(session, "storage_check_failed", failure); return; }
         control.postDelayed(session.watchdog, 1000);
+    }
+
+    static String mediaStallReason(long now,long cameraReceived,long encodedReceived){
+        if(cameraReceived>0&&now-cameraReceived>TimeUnit.SECONDS.toNanos(5))return "camera_stream_stalled_for_5_seconds";
+        if(encodedReceived>0&&now-encodedReceived>TimeUnit.SECONDS.toNanos(5))return "encoder_stream_stalled_for_5_seconds";
+        return null;
     }
 
     private void requestStop(Session session, String reason, boolean partial) {
@@ -873,6 +909,7 @@ public final class CaptureEngine implements AutoCloseable {
                             pts.write(frameIndex + "," + info.presentationTimeUs + "," + info.flags + "," + info.size + "\n");
                             session.encodedFrames.add(new TimestampAssociation.EncodedFrame(frameIndex, info.presentationTimeUs));
                             session.encodedFrameCount.incrementAndGet();
+                            session.lastEncodedReceivedNs=SystemClock.elapsedRealtimeNanos();
                             long bytes = session.encodedBytes.addAndGet(info.size);
                             if (bytes >= MAX_VIDEO_BYTES) control.post(() -> requestStop(session, "video_size_limit_6_gib", false));
                         }
@@ -1018,7 +1055,8 @@ public final class CaptureEngine implements AutoCloseable {
             if (new File(session.dir, file[1]).isFile()) put(files, file[0], file[1]);
         }
         if (exact) put(files, "timestamps", "timestamps.csv");
-        JSONObject camera = object("id", session.candidate == null ? JSONObject.NULL : session.candidate.id,
+        JSONObject camera = object("id", session.candidate == null ? JSONObject.NULL : FocusSettings.outputCameraId(session.candidate.id,session.focus),
+                "logical_camera_id",session.candidate==null?JSONObject.NULL:session.candidate.id,
                 "width", WIDTH, "height", HEIGHT, "fps", FPS, "fps_is_requested_target", true,
                 "timestamp_source", session.candidate == null ? "UNKNOWN" : session.candidate.json.optString("timestamp_source"),
                 "timestamp_base", "SENSOR", "timestamp_base_configured", session.timestampBaseConfigured,
@@ -1034,7 +1072,17 @@ public final class CaptureEngine implements AutoCloseable {
         put(camera, "recording_session", session.sessionSupport);
         try{put(camera,"focus_control",FocusSettings.metadata(session.focus).put("confirmed_frame_count",session.focusConfirmedFrames).put("unconfirmed_frame_count",session.focusUnconfirmedFrames));}catch(Exception ignored){}
         if (session.candidate != null) {
-            CameraCharacteristics c = session.candidate.characteristics;
+            CameraCharacteristics c = session.outputCharacteristics==null?session.candidate.characteristics:session.outputCharacteristics;
+            put(camera, "distortion_correction_request_key_available", c.getAvailableCaptureRequestKeys().contains(CaptureRequest.DISTORTION_CORRECTION_MODE));
+            put(camera, "distortion_correction_result_key_available", c.getAvailableCaptureResultKeys().contains(CaptureResult.DISTORTION_CORRECTION_MODE));
+            int[] modes=c.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES);
+            JSONArray modeValues=new JSONArray();if(modes!=null)for(int mode:modes)modeValues.put(mode);
+            put(camera, "distortion_correction_available_modes", modes==null?null:modeValues);
+            put(camera, "sensor_geometry_camera_id", session.candidate.id);
+            if(session.activePhysicalCameraId!=null){
+                try{c=cameras.getCameraCharacteristics(session.activePhysicalCameraId);put(camera,"sensor_geometry_camera_id",session.activePhysicalCameraId);}
+                catch(Exception unavailable){put(camera,"physical_sensor_geometry_error",unavailable.toString());}
+            }
             put(camera, "sensor_active_array_size", rect(c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)));
             put(camera, "sensor_pre_correction_active_array_size", rect(c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)));
             Size array = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
@@ -1257,15 +1305,23 @@ public final class CaptureEngine implements AutoCloseable {
     private static final class FrameRecord implements Record {
         final long frameNumber;
         final Long sensorTimestampNs, exposureTimeNs, frameDurationNs, rollingShutterSkewNs;
-        final Integer sensitivity, oisMode, eisMode, afState, aeState, rotateAndCrop, distortionCorrection;
+        final Integer sensitivity, oisMode, eisMode, afState, aeState, rotateAndCrop, distortionCorrection, sensorPixelMode;
         final Float focusDistance, focalLength, zoomRatio;
         final float[] intrinsics, distortion;
         final Rect crop;
-        final String physicalCameraId;
+        final String physicalCameraId, resultCameraId,logicalPhysicalCameraId,outputPhysicalCameraId;
+        final Long logicalTimestampNs;
+        final PhysicalFrameRecord physicalResult,logicalResult;
         final long receivedNs;
-        FrameRecord(TotalCaptureResult result, long receivedNs) {
+        FrameRecord(TotalCaptureResult total, String logicalCameraId, long receivedNs,FocusSettings.Lock focus) throws IOException {
+            CaptureResult result=FocusSettings.resultForOutput(total,focus);
             this.receivedNs = receivedNs;
-            frameNumber = result.getFrameNumber();
+            outputPhysicalCameraId=focus==null?null:focus.physicalId;
+            this.resultCameraId=outputPhysicalCameraId==null?logicalCameraId:outputPhysicalCameraId;
+            logicalTimestampNs=total.get(CaptureResult.SENSOR_TIMESTAMP);
+            logicalPhysicalCameraId=total.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID);
+            logicalResult=outputPhysicalCameraId==null?null:new PhysicalFrameRecord(logicalCameraId,total);
+            frameNumber = total.getFrameNumber();
             sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP);
             exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
             frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION);
@@ -1280,13 +1336,16 @@ public final class CaptureEngine implements AutoCloseable {
             zoomRatio = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
             rotateAndCrop = result.get(CaptureResult.SCALER_ROTATE_AND_CROP);
             distortionCorrection = result.get(CaptureResult.DISTORTION_CORRECTION_MODE);
+            sensorPixelMode = result.get(CaptureResult.SENSOR_PIXEL_MODE);
             float[] rawIntrinsics = result.get(CaptureResult.LENS_INTRINSIC_CALIBRATION);
             float[] rawDistortion = result.get(CaptureResult.LENS_DISTORTION);
             intrinsics = rawIntrinsics == null ? null : rawIntrinsics.clone();
             distortion = rawDistortion == null ? null : rawDistortion.clone();
             Rect rawCrop = result.get(CaptureResult.SCALER_CROP_REGION);
             crop = rawCrop == null ? null : new Rect(rawCrop);
-            physicalCameraId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID);
+            physicalCameraId=outputPhysicalCameraId==null?logicalPhysicalCameraId:outputPhysicalCameraId;
+            CaptureResult physical = physicalCameraId == null ? null : total.getPhysicalCameraResults().get(physicalCameraId);
+            physicalResult = physical == null ? null : new PhysicalFrameRecord(physicalCameraId, physical);
         }
         JSONObject json() {
             return object("frame_number", frameNumber, "sensor_timestamp_ns", sensorTimestampNs,
@@ -1296,10 +1355,51 @@ public final class CaptureEngine implements AutoCloseable {
                     "lens_focal_length_mm", focalLength, "crop_region", rect(crop), "zoom_ratio", zoomRatio,
                     "ois_mode", oisMode, "eis_mode", eisMode, "af_state", afState, "ae_state", aeState,
                     "rotate_and_crop_mode", rotateAndCrop, "distortion_correction_mode", distortionCorrection,
+                    "sensor_pixel_mode", sensorPixelMode,
+                    "result_camera_id", resultCameraId,
+                    "metadata_source",outputPhysicalCameraId==null?"logical_capture_result":"physical_output_capture_result",
+                    "output_physical_camera_id",outputPhysicalCameraId,
+                    "logical_active_physical_camera_id",logicalPhysicalCameraId,
+                    "logical_capture_result",logicalResult==null?null:logicalResult.json(),
                     "active_physical_camera_id", physicalCameraId,
+                    "physical_capture_result", physicalResult == null ? null : physicalResult.json(),
+                    "physical_capture_result_matches_logical_timestamp", physicalResult != null && logicalTimestampNs != null && logicalTimestampNs.equals(physicalResult.sensorTimestampNs),
                     "raw_android_lens_intrinsic_calibration", floats(intrinsics),
                     "raw_android_lens_distortion", floats(distortion),
                     "calibration_admitted", false);
+        }
+    }
+    /** Preserve each SDK result with its own camera identity; never relabel logical metadata. */
+    private static final class PhysicalFrameRecord {
+        final String cameraId;
+        final Long sensorTimestampNs, exposureTimeNs, rollingShutterSkewNs;
+        final Integer sensorPixelMode, distortionMode, oisMode, eisMode, rotateAndCrop,afMode,afState;
+        final Float zoomRatio,focusDistance,focalLength;
+        final Rect crop;
+        PhysicalFrameRecord(String cameraId, CaptureResult result) {
+            this.cameraId = cameraId;
+            sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+            exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+            rollingShutterSkewNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW);
+            sensorPixelMode = result.get(CaptureResult.SENSOR_PIXEL_MODE);
+            distortionMode = result.get(CaptureResult.DISTORTION_CORRECTION_MODE);
+            oisMode = result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE);
+            eisMode = result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE);
+            rotateAndCrop = result.get(CaptureResult.SCALER_ROTATE_AND_CROP);
+            zoomRatio = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
+            focusDistance=result.get(CaptureResult.LENS_FOCUS_DISTANCE);
+            focalLength=result.get(CaptureResult.LENS_FOCAL_LENGTH);
+            afMode=result.get(CaptureResult.CONTROL_AF_MODE);afState=result.get(CaptureResult.CONTROL_AF_STATE);
+            Rect rawCrop = result.get(CaptureResult.SCALER_CROP_REGION);
+            crop = rawCrop == null ? null : new Rect(rawCrop);
+        }
+        JSONObject json() {
+            return object("result_camera_id", cameraId, "sensor_timestamp_ns", sensorTimestampNs,
+                    "exposure_time_ns", exposureTimeNs, "rolling_shutter_skew_ns", rollingShutterSkewNs,
+                    "sensor_pixel_mode", sensorPixelMode, "distortion_correction_mode", distortionMode,
+                    "ois_mode", oisMode, "eis_mode", eisMode, "rotate_and_crop_mode", rotateAndCrop,
+                    "zoom_ratio", zoomRatio, "crop_region", rect(crop),
+                    "lens_focus_distance_diopters",focusDistance,"lens_focal_length_mm",focalLength,"af_mode",afMode,"af_state",afState);
         }
     }
     private static final class SensorStats {
@@ -1351,6 +1451,7 @@ public final class CaptureEngine implements AutoCloseable {
         }
     }
     private static final class Session {
+        CameraCharacteristics outputCharacteristics;
         final File dir;
         final Surface preview;
         final boolean shortTest;
@@ -1366,6 +1467,7 @@ public final class CaptureEngine implements AutoCloseable {
         volatile boolean acceptRecords, metadataStop, stopping, partial, forceDrainStop;
         volatile boolean metadataFinalized, muxerFinalized, encoderEosReceived;
         volatile long drainDeadlineNs;
+        volatile long lastCameraReceivedNs,lastEncodedReceivedNs;
         boolean outputOwned, cameraFinished, codecStarted, timestampBaseConfigured, rotateAndCropNoneRequested, distortionCorrectionOffRequested;
         int repeatingSequence = -1, requestedAfMode = -1, cameraResultCount;
         long recordingStartedNs;
@@ -1385,8 +1487,9 @@ public final class CaptureEngine implements AutoCloseable {
         Surface encoderSurface;
         Thread metadataThread, encoderThread;
         Runnable watchdog;
-        Session(File dir, Surface preview, boolean shortTest, long encoderUseCase) {
-            this.dir = dir; this.preview = preview; this.shortTest = shortTest; this.encoderUseCase = encoderUseCase;
+        final boolean useCalibrationFocus;
+        Session(File dir, Surface preview, boolean shortTest, long encoderUseCase, boolean useCalibrationFocus) {
+            this.dir = dir; this.preview = preview; this.shortTest = shortTest; this.encoderUseCase = encoderUseCase; this.useCalibrationFocus = useCalibrationFocus;
             this.maxDurationMs = shortTest ? SHORT_TEST_DURATION_MS : MAX_DURATION_MS;
         }
     }

@@ -117,7 +117,7 @@ final class UploadInstrumentation {
         final File selected=archive;String hash=digest(archive);long started=SystemClock.elapsedRealtime();
         test.runOnMainSync(()->{try{UploadService.start(context,selected,args.getString("uploadStoredServer"),false);}catch(Exception error){throw new RuntimeException(error);}});
         if(!existing){awaitState(context,"uploading",10000);Thread.sleep(1500);
-        test.runOnMainSync(()->{try{java.lang.reflect.Field field=MainActivity.class.getDeclaredField("transferPanel");field.setAccessible(true);android.view.View panel=(android.view.View)field.get(activity);panel.requestRectangleOnScreen(new android.graphics.Rect(0,0,panel.getWidth(),panel.getHeight()),true);}catch(Exception error){throw new RuntimeException(error);}});
+        test.runOnMainSync(()->{try{java.lang.reflect.Field field=MainActivity.class.getDeclaredField("shell");field.setAccessible(true);WebShell shell=(WebShell)field.get(activity);shell.view.evaluateJavascript("document.querySelector('#tab-capture')?.click();document.querySelector('#native-transfer')?.scrollIntoView()",null);}catch(Exception error){throw new RuntimeException(error);}});
         screenshot(test,"upload-progress-portrait.png");}
         JSONObject complete=awaitState(context,"complete",20000);JSONObject receipt=complete.getJSONObject("receipt"),stored=receipt.getJSONObject("upload_receipt");
         require("pending".equals(receipt.getString("validation_status")),"202 means transferred; validation stays pending");

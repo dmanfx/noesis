@@ -25,6 +25,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
+from .walk_intent import validate_walk_intent
+
 
 CAPTURE_SCHEMA = "noesis.phone_capture.v1"
 CAPTURE_MANIFEST_NAMES = {"capture_manifest.json", "manifest.json"}
@@ -427,6 +429,26 @@ def validate_capture_manifest(
     }
     if android_capture is not None:
         normalized["android_capture"] = android_capture
+        # Capture intent is not calibration evidence. Keep it separate from the
+        # numerical calibration/admission fields and retain the original board.
+        request = manifest.get("calibration_request")
+        if request is not None:
+            if (not isinstance(request, Mapping)
+                    or request.get("schema") != "roomwalk.calibration_request.v1"
+                    or request.get("mode") not in {"camera", "imu"}
+                    or not isinstance(request.get("board"), Mapping)
+                    or len(json.dumps(request)) > 64 * 1024):
+                raise CaptureImportError("Invalid or oversized native calibration capture request")
+            if request.get("capture_id") not in (None, capture_id):
+                raise CaptureImportError("Calibration request belongs to a different capture")
+            normalized["calibration_request"] = dict(request)
+    if manifest.get("walk_intent") is not None:
+        if manifest.get("calibration_request") is not None:
+            raise CaptureImportError("A calibration recording cannot also declare a room-walk intent")
+        try:
+            normalized["walk_intent"] = validate_walk_intent(manifest["walk_intent"])
+        except ValueError as exc:
+            raise CaptureImportError(str(exc)) from exc
     return normalized
 
 
@@ -986,6 +1008,16 @@ def import_capture_bundle(
                 limits=limits,
             )
         normalized = validate_capture_manifest(manifest, member_names=names)
+        if "walk_intent.json" in names:
+            sidecar = temporary_root / "walk_intent.json"
+            if sidecar.stat().st_size > 4096:
+                raise CaptureImportError("Walk intent exceeds its 4 KiB limit")
+            try:
+                intent = validate_walk_intent(json.loads(sidecar.read_text(encoding="utf-8")))
+            except (ValueError, UnicodeError) as exc:
+                raise CaptureImportError(f"Invalid walk intent: {exc}") from exc
+            if normalized.get("walk_intent") != intent:
+                raise CaptureImportError("Walk intent sidecar disagrees with the capture manifest")
         normalized_imu = normalized["imu"]
         if normalized_imu["sample_clock_mode"] == "separate_streams":
             accel_rows, accel_metrics = parse_imu_axis_csv(

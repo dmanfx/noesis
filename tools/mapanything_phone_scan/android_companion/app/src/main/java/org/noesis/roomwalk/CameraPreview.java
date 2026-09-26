@@ -60,12 +60,17 @@ public final class CameraPreview {
     }
 
     public void open(String cameraId, Surface surface, Listener listener) {
+        open(cameraId, surface, listener, true);
+    }
+
+    /** Open with the saved measured focus only for an explicitly selected calibration take. */
+    public void open(String cameraId, Surface surface, Listener listener, boolean useSavedFocus) {
         if (listener == null) throw new IllegalArgumentException("A preview listener is required");
         if (shutdownRequested || threadStopped) {
             main.post(() -> listener.onError("The preview controller has shut down"));
             return;
         }
-        if (!control.post(() -> beginOpen(cameraId, surface, listener)))
+        if (!control.post(() -> beginOpen(cameraId, surface, listener, useSavedFocus)))
             main.post(() -> listener.onError("The preview camera worker is unavailable"));
     }
 
@@ -93,7 +98,7 @@ public final class CameraPreview {
         close(null);
     }
 
-    private void beginOpen(String cameraId, Surface surface, Listener listener) {
+    private void beginOpen(String cameraId, Surface surface, Listener listener, boolean useSavedFocus) {
         if (shutdownRequested) {
             main.post(() -> listener.onError("The preview controller has shut down"));
             stopThreadIfClosed();
@@ -108,13 +113,13 @@ public final class CameraPreview {
             main.post(() -> listener.onError("A selected camera and a live preview surface are required"));
             return;
         }
-        PreviewSession session = new PreviewSession(cameraId, surface, listener);
+        PreviewSession session = new PreviewSession(cameraId, surface, listener, useSavedFocus);
         current = session;
         main.postDelayed(session.startupTimeout, STARTUP_TIMEOUT_MS);
         try {
             if (cameras == null) throw new IllegalStateException("Camera service is unavailable");
             session.characteristics = cameras.getCameraCharacteristics(cameraId);
-            session.focus = FocusSettings.read(context,cameraId);
+            session.focus = useSavedFocus ? FocusSettings.read(context,cameraId) : null;
             if (session.closing || shutdownRequested) {
                 beginClose(session, null);
                 return;
@@ -168,6 +173,8 @@ public final class CameraPreview {
 
     private void configure(PreviewSession session) throws Exception {
         if (!session.surface.isValid()) throw new IllegalStateException("The preview surface is no longer available");
+        final int generation=++session.configurationGeneration;
+        final FocusSettings.Lock outputFocus=session.pendingFocus==null?session.focus:session.pendingFocus;
         CaptureRequest.Builder request = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
         // The recording-capable path uses the same explicit, available camera controls.
         // Older devices can still display a preview with their standard template defaults.
@@ -183,11 +190,12 @@ public final class CameraPreview {
             if (!fixed30Available) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, templateFps);
         }
         session.autoFocusMode=request.get(CaptureRequest.CONTROL_AF_MODE);
-        FocusSettings.apply(request,session.characteristics,session.cameraId,session.focus);
+        FocusSettings.apply(request,session.characteristics,session.cameraId,outputFocus);
         session.request=request;
         request.addTarget(session.surface);
         CaptureRequest repeating = request.build();
         OutputConfiguration output = new OutputConfiguration(session.surface);
+        FocusSettings.bindOutput(output,outputFocus);
         if (Build.VERSION.SDK_INT >= 33) {
             long useCase = CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT;
             long[] advertised = session.characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES);
@@ -203,20 +211,20 @@ public final class CameraPreview {
         SessionConfiguration configuration = new SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
                 Collections.singletonList(output), command -> control.post(command), new CameraCaptureSession.StateCallback() {
             @Override public void onConfigured(CameraCaptureSession capture) {
-                if (current != session || session.closing || shutdownRequested) {
+                if (current != session || session.closing || shutdownRequested || generation!=session.configurationGeneration) {
                     closeCapture(session, capture);
-                    if (current == session) beginClose(session, null);
+                    if (current == session && (session.closing||shutdownRequested)) beginClose(session, null);
                     return;
                 }
                 session.capture = capture;
                 try {
                     session.callback = new CameraCaptureSession.CaptureCallback() {
                         @Override public void onCaptureCompleted(CameraCaptureSession capture, CaptureRequest request, TotalCaptureResult result) {
-                            if (current != session || session.closing || shutdownRequested) return;
+                            if (current != session || session.closing || shutdownRequested || session.capture!=capture || generation!=session.configurationGeneration) return;
                             session.latest=result;session.receivedNs=SystemClock.elapsedRealtimeNanos();
                             FocusSettings.Lock expected=session.pendingFocus==null?session.focus:session.pendingFocus;
                             if(expected!=null&&!FocusSettings.matches(expected,result)) {
-                                if(session.focusConfirmed)fail(session,"The camera no longer confirms the saved focus lock");
+                                if(session.focusConfirmed)fail(session,"The locked lens no longer confirms focus. Use Restart preview; your saved recording and focus setting are retained.");
                                 return;
                             }
                             if(session.pendingFocus!=null) {
@@ -226,13 +234,15 @@ public final class CameraPreview {
                             if(session.focus!=null)session.focusConfirmed=true;
                             if (session.startOutcome.compareAndSet(0, 1)) {
                                 main.removeCallbacks(session.startupTimeout);
+                                control.removeCallbacks(session.frameWatchdog);
+                                control.postDelayed(session.frameWatchdog,1000);
                                 main.post(() -> {
                                     if (current == session && !session.closing && !shutdownRequested) session.listener.onReady();
                                 });
                             }
                         }
                         @Override public void onCaptureFailed(CameraCaptureSession capture, CaptureRequest request, CaptureFailure failure) {
-                            if (current == session && !session.closing)
+                            if (current == session && !session.closing && session.capture==capture && generation==session.configurationGeneration)
                                 fail(session, "Preview capture failed with reason " + failure.getReason());
                         }
                     };
@@ -242,7 +252,10 @@ public final class CameraPreview {
 
             @Override public void onConfigureFailed(CameraCaptureSession capture) {
                 closeCapture(session, capture);
-                if (current == session && !session.closing) fail(session, "The camera rejected the preview session");
+                if(generation!=session.configurationGeneration)return;
+                if (current == session && !session.closing) fail(session, outputFocus!=null&&outputFocus.physicalId!=null
+                        ? "The phone rejected preview on the locked physical lens. Unlock focus to recover; no other lens was substituted."
+                        : "The camera rejected the preview session. Use Restart preview.");
                 else if (current == session) beginClose(session, null);
             }
         });
@@ -251,6 +264,15 @@ public final class CameraPreview {
     }
 
     public interface FocusListener { void onFocus(boolean confirmed,String message); }
+    private void reconfigure(PreviewSession session) throws Exception {
+        control.removeCallbacks(session.frameWatchdog);
+        session.latest=null;session.focusConfirmed=false;
+        if(session.capture!=null){CameraCaptureSession old=session.capture;session.capture=null;old.close();}
+        session.startOutcome.set(0);
+        main.removeCallbacks(session.startupTimeout);
+        main.postDelayed(session.startupTimeout,STARTUP_TIMEOUT_MS);
+        configure(session);
+    }
     /** Lock the measured, settled preview focus. Persist only after an actual result confirms it. */
     public void lockFocus(FocusListener listener) {
         control.post(()->{
@@ -259,10 +281,11 @@ public final class CameraPreview {
             try{
                 s.pendingFocus=FocusSettings.measured(s.characteristics,s.cameraId,s.latest,s.receivedNs);
                 s.focusListener=listener;s.focusConfirmed=false;
-                FocusSettings.apply(s.request,s.characteristics,s.cameraId,s.pendingFocus);
-                s.capture.setRepeatingRequest(s.request.build(),s.callback,control);
-                s.focusTimeout=()->{if(s.pendingFocus!=null){completeFocus(s,false,"The camera did not confirm manual focus within 3 seconds");fail(s,"Focus lock was not confirmed; reopen the preview to retry");}};
-                control.postDelayed(s.focusTimeout,3000);
+                // Changing a stream's physical camera requires a new session;
+                // changing only the repeating request leaves lens switching enabled.
+                reconfigure(s);
+                s.focusTimeout=()->{if(s.pendingFocus!=null){completeFocus(s,false,"The camera did not confirm the locked lens within 5 seconds");fail(s,"Lens/focus lock was not confirmed. Use Restart preview to retry.");}};
+                control.postDelayed(s.focusTimeout,5000);
             }catch(Exception failure){s.pendingFocus=null;boolean submitted=s.focusListener!=null;completeFocus(s,false,describe(failure));if(!submitted)main.post(()->listener.onFocus(false,describe(failure)));else fail(s,"Focus request failed; reopen the preview to retry");}
         });
     }
@@ -272,9 +295,7 @@ public final class CameraPreview {
                 FocusSettings.clear(context,cameraId);PreviewSession s=current;
                 if(s!=null&&!s.closing&&s.cameraId.equals(cameraId)&&s.capture!=null){
                     completeFocus(s,false,"Focus lock cancelled");s.pendingFocus=null;s.focus=null;s.focusConfirmed=false;
-                    s.request.set(CaptureRequest.CONTROL_AF_MODE,s.autoFocusMode);
-                    s.request.set(CaptureRequest.LENS_FOCUS_DISTANCE,null);
-                    s.capture.setRepeatingRequest(s.request.build(),s.callback,control);
+                    reconfigure(s);
                 }
                 main.post(()->listener.onFocus(true,"Automatic focus restored; saved lock removed"));
             }catch(Exception failure){main.post(()->listener.onFocus(false,describe(failure)));if(current!=null)fail(current,"Could not restore automatic focus");}
@@ -297,6 +318,7 @@ public final class CameraPreview {
             return;
         }
         completeFocus(session,false,"Preview closed before focus was confirmed");
+        control.removeCallbacks(session.frameWatchdog);
         session.closing = true;
         session.startOutcome.compareAndSet(0, 2);
         main.removeCallbacks(session.startupTimeout);
@@ -407,19 +429,25 @@ public final class CameraPreview {
         final List<CloseRequest> closeRequests = new ArrayList<>();
         final Runnable startupTimeout;
         final Runnable closeTimeout;
+        final Runnable frameWatchdog;
         volatile boolean closing, closed;
         boolean openPending, deviceCloseRequested, closeWatchStarted;
-        CameraCharacteristics characteristics;
+        CameraCharacteristics characteristics;int configurationGeneration;
         CameraDevice device;
         CameraCaptureSession capture;
         CaptureRequest.Builder request;CameraCaptureSession.CaptureCallback callback;
         TotalCaptureResult latest;long receivedNs;Integer autoFocusMode;
         FocusSettings.Lock focus,pendingFocus;boolean focusConfirmed;FocusListener focusListener;Runnable focusTimeout;
 
-        PreviewSession(String cameraId, Surface surface, Listener listener) {
+        PreviewSession(String cameraId, Surface surface, Listener listener, boolean useSavedFocus) {
             this.cameraId = cameraId;
             this.surface = surface;
             this.listener = listener;
+            frameWatchdog=new Runnable(){public void run(){
+                if(current!=PreviewSession.this||closing||shutdownRequested||startOutcome.get()!=1)return;
+                if(SystemClock.elapsedRealtimeNanos()-receivedNs>5_000_000_000L){fail(PreviewSession.this,"Preview frames stopped for 5 seconds. Use Restart preview; the saved focus is unchanged.");return;}
+                control.postDelayed(this,1000);
+            }};
             startupTimeout = () -> {
                 if (current != this || closing || !startOutcome.compareAndSet(0, 2)) return;
                 closing = true;

@@ -16,7 +16,7 @@ import java.io.IOException;
 /** Foreground-only long IMU acquisition. It never opens a camera or encoder. */
 public final class ImuCalibrationRecorder {
     public static final long DEFAULT_DURATION_SECONDS = 60;
-    public static final long MAX_DURATION_SECONDS = 5 * 60;
+    public static final long MAX_DURATION_SECONDS = 3 * 60 * 60;
     private static final long STORAGE_RESERVE_BYTES = 64L * 1024 * 1024;
     public interface Listener {
         void onImuState(String state, JSONObject details);
@@ -41,7 +41,7 @@ public final class ImuCalibrationRecorder {
         control.post(() -> {
             if (closing || current != null) { error("IMU recorder is unavailable or already active"); return; }
             if (durationSeconds < 60 || durationSeconds > MAX_DURATION_SECONDS) {
-                error("Choose an IMU diagnostic duration from 1 to 5 minutes"); return;
+                error("Choose 1–180 minutes: short diagnostics or a three-hour stationary noise recording"); return;
             }
             Session session = new Session(directory, durationSeconds); current = session;
             try {

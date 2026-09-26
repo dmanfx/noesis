@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101312" />
-    <title>Noesis · Phone Room Scan</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.9.1" />
+    <title>Noesis · RoomWalk</title>
+    <link rel="stylesheet" href="/static/style.css?v=2.3.0" />
     <script type="importmap">
       {
         "imports": {
@@ -18,25 +18,65 @@
     <header class="topbar">
       <a class="brand" href="#" aria-label="Phone scan home">
         <span class="brand-mark">N</span>
-        <span><b>Noesis</b><small>Multi-view phone scan</small></span>
+        <span><b>Noesis</b><small>RoomWalk</small></span>
       </a>
       <div class="topbar-actions">
         <button id="new-walk-button" class="new-walk-button" type="button">
-          <span aria-hidden="true">＋</span> New Walk
+          <span aria-hidden="true">＋</span> New capture
         </button>
         <span id="health-pill" class="health-pill">Connecting…</span>
       </div>
     </header>
 
     <main>
+      <nav class="workspace-tabs" role="tablist" aria-label="RoomWalk workspace">
+        <button id="tab-capture" type="button" role="tab" aria-selected="true" aria-controls="panel-capture" data-workspace-tab="capture">Capture</button>
+        <button id="tab-library" type="button" role="tab" aria-selected="false" aria-controls="panel-library" tabindex="-1" data-workspace-tab="library">Library</button>
+        <button id="tab-setup" type="button" role="tab" aria-selected="false" aria-controls="panel-setup" tabindex="-1" data-workspace-tab="setup">Setup</button>
+      </nav>
+      <div id="upload-panel" class="upload-panel hidden" aria-live="polite">
+        <div class="progress-header"><span id="upload-label">Uploading…</span><b id="upload-percent">0%</b></div>
+        <div class="progress-track"><span id="upload-bar"></span></div>
+      </div>
+      <section id="panel-capture" class="workspace-panel" role="tabpanel" aria-labelledby="tab-capture">
+      <section id="capture-purpose" class="capture-purpose" aria-label="Capture purpose and target">
+          <fieldset id="capture-intent" class="mode-picker">
+            <legend>Capture purpose</legend>
+            <div class="mode-options">
+              <label class="mode-option"><input id="capture-mode-reconstruction" type="radio" name="capture-mode" value="reconstruction" checked /><span><b>Reconstruction</b><small>New room coverage or add useful views.</small></span></label>
+              <label class="mode-option"><input id="capture-mode-path" type="radio" name="capture-mode" value="path_refinement" /><span><b>Path refinement</b><small>Phone against your own torso; elbows tucked; whole-body movement with a paired Noesis camera.</small></span></label>
+            </div>
+          </fieldset>
+          <div id="reconstruction-options" class="intent-options">
+            <label class="field-label" for="reconstruction-target-scan">Add views to an existing reconstruction <span class="optional-label">(optional)</span></label>
+            <select id="reconstruction-target-scan" class="text-input"><option value="">New room reconstruction</option></select>
+            <p class="microcopy">A selected target is kept as a link. The new capture remains its own retained source until you explicitly add its views.</p>
+          </div>
+          <div id="path-options" class="intent-options hidden">
+            <label class="field-label" for="path-target-scan">Existing reconstruction <span class="required-label">required</span></label>
+            <select id="path-target-scan" class="text-input"><option value="">Choose a completed reconstruction…</option></select>
+            <p id="path-reference-status" class="microcopy" role="status">The selected reconstruction's retained reference will be used here; absence means the original reconstruction base.</p>
+            <label class="field-label" for="path-camera-select">Paired Noesis camera <span class="required-label">required</span></label>
+            <select id="path-camera-select" class="text-input"><option value="">Choose a paired camera…</option></select>
+            <p class="microcopy">Carry the phone against your own torso with elbows tucked and stable. Turn and move your whole body with the phone. Do not film another person, sweep the phone with your arm, vary phone-to-body distance, or walk a nearby body route. The 10 cm target guides validation; it is not an accuracy claim.</p>
+            <p id="path-browser-note" class="intent-warning">Path refinement needs a native paired capture. Browser video/import remains reconstruction-only.</p>
+          </div>
+      </section>
+      <section id="native-capture-panel" class="native-panel hidden" aria-label="Native phone capture"></section>
+      <details id="browser-tools" class="browser-tools" open>
+      <summary>Import a recording or use browser capture</summary>
       <section class="capture-card">
         <div class="capture-copy">
-          <span class="eyebrow">New room walk</span>
-          <h1>Capture the room, then choose the reconstruction model.</h1>
+          <span class="eyebrow">RoomWalk capture</span>
+          <h1>Choose the job, then capture useful views.</h1>
           <p>
-            Walk slowly with the rear camera. Keep one lens selected, overlap each view,
-            and avoid people moving through the scene.
+            Reconstruction builds room coverage. Path refinement is a self-carried walk:
+            keep the phone against your own torso, elbows tucked and stable, and turn or
+            move your whole body with the phone for review against paired Noesis detections.
           </p>
+          <div class="capture-principles" aria-label="Capture principles">
+            <span>Raw acquisition is retained</span><span>10 cm is a validation target, not proof</span>
+          </div>
           <div id="secure-capture-note" class="secure-capture-note hidden" role="note">
             <b>Camera capture needs HTTPS.</b>
             <span>Open the secure phone page:</span>
@@ -49,14 +89,14 @@
           <label class="field-label" for="scan-name">Scan name</label>
           <input id="scan-name" class="text-input" maxlength="80" value="Phone room walk" />
           <button id="record-phone-walk-button" class="primary-button capture-button" type="button">
-            <span class="button-icon">●</span> Record phone walk
+            <span class="button-icon">●</span> Record reconstruction walk
           </button>
-          <label class="secondary-button capture-button" for="existing-video">Use an existing video</label>
-          <a class="secondary-button capture-button" href="/static/downloads/install.html">Install RoomWalk Android companion</a>
+          <label id="existing-video-label" class="secondary-button capture-button" for="existing-video">Use video for reconstruction</label>
+          <a id="install-companion-link" class="secondary-button capture-button" href="/static/downloads/install.html">Install RoomWalk Android companion</a>
           <input id="existing-video" class="visually-hidden" type="file" accept="video/*" />
-          <label class="secondary-button capture-button" for="sensor-bundle">Import camera + IMU bundle</label>
+          <label id="sensor-bundle-label" class="secondary-button capture-button" for="sensor-bundle">Import camera + IMU evidence</label>
           <input id="sensor-bundle" class="visually-hidden" type="file" accept=".zip,.tar,.tgz,.tar.gz,application/zip,application/x-tar,application/gzip" />
-          <p class="microcopy sensor-microcopy"><b>Phone video + IMU + room camera:</b> use the RoomWalk Android companion to select the static room camera and record all three together. Stop, then upload the saved capture. No separate calibration recording is needed for a room walk.</p>
+          <p class="microcopy sensor-microcopy"><b>Native paired capture:</b> the RoomWalk Android companion can retain phone video, IMU, and a selected static room camera together. RGB reconstruction works without a calibration job; basic calibration and sensor diagnostics live under Setup.</p>
           <p id="phone-calibration-note" class="microcopy hidden" role="note"></p>
           <p class="microcopy"><b>Auto-saved:</b> each uploaded walk and every generated asset stay on this Noesis machine. Starting a new walk never overwrites an older one.</p>
         </div>
@@ -99,12 +139,13 @@
             </div>
           </div>
         </section>
-        <div id="upload-panel" class="upload-panel hidden" aria-live="polite">
-          <div class="progress-header"><span id="upload-label">Uploading…</span><b id="upload-percent">0%</b></div>
-          <div class="progress-track"><span id="upload-bar"></span></div>
-        </div>
+      </section>
+      </details>
       </section>
 
+      <section id="panel-library" class="workspace-panel hidden" role="tabpanel" aria-labelledby="tab-library">
+      <section id="native-library-panel" class="native-panel hidden" aria-label="Captures saved on this phone"></section>
+      <p id="library-connection" class="connection-note" role="status">Connecting to saved walks on the Noesis machine…</p>
       <section class="workspace">
         <aside class="scan-sidebar">
           <div class="section-heading">
@@ -123,9 +164,13 @@
           </div>
         </section>
       </section>
+      </section>
+      <section id="panel-setup" class="workspace-panel hidden" role="tabpanel" aria-labelledby="tab-setup">
+        <section id="calibration-panel" class="calibration-panel" aria-label="Camera and camera–IMU calibration"></section>
+      </section>
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script type="module" src="/static/app.js?v=1.9.9"></script>
+    <script type="module" src="/static/app.js?v=2.2.0"></script>
   </body>
 </html>

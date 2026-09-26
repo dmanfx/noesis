@@ -1,8 +1,8 @@
-import * as THREE from "three";
-import { OrbitControls } from "/three/examples/controls/OrbitControls.js";
-import { GLTFLoader } from "/three/examples/loaders/GLTFLoader.js";
 import BrowserCapture from "./browser_capture.js?v=2.1.0";
 import CompanionCapture from "./companion_capture.js?v=1.0.1";
+import NativeCaptureUI, { isRoomWalkAndroid, pathReferenceForScan, pathSelectionLabel } from "./native_capture.js?v=2.3.0";
+import CalibrationUI, { scanCameraSelectionMarkup } from "./calibration.js?v=2.2.0";
+import { createPathComparisonController } from "./path_comparison.js?v=1.0.0";
 
 const healthPill = document.querySelector("#health-pill");
 const scanList = document.querySelector("#scan-list");
@@ -44,13 +44,33 @@ const toast = document.querySelector("#toast");
 const secureCaptureNote = document.querySelector("#secure-capture-note");
 const secureCaptureLink = document.querySelector("#secure-capture-link");
 const secureCaptureCaLink = document.querySelector("#secure-capture-ca-link");
+const captureModeReconstruction = document.querySelector("#capture-mode-reconstruction");
+const captureModePath = document.querySelector("#capture-mode-path");
+const reconstructionOptions = document.querySelector("#reconstruction-options");
+const pathOptions = document.querySelector("#path-options");
+const reconstructionTargetScan = document.querySelector("#reconstruction-target-scan");
+const pathTargetScan = document.querySelector("#path-target-scan");
+const pathReferenceStatus = document.querySelector("#path-reference-status");
+const pathCameraSelect = document.querySelector("#path-camera-select");
+const recordExistingVideoLabel = document.querySelector("#existing-video-label");
+const sensorBundleLabel = document.querySelector("#sensor-bundle-label");
+const pathBrowserNote = document.querySelector("#path-browser-note");
 
 const NEW_WALK_MODE_KEY = "phoneScanNewWalkMode";
+const CAPTURE_MODE_KEY = "phoneScanCaptureMode";
+const RECONSTRUCTION_TARGET_KEY = "phoneScanReconstructionTarget";
+const PATH_TARGET_KEY = "phoneScanPathTarget";
+const PATH_CAMERA_KEY = "phoneScanPathCamera";
+const WALK_INTENT_SCHEMA = "roomwalk.walk_intent.v1";
 const LONG_PRESS_MS = 650;
 
 let scans = [];
 let newWalkMode = localStorage.getItem(NEW_WALK_MODE_KEY) === "1";
 let selectedId = newWalkMode ? null : localStorage.getItem("phoneScanSelected") || null;
+let captureMode = ["reconstruction", "path_refinement"].includes(localStorage.getItem(CAPTURE_MODE_KEY)) ? localStorage.getItem(CAPTURE_MODE_KEY) : "reconstruction";
+let reconstructionTargetId = localStorage.getItem(RECONSTRUCTION_TARGET_KEY) || "";
+let pathTargetId = localStorage.getItem(PATH_TARGET_KEY) || "";
+let pathCameraId = localStorage.getItem(PATH_CAMERA_KEY) || "";
 let lastDetailFingerprint = "";
 let outputPage = 0;
 let currentViewer = null;
@@ -64,11 +84,101 @@ let alignmentReleaseId = null;
 let pcfPausesAppliance = false;
 let pairedStaticAlignmentAvailable = false;
 let browserBundleUploadFailed = false;
+let activeBrowserIntent = null;
+let activeWorkspaceTab = "capture";
+let viewerModules = null;
+let viewerGeneration = 0;
+let serverUnavailable = false;
+let calibrationUI = null;
+const pathComparisonController = createPathComparisonController();
 
 function handleCompanionFailure(error) {
   const message = error?.message || "The static room camera or tracking stream became unavailable.";
   toastMessage(`${message} The phone capture will stop and remain available for download or retry.`);
   if (browserCapture?.isRecording) void browserCapture.stop("companion_capture_lost").catch(() => {});
+}
+
+function normalizeCaptureMode(value) {
+  return value === "path_refinement" ? "path_refinement" : "reconstruction";
+}
+
+function captureTargetId(mode = captureMode) {
+  return mode === "path_refinement" ? pathTargetId : reconstructionTargetId;
+}
+
+function currentWalkIntent(mode = captureMode) {
+  const normalized = normalizeCaptureMode(mode);
+  const intent = {
+    schema: WALK_INTENT_SCHEMA,
+    mode: normalized,
+    target_scan_id: captureTargetId(normalized) || null,
+    carry_protocol: normalized === "path_refinement" ? "close_body" : "coverage",
+    accuracy_target_m: 0.1,
+  };
+  if (normalized === "path_refinement") {
+    const target = scans.find((scan) => scan?.id === pathTargetId);
+    const reference = pathReferenceForScan(target);
+    if (reference.status === "available") intent.target_reference = reference.selection;
+  }
+  return intent;
+}
+
+function targetScanLabel(scan, { path = false } = {}) {
+  const base = `${scan.name || scan.id} · ${scan.status || "unknown"}`;
+  if (!path) return base;
+  return `${base} · ${pathReferenceForScan(scan).label}`;
+}
+
+function populateIntentTargets() {
+  const completed = scans.filter((scan) => scan?.id && scan.status === "complete"
+    && scan.outputs && typeof scan.outputs === "object" && !Array.isArray(scan.outputs)
+    && (scan.walk_intent || scan.capture?.walk_intent)?.mode !== "path_refinement"
+    && !scan.capture?.calibration_request && !scan.calibration_request);
+  const optionMarkup = (selected, emptyLabel, { path = false } = {}) => `<option value="">${escapeHtml(emptyLabel)}</option>${completed.map((scan) => {
+    const reference = path ? pathReferenceForScan(scan) : null;
+    const disabled = reference?.status === "unavailable" ? " disabled" : "";
+    const title = reference?.status === "unavailable" ? ` title="${escapeHtml(reference.reason)}"` : "";
+    return `<option value="${escapeHtml(scan.id)}" ${scan.id === selected ? "selected" : ""}${disabled}${title}>${escapeHtml(targetScanLabel(scan, { path }))}</option>`;
+  }).join("")}`;
+  if (reconstructionTargetScan) {
+    if (!completed.some((scan) => scan.id === reconstructionTargetId)) reconstructionTargetId = "";
+    reconstructionTargetScan.innerHTML = optionMarkup(reconstructionTargetId, "New room reconstruction");
+    reconstructionTargetScan.value = reconstructionTargetId;
+  }
+  if (pathTargetScan) {
+    if (!completed.some((scan) => scan.id === pathTargetId)) pathTargetId = "";
+    pathTargetScan.innerHTML = optionMarkup(pathTargetId, "Choose a completed reconstruction…", { path: true });
+    pathTargetScan.value = pathTargetId;
+  }
+  if (pathCameraSelect) {
+    const available = (nativeCaptureUI?.available ? nativeCaptureUI.snapshot?.room_cameras || [] : alignmentTargets).filter((target) => target?.camera_id);
+    if (!available.some((target) => target.camera_id === pathCameraId)) pathCameraId = "";
+    pathCameraSelect.innerHTML = `<option value="">Choose a paired camera…</option>${available.map((target) => `<option value="${escapeHtml(target.camera_id)}" ${target.camera_id === pathCameraId ? "selected" : ""}>${escapeHtml(target.label || target.camera_id)} camera</option>`).join("")}`;
+    pathCameraSelect.value = pathCameraId;
+  }
+}
+
+function captureIntentReady({ browser = false } = {}) {
+  if (captureMode !== "path_refinement") return true;
+  if (!pathTargetId) { toastMessage("Choose the existing reconstruction for this path refinement first."); return false; }
+  const target = scans.find((scan) => scan?.id === pathTargetId);
+  const reference = pathReferenceForScan(target);
+  if (reference.status === "unavailable") {
+    toastMessage(`${reference.label}. Choose a reconstruction with an available retained PCF reference or an explicit ordinary base.`);
+    return false;
+  }
+  if (!pathCameraId) { toastMessage("Choose the paired Noesis camera before starting path refinement."); return false; }
+  if (reference.status === "available" && reference.selection.camera_id !== pathCameraId) {
+    toastMessage(`The selected PCF is bound to camera ${reference.selection.camera_id}, but path capture is set to ${pathCameraId}. Choose the bound camera before starting.`);
+    return false;
+  }
+  if (browser) { toastMessage("Path refinement needs the native paired recorder. Browser video/import is reconstruction-only."); return false; }
+  const snapshot = nativeCaptureUI.snapshot;
+  if (snapshot?.room_cameras?.[snapshot.room_camera_index]?.camera_id !== pathCameraId) {
+    toastMessage("The phone's room camera differs from the path selection. Select and apply the same camera in Connection and camera selection, then wait for the phone to confirm the selected paired camera.");
+    return false;
+  }
+  return true;
 }
 
 const companionCapture = new CompanionCapture({
@@ -93,10 +203,90 @@ const browserCapture = new BrowserCapture({
   },
 });
 
+const nativeCaptureUI = new NativeCaptureUI({
+  captureRoot: document.querySelector("#native-capture-panel"),
+  libraryRoot: document.querySelector("#native-library-panel"),
+  platform: window,
+  onError: (error) => toastMessage(error.message || String(error)),
+  canCapture: (mode) => {
+    if (uploadInProgress) { toastMessage("Finish the browser upload before starting native capture."); return false; }
+    if (browserCaptureBlocked("start native capture")) return false;
+    if (!["reconstruction", "path_refinement"].includes(mode)) return true;
+    if (!captureIntentReady()) return false;
+    const intent = currentWalkIntent(mode);
+    if (intent.target_reference && nativeCaptureUI?.snapshot?.supports_target_reference !== true) {
+      toastMessage("This RoomWalk app cannot preserve the selected PCF reference. Update the companion before recording this path.");
+      return false;
+    }
+    return true;
+  },
+  onState: (snapshot) => { calibrationUI?.updateNative(snapshot); syncCaptureIntentUi(); },
+  onUploaded: (scanId) => { void handleNativeUpload(scanId); },
+  onPackaged: (snapshot) => {
+    if (calibrationUI?.handlePackaged(snapshot)) return;
+    activateWorkspaceTab("library");
+    document.querySelector("#native-selected-card")?.scrollIntoView({ block: "start", behavior: "smooth" });
+    toastMessage("Recording saved on this phone. Upload the selected capture when ready.");
+  },
+  onOpenLibrary: () => activateWorkspaceTab("library"),
+});
+calibrationUI = new CalibrationUI({
+  root: document.querySelector("#calibration-panel"),
+  nativeCapture: nativeCaptureUI,
+  platform: window,
+  onOpenScan: openScan,
+});
+
+function activateWorkspaceTab(name) {
+  if (!["capture", "library", "setup"].includes(name)) return;
+  if (name !== "capture" && (browserCapture.isRecording || browserCapture.status.state === "stopping")) {
+    toastMessage("Stop and save the browser recording before leaving Capture.");
+    return;
+  }
+  activeWorkspaceTab = name;
+  for (const button of document.querySelectorAll("[data-workspace-tab]")) {
+    const selected = button.dataset.workspaceTab === name;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    document.querySelector(`#panel-${button.dataset.workspaceTab}`)?.classList.toggle("hidden", !selected);
+  }
+  calibrationUI?.setVisible(name === "setup");
+  disposeViewer();
+  if (name === "library") { lastDetailFingerprint = ""; renderSelected(); }
+}
+
+async function handleNativeUpload(scanId) {
+  // The native upload service retains its last receipt across new recordings.
+  // A replay of that receipt must not move or interrupt the active capture UI.
+  const native = nativeCaptureUI.snapshot;
+  if (native?.active || native?.imu_active || native?.imu_preparing) return;
+  try {
+    // Fetch the exact receipt identity; an in-flight list refresh may predate
+    // upload acceptance. Never select whichever walk happens to be newest.
+    const scan = await jsonFetch(`/api/scans/${encodeURIComponent(scanId)}`);
+    if (scan?.id !== scanId) throw new Error("The upload receipt does not match the returned walk.");
+    const index = scans.findIndex((item) => item.id === scanId);
+    if (index < 0) scans.unshift(scan); else scans[index] = scan;
+    if (!calibrationUI.visible || !calibrationUI.workflow) openScan(scanId);
+    calibrationUI.setScans(scans, { preferredId: scanId });
+    if (calibrationUI.hasNativeCalibrationRequest || scan.capture?.calibration_request) activateWorkspaceTab("setup");
+    else activateWorkspaceTab("library");
+    const intent = scan.walk_intent;
+    toastMessage(intent?.mode === "path_refinement"
+      ? "Path refinement received. Review the retained path evidence when frame preparation is ready."
+      : intent?.target_scan_id
+        ? "Reconstruction capture received. Open it in Library to explicitly add its views to the linked reconstruction."
+        : "Capture received by Noesis. Follow server validation before processing or reconstruction.");
+  } catch (error) {
+    toastMessage(`The phone retains the upload receipt. Refresh Library when the server is reachable: ${error.message}`);
+  }
+}
+
 const statusLabels = {
   uploading: "Uploading",
   importing_capture: "Validating received capture",
   import_failed: "Capture validation needs attention",
+  calibration_ready: "Calibration capture ready",
   processing_frames: "Preparing frames",
   ready: "Ready for inference",
   frame_failed: "Frame preparation failed",
@@ -282,6 +472,7 @@ function companionHeartbeatAge(status) {
 
 function renderCompanionCaptureState(status = companionCapture.status) {
   if (!companionCameraSelect) return;
+  const pairedRequired = captureMode === "path_refinement";
   const cameras = Array.isArray(status?.cameras) ? status.cameras : [];
   const selected = status?.selectedCameraId || "";
   const active = ["starting", "recording", "stopping", "finalizing"].includes(status?.state);
@@ -299,13 +490,15 @@ function renderCompanionCaptureState(status = companionCapture.status) {
 
   const availableCount = cameras.filter((camera) => camera.available === true).length;
   if (!status?.camerasAvailable) {
-    companionCameraStatus.textContent = status?.cameraReason || "No available static room cameras were reported by the appliance.";
+    companionCameraStatus.textContent = pairedRequired
+      ? status?.cameraReason || "No available static room cameras were reported by the appliance."
+      : "Pairing is optional for reconstruction; no static room camera is selected.";
   } else if (active) {
     companionCameraStatus.textContent = `${availableCount} room camera${availableCount === 1 ? "" : "s"} available · selected ${status.cameraId || selected}`;
   } else if (selected) {
-    companionCameraStatus.textContent = "Selected camera is required for the paired recording.";
+    companionCameraStatus.textContent = pairedRequired ? "Selected camera is required for path refinement." : "Selected camera will be retained as independent reconstruction reference.";
   } else {
-    companionCameraStatus.textContent = "Choose the physically installed room camera before starting the walk.";
+    companionCameraStatus.textContent = pairedRequired ? "Choose the physically installed room camera before starting path refinement." : "Optional: choose a static room camera to retain paired reconstruction evidence.";
   }
 
   const staticStatus = status?.state === "recording"
@@ -316,7 +509,7 @@ function renderCompanionCaptureState(status = companionCapture.status) {
         ? "Static capture finalized"
         : status?.state === "failed"
           ? `Static capture failed${status.error ? `: ${status.error.message || status.error}` : ""}`
-          : "Static capture is required before phone recording starts";
+          : pairedRequired ? "Static capture is required before phone recording starts" : "Phone-only reconstruction can start without a static recording";
   if (companionCaptureStatus) companionCaptureStatus.textContent = staticStatus;
   if (companionHeartbeatStatus) {
     const heartbeat = status?.lastHeartbeat;
@@ -339,7 +532,7 @@ function renderCompanionCaptureState(status = companionCapture.status) {
   }
   if (browserStartButton) {
     const phoneReady = browserCapture.status.state === "ready" && browserCapture.status.ready === true;
-    browserStartButton.disabled = !phoneReady || !companionCapture.readyToStart;
+    browserStartButton.disabled = !phoneReady || (captureMode === "path_refinement" && !companionCapture.readyToStart);
   }
 }
 
@@ -356,7 +549,7 @@ function renderBrowserCaptureState(status) {
   const modeStatus = document.querySelector("#browser-mode-status");
   if (modeStatus) modeStatus.textContent = `${cameraSettings ? `Camera reports ${cameraSettings.width} × ${cameraSettings.height}. Encoded dimensions will be checked on upload.` : "Requests unscaled rear-camera 8K; unsupported modes stop setup."} Synchronization is unverified: this browser recorder cannot associate IMU acquisition times with encoded frames. The bounded capture holds about ${status?.estimatedMaxVideoSeconds || 31}s at the requested bitrate; actual capacity varies.`;
   renderCompanionCaptureState(companionCapture.status);
-  browserStartButton.disabled = state !== "ready" || status.ready !== true || !companionCapture.readyToStart;
+  browserStartButton.disabled = state !== "ready" || status.ready !== true || (captureMode === "path_refinement" && !companionCapture.readyToStart);
   browserStopButton.disabled = state !== "recording";
   browserCloseButton.disabled = ["recording", "stopping"].includes(state) || companionCapture.needsServerStop;
   browserDownloadButton.classList.toggle("hidden", !status.bundle);
@@ -369,7 +562,7 @@ function renderBrowserCaptureState(status) {
     idle: "Camera and motion permission are required.",
     starting: "Requesting camera and motion access…",
     waiting_sensors: "Keep the phone stationary while both sensor streams initialize.",
-    ready: `8K camera preview and both sensor streams are progressing (${modeLabel}). Choose the static room camera. This records video and motion observations; synchronized capture requires the native recorder.`,
+    ready: `8K camera preview and both sensor streams are progressing (${modeLabel}). ${captureMode === "path_refinement" ? "Choose the paired static room camera." : "A static room camera is optional for reconstruction."} This records video and motion observations; synchronized capture requires the native recorder.`,
     recording: `Recording phone camera + motion with the selected static room capture (${modeLabel}). Walk slowly; ${Math.round(Number(status.durationMs || 0) / 1000)}s elapsed.`,
     stopping: "Stopping the phone recorder and finalizing the static capture…",
     complete: browserBundleUploadFailed ? "Capture is still in this tab. Retry upload or download before closing." : "Capture is ready. Video and motion are saved together. Timing and calibration still need checking before IMU-based reconstruction.",
@@ -423,6 +616,62 @@ function syncCaptureModeUi() {
   }
 }
 
+function syncCaptureIntentUi() {
+  captureMode = normalizeCaptureMode(captureMode);
+  if (captureModeReconstruction) captureModeReconstruction.checked = captureMode === "reconstruction";
+  if (captureModePath) captureModePath.checked = captureMode === "path_refinement";
+  reconstructionOptions?.classList.toggle("hidden", captureMode !== "reconstruction");
+  pathOptions?.classList.toggle("hidden", captureMode !== "path_refinement");
+  captureCard?.classList.toggle("path-refinement-mode", captureMode === "path_refinement");
+  const native = nativeCaptureUI?.available === true;
+  const path = captureMode === "path_refinement";
+  if (recordPhoneWalkButton) {
+    recordPhoneWalkButton.textContent = path
+      ? (native ? "Open paired path capture" : "Native app required for path refinement")
+      : (native ? "Open native reconstruction capture" : "Record reconstruction walk");
+    recordPhoneWalkButton.disabled = path && !native;
+  }
+  if (recordExistingVideoLabel) {
+    recordExistingVideoLabel.textContent = path ? "Video import unavailable for path mode" : "Use video for reconstruction";
+    recordExistingVideoLabel.classList.toggle("disabled-control", path);
+  }
+  if (sensorBundleLabel) {
+    sensorBundleLabel.textContent = path ? "Sensor import unavailable for path mode" : "Import camera + IMU evidence";
+    sensorBundleLabel.classList.toggle("disabled-control", path);
+  }
+  if (existingInput) existingInput.disabled = path;
+  if (sensorBundleInput) sensorBundleInput.disabled = path;
+  if (pathBrowserNote) pathBrowserNote.classList.toggle("hidden", !path || native);
+  populateIntentTargets();
+  const target = scans.find((scan) => scan?.id === pathTargetId);
+  const reference = pathReferenceForScan(target);
+  if (pathReferenceStatus) {
+    pathReferenceStatus.classList.toggle("intent-warning", path && reference.status === "unavailable");
+    pathReferenceStatus.textContent = !path || !pathTargetId
+      ? "The selected reconstruction's retained reference will be used here; absence means the original reconstruction base."
+      : reference.status === "available"
+        ? `Selected path reference: ${reference.label}. The backend will verify its binding during path review.`
+        : reference.status === "unavailable"
+          ? `Selected path reference unavailable: ${reference.reason}. This path cannot silently use the ordinary base.`
+          : `Selected path reference: ${reference.label}.`;
+  }
+  // An unavailable retained reference is a hard UI state, not an instruction to
+  // send a base-mode intent. Keep the existing native intent visible but block
+  // captureIntentReady() until the operator chooses a valid target.
+  if (!(path && reference.status === "unavailable")) nativeCaptureUI?.setCaptureIntent?.(currentWalkIntent());
+}
+
+function setCaptureIntentMode(mode) {
+  if (browserCapture?.hasUnsavedWork?.()) {
+    toastMessage("Finish or discard the current browser capture before changing its purpose.");
+    syncCaptureIntentUi();
+    return;
+  }
+  captureMode = normalizeCaptureMode(mode);
+  localStorage.setItem(CAPTURE_MODE_KEY, captureMode);
+  syncCaptureIntentUi();
+}
+
 function rememberSelectedScan(scanId) {
   selectedId = scanId;
   newWalkMode = false;
@@ -437,7 +686,8 @@ function openScan(scanId) {
   outputPage = 0;
   lastDetailFingerprint = "";
   renderScanList();
-  renderSelected();
+  calibrationUI?.setScans(scans, { preferredId: scanId });
+  activateWorkspaceTab("library");
 }
 
 function startNewWalk() {
@@ -446,6 +696,11 @@ function startNewWalk() {
     return;
   }
   if (browserCaptureBlocked("start a new walk")) return;
+  if (nativeCaptureUI.hasActiveWork()) {
+    toastMessage("Finish the active native capture or transfer before starting a new walk.");
+    return;
+  }
+  activateWorkspaceTab("capture");
   if (["starting", "waiting_sensors", "ready", "complete", "error"].includes(browserCapture.status.state)) {
     void browserCapture.close();
     browserCapturePanel.classList.add("hidden");
@@ -453,6 +708,14 @@ function startNewWalk() {
   if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
   newWalkMode = true;
   selectedId = null;
+  captureMode = "reconstruction";
+  reconstructionTargetId = "";
+  pathTargetId = "";
+  pathCameraId = "";
+  localStorage.setItem(CAPTURE_MODE_KEY, captureMode);
+  localStorage.removeItem(RECONSTRUCTION_TARGET_KEY);
+  localStorage.removeItem(PATH_TARGET_KEY);
+  localStorage.removeItem(PATH_CAMERA_KEY);
   localStorage.setItem(NEW_WALK_MODE_KEY, "1");
   localStorage.removeItem("phoneScanSelected");
   scanName.value = "Phone room walk";
@@ -463,8 +726,9 @@ function startNewWalk() {
   disposeViewer();
   syncCaptureModeUi();
   renderScanList();
+  syncCaptureIntentUi();
   renderSelected();
-  captureCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  (nativeCaptureUI.available ? document.querySelector("#native-capture-panel") : captureCard).scrollIntoView({ behavior: "smooth", block: "start" });
   toastMessage("Ready for a new walk. Your earlier walks remain auto-saved.");
 }
 
@@ -482,6 +746,22 @@ async function jsonFetch(url, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function persistWalkIntent(scanId, intent) {
+  if (!scanId || !intent) return null;
+  try {
+    return await jsonFetch(`/api/scans/${encodeURIComponent(scanId)}/walk-intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(intent),
+    });
+  } catch (error) {
+    // Browser/imported evidence remains usable when the optional metadata route
+    // has not reached the current service yet. Do not discard the source upload.
+    toastMessage(`Capture saved, but its walk intent could not be recorded yet: ${error.message}`);
+    return null;
+  }
 }
 
 async function renameScan(scanId) {
@@ -578,6 +858,7 @@ function wireScanCard(button) {
 async function refreshHealth() {
   try {
     const health = await jsonFetch("/api/health");
+    calibrationUI?.setCapabilities(health.calibration);
     healthPill.textContent = `${health.device} · adaptive views · ${health.max_selected_frames} emergency max`;
     healthPill.className = "health-pill online";
     const calibrationNote = document.querySelector("#phone-calibration-note");
@@ -623,12 +904,14 @@ async function refreshHealth() {
     alignmentReleaseId = nextReleaseId;
     pcfPausesAppliance = nextPcfPausesAppliance;
     pairedStaticAlignmentAvailable = nextPairedStaticAlignmentAvailable;
+    populateIntentTargets();
     if (alignmentConfigChanged) {
       lastDetailFingerprint = "";
       renderSelected();
     }
   } catch (error) {
     healthPill.textContent = "Tool offline";
+    calibrationUI?.setCapabilities(null, { offline: true });
     healthPill.className = "health-pill offline";
     if (pairedStaticAlignmentAvailable) {
       pairedStaticAlignmentAvailable = false;
@@ -722,6 +1005,80 @@ function companionCaptureSection(companion) {
     .map(([name, url]) => `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(name.replaceAll("_", " "))}</a>`)
     .join("");
   return `<div class="companion-result"><div><span class="eyebrow">Paired static room recording</span><p><b>${escapeHtml(companion.camera_id || "Selected room camera")}</b> · ${escapeHtml(companion.status || "unknown")}</p><p>Retained with this phone walk for independent room reconstruction and alignment.</p><div class="sensor-checks"><span>video: ${escapeHtml(companion.video_status || companion.recorder?.status || "unknown")}</span><span>tracking: ${escapeHtml(companion.tracking_status || companion.tracking?.status || "unknown")}</span><span>${Number(companion.clock_probes?.length || 0)} clock probes</span></div>${companion.error ? `<p class="error-box">${escapeHtml(companion.error)}</p>` : ""}</div>${links ? `<div class="artifact-row">${links}</div>` : ""}</div>`;
+}
+
+function walkIntentReferenceLabel(intent) {
+  if (intent?.mode !== "path_refinement") return "";
+  if (!Object.prototype.hasOwnProperty.call(intent, "target_reference")) return "Original reconstruction · no retained PCF reference";
+  try { return pathSelectionLabel(intent.target_reference); }
+  catch (_) { return "Noesis PCF selection needs review · no fallback applied"; }
+}
+
+function walkIntentSection(scan) {
+  const intent = scan?.walk_intent;
+  if (!intent || typeof intent !== "object") {
+    return `<section class="walk-intent-card legacy-intent"><div><span class="eyebrow">Capture intent</span><h3>Older capture · intent not recorded</h3><p>Original video, prepared views, calibration and IMU evidence remain available. This page does not infer whether an older walk was intended for reconstruction or path refinement.</p></div></section>`;
+  }
+  const mode = intent.mode === "path_refinement" ? "Path refinement" : "Reconstruction";
+  const carry = intent.carry_protocol === "close_body" ? "close-body" : "coverage";
+  const targetId = typeof intent.target_scan_id === "string" ? intent.target_scan_id : "";
+  const target = scans.find((candidate) => candidate.id === targetId);
+  const referenceLabel = walkIntentReferenceLabel(intent);
+  const targetLink = target
+    ? `<button class="ghost-button compact-button" type="button" data-open-target-scan="${escapeHtml(target.id)}">Open ${escapeHtml(target.name || target.id)}</button>`
+    : targetId ? `<span class="status-badge">Target ${escapeHtml(targetId)} not in current library</span>` : "";
+  const sourceReady = ["ready", "complete"].includes(scan.status);
+  const targetReady = target?.status === "complete";
+  const canAdd = mode === "Reconstruction" && target && target.id !== scan.id && sourceReady && targetReady;
+  const addAction = canAdd ? `<button id="add-views-to-target" class="primary-button compact-button" type="button" data-target-scan="${escapeHtml(target.id)}">Add these views to target</button>` : "";
+  const note = mode === "Path refinement"
+    ? `Self-carried path: phone against your own torso, elbows tucked and stable, with whole-body turns and movement. Selected reference: ${referenceLabel}. Review compares the original visual path with retained IMU diagnostics and paired Noesis references; it does not prove 10 cm accuracy.`
+    : target
+      ? "This source capture stays retained separately. Adding its prepared views is an explicit, versioned action."
+      : "RGB reconstruction is available without metric calibration; useful saved evidence remains downloadable below.";
+  return `<section class="walk-intent-card ${mode === "Path refinement" ? "path-intent" : "reconstruction-intent"}">
+    <div class="walk-intent-copy"><span class="eyebrow">Capture intent</span><h3>${mode}</h3><div class="intent-facts"><span>Protocol: ${escapeHtml(carry)}</span><span>Target: ${target ? escapeHtml(target.name || target.id) : "new room"}</span>${referenceLabel ? `<span>Reference: ${escapeHtml(referenceLabel)}</span>` : ""}<span>Desired validation target: ${Number(intent.accuracy_target_m) === 0.1 ? "10 cm" : "not reported"}</span></div><p>${escapeHtml(note)}</p></div>
+    <div class="walk-intent-actions">${targetLink}${addAction}</div>
+  </section>`;
+}
+
+function pathReviewSection(scan) {
+  const intent = scan?.walk_intent || scan?.capture?.walk_intent;
+  const legacyNative = !intent && scan?.capture?.capture_kind === "android_camera_imu"
+    && !scan.capture.calibration_request && !scan.calibration_request && scan.status !== "calibration_ready";
+  if (intent?.mode !== "path_refinement" && !legacyNative) return "";
+  const protocolNote = legacyNative ? "<p class=\"microcopy\">Retained camera path; original carry protocol unknown. Pairing is shown only when recorded in the retained evidence.</p>" : "";
+  const review = scan.path_review && typeof scan.path_review === "object" ? scan.path_review : null;
+  const status = String(review?.status || "").toLowerCase();
+  const progress = Math.round(Math.max(0, Math.min(1, Number(review?.progress || 0))) * 100);
+  const results = review?.results && typeof review.results === "object" ? review.results : {};
+  const reviewReference = results.reference_reconstruction && typeof results.reference_reconstruction === "object" ? results.reference_reconstruction : {};
+  const referenceLabel = typeof reviewReference.label === "string" && reviewReference.label.trim()
+    ? reviewReference.label.trim().slice(0, 240)
+    : walkIntentReferenceLabel(intent);
+  const referenceNote = referenceLabel ? `<p class="microcopy path-reference-identity">Selected path reference: ${escapeHtml(referenceLabel)}. The backend will verify the retained manifest and frame binding; no metric accuracy is implied.</p>` : "";
+  const artifact = results.artifact_url || results.artifact_urls?.artifact || review?.artifact_url || "";
+  const artifactLabels = { report: "Review report", trajectory: "Visual trajectory", motion: "IMU consistency", motion_intervals: "Motion intervals", reference_pcf_manifest: "Selected PCF manifest", reference_pcf_points: "Selected PCF points", reference_pcf_binding: "Selected PCF binding" };
+  const artifactUrls = results.artifact_urls || review?.artifact_urls || {};
+  const artifactLinks = Object.entries(artifactUrls)
+    .filter(([name, url]) => /^[A-Za-z0-9_.-]{1,80}$/.test(name) && typeof url === "string" && (url.startsWith("/") || /^https?:\/\//i.test(url)))
+    .slice(0, 32)
+    .map(([name, url]) => `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener" download>${escapeHtml(artifactLabels[name] || name.replaceAll("_", " "))}</a>`)
+    .join("");
+  const comparison = results.path_comparison || review?.path_comparison || {};
+  const refinement = results.path_refinement || review?.path_refinement || results.sensor_refined_path || {};
+  const provider = String(results.provider || scan.outputs?.provider || scan.provider || "").toLowerCase();
+  const modelNote = provider === "mapanything"
+    ? "<p class=\"microcopy path-model-note\">Path model: MapAnything · comparison only. Run DA3 for a position-refined path when the backend reports one.</p>"
+    : provider === "da3"
+      ? "<p class=\"microcopy path-model-note\">Path model: DA3 · position refinement is shown only when the backend reports it.</p>"
+      : "";
+  const evidenceSummary = status === "complete" ? `<div class="path-review-evidence"><span>Visual path: ${escapeHtml(results.visual_path?.status || "not reported")} · ${Number(results.visual_path?.pose_count || 0).toLocaleString()} poses</span><span>Gyro diagnostic: ${escapeHtml(results.imu_consistency?.status || results.gyro_diagnostic?.status || "not reported")}</span><span>Body-ground reference: ${escapeHtml(results.body_ground_reference?.status || "not established")}</span></div><p class="microcopy">Desired target: ${Number(results.accuracy?.target_m ?? intent?.accuracy_target_m) === 0.1 ? "10 cm" : "not reported"}. Qualified: no. Measured position error: ${results.accuracy?.measured_position_error_m == null ? "not reported" : `${Number(results.accuracy.measured_position_error_m).toFixed(3)} m`}. Separation remains a review diagnostic, not an accuracy claim.</p>` : "";
+  const canReview = scan.status === "complete" && scan.outputs && typeof scan.outputs === "object" && !Array.isArray(scan.outputs);
+  if (["queued", "running"].includes(status)) return `<section class="path-review-card status-panel"><div class="status-line"><span>${escapeHtml(review.message || "Preparing retained path review")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div><p class="alignment-target-note">Review-only: original visual path, IMU consistency, and any retained paired references.</p>${referenceNote}${protocolNote}</section>`;
+  if (status === "complete") return `<section class="path-review-card ready-callout"><div><span class="eyebrow">Path review</span><h3>Review package ready</h3><p>${escapeHtml(review.message || "The original path and retained evidence are available for inspection. This is not 10 cm accuracy proof.")}</p>${referenceNote}${protocolNote}${modelNote}${evidenceSummary}<div id="path-comparison-host" class="path-comparison-host" data-path-comparison-scan="${escapeHtml(scan.id)}"></div><div class="artifact-row">${artifact ? `<a class="primary-button compact-button" href="${escapeHtml(artifact)}" target="_blank" rel="noopener">Export path review</a>` : ""}${artifactLinks}</div><button id="review-path" class="secondary-button compact-button" type="button" ${canReview ? "" : "disabled"}>${canReview ? "Rerun review" : "Review retained result"}</button></div></section>`;
+  if (status === "failed") return `<section class="path-review-card status-panel"><div class="status-line"><span>Path review needs attention</span><b>Not completed</b></div><div class="error-box">${escapeHtml(review.error || "The retained path review could not be prepared.")}</div>${referenceNote}${protocolNote}<button id="review-path" class="secondary-button compact-button" type="button" ${canReview ? "" : "disabled"}>Retry path review</button></section>`;
+  return `<section class="path-review-card ready-callout"><div><span class="eyebrow">Path review</span><h3>${legacyNative ? "Inspect the retained camera path" : "Inspect the paired walk"}</h3><p>${canReview ? "Export the original visual path, gyro diagnostic eligibility, and any retained paired references." : "Run reconstruction below to produce this walk’s visual camera trajectory before reviewing the path."} The 10 cm target is a validation target, not a proof claim.</p>${referenceNote}${protocolNote}${modelNote}</div><button id="review-path" class="primary-button compact-button" type="button" ${canReview ? "" : "disabled"}>Review path</button></section>`;
 }
 
 function captureSection(scan) {
@@ -1008,7 +1365,7 @@ function outputsSection(scan) {
       <div class="stat"><b>${Number(outputs.window_count || 1)}</b><span>Joint inference windows</span></div>
       <div class="stat"><b>${Number(scale.median || 0).toFixed(3)}</b><span>Median metric scale</span></div>
     </div>
-    ${supplementsSection(scan)}
+    ${scan.walk_intent?.mode === "path_refinement" ? "" : supplementsSection(scan)}
     ${alignmentSection(scan)}
     ${pcfSection(scan)}
     <div class="subheading"><div><span class="eyebrow">3D review</span><h3>${viewerTitle}</h3></div><span class="status-badge">${viewerBadge}</span></div>
@@ -1028,6 +1385,7 @@ function outputsSection(scan) {
 }
 
 function disposeViewer() {
+  viewerGeneration += 1;
   if (!currentViewer) return;
   cancelAnimationFrame(currentViewer.animation);
   currentViewer.resizeObserver?.disconnect();
@@ -1041,15 +1399,35 @@ function disposeViewer() {
   currentViewer = null;
 }
 
-function initializeViewer(glbUrl) {
+async function initializeViewer(glbUrl) {
   const host = document.querySelector("#viewer-canvas");
   const overlay = document.querySelector("#viewer-overlay");
-  if (!host || !glbUrl) return;
+  if (!host || !glbUrl || activeWorkspaceTab !== "library") return;
   disposeViewer();
+  const generation = viewerGeneration;
+  let THREE, OrbitControls, GLTFLoader;
+  try {
+    // A failed/offline 3D dependency must never prevent capture, native bridge
+    // registration, board editing, or the rest of the Library from booting.
+    viewerModules ||= Promise.all([
+      import("three"),
+      import("/three/examples/controls/OrbitControls.js"),
+      import("/three/examples/loaders/GLTFLoader.js"),
+    ]);
+    const modules = await viewerModules;
+    [THREE, { OrbitControls }, { GLTFLoader }] = modules;
+  } catch (error) {
+    viewerModules = null;
+    if (generation === viewerGeneration && host.isConnected) overlay.textContent = `3D review unavailable: ${error.message || "viewer dependencies could not load"}. Capture and saved evidence remain available.`;
+    return;
+  }
+  if (generation !== viewerGeneration || !host.isConnected || activeWorkspaceTab !== "library") return;
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x090b0a);
   const camera = new THREE.PerspectiveCamera(52, 1, 0.001, 10000);
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  let renderer;
+  try { renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" }); }
+  catch (error) { overlay.textContent = `3D rendering is unavailable: ${error.message || "WebGL unavailable"}. Saved artifact links remain usable.`; return; }
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   host.appendChild(renderer.domElement);
@@ -1075,6 +1453,7 @@ function initializeViewer(glbUrl) {
 
   let animation = 0;
   const tick = () => {
+    if (generation !== viewerGeneration) return;
     controls.update();
     renderer.render(scene, camera);
     animation = requestAnimationFrame(tick);
@@ -1087,6 +1466,14 @@ function initializeViewer(glbUrl) {
     glbUrl,
     (gltf) => {
       const root = gltf.scene;
+      if (generation !== viewerGeneration || !host.isConnected) {
+        root.traverse((object) => {
+          object.geometry?.dispose?.();
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          for (const material of materials) material?.dispose?.();
+        });
+        return;
+      }
       scene.add(root);
       const box = new THREE.Box3().setFromObject(root);
       const size = box.getSize(new THREE.Vector3());
@@ -1114,15 +1501,68 @@ function initializeViewer(glbUrl) {
     },
     undefined,
     (error) => {
-      overlay.textContent = `3D viewer could not load: ${error?.message || "unknown error"}`;
+      if (generation === viewerGeneration) overlay.textContent = `3D viewer could not load: ${error?.message || "unknown error"}`;
     },
   );
 }
 
 function wireDetailActions(scan) {
+  document.querySelector("#open-calibration")?.addEventListener("click", () => {
+    calibrationUI.setScans(scans, { preferredId: scan.id });
+    activateWorkspaceTab("setup");
+  });
   document.querySelector("#rename-scan")?.addEventListener("click", () => {
     void renameScan(scan.id);
   });
+  document.querySelectorAll("[data-open-target-scan]").forEach((button) => {
+    button.addEventListener("click", () => openScan(button.dataset.openTargetScan));
+  });
+  document.querySelector("#add-views-to-target")?.addEventListener("click", async (event) => {
+    const targetId = event.currentTarget.dataset.targetScan;
+    if (!targetId || !scan.walk_intent?.target_scan_id) return;
+    event.currentTarget.disabled = true;
+    try {
+      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(targetId)}/supplements/from-scan?source_scan_id=${encodeURIComponent(scan.id)}`, { method: "POST" });
+      const index = scans.findIndex((item) => item.id === targetId);
+      if (index >= 0 && updated?.id === targetId) scans[index] = updated;
+      lastDetailFingerprint = "";
+      renderSelected();
+      toastMessage("These views were queued as an explicit additive revision; the source capture remains retained.");
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      toastMessage(`Views were not added: ${error.message}`);
+    }
+  });
+  document.querySelector("#review-path")?.addEventListener("click", async (event) => {
+    event.currentTarget.disabled = true;
+    try {
+      const targetId = typeof scan.walk_intent?.target_scan_id === "string" ? scan.walk_intent.target_scan_id : "";
+      const targetQuery = targetId ? `?target_scan_id=${encodeURIComponent(targetId)}` : "";
+      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/path-review${targetQuery}`, { method: "POST" });
+      const index = scans.findIndex((item) => item.id === scan.id);
+      if (index >= 0) scans[index] = updated;
+      lastDetailFingerprint = "";
+      renderSelected();
+      toastMessage("Path review queued. The original visual, IMU, and paired evidence remains unchanged.");
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      toastMessage(`Path review could not start: ${error.message}`);
+    }
+  });
+  const pathComparisonHost = document.querySelector("#path-comparison-host");
+  if (pathComparisonHost) {
+    const review = scan.path_review && typeof scan.path_review === "object" ? scan.path_review : {};
+    const results = review.results && typeof review.results === "object" ? review.results : {};
+    void pathComparisonController.render({
+      host: pathComparisonHost,
+      scanId: scan.id,
+      summary: results.path_comparison || review.path_comparison || {},
+      pathRefinement: results.path_refinement || review.path_refinement || results.sensor_refined_path || {},
+      artifactUrls: results.artifact_urls || review.artifact_urls || {},
+    });
+  } else {
+    pathComparisonController.cancel();
+  }
   document.querySelector("#delete-scan")?.addEventListener("click", async () => {
     const accepted = window.confirm(`Permanently delete “${scan.name}” and every saved video, frame, and reconstruction output?`);
     if (!accepted) return;
@@ -1305,6 +1745,7 @@ function wireDetailActions(scan) {
 function renderSelected() {
   const scan = scans.find((item) => item.id === selectedId);
   if (!scan) {
+    pathComparisonController.cancel();
     disposeViewer();
     if (newWalkMode) {
       scanDetail.replaceChildren();
@@ -1319,12 +1760,17 @@ function renderSelected() {
   const fingerprint = JSON.stringify(scan);
   if (fingerprint === lastDetailFingerprint) return;
   lastDetailFingerprint = fingerprint;
+  pathComparisonController.cancel();
   disposeViewer();
   const alignmentRunning = ["queued", "running"].includes(scan.alignment?.status);
   const supplementRunning = (scan.supplements || []).some((addition) => ["uploading", "processing_frames", "queued", "running"].includes(addition.status));
   const pcfRunning = ["queued", "running"].includes(scan.pcf?.status);
-  const canDelete = !["uploading", "importing_capture", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning && !supplementRunning && !pcfRunning;
-  const canInitiate = ["ready", "ma_failed", "da3_failed"].includes(scan.status);
+  const pathReviewRunning = ["queued", "running"].includes(scan.path_review?.status);
+  const canDelete = !["uploading", "importing_capture", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning && !supplementRunning && !pcfRunning && !pathReviewRunning;
+  const canInitiate = ["ready", "ma_failed", "da3_failed"].includes(scan.status) && !pathReviewRunning;
+  const pathScan = scan.walk_intent?.mode === "path_refinement";
+  const requestedProvider = [scan.provider, scan.requested_provider, scan.selected_provider].find((value) => ["da3", "mapanything"].includes(value)) || "";
+  const providerChoice = requestedProvider || (pathScan ? "da3" : "mapanything");
   const videoSize = formatBytes(scan.video?.size_bytes);
   scanDetail.innerHTML = `
     <div class="detail-header">
@@ -1334,15 +1780,19 @@ function renderSelected() {
         <div class="detail-meta"><span>${escapeHtml(formatDate(scan.created_at))}</span><span>${videoSize}</span><span>${escapeHtml(scan.id)}</span></div>
       </div>
       <div class="detail-actions">
-        ${scan.status === "complete" && !supplementRunning && !pcfRunning ? '<label class="secondary-button" for="additional-camera-video">＋ Add Video</label><input id="additional-camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />' : ""}
+        ${scan.walk_intent?.mode !== "path_refinement" && scan.status === "complete" && !supplementRunning && !pcfRunning ? '<label class="secondary-button" for="additional-camera-video">＋ Add Video</label><input id="additional-camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />' : ""}
         ${scan.video?.url ? `<a class="ghost-button" href="${scan.video.url}" target="_blank" rel="noopener">Original video</a>` : ""}
+        ${scan.capture?.calibration_request || scan.status === "calibration_ready" ? '<button id="open-calibration" class="primary-button" type="button">Open Setup</button>' : ""}
         <button id="rename-scan" class="ghost-button" type="button">Rename</button>
         ${canDelete ? '<button id="delete-scan" class="danger-button" type="button">Delete scan</button>' : ""}
       </div>
     </div>
     ${statusPanel(scan)}
+    ${walkIntentSection(scan)}
+    ${pathReviewSection(scan)}
+    ${scanCameraSelectionMarkup(scan)}
     ${captureSection(scan)}
-    ${canInitiate ? `<div class="ready-callout inference-callout"><div><h3>${scan.status.endsWith("_failed") ? "The prepared views are still safe." : "The room walk is ready."}</h3><p>Reconstruction uses all ${Number(scan.prepared?.frame_count || 0)} adaptive phone views. MapAnything automatically uses overlapping registered windows above its measured joint-view capacity. DA3 uses DA3-BASE any-view geometry plus the validated DA3Metric-Large FP16 TensorRT engine for metric scale.</p></div><label class="provider-picker"><span>Provider</span><select id="inference-provider"><option value="mapanything" ${scan.provider !== "da3" ? "selected" : ""}>MapAnything</option><option value="da3" ${scan.provider === "da3" ? "selected" : ""}>DA3</option></select></label><button id="initiate-inference" class="primary-button" type="button">Run reconstruction</button></div>` : ""}
+    ${canInitiate ? `<div class="ready-callout inference-callout"><div><h3>${scan.status.endsWith("_failed") ? "The prepared views are still safe." : pathScan ? "The path walk is ready." : "The room walk is ready."}</h3><p>Reconstruction uses all ${Number(scan.prepared?.frame_count || 0)} adaptive phone views. ${pathScan ? "DA3 is the path model for position refinement when the backend accepts it; MapAnything remains available for comparison-only review." : "MapAnything automatically uses overlapping registered windows above its measured joint-view capacity. DA3 uses DA3-BASE any-view geometry plus the validated DA3Metric-Large FP16 TensorRT engine for metric scale."}</p></div><label class="provider-picker"><span>${pathScan ? "Path model" : "Provider"}</span><select id="inference-provider"><option value="da3" ${providerChoice === "da3" ? "selected" : ""}>DA3${pathScan ? " · position refinement" : ""}</option><option value="mapanything" ${providerChoice === "mapanything" ? "selected" : ""}>MapAnything${pathScan ? " · comparison only" : ""}</option></select>${pathScan ? '<small class="provider-note">Choosing MapAnything does not produce a position-refined path.</small>' : ""}</label><button id="initiate-inference" class="primary-button" type="button">${pathScan ? "Run path reconstruction" : "Run reconstruction"}</button></div>` : ""}
     ${scan.status === "complete" ? outputsSection(scan) : preparedSection(scan)}
     ${scan.status !== "complete" && scan.video?.url ? `<div class="subheading"><div><span class="eyebrow">Source</span><h3>Original phone video</h3></div></div><div class="media-panel"><video src="${scan.video.url}" controls preload="metadata" playsinline></video><div class="media-caption"><span>${escapeHtml(scan.video.original_name || "phone video")}</span><span>${videoSize}</span></div></div>` : ""}`;
   wireDetailActions(scan);
@@ -1364,6 +1814,10 @@ async function refreshScans({ force = false } = {}) {
   refreshing = true;
   try {
     scans = await jsonFetch("/api/scans");
+    serverUnavailable = false;
+    populateIntentTargets();
+    document.querySelector("#library-connection").textContent = "Server library · videos, prepared views, and reconstruction evidence retained on the Noesis machine.";
+    calibrationUI?.setScans(scans);
     if (selectedId && !scans.some((scan) => scan.id === selectedId)) {
       selectedId = null;
       localStorage.removeItem("phoneScanSelected");
@@ -1375,7 +1829,9 @@ async function refreshScans({ force = false } = {}) {
     renderScanList();
     renderSelected();
   } catch (error) {
-    toastMessage(`Could not refresh scans: ${error.message}`);
+    document.querySelector("#library-connection").textContent = "Server library unavailable. Previously displayed walks may be stale; native phone captures and board editing remain available offline.";
+    if (force || !serverUnavailable) toastMessage(`Could not refresh scans: ${error.message}`);
+    serverUnavailable = true;
   } finally {
     refreshing = false;
   }
@@ -1383,6 +1839,7 @@ async function refreshScans({ force = false } = {}) {
 
 function uploadVideo(file) {
   if (!file) return;
+  if (!captureIntentReady({ browser: true })) return;
   if (browserCaptureBlocked("use another video")) return;
   if (uploadInProgress) {
     toastMessage("A walk is already uploading");
@@ -1414,13 +1871,17 @@ function uploadVideo(file) {
       toastMessage(detail);
       return;
     }
-    const scan = JSON.parse(xhr.responseText);
+    let scan = JSON.parse(xhr.responseText);
+    const intentResponse = await persistWalkIntent(scan.id, activeBrowserIntent || currentWalkIntent());
+    if (intentResponse?.id === scan.id) scan = intentResponse;
+    activeBrowserIntent = null;
     rememberSelectedScan(scan.id);
     uploadPercent.textContent = "100%";
     uploadBar.style.width = "100%";
     uploadLabel.textContent = "Upload saved · preparing multi-view frames";
     toastMessage("Walk auto-saved; frame preparation started");
     await refreshScans({ force: true });
+    activateWorkspaceTab("library");
     setTimeout(() => uploadPanel.classList.add("hidden"), 1800);
   });
   xhr.addEventListener("error", () => {
@@ -1436,6 +1897,7 @@ function uploadVideo(file) {
 
 function uploadSensorBundle(file, { fileName = file?.name, fromBrowser = false } = {}) {
   if (!file) return;
+  if (!captureIntentReady({ browser: true })) return;
   if (!fromBrowser && browserCaptureBlocked("import another sensor bundle")) return;
   if (uploadInProgress) {
     toastMessage("A walk is already uploading");
@@ -1476,8 +1938,11 @@ function uploadSensorBundle(file, { fileName = file?.name, fromBrowser = false }
       toastMessage(detail);
       return;
     }
-    const scan = JSON.parse(xhr.responseText);
+    let scan = JSON.parse(xhr.responseText);
     if (fromBrowser && browserCapture.status.bundle?.blob !== file) return;
+    const intentResponse = await persistWalkIntent(scan.id, fromBrowser ? (activeBrowserIntent || currentWalkIntent()) : currentWalkIntent());
+    if (intentResponse?.id === scan.id) scan = intentResponse;
+    if (fromBrowser) activeBrowserIntent = null;
     if (fromBrowser) browserCapture.markBundleUploaded();
     rememberSelectedScan(scan.id);
     uploadPercent.textContent = "100%";
@@ -1485,6 +1950,8 @@ function uploadSensorBundle(file, { fileName = file?.name, fromBrowser = false }
     uploadLabel.textContent = "Sensor bundle saved · preparing timestamped frames";
     toastMessage("Sensor capture auto-saved; frame preparation started");
     await refreshScans({ force: true });
+    calibrationUI?.setScans(scans, { preferredId: scan.id });
+    activateWorkspaceTab("library");
     setTimeout(() => uploadPanel.classList.add("hidden"), 1800);
   });
   xhr.addEventListener("error", () => {
@@ -1554,6 +2021,17 @@ function uploadSupplementVideo(scan, file) {
 }
 
 recordPhoneWalkButton.addEventListener("click", async () => {
+  if (!captureIntentReady({ browser: !nativeCaptureUI.available })) return;
+  if (nativeCaptureUI.available) {
+    const intent = currentWalkIntent();
+    nativeCaptureUI.capture(intent.mode, undefined, {
+      target_scan_id: intent.target_scan_id,
+      carry_protocol: intent.carry_protocol,
+      accuracy_target_m: intent.accuracy_target_m,
+      ...(intent.target_reference ? { target_reference: intent.target_reference } : {}),
+    });
+    return;
+  }
   if (uploadInProgress) {
     toastMessage("Finish the current upload before starting another recording.");
     return;
@@ -1590,17 +2068,25 @@ browserStartButton.addEventListener("click", async () => {
   browserStartButton.disabled = true;
   let startedStatic = false;
   try {
-    if (!companionCapture.readyToStart) throw new Error("Choose an available static room camera before starting the paired recording.");
-    const phoneCaptureId = companionCapture.reservePhoneCaptureId();
-    await companionCapture.start({
-      cameraId: companionCameraSelect.value,
-      phoneCaptureId,
-      browserCapture,
-    });
-    startedStatic = true;
-    browserCapture.start({ captureId: phoneCaptureId, companionCapture: companionCapture.companionContext() });
-    toastMessage("Static room video and phone camera are recording together");
+    activeBrowserIntent = currentWalkIntent();
+    const paired = captureMode === "path_refinement" || companionCapture.readyToStart;
+    if (captureMode === "path_refinement" && !companionCapture.readyToStart) throw new Error("Choose an available static room camera before starting the paired recording.");
+    if (paired) {
+      const phoneCaptureId = companionCapture.reservePhoneCaptureId();
+      await companionCapture.start({
+        cameraId: companionCameraSelect.value,
+        phoneCaptureId,
+        browserCapture,
+      });
+      startedStatic = true;
+      browserCapture.start({ captureId: phoneCaptureId, companionCapture: companionCapture.companionContext() });
+      toastMessage("Static room video and phone camera are recording together");
+    } else {
+      browserCapture.start({ captureId: null, companionCapture: null });
+      toastMessage("Phone reconstruction recording started; static pairing is optional");
+    }
   } catch (error) {
+    activeBrowserIntent = null;
     if (startedStatic || companionCapture.hasLiveSession || companionCapture.needsServerStop) {
       await companionCapture.stop("phone_start_failed").catch(() => {});
     }
@@ -1659,6 +2145,7 @@ browserDiscardButton.addEventListener("click", () => {
     return;
   }
   browserCapture.discardBundle();
+  activeBrowserIntent = null;
   if (["failed", "stopped", "error"].includes(companionCapture.status.state) && !companionCapture.needsServerStop) companionCapture.reset();
   browserBundleUploadFailed = false;
   browserCapturePanel.classList.add("hidden");
@@ -1673,9 +2160,57 @@ existingInput.addEventListener("change", () => uploadVideo(existingInput.files?.
 sensorBundleInput.addEventListener("change", () => uploadSensorBundle(sensorBundleInput.files?.[0]));
 refreshButton.addEventListener("click", () => refreshScans({ force: true }));
 newWalkButton.addEventListener("click", startNewWalk);
+captureModeReconstruction?.addEventListener("change", () => setCaptureIntentMode("reconstruction"));
+captureModePath?.addEventListener("change", () => setCaptureIntentMode("path_refinement"));
+reconstructionTargetScan?.addEventListener("change", (event) => {
+  reconstructionTargetId = event.currentTarget.value || "";
+  if (reconstructionTargetId) localStorage.setItem(RECONSTRUCTION_TARGET_KEY, reconstructionTargetId);
+  else localStorage.removeItem(RECONSTRUCTION_TARGET_KEY);
+  syncCaptureIntentUi();
+});
+pathTargetScan?.addEventListener("change", (event) => {
+  pathTargetId = event.currentTarget.value || "";
+  if (pathTargetId) localStorage.setItem(PATH_TARGET_KEY, pathTargetId);
+  else localStorage.removeItem(PATH_TARGET_KEY);
+  syncCaptureIntentUi();
+});
+pathCameraSelect?.addEventListener("change", (event) => {
+  pathCameraId = event.currentTarget.value || "";
+  if (pathCameraId) localStorage.setItem(PATH_CAMERA_KEY, pathCameraId);
+  else localStorage.removeItem(PATH_CAMERA_KEY);
+  if (pathCameraId && nativeCaptureUI.available) {
+    const snapshot = nativeCaptureUI.snapshot;
+    const roomIndex = snapshot?.room_cameras?.findIndex((camera) => camera.camera_id === pathCameraId) ?? -1;
+    if (roomIndex >= 0 && roomIndex !== snapshot.room_camera_index) {
+      nativeCaptureUI.perform("configure", { room_camera_index: roomIndex });
+    }
+  }
+  syncCaptureIntentUi();
+});
 
 if (newWalkMode) localStorage.removeItem("phoneScanSelected");
+for (const button of document.querySelectorAll("[data-workspace-tab]")) {
+  button.addEventListener("click", () => activateWorkspaceTab(button.dataset.workspaceTab));
+  button.addEventListener("keydown", (event) => {
+    const tabs = Array.from(document.querySelectorAll("[data-workspace-tab]"));
+    const index = tabs.indexOf(button);
+    const next = event.key === "ArrowRight" ? (index + 1) % tabs.length
+      : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+        : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
+    if (next < 0) return;
+    event.preventDefault();
+    activateWorkspaceTab(tabs[next].dataset.workspaceTab);
+    if (activeWorkspaceTab === tabs[next].dataset.workspaceTab) tabs[next].focus();
+  });
+}
+if (isRoomWalkAndroid(window)) {
+  document.querySelector("#browser-tools").open = false;
+  recordPhoneWalkButton.textContent = "Open native camera";
+}
 syncCaptureModeUi();
+syncCaptureIntentUi();
+activateWorkspaceTab(!nativeCaptureUI.available && selectedId && !newWalkMode ? "library" : "capture");
+nativeCaptureUI.refresh();
 refreshHealth();
 refreshScans({ force: true });
 setInterval(refreshHealth, 30_000);

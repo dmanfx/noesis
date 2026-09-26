@@ -452,6 +452,8 @@ def _primitive(
     frame=1,
     embedding=(1.0, 0.0, 0.0, 0.0),
     world=(1.0, 0.0, 2.0),
+    world_frame="backend_world_m",
+    world_frame_revision="shared-test-world-r1",
 ):
     public = {
         "stable_id": 9001,
@@ -473,6 +475,8 @@ def _primitive(
         tracker_confidence=0.9,
         world_xyz=world,
         world_valid=True,
+        world_frame=world_frame,
+        world_frame_revision=world_frame_revision,
     )
 
 
@@ -1509,6 +1513,48 @@ def test_overlap_permit_requires_topology_world_and_appearance_proof(tmp_path):
             observed_at=10.3,
         )
         assert permitted.overlap_permit_count == 1
+
+        mismatched_revision = _primitive(
+            camera="camera-b",
+            tracker="different-revision",
+            frame=1,
+            world_frame_revision="camera-b-local-r2",
+        )
+        denied_revision = service.process_source_frame(
+            camera_id="camera-b",
+            frame_id=1,
+            primitives=(mismatched_revision,),
+            observed_at=10.35,
+        )
+        assert denied_revision.overlap_permit_count == 0
+
+        mismatched_frame = _primitive(
+            camera="camera-b",
+            tracker="different-frame",
+            frame=1,
+            world_frame="camera_b_local_m",
+        )
+        denied_frame = service.process_source_frame(
+            camera_id="camera-b",
+            frame_id=1,
+            primitives=(mismatched_frame,),
+            observed_at=10.36,
+        )
+        assert denied_frame.overlap_permit_count == 0
+
+        missing_revision = _primitive(
+            camera="camera-b",
+            tracker="missing-revision",
+            frame=1,
+            world_frame_revision=None,
+        )
+        denied_missing = service.process_source_frame(
+            camera_id="camera-b",
+            frame_id=1,
+            primitives=(missing_revision,),
+            observed_at=10.37,
+        )
+        assert denied_missing.overlap_permit_count == 0
 
         wrong_appearance = _primitive(
             camera="camera-b",

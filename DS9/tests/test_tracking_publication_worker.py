@@ -953,6 +953,8 @@ def test_shadow_identity_isolated_from_exact_outbound_row() -> None:
         tracker_confidence=0.8,
         world_xyz=(1.0, 0.0, 2.0),
         world_valid=True,
+        world_frame="backend_world_m",
+        world_frame_revision="shared-test-world-r1",
     )
 
     assert processor._enqueue_tracking_publication(
@@ -985,6 +987,8 @@ def test_shadow_identity_isolated_from_exact_outbound_row() -> None:
     assert detached.public_track is not public_track
     assert detached.diagnostic_track is None
     assert detached.embedding == (1.0, 0.0)
+    assert detached.world_frame == "backend_world_m"
+    assert detached.world_frame_revision == "shared-test-world-r1"
 
     release_scoring.set()
     processor.shutdown(wait=True, timeout_s=2.0)

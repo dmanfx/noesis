@@ -8999,6 +8999,16 @@ def _copy_shadow_identity_primitives(
                     field_name="identity-v2 world_xyz",
                 ),
                 world_valid=bool(primitive.world_valid),
+                world_frame=(
+                    str(primitive.world_frame)
+                    if primitive.world_frame is not None
+                    else None
+                ),
+                world_frame_revision=(
+                    str(primitive.world_frame_revision)
+                    if primitive.world_frame_revision is not None
+                    else None
+                ),
             )
         )
     if primitive_by_track:
@@ -11618,6 +11628,8 @@ class _AnalyticsTelemetryProcessor:
                         tracker_confidence=public_track.get("tracker_confidence"),
                         world_xyz=public_track.get("world"),
                         world_valid=public_track.get("world_valid") is True,
+                        world_frame=public_track.get("world_frame"),
+                        world_frame_revision=public_track.get("world_frame_revision"),
                     )
                 )
                 diagnostics_tracks.append(diag_track)

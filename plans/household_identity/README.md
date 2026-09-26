@@ -8,16 +8,19 @@ The goal is a closed-world household identity system: a small enrolled resident
 set, bounded visitor identities, geometry-aware multi-camera association, and
 quality-gated Swin embeddings without CPU-frame extraction.
 
-## Current data flow
+## Identity-v2 authority contract
+
+This diagram describes the authoritative identity-v2 lane. The configured mode
+and admitted authority artifacts determine whether it owns live public output.
 
 ```mermaid
 flowchart LR
     TRACK[DS9.1 NvDCF track] --> JOIN[DS9.1 identity hook]
     REID[Swin SGIE tensor meta] --> JOIN
-    POSE[Pose and quality evidence] --> JOIN
-    WORLD[Fresh world/BEV footpoint] --> JOIN
-    TOPO[Accepted camera topology] --> JOIN
-    JOIN --> RESOLVE[StableID manager]
+    POSE[Pose-derived anchor] --> WORLD[Fresh world evidence]
+    WORLD --> JOIN
+    TOPO[Configured topology and overlap proof] --> JOIN
+    JOIN --> RESOLVE[Identity-v2 source-frame resolver]
     RESOLVE --> RESIDENT[Enrolled resident]
     RESOLVE --> VISITOR[TTL visitor]
     RESOLVE --> PROVISIONAL[Withheld provisional]
@@ -25,23 +28,27 @@ flowchart LR
     VISITOR --> WIRE
 ```
 
-The only prospective co-visibility edge is Kitchen ↔ Family Room and it remains
-disabled until the geometry and synchronized overlap evidence are accepted.
-Living Room ↔ Family Room do not overlap. Kitchen ↔ Living Room are adjacent,
-not overlapping.
+The [checked-in topology](../../config/camera_topology.yaml) enables a
+conditional Kitchen ↔ Family Room identity-overlap pair. A permit still requires
+the current geometry, timestamps, and appearance evidence specified by the
+[topology contract](camera_topology.md); configuration alone does not satisfy
+the remaining authority-acceptance gates or prove live activation. Living Room
+↔ Family Room do not overlap. Kitchen ↔ Living Room are adjacent, not overlapping.
 
 ## Current implementation
 
-- `reid/stable_id_manager.py` owns identity assignment, resident/visitor state,
-  assignment constraints, and gallery policy.
-- `DS9/noesis/ds9_runtime_core.py` constructs the process-owned manager.
+- `reid/stable_id_manager.py` retains the legacy assignment and gallery lane.
+- `noesis/identity_v2_service.py` owns the identity-v2 source-frame resolver and
+  public overlays when authoritative mode is selected and admitted.
+- `DS9/noesis/ds9_runtime_core.py` constructs the process-owned identity services.
 - `DS9/noesis/pipelines/hooks.py` joins tracker, ReID, pose, and world evidence.
 - `noesis/server/reid_api.py` exposes enrollment and alias operations.
 - `DS9/pipelines/config_infer_secondary_reid_swin.ini` is the selected ReID
   SGIE; `DS9/config/infer.yaml` selects it.
 
-MV3DT is not part of the active identity path. Older DS8 implementation phase
-documents are retained under
+Identity topology does not enable MV3DT; its accepted Kitchen/Family Room
+tracking lane remains a separate explicit runtime opt-in. Older DS8
+implementation phase documents are retained under
 `plans/archive/completed/household_identity_ds8_implementation/` only to explain
 how the current contracts evolved.
 

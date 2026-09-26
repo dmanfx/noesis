@@ -1,73 +1,67 @@
-# Pose-assisted StableID integration
-_Status: canonical native DS9.1 behavior, updated 2026-08-15._
+# Pose metadata and StableID routing
 
-This note records how pose features are used to strengthen StableID assignment in the DS9.1 pipeline.
+_Status: checked-out native DS9.1 routing, verified 2026-09-07._
 
-## Overview
+This note describes the identity calls in the current source. The configured
+process mode and admitted authority artifacts determine which lane owns live
+public identity; inspect them before making a runtime claim.
 
-- **Source:** YOLO26 pose SGIE → `PoseFeatureProcessor` attaches `NOESIS.POSE_FEATURES` object meta.
-- **Transport:** Native bridge `noesis_pose_meta_ext.extract_pose_features(obj_meta)` reads JSON from `NvDsObjectMeta`.
-- **Consumer:** `_AnalyticsTelemetryProcessor` passes pose features into `StableIDManager.update(...)`.
-- **Goal:** Use pose ratios as a **secondary identity signal** to reduce ID switches, while keeping
-  appearance (ReID embeddings) as the primary matcher.
+## Current DS9 hook integration
 
-## Data Flow
+The [`_AnalyticsTelemetryProcessor`](../DS9/noesis/pipelines/hooks.py) has two
+identity routes:
 
-1. Pose SGIE produces keypoints and ratio features per person.
-2. `PoseFeatureProcessor` attaches JSON to each object:
-   `type="pose_features"`, `features`, `kpt_mean_conf`, `kpt_valid_frac`.
-3. `_AnalyticsTelemetryProcessor` extracts pose JSON (native bridge) and supplies:
-   - `pose_features`: dict of float ratios
-   - `pose_quality`: dict with `kpt_mean_conf`, `kpt_valid_frac`
-4. `StableIDManager.update(...)` fuses pose similarity with ReID similarity
-   or uses pose-only matching when embeddings are missing.
+- When identity-v2 is not authoritative, `_maybe_assign_stable_id()` calls
+  `StableIDManager.update()` with the sensor/tracker identity, box, timestamp,
+  zone, frame placeholder, and ReID embedding. It does not pass the optional
+  `pose_features` or `pose_quality` arguments.
+- When identity-v2 is authoritative, that legacy assignment call is bypassed.
+  The hook collects `IdentityFramePrimitive` rows and calls
+  `IdentityV2Service.process_source_frame()` once for the complete source-frame
+  cohort. The primitives carry the embedding, box/confidence data, and world
+  evidence alongside the public and diagnostic rows.
 
-## StableID Behavior
+The hook separately extracts pose keypoints for anchor processing and the
+`pose_present` diagnostic. A present pose or a persistent label does not prove
+that optional pose matching in `StableIDManager` contributed to the decision.
 
-- **Gated blend:** pose contributes only when pose quality is good and pose similarity passes
-  thresholds. ReID thresholds still gate final acceptance.
-- **Pose-only fallback:** if ReID embeddings are missing, pose similarity alone can match
-  (higher threshold).
-- **Ghost re-association:** pose vectors are stored in ghost records to recover IDs after
-  short occlusions when embeddings are missing.
+## Identity-v2 mode and missing embeddings
 
-## Memory & Storage Control
+[`noesis/identity_v2_service.py`](../noesis/identity_v2_service.py) reads
+`NOESIS_IDENTITY_V2_MODE`; its source default is `shadow`. Authoritative startup
+requires the matching authority-cutover artifact in addition to the scorer's
+calibration. The source default is not evidence of the running process's mode.
 
-- **Bounded RAM:** per-stable-id deque with a size cap + global cap.
-- **TTL pruning:** pose entries older than `pose_max_age_s` are removed during `prune_ghosts`.
-- **No persistence:** pose features are not written to disk.
+Without a fresh embedding, the service may retain an already accepted overlay
+within its bounded tracker-continuity hold and marks it
+`tracker_continuity_hold_no_fresh_embedding`. Without an eligible hold, the row
+becomes provisional with `server_embedding_unavailable`; authoritative mode
+clears its public identity. Neither path is pose-only matching or a fallback to
+legacy identity output.
 
-## Configuration (env vars + defaults)
+## Optional manager capabilities
 
-Enable/disable:
-- `NOESIS_REID_POSE_ENABLED` (auto-on if pose SGIE enabled and pose features not disabled)
-- `NOESIS_POSE_FEATURES_ENABLED=0` disables pose features globally
+[`StableIDManager.update()`](../reid/stable_id_manager.py) still accepts optional
+pose features and quality. Its manager-level implementation includes quality
+gating, pose/appearance blending, and pose-only ghost/gallery matching for
+callers that supply those inputs. These capabilities are not wired by the
+current DS9 hook call described above. Changing a manager pose threshold does
+not add the missing call inputs.
 
-Fusion + thresholds:
-- `NOESIS_REID_POSE_WEIGHT=0.15`
-- `NOESIS_REID_POSE_SIM_THRESHOLD=0.55`
-- `NOESIS_REID_POSE_SIM_HIGH_THRESHOLD=0.65`
-- `NOESIS_REID_POSE_ONLY_THRESHOLD=0.80`
-- `NOESIS_REID_POSE_MIN_VALID_FRAC=0.45`
-- `NOESIS_REID_POSE_MIN_MEAN_CONF=0.50`
-- `NOESIS_REID_POSE_MIN_FEATURES=6`
-- `NOESIS_REID_POSE_INTERVAL_S=0.75`
+[`test_stable_id_manager_pose.py`](../tests/test_stable_id_manager_pose.py)
+exercises those optional manager capabilities in isolation. It does not prove
+the DS9 hook uses them or authorize an identity-v2 authority cutover.
 
-Memory caps:
-- `NOESIS_REID_POSE_GALLERY_SIZE=8`
-- `NOESIS_REID_POSE_MAX_AGE_S=30`
-- `NOESIS_REID_POSE_MAX_TOTAL_ENTRIES=0` (auto-derived from `max_total_ids`)
+## Scope and validation
 
-## Validation
+Follow [identity guidance](../reid/AGENTS.md) and the
+[household identity contracts](../plans/household_identity/contracts.md) for
+assignment changes. Preserve selected SGIE/native extraction, exact
+camera/frame/tracker joins, and the separate authority-acceptance gates. Do not
+add pose-only assignment or another extraction path merely to match older
+descriptions of this integration.
 
-- Unit tests:
-  - `python3 -m pytest tests/test_stable_id_manager_pose.py`
-- Runtime:
-  - Ensure `noesis_pose_meta_ext` is built.
-  - Run DS9.1 pipeline and confirm stable_id persistence when pose is present.
-
-## Notes for Agents
-
-- Service Maker Python does not expose `obj_user_meta_list`; pose extraction **must**
-  go through the native bridge.
-- This integration is DS9.1-only; do not add legacy pad-probe or CPU fallback branches.
+Documentation-only corrections use the [root documentation checks](../AGENTS.md#files-docs-and-commits).
+An authorized integration change needs focused producer/consumer validation
+selected from the affected contracts; it does not require rebuilding unchanged
+native artifacts or running the application for a documentation correction.

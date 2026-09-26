@@ -99,6 +99,8 @@ class IdentityFramePrimitive:
     tracker_confidence: Optional[float] = None
     world_xyz: Optional[Sequence[float]] = None
     world_valid: bool = False
+    world_frame: Optional[str] = None
+    world_frame_revision: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,8 @@ class _RecentProof:
     observed_at: float
     embedding: Tuple[float, ...]
     world_xyz: Tuple[float, float, float]
+    world_frame: Optional[str]
+    world_frame_revision: Optional[str]
     subject_id: Optional[str]
 
 
@@ -1123,6 +1127,8 @@ class IdentityV2Service:
                     world_xyz=(
                         world if world is not None else (math.nan, math.nan, math.nan)
                     ),
+                    world_frame=primitive.world_frame,
+                    world_frame_revision=primitive.world_frame_revision,
                     subject_id=overlay.subject_id,
                 )
 
@@ -1424,6 +1430,10 @@ class IdentityV2Service:
             current_world = self._valid_world(primitive)
             if current_world is None:
                 continue
+            current_frame = str(primitive.world_frame or "").strip()
+            current_revision = str(primitive.world_frame_revision or "").strip()
+            if not current_frame or not current_revision:
+                continue
             for recent in self._recent_proofs.values():
                 if recent.subject_id is None or recent.tracklet_id == current_tracklet:
                     continue
@@ -1431,6 +1441,11 @@ class IdentityV2Service:
                     tuple(sorted((current_key.camera_id, recent.camera_id)))
                 )
                 if policy is None:
+                    continue
+                if (
+                    recent.world_frame != current_frame
+                    or recent.world_frame_revision != current_revision
+                ):
                     continue
                 age = observed_at - recent.observed_at
                 if age < 0.0 or age > policy.max_time_delta_s:

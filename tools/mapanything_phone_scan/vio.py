@@ -9,6 +9,7 @@ reconstruction remains usable.
 from __future__ import annotations
 
 import bisect
+import csv
 import hashlib
 import json
 import math
@@ -29,6 +30,14 @@ from .phone_calibration import PhoneCalibrationError, rectification_maps
 VIO_SCHEMA = "noesis.phone_capture.vio_result.v1"
 VIO_CALIBRATION_PRIOR_SCHEMA = "noesis.phone_capture.vio_calibration_prior.v1"
 VIO_CALIBRATION_SCHEMA = "noesis.phone_capture.vio_calibration_result.v1"
+VIO_PROFILE_VALIDATION_SCHEMA = "noesis.phone_capture.vio_profile_validation_result.v1"
+VIO_PROFILE_INPUT_SCHEMA = "noesis.phone_capture.openvins_profile_validation_input.v1"
+SHORT_CONSUMER_VERSION = "roomwalk.openvins.short_walk.v1"
+POSE_TIME_REFERENCE = "camera2_encoded_viewport_centre_exposure_midpoint"
+SHORT_IMAGE_MODEL = "centre_timed_global_shutter_approximation"
+SHORT_RUNTIME_QUALITY_POLICY = {"version": "roomwalk.short_walk_runtime_quality.v1",
+                                "minimum_camera_coverage": 0.8, "maximum_pose_gap_s": 0.2,
+                                "maximum_end_gap_s": 0.2, "maximum_resets": 0}
 # Computational experiment limits. These never establish calibration admission.
 CALIBRATION_BOUNDS = {
     "rotation_change_rad": 0.50,
@@ -44,6 +53,7 @@ CALIBRATION_UNCERTAINTY = {
 }
 CALIBRATION_COVARIANCE_CONVENTION = "openvins_jpl_left_rotation_I_to_C_position_I_in_C_camera_to_imu_offset"
 ProgressCallback = Callable[[float, str], None]
+RuntimeQualityCheck = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
 
 
 class VIOError(RuntimeError):
@@ -102,6 +112,8 @@ def validate_vio_input(capture_report: Mapping[str, Any], prepared: Mapping[str,
         raise VIOError("capture report is not a supported phone capture")
     if capture_report.get("metric_vio_allowed") is not True:
         raise VIOError("metric VIO is blocked because capture calibration or timing is incomplete")
+    if "short_session" in capture_report:
+        _checked_short_session(capture_report, validation=False)
     imu = capture_report.get("imu")
     video = capture_report.get("video")
     coverage = capture_report.get("coverage")
@@ -306,6 +318,74 @@ def materialize_openvins_input(
     return _materialize_openvins_input(capture_dir, capture_report, output_dir, settings, progress)
 
 
+def _file_sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _source_file(root: Path, name: str) -> Path:
+    relative = Path(name)
+    path = root / relative
+    if (not name or relative.is_absolute() or ".." in relative.parts or "\\" in name
+            or path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve())):
+        raise VIOError("short-profile input has an invalid source path")
+    return path
+
+
+def _checked_short_session(report, *, validation):
+    from .motion_preprocessing import checked_corrections, MotionProfileError
+
+    short = report.get("short_session")
+    if (report.get("schema") != "noesis.phone_capture.v1" or not isinstance(short, Mapping)
+            or short.get("consumer_version") != SHORT_CONSUMER_VERSION
+            or short.get("validation_run") is not validation
+            or report.get("metric_vio_allowed") is not (not validation)):
+        raise VIOError("short-profile capture admission/mode or consumer version is invalid")
+    if (not isinstance(short.get("profile_id"), str) or not 1 <= len(short["profile_id"]) <= 128
+            or short.get("analysis_max_side") != 1280
+            or short.get("image_motion_model") != SHORT_IMAGE_MODEL
+            or short.get("rolling_shutter_compensated") is not False
+            or short.get("imu_correction_equation") != "corrected = matrix * raw - bias"
+            or short.get("vendor_bias_subtracted") is not False
+            or not isinstance(short.get("point_timing"), Mapping)
+            or short["point_timing"].get("qualified") is not True
+            or short["point_timing"].get("model") != "camera2_active_array_row_exposure_midpoint"
+            or not re.fullmatch(r"[0-9a-f]{64}", str(short.get("base_capture_report_sha256", "")))):
+        raise VIOError("short-profile correction, centre timing, or provenance contract is invalid")
+    pairs = short.get("source_and_pose_times_ns")
+    if (not isinstance(pairs, (list, tuple)) or not 2 <= len(pairs) <= 12000
+            or any(not isinstance(pair, (list, tuple)) or len(pair) != 2
+                   or any(type(t) is not int or not 0 < t < 2**63 for t in pair)
+                   or not 0 <= pair[1] - pair[0] <= 150_000_000 for pair in pairs)
+            or any(a[0] >= b[0] or a[1] >= b[1] for a, b in zip(pairs, pairs[1:]))):
+        raise VIOError("short-profile source/pose timestamp mapping is invalid")
+    try:
+        checked_corrections(report["manifest"]["imu"]["corrections"])
+        _matrix(report["manifest"]["extrinsics"]["T_imu_camera"], "short_profile.T_imu_camera")
+        offset = report["manifest"]["clocks"]["imu_to_camera_offset_ns"]
+        if type(offset) is not int or abs(offset) > 100_000_000:
+            raise VIOError("short-profile offset must be measured integer nanoseconds")
+    except (KeyError, TypeError, ValueError, MotionProfileError) as exc:
+        raise VIOError("short-profile calibration/corrections are invalid") from exc
+    return dict(short)
+
+
+def materialize_openvins_profile_validation_input(
+    capture_dir: Path,
+    capture_report: Mapping[str, Any],
+    output_dir: Path,
+    settings: VIOSettings,
+    progress: ProgressCallback,
+) -> tuple[Path, Path]:
+    """Use a bound fixed short-profile model without granting metric admission."""
+    _checked_short_session(capture_report, validation=True)
+    return _materialize_openvins_input(capture_dir, capture_report, output_dir, settings, progress,
+                                      profile_validation=True)
+
+
 def validate_vio_calibration_prior(prior: Mapping[str, Any], capture_id: str) -> dict[str, Any]:
     """Validate explicit provisional assumptions, without changing capture admission."""
     if prior.get("schema") != VIO_CALIBRATION_PRIOR_SCHEMA or prior.get("status") != "provisional":
@@ -369,9 +449,15 @@ def _materialize_openvins_input(
     progress: ProgressCallback,
     *,
     calibration_prior: Mapping[str, Any] | None = None,
+    profile_validation: bool = False,
 ) -> tuple[Path, Path]:
 
-    if calibration_prior is None and capture_report.get("metric_vio_allowed") is not True:
+    short = None
+    if "short_session" in capture_report or profile_validation:
+        if calibration_prior is not None:
+            raise VIOError("short-profile validation must not enable online calibration")
+        short = _checked_short_session(capture_report, validation=profile_validation)
+    if calibration_prior is None and not profile_validation and capture_report.get("metric_vio_allowed") is not True:
         raise VIOError("metric OpenVINS input is blocked by the capture report")
     manifest = capture_report.get("manifest")
     if not isinstance(manifest, Mapping):
@@ -395,7 +481,10 @@ def _materialize_openvins_input(
     video_path = capture_dir / str(video_meta.get("path") or "")
     timestamps_path = capture_dir / "video_timestamps_ns.json"
     try:
-        frame_timestamps = [int(value) for value in json.loads(timestamps_path.read_text(encoding="utf-8"))]
+        raw_times = json.loads(timestamps_path.read_text(encoding="utf-8"))
+        if short and (not isinstance(raw_times, list) or any(type(t) is not int for t in raw_times)):
+            raise VIOError("short-profile source timestamps must be integer nanoseconds")
+        frame_timestamps = [int(value) for value in raw_times]
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise VIOError("imported camera timestamps are unreadable") from exc
     if len(frame_timestamps) < 2 or any(
@@ -412,6 +501,21 @@ def _materialize_openvins_input(
         )
     if not video_path.is_file():
         raise VIOError(f"imported camera video is missing: {video_path}")
+    source_timestamps = list(frame_timestamps)
+    source_artifacts = {}
+    if short:
+        if source_timestamps != [pair[0] for pair in short["source_and_pose_times_ns"]]:
+            raise VIOError("short-profile mapping differs from original camera timestamps")
+        frame_timestamps = [pair[1] for pair in short["source_and_pose_times_ns"]]
+        if output_dir.resolve() == capture_dir.resolve() or output_dir.resolve().is_relative_to(capture_dir.resolve()):
+            raise VIOError("short-profile output must be separate from retained capture")
+        source_names = [str(video_meta["path"]), "video_timestamps_ns.json", "imu_normalized.json"]
+        android = manifest.get("android_capture")
+        if isinstance(android, Mapping):
+            source_names.extend(str(android[k]) for k in ("camera_results_path", "capture_result_path") if k in android)
+        for name in source_names:
+            path = _source_file(capture_dir, name)
+            source_artifacts[name] = {"sha256": _file_sha(path), "bytes": path.stat().st_size}
 
     # The calibration is expressed in the encoded image axes.  ffmpeg's
     # default display-matrix autorotation would silently move those axes, so
@@ -448,8 +552,8 @@ def _materialize_openvins_input(
     ):
         raise VIOError("encoded camera geometry does not match calibrated K/crop")
     analysis_resize = None
-    if calibration_prior is not None:
-        max_side = calibration_prior["analysis_max_side"]
+    if calibration_prior is not None or short is not None:
+        max_side = (short if short is not None else calibration_prior)["analysis_max_side"]
         scale = min(1.0, max_side / max(encoded_width, encoded_height))
         analysis_width = max(1, int(round(encoded_width * scale)))
         analysis_height = max(1, int(round(encoded_height * scale)))
@@ -486,10 +590,10 @@ def _materialize_openvins_input(
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "info", "-nostdin",
         "-noautorotate",
-        *(["-threads", "4", "-filter_threads", "2"] if calibration_prior is not None else []),
+        *(["-threads", "4", "-filter_threads", "2"] if calibration_prior is not None or short is not None else []),
         "-i", str(video_path), "-map", "0:v:0", "-vf", video_filter,
         "-fps_mode", "passthrough", "-start_number", "0",
-        *(["-threads", "4"] if calibration_prior is not None else []),
+        *(["-threads", "4"] if calibration_prior is not None or short is not None else []),
         str(image_dir / "frame-%08d.png"),
     ]
     progress(0.12, "Decoding the dense camera stream for OpenVINS")
@@ -549,6 +653,19 @@ def _materialize_openvins_input(
         gyro_times = [int(row["timestamp_ns"]) for row in gyro_rows]
         accel_values = [[float(value) for value in row["si"]] for row in accel_rows]
         gyro_values = [[float(value) for value in row["si"]] for row in gyro_rows]
+        if short:
+            from .motion_preprocessing import correct_samples, MotionProfileError
+            for rows, times in ((accel_rows, accel_times), (gyro_rows, gyro_times)):
+                if (len(rows) > 300000 or any(type(r.get("timestamp_ns")) is not int for r in rows)
+                        or any(not 0 < b - a <= 50_000_000 for a, b in zip(times, times[1:]))):
+                    raise VIOError("short-profile IMU timestamps/cadence exceed their bound")
+            try:
+                # Apply to each original stream exactly once BEFORE creating
+                # the joint grid. Vendor bias estimates are not subtracted.
+                accel_values = correct_samples(accel_values, imu_meta["corrections"], "accelerometer").tolist()
+                gyro_values = correct_samples(gyro_values, imu_meta["corrections"], "gyroscope").tolist()
+            except (ValueError, MotionProfileError) as exc:
+                raise VIOError("short-profile IMU correction failed") from exc
         # Keep the common stream range, including the samples bracketing the
         # camera interval.  Dropping those rows forces the estimator to start
         # or end on an interpolated value and breaks nonzero time offsets.
@@ -574,6 +691,8 @@ def _materialize_openvins_input(
             for timestamp in grid
         ]
         stream_method = "linear_interpolation_to_union_timestamp_grid_with_brackets"
+    elif short:
+        raise VIOError("short profiles require original separate IMU streams")
     elif isinstance(normalized_imu, list):
         imu_rows = [
             (
@@ -686,14 +805,20 @@ def _materialize_openvins_input(
         # The pinned dynamic initializer does not return optimized calibration.
         config_text = _replace_yaml_key(config_text, "init_dyn_mle_opt_calib", "false")
         config_text = _replace_yaml_key(config_text, "multi_threading_subs", "false")
+    if short:
+        for key, value in {
+            "calib_imu_intrinsics": "false", "calib_imu_g_sensitivity": "false",
+            "init_dyn_mle_opt_calib": "false", "downsample_cameras": "false",
+            "multi_threading_subs": "false", "multi_threading_pubs": "false",
+            "num_opencv_threads": "4", "init_dyn_mle_max_threads": "2",
+        }.items():
+            config_text = _replace_yaml_key(config_text, key, value)
     config_text = _replace_yaml_key(config_text, "record_timing_filepath", '"logs/openvins_timing.txt"')
     generated_config = input_root / "estimator_config.yaml"
     generated_config.write_text(config_text, encoding="utf-8")
-    (input_root / "openvins_input.json").write_text(
-        json.dumps(
-            {
-                "schema": "noesis.phone_capture.openvins_calibration_input.v1" if calibration_prior is not None else "noesis.phone_capture.openvins_input.v1",
-                "mode": "calibration" if calibration_prior is not None else "metric_vio",
+    metadata = {
+                "schema": VIO_PROFILE_INPUT_SCHEMA if profile_validation else "noesis.phone_capture.openvins_calibration_input.v1" if calibration_prior is not None else "noesis.phone_capture.openvins_input.v1",
+                "mode": "profile_validation" if profile_validation else "calibration" if calibration_prior is not None else "metric_vio",
                 "capture_metric_vio_allowed": capture_report.get("metric_vio_allowed") is True,
                 **({"calibration_prior": calibration_prior, "accepted_for_metric_vio": False} if calibration_prior is not None else {}),
                 "capture_id": str(manifest.get("capture_id") or ""),
@@ -704,7 +829,8 @@ def _materialize_openvins_input(
                 "frame_mapping": [
                     {
                         "source_frame_index": index,
-                        "capture_time_ns": timestamp,
+                        "capture_time_ns": source_timestamps[index],
+                        **({"pose_time_ns": timestamp} if short else {}),
                         "filename": path.name,
                         **image_provenance[index],
                     }
@@ -715,12 +841,35 @@ def _materialize_openvins_input(
                 "imu_time_offset_applied_in_config_s": offset_s,
                 "separate_stream_method": stream_method,
                 "dense_source_timestamp": str((capture_report.get("video") or {}).get("timestamp_source") or ""),
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+            }
+    if short:
+        mapping_path = input_root / "source_frame_mapping.csv"
+        with mapping_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(["source_frame_index", "capture_time_ns", "pose_time_ns"])
+            writer.writerows((row["source_frame_index"], row["capture_time_ns"], row["pose_time_ns"]) for row in metadata["frame_mapping"])
+        report_path = input_root / "short_session_capture_report.json"
+        report_path.write_text(json.dumps(capture_report, sort_keys=True, allow_nan=False), encoding="utf-8")
+        for row, image_path in zip(metadata["frame_mapping"], image_paths, strict=True):
+            row["estimator_image_sha256"] = _file_sha(image_path)
+        names = ["source_frame_mapping.csv", "short_session_capture_report.json", "cam0/data.csv", "imu0/data.csv",
+                 "kalibr_imucam_chain.yaml", "kalibr_imu_chain.yaml", "estimator_config.yaml"]
+        metadata.update({
+            "short_session": short, "accepted_for_metric_vio": False,
+            "runtime_quality_control_required": not profile_validation,
+            "pose_time_reference": POSE_TIME_REFERENCE,
+            "source_capture_dir": str(capture_dir.resolve()), "source_artifacts": source_artifacts,
+            "input_artifacts": {name: {"sha256": _file_sha(input_root / name), "bytes": (input_root / name).stat().st_size} for name in names},
+            "imu_preprocessing": {"equation": "corrected = matrix * raw - bias", "applied_before_joint_interpolation": True,
+                                  "application_count": 1, "corrections": imu_meta["corrections"],
+                                  "vendor_bias_subtracted": False, "native_imu_corrections": "identity",
+                                  "noise_already_transformed_by_profile": True},
+            "fixed_calibration": {"T_imu_camera": t_imu_camera, "imu_to_camera_offset_ns": offset_ns},
+        })
+        for name, info in source_artifacts.items():
+            if _file_sha(_source_file(capture_dir, name)) != info["sha256"]:
+                raise VIOError("short-profile source changed during materialization")
+    (input_root / "openvins_input.json").write_text(json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     progress(0.28, f"Materialized {len(image_paths)} dense camera frames and {len(imu_rows)} IMU samples")
     return input_root, generated_config
 
@@ -734,10 +883,18 @@ def validate_vio_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise VIOError("VIO output estimator identity is not OpenVINS")
     if payload.get("accepted_for_metric_vio") is not True:
         raise VIOError("VIO output was not accepted for metric use")
+    if "short_session_consumer" in payload:
+        if payload.get("status") != "completed":
+            raise VIOError("short-profile metric result has no completed runtime quality admission")
+        for field in ("direct_runtime_quality", "runtime_quality_control"):
+            proof = payload.get(field)
+            if not isinstance(proof, Mapping) or proof.get("accepted") is not True:
+                raise VIOError(f"short-profile metric result has no retained {field} approval")
     return _validate_vio_trajectory(payload)
 
 
-def _validate_vio_trajectory(payload: Mapping[str, Any], *, calibration: bool = False) -> dict[str, Any]:
+def _validate_vio_trajectory(payload: Mapping[str, Any], *, calibration: bool = False,
+                             profile_validation: bool = False) -> dict[str, Any]:
     """Check pose semantics without converting provisional output to admission."""
     if payload.get("estimator") != "openvins":
         raise VIOError("VIO output estimator identity is not OpenVINS")
@@ -760,23 +917,45 @@ def _validate_vio_trajectory(payload: Mapping[str, Any], *, calibration: bool = 
     ):
         raise VIOError("VIO output has no explicit camera/vio_world frame contract")
     scale = payload.get("scale")
-    scale_mode = "provisional_metric" if calibration else "metric"
-    scale_source = "provisional_imu_camera_prior_online_calibration" if calibration else "imu_camera_calibration"
+    if calibration and profile_validation:
+        raise VIOError("profile validation is not online calibration")
+    scale_mode = "provisional_metric" if calibration or profile_validation else "metric"
+    scale_source = "short_session_profile_validation" if profile_validation else "provisional_imu_camera_prior_online_calibration" if calibration else "imu_camera_calibration"
     if not isinstance(scale, Mapping) or scale.get("mode") != scale_mode or scale.get("source") != scale_source:
         raise VIOError("VIO output has no calibrated metric-scale declaration")
     rows = payload.get("poses")
     if not isinstance(rows, list) or len(rows) < 2:
         raise VIOError("VIO output contains too few poses")
     previous = None
+    previous_pose_time = None
+    short = payload.get("short_session_consumer")
+    if profile_validation or short is not None:
+        if (not isinstance(short, Mapping) or short.get("consumer_version") != SHORT_CONSUMER_VERSION
+                or short.get("validation_run") is not profile_validation
+                or short.get("fixed_camera_imu_calibration") is not True
+                or short.get("native_imu_corrections") != "identity"
+                or short.get("dense_frame_mapping_verified") is not True
+                or short.get("image_motion_model") != SHORT_IMAGE_MODEL
+                or short.get("rolling_shutter_compensated") is not False
+                or not short.get("profile_id")
+                or frame.get("pose_time_reference") != POSE_TIME_REFERENCE
+                or frame.get("capture_time_reference") != "original_camera_sensor_timestamp"):
+            raise VIOError("short-profile output does not confirm the fixed centre-timed consumer")
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise VIOError(f"VIO pose {index} is invalid")
         timestamp = row.get("capture_time_ns")
-        if not isinstance(timestamp, int):
+        if type(timestamp) is not int:
             raise VIOError(f"VIO pose {index} has no integer capture_time_ns")
         if previous is not None and timestamp <= previous:
             raise VIOError("VIO pose timestamps are not strictly increasing")
         previous = timestamp
+        if short is not None:
+            pose_time = row.get("pose_time_ns")
+            if (type(pose_time) is not int or not 0 <= pose_time - timestamp <= 150_000_000
+                    or (previous_pose_time is not None and pose_time <= previous_pose_time)):
+                raise VIOError("short-profile output has invalid centre-exposure pose timestamps")
+            previous_pose_time = pose_time
         if not isinstance(row.get("prepared_frame_id"), str) or not row["prepared_frame_id"]:
             raise VIOError(f"VIO pose {index} has no prepared frame identity")
         _matrix(row.get("T_vio_world_camera"), f"poses[{index}].T_vio_world_camera")
@@ -860,13 +1039,28 @@ def validate_vio_calibration_result(payload: Mapping[str, Any]) -> dict[str, Any
     return result
 
 
-def _read_result(path: Path, *, calibration: bool = False) -> dict[str, Any]:
+def validate_vio_profile_validation_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if (payload.get("schema") != VIO_PROFILE_VALIDATION_SCHEMA
+            or payload.get("accepted_for_metric_vio") is not False or payload.get("status") != "provisional"):
+        raise VIOError("short-profile validation output must remain explicitly provisional")
+    return _validate_vio_trajectory(payload, profile_validation=True)
+
+
+def _read_result(path: Path, *, calibration: bool = False, profile_validation: bool = False,
+                 pending_short_quality: bool = False) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise VIOError(f"OpenVINS output is unreadable: {path}") from exc
     if not isinstance(payload, Mapping):
         raise VIOError("OpenVINS output must be a JSON object")
+    if profile_validation:
+        return validate_vio_profile_validation_result(payload)
+    if pending_short_quality:
+        if (payload.get("schema") != VIO_SCHEMA or payload.get("accepted_for_metric_vio") is not False
+                or payload.get("status") != "pending_runtime_quality_control"):
+            raise VIOError("short-profile metric result must await runtime quality control")
+        return _validate_vio_trajectory(payload)
     return validate_vio_calibration_result(payload) if calibration else validate_vio_result(payload)
 
 
@@ -875,10 +1069,13 @@ def run_openvins(
     output_dir: Path,
     settings: VIOSettings,
     progress: ProgressCallback,
+    *,
+    runtime_quality_check: RuntimeQualityCheck | None = None,
 ) -> dict[str, Any]:
     """Run the pinned native OpenVINS bridge and validate its JSON result."""
 
-    return _run_openvins(capture_dir, output_dir, settings, progress)
+    return _run_openvins(capture_dir, output_dir, settings, progress,
+                         runtime_quality_check=runtime_quality_check)
 
 
 def run_openvins_calibration(
@@ -891,6 +1088,98 @@ def run_openvins_calibration(
     return _run_openvins(capture_dir, output_dir, settings, progress, calibration=True)
 
 
+def run_openvins_profile_validation(
+    capture_dir: Path,
+    output_dir: Path,
+    settings: VIOSettings,
+    progress: ProgressCallback,
+) -> dict[str, Any]:
+    """Run a fixed short-session profile as non-admitted validation evidence."""
+    return _run_openvins(capture_dir, output_dir, settings, progress, profile_validation=True)
+
+
+def _verify_short_input(root, metadata, settings, *, validation):
+    expected_schema = VIO_PROFILE_INPUT_SCHEMA if validation else "noesis.phone_capture.openvins_input.v1"
+    if (metadata.get("schema") != expected_schema
+            or metadata.get("mode") != ("profile_validation" if validation else "metric_vio")
+            or metadata.get("accepted_for_metric_vio") is not False
+            or metadata.get("capture_metric_vio_allowed") is not (not validation)
+            or metadata.get("runtime_quality_control_required") is not (not validation)):
+        raise VIOError("short-profile materialized input has the wrong mode/admission contract")
+    artifacts = metadata.get("input_artifacts")
+    required = {"source_frame_mapping.csv", "short_session_capture_report.json", "cam0/data.csv", "imu0/data.csv",
+                "kalibr_imucam_chain.yaml", "kalibr_imu_chain.yaml", "estimator_config.yaml"}
+    if not isinstance(artifacts, Mapping) or set(artifacts) != required:
+        raise VIOError("short-profile input artifact binding is incomplete")
+    for name, info in artifacts.items():
+        path = _source_file(root, name)
+        if not isinstance(info, Mapping) or path.stat().st_size != info.get("bytes") or _file_sha(path) != info.get("sha256"):
+            raise VIOError("short-profile input artifact changed after materialization")
+    if settings.config.resolve() != (root / "estimator_config.yaml").resolve() or _file_sha(settings.config) != metadata.get("estimator_config_sha256"):
+        raise VIOError("short-profile config differs from its materialized input")
+    report = json.loads((root / "short_session_capture_report.json").read_text())
+    short = _checked_short_session(report, validation=validation)
+    if metadata.get("short_session") != short or metadata.get("pose_time_reference") != POSE_TIME_REFERENCE:
+        raise VIOError("short-profile consumer metadata differs from its bound report")
+    for key, expected in (("capture_id", report["manifest"]["capture_id"]),
+                          ("camera_sensor_id", report["manifest"]["camera"]["id"]),
+                          ("time_domain", report["manifest"]["clocks"]["camera_domain"])):
+        if metadata.get(key) != expected:
+            raise VIOError("short-profile input changed its source identity")
+    source = Path(metadata.get("source_capture_dir", ""))
+    sources = metadata.get("source_artifacts")
+    if not isinstance(sources, Mapping) or not {"video_timestamps_ns.json", "imu_normalized.json", report["manifest"]["video"]["path"]} <= set(sources):
+        raise VIOError("short-profile original source binding is incomplete")
+    for name, info in sources.items():
+        path = _source_file(source, name)
+        if not isinstance(info, Mapping) or path.stat().st_size != info.get("bytes") or _file_sha(path) != info.get("sha256"):
+            raise VIOError("short-profile original source changed after materialization")
+    source_times = json.loads((source / "video_timestamps_ns.json").read_text())
+    if source_times != [pair[0] for pair in short["source_and_pose_times_ns"]]:
+        raise VIOError("short-profile input changed the original timestamp mapping")
+    mappings = metadata.get("frame_mapping")
+    if not isinstance(mappings, list) or len(mappings) != len(source_times) or metadata.get("frame_count") != len(mappings):
+        raise VIOError("short-profile dense camera mapping is incomplete")
+    expected_csv = "source_frame_index,capture_time_ns,pose_time_ns\n"
+    camera_csv = ""
+    for index, (row, pair) in enumerate(zip(mappings, short["source_and_pose_times_ns"], strict=True)):
+        if (not isinstance(row, Mapping) or row.get("source_frame_index") != index
+                or row.get("capture_time_ns") != pair[0] or row.get("pose_time_ns") != pair[1]
+                or row.get("filename") != f"frame-{index:08d}.png"):
+            raise VIOError("short-profile dense frame mapping changed")
+        image_path = _source_file(root, "cam0/data/" + row["filename"])
+        if _file_sha(image_path) != row.get("estimator_image_sha256"):
+            raise VIOError("short-profile analysis image changed")
+        expected_csv += f"{index},{pair[0]},{pair[1]}\n"
+        camera_csv += f"{pair[1]},{row['filename']}\n"
+    if (root / "source_frame_mapping.csv").read_text() != expected_csv or (root / "cam0/data.csv").read_text() != camera_csv:
+        raise VIOError("short-profile native timestamp mapping differs from source/pose identity")
+    preprocessing = metadata.get("imu_preprocessing", {})
+    if (preprocessing.get("corrections") != report["manifest"]["imu"]["corrections"]
+            or preprocessing.get("application_count") != 1 or preprocessing.get("applied_before_joint_interpolation") is not True
+            or preprocessing.get("native_imu_corrections") != "identity"
+            or preprocessing.get("noise_already_transformed_by_profile") is not True):
+        raise VIOError("short-profile IMU correction provenance changed")
+    return short
+
+
+def _short_runtime_quality(result, metadata):
+    """Recompute bounded tracking checks from exact rows, not native ratios."""
+    poses = result["poses"]
+    total = len(metadata["frame_mapping"])
+    coverage = len(poses) / total
+    max_gap = max(b["pose_time_ns"] - a["pose_time_ns"] for a, b in zip(poses, poses[1:])) * 1e-9
+    end_gap = (metadata["frame_mapping"][-1]["pose_time_ns"] - poses[-1]["pose_time_ns"]) * 1e-9
+    reset = any(segment.get("reset") is not False for segment in result["segments"])
+    accepted = (coverage >= SHORT_RUNTIME_QUALITY_POLICY["minimum_camera_coverage"]
+                and max_gap <= SHORT_RUNTIME_QUALITY_POLICY["maximum_pose_gap_s"]
+                and 0 <= end_gap <= SHORT_RUNTIME_QUALITY_POLICY["maximum_end_gap_s"]
+                and not reset and result["quality"].get("reset_count") == 0)
+    return {"accepted": accepted, "policy": dict(SHORT_RUNTIME_QUALITY_POLICY),
+            "camera_coverage": coverage, "maximum_pose_gap_s": max_gap, "end_gap_s": end_gap,
+            "reset_observed": reset, "accuracy_validated": False}
+
+
 def _run_openvins(
     capture_dir: Path,
     output_dir: Path,
@@ -898,6 +1187,8 @@ def _run_openvins(
     progress: ProgressCallback,
     *,
     calibration: bool = False,
+    profile_validation: bool = False,
+    runtime_quality_check: RuntimeQualityCheck | None = None,
 ) -> dict[str, Any]:
 
     if settings.estimator != "openvins":
@@ -907,7 +1198,7 @@ def _run_openvins(
     if settings.config is None or not settings.config.is_file():
         raise VIOError("OpenVINS config is missing; configure NOESIS_PHONE_SCAN_VIO_CONFIG")
     output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = output_dir / ("vio_calibration_result.json" if calibration else "vio_result.json")
+    result_path = output_dir / ("vio_profile_validation_result.json" if profile_validation else "vio_calibration_result.json" if calibration else "vio_result.json")
     if result_path.exists():
         result_path.unlink()
     stdout_path = output_dir / "openvins.stdout.log"
@@ -922,6 +1213,7 @@ def _run_openvins(
     required_mask: dict[str, Any] | None = None
     calibration_prior = None
     input_metadata: dict[str, Any] = {}
+    short = None
     if input_metadata_path.is_file():
         try:
             input_metadata = json.loads(input_metadata_path.read_text(encoding="utf-8"))
@@ -929,8 +1221,16 @@ def _run_openvins(
             raise VIOError("OpenVINS input metadata is unreadable") from exc
         if not isinstance(input_metadata, dict):
             raise VIOError("OpenVINS input metadata must be an object")
-        if not calibration and input_metadata.get("mode") == "calibration":
+        if not calibration and not profile_validation and input_metadata.get("mode") in {"calibration", "profile_validation"}:
             raise VIOError("provisional calibration input cannot run as admitted metric VIO")
+        if "short_session" in input_metadata or profile_validation:
+            if calibration:
+                raise VIOError("short-profile input cannot enable online calibration")
+            short = _verify_short_input(capture_dir, input_metadata, settings, validation=profile_validation)
+            if runtime_quality_check is not None and not callable(runtime_quality_check):
+                raise VIOError("runtime quality check must be callable")
+            command.extend(["--short-session-consumer", SHORT_CONSUMER_VERSION,
+                            "--profile-id", short["profile_id"], "--frame-mapping", str(capture_dir / "source_frame_mapping.csv")])
         for key, option in (
             ("capture_id", "--capture-id"),
             ("camera_sensor_id", "--camera-sensor-id"),
@@ -959,6 +1259,10 @@ def _run_openvins(
             # Older bridges reject this explicit option rather than running
             # rectified images while silently admitting their invalid borders.
             command.extend(["--camera-mask", str(mask_path)])
+    if profile_validation:
+        if short is None:
+            raise VIOError("profile validation requires materialized short-profile input")
+        command.extend(["--mode", "profile_validation"])
     if calibration:
         if input_metadata.get("schema") != "noesis.phone_capture.openvins_calibration_input.v1" or input_metadata.get("mode") != "calibration" or input_metadata.get("accepted_for_metric_vio") is not False:
             raise VIOError("online calibration requires materialized provisional input")
@@ -985,6 +1289,7 @@ def _run_openvins(
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 text=True,
+                **({"env": {**os.environ, "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}} if short else {}),
             )
             try:
                 return_code = process.wait(timeout=settings.timeout_s)
@@ -1000,7 +1305,8 @@ def _run_openvins(
         detail = (stderr_tail or stdout_tail or "unknown OpenVINS error").strip()
         raise VIOError(f"OpenVINS failed with exit code {return_code}: {detail}")
     progress(0.90, "Validating OpenVINS trajectory and reset boundaries")
-    result = _read_result(result_path, calibration=calibration)
+    result = _read_result(result_path, calibration=calibration, profile_validation=profile_validation,
+                          pending_short_quality=short is not None and not profile_validation)
     if required_mask is not None and result.get("camera_mask") != required_mask:
         raise VIOError("OpenVINS did not confirm the required rectification mask")
     if calibration_prior is not None:
@@ -1019,6 +1325,49 @@ def _run_openvins(
             raise VIOError("online calibration output changed its camera-frame mapping")
         result["calibration_prior"] = calibration_prior
         result["camera_preprocessing"] = input_metadata.get("camera_preprocessing")
+    if short is not None:
+        confirmation = result.get("short_session_consumer")
+        if (not isinstance(confirmation, Mapping) or confirmation.get("profile_id") != short["profile_id"]
+                or confirmation.get("consumer_version") != SHORT_CONSUMER_VERSION):
+            raise VIOError("OpenVINS did not confirm the selected short-profile consumer")
+        for key in ("capture_id", "camera_sensor_id", "time_domain"):
+            if result["frame"].get(key) != input_metadata.get(key):
+                raise VIOError("short-profile output changed its source identity")
+        identities = {row["capture_time_ns"]: (row["source_frame_index"], row["pose_time_ns"]) for row in input_metadata["frame_mapping"]}
+        if any(identities.get(row["capture_time_ns"]) != (row.get("source_frame_index"), row.get("pose_time_ns"))
+               or row.get("prepared_frame_id") != f"{input_metadata['capture_id']}:source:{row.get('source_frame_index')}" for row in result["poses"]):
+            raise VIOError("short-profile output changed the source/pose timestamp mapping")
+        fixed = result.get("fixed_calibration", {})
+        expected = input_metadata["fixed_calibration"]
+        if (np.shape(fixed.get("T_imu_camera")) != (4, 4)
+                or not np.allclose(fixed["T_imu_camera"], expected["T_imu_camera"], atol=1e-9, rtol=0)
+                or fixed.get("imu_to_camera_offset_ns") != expected["imu_to_camera_offset_ns"]):
+            raise VIOError("short-profile native fixed calibration differs from its supplied model")
+        _verify_short_input(capture_dir, input_metadata, settings, validation=profile_validation)
+        result.update(short_session=short, camera_preprocessing=input_metadata["camera_preprocessing"],
+                      imu_preprocessing=input_metadata["imu_preprocessing"])
+        if not profile_validation:
+            direct_quality = _short_runtime_quality(result, input_metadata)
+            if not direct_quality["accepted"]:
+                raise VIOError("short-profile direct runtime quality failed: coverage, gap or reset")
+            # The ordinary API is safe without caller plumbing: always use
+            # the parent's versioned envelope/trajectory policy by default.
+            # An explicit callback can supply additional caller-owned evidence.
+            from .motion_profile import validate_short_walk_runtime, MotionProfileError
+            try:
+                quality = validate_short_walk_runtime(result, input_metadata)
+                extra_quality = runtime_quality_check(result, input_metadata) if runtime_quality_check else None
+            except MotionProfileError as exc:
+                raise VIOError("short-profile runtime quality input is invalid") from exc
+            if not isinstance(quality, Mapping) or quality.get("accepted") is not True:
+                raise VIOError("short-profile runtime quality control rejected this walk")
+            if extra_quality is not None:
+                if not isinstance(extra_quality, Mapping) or extra_quality.get("accepted") is not True:
+                    raise VIOError("additional short-profile runtime quality control rejected this walk")
+                result["additional_runtime_quality_control"] = dict(extra_quality)
+            result.update(runtime_quality_control=dict(quality), direct_runtime_quality=direct_quality,
+                          accepted_for_metric_vio=True, status="completed")
+            validate_vio_result(result)
     result["command"] = command
     result["stdout_tail"] = stdout_tail
     result["stderr_tail"] = stderr_tail
@@ -1031,14 +1380,18 @@ __all__ = [
     "VIOError",
     "VIO_SCHEMA",
     "VIO_CALIBRATION_SCHEMA",
+    "VIO_PROFILE_VALIDATION_SCHEMA",
     "VIO_CALIBRATION_PRIOR_SCHEMA",
     "VIOSettings",
     "materialize_openvins_input",
     "materialize_openvins_calibration_input",
+    "materialize_openvins_profile_validation_input",
     "run_openvins",
     "run_openvins_calibration",
+    "run_openvins_profile_validation",
     "validate_vio_input",
     "validate_vio_result",
     "validate_vio_calibration_prior",
     "validate_vio_calibration_result",
+    "validate_vio_profile_validation_result",
 ]

@@ -44,6 +44,9 @@ struct Cli {
   fs::path config;
   fs::path output;
   fs::path camera_mask;
+  fs::path frame_mapping;
+  std::string short_session_consumer;
+  std::string profile_id;
   std::string capture_id = "euroc_mh_01_easy_mono_subset";
   std::string camera_sensor_id = "cam0";
   std::string time_domain = "euroc_ns";
@@ -61,6 +64,7 @@ struct Calibration {
 
 struct Snapshot {
   std::int64_t timestamp_ns;
+  std::int64_t capture_time_ns;
   std::int64_t source_frame_index;
   std::string prepared_frame_id;
   Eigen::Matrix4d T_world_camera;
@@ -74,7 +78,11 @@ struct Snapshot {
 struct FrameIdentity {
   std::int64_t source_frame_index;
   std::string prepared_frame_id;
+  std::int64_t capture_time_ns;
 };
+
+constexpr const char *SHORT_CONSUMER = "roomwalk.openvins.short_walk.v1";
+constexpr const char *POSE_TIME_REFERENCE = "camera2_encoded_viewport_centre_exposure_midpoint";
 
 std::map<std::int64_t, FrameIdentity> read_frame_identities(const fs::path &capture_dir,
                                                              const std::string &capture_id) {
@@ -91,7 +99,7 @@ std::map<std::int64_t, FrameIdentity> read_frame_identities(const fs::path &capt
     const std::int64_t source_index = std::stoll((*match)[1].str());
     const std::int64_t timestamp_ns = std::stoll((*match)[2].str());
     identities.emplace(timestamp_ns,
-                       FrameIdentity{source_index, capture_id + ":source:" + std::to_string(source_index)});
+                       FrameIdentity{source_index, capture_id + ":source:" + std::to_string(source_index), timestamp_ns});
   }
   return identities;
 }
@@ -117,6 +125,37 @@ std::int64_t parse_i64(const std::string &value) {
     throw std::runtime_error("invalid integer timestamp: " + value);
   }
   return parsed;
+}
+
+std::map<std::int64_t, FrameIdentity> read_short_frame_mapping(
+    const Cli &cli, const std::vector<ImageRecord> &images) {
+  std::ifstream input(cli.frame_mapping);
+  std::string line;
+  if (!input || !std::getline(input, line) || line != "source_frame_index,capture_time_ns,pose_time_ns")
+    throw std::runtime_error("short-profile frame mapping header is missing or invalid");
+  std::map<std::int64_t, FrameIdentity> result;
+  std::int64_t previous_source = -1, previous_pose = -1;
+  std::size_t index = 0;
+  while (std::getline(input, line)) {
+    if (line.size() > 128 || index >= images.size() || index >= 12000)
+      throw std::runtime_error("short-profile frame mapping exceeds its bound");
+    const auto values = split_csv(line);
+    if (values.size() != 3) throw std::runtime_error("invalid short-profile frame mapping row");
+    const auto source_index = parse_i64(values[0]);
+    const auto source_time = parse_i64(values[1]);
+    const auto pose_time = parse_i64(values[2]);
+    if (source_index != static_cast<std::int64_t>(index) || source_time <= 0 || pose_time < source_time ||
+        pose_time - source_time > 150000000 || source_time <= previous_source || pose_time <= previous_pose ||
+        pose_time != images[index].timestamp_ns)
+      throw std::runtime_error("short-profile frame mapping disagrees with dense camera timestamps");
+    result.emplace(pose_time, FrameIdentity{source_index,
+        cli.capture_id + ":source:" + std::to_string(source_index), source_time});
+    previous_source = source_time;
+    previous_pose = pose_time;
+    ++index;
+  }
+  if (index != images.size()) throw std::runtime_error("short-profile frame mapping is incomplete");
+  return result;
 }
 
 double parse_double(const std::string &value) {
@@ -340,6 +379,9 @@ Cli parse_cli(int argc, char **argv) {
     else if (argument == "--config") cli.config = argv[++index];
     else if (argument == "--output") cli.output = argv[++index];
     else if (argument == "--camera-mask") cli.camera_mask = argv[++index];
+    else if (argument == "--frame-mapping") cli.frame_mapping = argv[++index];
+    else if (argument == "--short-session-consumer") cli.short_session_consumer = argv[++index];
+    else if (argument == "--profile-id") cli.profile_id = argv[++index];
     else if (argument == "--capture-id") cli.capture_id = argv[++index];
     else if (argument == "--camera-sensor-id") cli.camera_sensor_id = argv[++index];
     else if (argument == "--time-domain") cli.time_domain = argv[++index];
@@ -352,7 +394,13 @@ Cli parse_cli(int argc, char **argv) {
   if (cli.capture_dir.empty() || cli.config.empty() || cli.output.empty()) {
     throw std::runtime_error("usage: openvins_phone_runner --capture-dir DIR --config FILE --output FILE");
   }
-  if (cli.mode != "metric_vio" && cli.mode != "calibration") throw std::runtime_error("unsupported estimator mode");
+  if (cli.mode != "metric_vio" && cli.mode != "calibration" && cli.mode != "profile_validation")
+    throw std::runtime_error("unsupported estimator mode");
+  if (cli.mode == "profile_validation" || !cli.short_session_consumer.empty() || !cli.frame_mapping.empty() || !cli.profile_id.empty()) {
+    if (cli.short_session_consumer != SHORT_CONSUMER || cli.frame_mapping.empty() || cli.profile_id.empty() ||
+        cli.profile_id.size() > 128 || cli.mode == "calibration")
+      throw std::runtime_error("short-profile mode requires the exact consumer version, profile ID and frame mapping");
+  }
   if (cli.mode == "calibration" &&
       (!std::isfinite(cli.rotation_std_rad) || cli.rotation_std_rad <= 0 || cli.rotation_std_rad > 0.50 ||
        !std::isfinite(cli.translation_std_m) || cli.translation_std_m <= 0 || cli.translation_std_m > 0.20 ||
@@ -368,9 +416,20 @@ int main(int argc, char **argv) {
   try {
     const Cli cli = parse_cli(argc, argv);
     const bool online = cli.mode == "calibration";
+    const bool profile_validation = cli.mode == "profile_validation";
+    const bool short_profile = !cli.short_session_consumer.empty();
     const auto images = read_images(cli.capture_dir);
     const auto imu = read_imu(cli.capture_dir);
     const double time_origin = static_cast<double>(images.front().timestamp_ns) * 1e-9;
+    const std::int64_t time_origin_ns = images.front().timestamp_ns;
+    const auto relative_time = [&](std::int64_t stamp) {
+      // Preserve hardware integer nanoseconds before converting the bounded
+      // relative interval. The legacy modes retain their existing convention.
+      return short_profile ? static_cast<double>(stamp - time_origin_ns) * 1e-9
+                           : static_cast<double>(stamp) * 1e-9 - time_origin;
+    };
+    const auto frame_identities = short_profile ? read_short_frame_mapping(cli, images)
+                                               : read_frame_identities(cli.capture_dir, cli.capture_id);
 
     auto parser = std::make_shared<ov_core::YamlParser>(cli.config.string());
     ov_msckf::VioManagerOptions options;
@@ -383,7 +442,21 @@ int main(int argc, char **argv) {
         options.state_options.do_calib_camera_intrinsics || options.init_options.init_dyn_mle_opt_calib) {
       throw std::runtime_error("estimator calibration flags do not match the explicit runner mode");
     }
+    if (short_profile &&
+        (options.state_options.do_calib_imu_intrinsics || options.state_options.do_calib_imu_g_sensitivity ||
+         options.downsample_cameras || options.num_opencv_threads < 1 || options.num_opencv_threads > 4 ||
+         options.use_multi_threading_subs || options.init_options.init_dyn_mle_max_threads < 1 ||
+         options.init_options.init_dyn_mle_max_threads > 2 ||
+         !ov_msckf::State::Dm(options.state_options.imu_model, options.vec_dw).isIdentity(1e-12) ||
+         !ov_msckf::State::Dm(options.state_options.imu_model, options.vec_da).isIdentity(1e-12) ||
+         !options.vec_tg.isZero(1e-12) ||
+         !ov_core::quat_2_Rot(options.q_GYROtoIMU).isIdentity(1e-12) ||
+         !ov_core::quat_2_Rot(options.q_ACCtoIMU).isIdentity(1e-12))) {
+      throw std::runtime_error("short-profile consumer requires fixed identity native IMU correction and bounded threads/images");
+    }
     const cv::Size camera_size(options.camera_intrinsics.at(0)->w(), options.camera_intrinsics.at(0)->h());
+    if (short_profile && std::max(camera_size.width, camera_size.height) > 1280)
+      throw std::runtime_error("short-profile analysis images exceed 1280 pixels");
     cv::Mat camera_mask = cli.camera_mask.empty() ? cv::Mat::zeros(camera_size, CV_8UC1) : read_png_gray(cli.camera_mask);
     if (camera_mask.size() != camera_size) {
       throw std::runtime_error("static camera mask dimensions do not match calibrated camera resolution");
@@ -418,22 +491,24 @@ int main(int argc, char **argv) {
     // needed for a camera message at t is at t + dt.  Feed through that
     // target and retain one following sample so the propagator has a genuine
     // bracket at the camera interval boundary.
-    const auto frame_identities = read_frame_identities(cli.capture_dir, cli.capture_id);
     std::size_t imu_index = 0;
     std::size_t emitted = 0;
     std::vector<Snapshot> states;
+    bool previously_initialized = false;
+    double previous_state_time = -std::numeric_limits<double>::infinity();
+    std::size_t reset_count = 0;
     double previous_imu_target = -std::numeric_limits<double>::infinity();
     for (std::size_t image_index = 0; image_index < images.size(); ++image_index) {
       const auto &image = images[image_index];
-      const double camera_time = static_cast<double>(image.timestamp_ns) * 1e-9 - time_origin;
+      const double camera_time = relative_time(image.timestamp_ns);
       // Re-read the learned offset before every camera propagation. A cached
       // initial offset would feed the wrong IMU interval after calibration updates.
       const double imu_target_time = camera_time + vio.get_state()->_calib_dt_CAMtoIMU->value()(0);
       if (imu_target_time <= previous_imu_target) throw std::runtime_error("learned offset reverses the IMU propagation interval");
       previous_imu_target = imu_target_time;
-      while (imu_index < imu.size() && static_cast<double>(imu[imu_index].timestamp_ns) * 1e-9 - time_origin <= imu_target_time) {
+      while (imu_index < imu.size() && relative_time(imu[imu_index].timestamp_ns) <= imu_target_time) {
         ov_core::ImuData message;
-        message.timestamp = static_cast<double>(imu[imu_index].timestamp_ns) * 1e-9 - time_origin;
+        message.timestamp = relative_time(imu[imu_index].timestamp_ns);
         message.wm = imu[imu_index].gyro;
         message.am = imu[imu_index].accel;
         vio.feed_measurement_imu(message);
@@ -441,7 +516,7 @@ int main(int argc, char **argv) {
       }
       if (imu_index < imu.size()) {
         ov_core::ImuData bracket_message;
-        bracket_message.timestamp = static_cast<double>(imu[imu_index].timestamp_ns) * 1e-9 - time_origin;
+        bracket_message.timestamp = relative_time(imu[imu_index].timestamp_ns);
         bracket_message.wm = imu[imu_index].gyro;
         bracket_message.am = imu[imu_index].accel;
         vio.feed_measurement_imu(bracket_message);
@@ -459,8 +534,17 @@ int main(int argc, char **argv) {
       message.masks = {camera_mask};
       vio.feed_measurement_camera(message);
       const auto current = vio.get_state();
+      if (short_profile && previously_initialized &&
+          (!vio.initialized() || current->_timestamp < previous_state_time)) ++reset_count;
+      if (vio.initialized()) {
+        previously_initialized = true;
+        previous_state_time = current->_timestamp;
+      }
       const auto current_calibration = read_calibration(current, online);
       if (online) check_calibration_bounds(current_calibration, seed);
+      if (short_profile && (!current_calibration.T_imu_camera.isApprox(seed.T_imu_camera, 1e-12) ||
+                            std::abs(current_calibration.camera_to_imu_offset_s - seed.camera_to_imu_offset_s) > 1e-12))
+        throw std::runtime_error("short-profile fixed calibration changed during estimation");
       // Keep a pose only when the state update belongs to this camera frame.
       // A delayed or reset update must not be emitted with a stale identity.
       if (vio.initialized() && std::abs(current->_timestamp - camera_time) <= 1e-9) {
@@ -475,6 +559,7 @@ int main(int argc, char **argv) {
                                                   ? cli.capture_id + ":source:" + std::to_string(source_frame_index)
                                                   : identity->second.prepared_frame_id;
         states.push_back({image.timestamp_ns,
+                          identity == frame_identities.end() ? image.timestamp_ns : identity->second.capture_time_ns,
                           source_frame_index,
                           prepared_frame_id,
                           T_world_camera,
@@ -489,13 +574,27 @@ int main(int argc, char **argv) {
     if (!vio.initialized() || states.size() < 2) {
       throw std::runtime_error("OpenVINS did not initialize on the supplied monocular sequence");
     }
+    double maximum_pose_gap_s = 0.0;
+    for (std::size_t i = 1; i < states.size(); ++i)
+      maximum_pose_gap_s = std::max(maximum_pose_gap_s,
+          static_cast<double>(states[i].timestamp_ns - states[i-1].timestamp_ns) * 1e-9);
+    const double end_gap_s = static_cast<double>(images.back().timestamp_ns - states.back().timestamp_ns) * 1e-9;
+    const double coverage = static_cast<double>(states.size()) / static_cast<double>(images.size());
+    // Versioned practical tracking gate, not evidence of metric accuracy.
+    // Do not apply it to legacy runs or to evidence-producing profile checks.
+    if (short_profile && !profile_validation &&
+        (reset_count != 0 || coverage < 0.8 || maximum_pose_gap_s > 0.2 || end_gap_s > 0.2))
+      throw std::runtime_error("short-profile runtime quality failed: reset, coverage below 0.8, or pose/end gap over 0.2s");
 
     fs::create_directories(cli.output.parent_path());
     std::ofstream output(cli.output);
     if (!output) throw std::runtime_error("cannot open output: " + cli.output.string());
     output << "{\"schema\":";
-    write_json_string(output, online ? "noesis.phone_capture.vio_calibration_result.v1" : "noesis.phone_capture.vio_result.v1");
-    output << ",\"estimator\":\"openvins\",\"accepted_for_metric_vio\":" << (online ? "false" : "true") << ",\"frame\":{";
+    write_json_string(output, profile_validation ? "noesis.phone_capture.vio_profile_validation_result.v1" :
+                              online ? "noesis.phone_capture.vio_calibration_result.v1" : "noesis.phone_capture.vio_result.v1");
+    // Short metric runs are admitted only by the wrapper's separate runtime
+    // quality callback. Validation output can never become a metric result.
+    output << ",\"estimator\":\"openvins\",\"accepted_for_metric_vio\":" << ((online || short_profile) ? "false" : "true") << ",\"frame\":{";
     output << "\"source\":\"camera\",\"target\":\"vio_world\",\"pose_convention\":\"T_vio_world_camera\","
            << "\"units\":\"meters\",\"capture_id\":";
     write_json_string(output, cli.capture_id);
@@ -503,13 +602,19 @@ int main(int argc, char **argv) {
     write_json_string(output, cli.camera_sensor_id);
     output << ",\"time_domain\":";
     write_json_string(output, cli.time_domain);
+    if (short_profile) {
+      output << ",\"pose_time_reference\":";
+      write_json_string(output, POSE_TIME_REFERENCE);
+      output << ",\"capture_time_reference\":\"original_camera_sensor_timestamp\"";
+    }
     output << ",\"camera_axes\":\"x_right_y_down_z_forward\",\"world_axes\":\"z_up_gravity_up\","
            << "\"pose_origin\":\"camera_optical_center\",\"velocity_origin\":\"imu_center\","
            << "\"gravity_frame\":\"vio_world\",\"gravity_semantics\":\"physical_world_acceleration\"},"
            << "\"scale\":{\"mode\":";
-    write_json_string(output, online ? "provisional_metric" : "metric");
+    write_json_string(output, (online || profile_validation) ? "provisional_metric" : "metric");
     output << ",\"source\":";
-    write_json_string(output, online ? "provisional_imu_camera_prior_online_calibration" : "imu_camera_calibration");
+    write_json_string(output, profile_validation ? "short_session_profile_validation" :
+                              online ? "provisional_imu_camera_prior_online_calibration" : "imu_camera_calibration");
     output << "},\"camera_mask\":{\"applied\":" << (cli.camera_mask.empty() ? "false" : "true")
            << ",\"invalid_pixel_count\":" << masked_pixels
            << ",\"resolution_px\":[" << camera_size.width << ',' << camera_size.height << "]},"
@@ -517,7 +622,9 @@ int main(int argc, char **argv) {
     for (std::size_t index = 0; index < states.size(); ++index) {
       if (index) output << ',';
       const auto &entry = states[index];
-      output << "{\"capture_time_ns\":" << entry.timestamp_ns << ",\"prepared_frame_id\":";
+      output << "{\"capture_time_ns\":" << entry.capture_time_ns;
+      if (short_profile) output << ",\"pose_time_ns\":" << entry.timestamp_ns;
+      output << ",\"prepared_frame_id\":";
       write_json_string(output, entry.prepared_frame_id);
       output << ",\"source_frame_index\":" << entry.source_frame_index << ","
              << "\"T_vio_world_camera\":";
@@ -545,14 +652,35 @@ int main(int argc, char **argv) {
       output << ",\"bounds\":{\"rotation_change_rad\":0.50,\"translation_change_m\":0.20,"
                 "\"time_offset_change_s\":0.050,\"translation_norm_m\":0.50,\"absolute_time_offset_s\":0.100}";
     }
+    if (short_profile) {
+      output << ",\"status\":";
+      write_json_string(output, profile_validation ? "provisional" : "pending_runtime_quality_control");
+      output << ",\"short_session_consumer\":{\"consumer_version\":";
+      write_json_string(output, SHORT_CONSUMER);
+      output << ",\"profile_id\":";
+      write_json_string(output, cli.profile_id);
+      output << ",\"validation_run\":" << (profile_validation ? "true" : "false")
+             << ",\"fixed_camera_imu_calibration\":true,\"native_imu_corrections\":\"identity\","
+                "\"dense_frame_mapping_verified\":true,\"rolling_shutter_compensated\":false,"
+                "\"image_motion_model\":\"centre_timed_global_shutter_approximation\"},"
+                "\"fixed_calibration\":{\"T_imu_camera\":";
+      write_json_value(output, as_matrix(seed.T_imu_camera));
+      output << ",\"imu_to_camera_offset_ns\":" << std::llround(-seed.camera_to_imu_offset_s * 1e9) << "}";
+    }
     output << ",\"quality\":{\"initialized\":true,\"tracking_ratio\":"
            << static_cast<double>(emitted) / static_cast<double>(images.size())
            << ",\"initialization_delay_s\":"
            << static_cast<double>(states.front().timestamp_ns - images.front().timestamp_ns) * 1e-9
            << ",\"retained_interval_s\":"
-           << static_cast<double>(states.back().timestamp_ns - states.front().timestamp_ns) * 1e-9
-           << "},\"segments\":[{\"id\":\"openvins-0\",\"reset\":false,\"start_capture_time_ns\":"
-           << states.front().timestamp_ns << ",\"end_capture_time_ns\":" << states.back().timestamp_ns << "}]}";
+           << static_cast<double>(states.back().timestamp_ns - states.front().timestamp_ns) * 1e-9;
+    if (short_profile) output << ",\"maximum_pose_gap_s\":" << maximum_pose_gap_s
+                              << ",\"end_gap_s\":" << end_gap_s << ",\"reset_count\":" << reset_count;
+    output << "},\"segments\":[{\"id\":\"openvins-0\",\"reset\":"
+           << ((short_profile && reset_count) ? "true" : "false") << ",\"start_capture_time_ns\":"
+           << states.front().capture_time_ns << ",\"end_capture_time_ns\":" << states.back().capture_time_ns;
+    if (short_profile) output << ",\"start_pose_time_ns\":" << states.front().timestamp_ns
+                              << ",\"end_pose_time_ns\":" << states.back().timestamp_ns;
+    output << "}]}";
     output << std::endl;
     std::cerr << "OpenVINS processed " << images.size() << " images and emitted " << states.size() << " initialized camera states\n";
     return 0;

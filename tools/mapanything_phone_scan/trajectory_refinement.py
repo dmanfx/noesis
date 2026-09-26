@@ -679,6 +679,11 @@ def _validate_vio_constraints(
                 "source_from_target_semantics": "target_camera_coordinates_to_source_camera_coordinates",
                 "source_time_ns": source_row["capture_time_ns"],
                 "target_time_ns": target_row["capture_time_ns"],
+                **({"source_pose_time_ns": source_row["pose_time_ns"],
+                    "target_pose_time_ns": target_row["pose_time_ns"],
+                    "pose_time_reference": frame["pose_time_reference"],
+                    "source_time_reference": "original_camera_sensor_timestamp"}
+                   if payload.get("short_session_consumer") else {}),
                 "openvins_world_axes": "z_up",
                 "noesis_camera_axes": "opencv_x_right_y_down_z_forward",
             }
@@ -694,6 +699,11 @@ def _validate_vio_constraints(
         "world_axes": "openvins_z_up",
         "relative_constraint_axes": "opencv_x_right_y_down_z_forward",
         "relative_constraints_use_global_axis_map": False,
+        **({"pose_time_reference": frame["pose_time_reference"],
+            "capture_time_reference": frame["capture_time_reference"],
+            "short_profile_id": payload["short_session_consumer"]["profile_id"],
+            "image_motion_model": payload["short_session_consumer"]["image_motion_model"]}
+           if payload.get("short_session_consumer") else {}),
         "skipped_gap_or_reset_count": skipped_gaps,
     }
 

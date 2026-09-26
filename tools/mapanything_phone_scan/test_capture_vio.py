@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import copy
+from dataclasses import replace
 import json
 import subprocess
 import sys
@@ -29,16 +30,23 @@ from tools.mapanything_phone_scan.vio import (
     CALIBRATION_COVARIANCE_CONVENTION,
     VIO_CALIBRATION_PRIOR_SCHEMA,
     VIO_CALIBRATION_SCHEMA,
+    VIO_PROFILE_VALIDATION_SCHEMA,
+    SHORT_CONSUMER_VERSION,
+    POSE_TIME_REFERENCE,
+    SHORT_IMAGE_MODEL,
     _interpolate_stream,
     _openvins_camera_projection,
     _rectify_dense_camera_images,
     materialize_openvins_input,
     materialize_openvins_calibration_input,
+    materialize_openvins_profile_validation_input,
     run_openvins,
     run_openvins_calibration,
+    run_openvins_profile_validation,
     validate_vio_calibration_prior,
     validate_vio_calibration_result,
     validate_vio_result,
+    validate_vio_profile_validation_result,
 )
 
 
@@ -676,3 +684,327 @@ def test_online_calibration_runner_binds_native_prior_and_identity(tmp_path: Pat
     output["initial_calibration"]["covariance"][0][0] = 0.02
     with pytest.raises(VIOError, match="did not apply"):
         run_openvins_calibration(input_root, tmp_path / "wrong-prior", VIOSettings(executable=Path(sys.executable), config=config), lambda *_: None)
+
+
+def _short_profile_fixture(tmp_path, *, validation=True):
+    root, report, settings, images = _dense_capture_fixture(tmp_path)
+    report.update(schema="noesis.phone_capture.v1", metric_vio_allowed=not validation)
+    corrections = {
+        "accelerometer_matrix": [[1.02, 0.01, 0], [0.02, 0.99, 0.01], [0, -0.01, 1.01]],
+        "accelerometer_bias": [0.02, -0.03, 0.01],
+        "gyroscope_matrix": [[0.99, 0.01, -0.02], [0.03, 1.02, 0.01], [0.01, -0.01, 1.03]],
+        "gyroscope_bias": [0.002, 0.001, -0.003],
+    }
+    report["manifest"]["imu"].update(sample_clock_mode="separate_streams", corrections=corrections)
+    report["manifest"]["clocks"]["imu_to_camera_offset_ns"] = 0
+    # Distinct asynchronous clocks and raw vectors, including vendor estimates
+    # which must never be subtracted by this consumer.
+    normalized = {}
+    for kind, shift in (("accel", 0), ("gyro", 2_000_000)):
+        normalized[kind] = [
+            {"timestamp_ns": t + shift, "si": [t * 1e-9, 2*t*1e-9, 9.81 if kind == "accel" else 0.03],
+             "bias_estimate": [7, 8, 9]}
+            for t in range(900_000_000, 1_325_000_001, 25_000_000)]
+    (root / "imu_normalized.json").write_text(json.dumps(normalized))
+    times = json.loads((root / "video_timestamps_ns.json").read_text())
+    report["short_session"] = {
+        "consumer_version": SHORT_CONSUMER_VERSION, "profile_id": "test-profile", "validation_run": validation,
+        "analysis_max_side": 1280,
+        "source_and_pose_times_ns": [(t, t + 7_000_007 + i*100_000) for i, t in enumerate(times)],
+        "point_timing": {"qualified": True, "model": "camera2_active_array_row_exposure_midpoint"},
+        "image_motion_model": SHORT_IMAGE_MODEL, "rolling_shutter_compensated": False,
+        "imu_correction_equation": "corrected = matrix * raw - bias", "vendor_bias_subtracted": False,
+        "base_capture_report_sha256": "a"*64,
+        "profile_validation_sha256": "b"*64,
+        "motion_envelope": {"maximum_rotation_during_exposure_rad": 0.001,
+                            "maximum_rotation_during_readout_rad": 0.002},
+        "validated_motion_envelope": {"maximum_rotation_during_exposure_rad": 0.002,
+                                      "maximum_rotation_during_readout_rad": 0.004},
+    }
+    return root, report, settings, images
+
+
+def test_short_profile_materialization_corrects_once_before_union_and_retains_both_times(tmp_path, monkeypatch):
+    from . import vio as module
+    root, report, settings, _ = _short_profile_fixture(tmp_path)
+    original_report = copy.deepcopy(report)
+    original_files = {p.name: p.read_bytes() for p in root.iterdir()}
+    raw = json.loads((root / "imu_normalized.json").read_text())
+    corrections = report["manifest"]["imu"]["corrections"]
+    expected_values = {sensor: np.asarray([r["si"] for r in raw[k]]) @ np.array(corrections[sensor+"_matrix"]).T
+                      - np.asarray(corrections[sensor+"_bias"])
+                      for k, sensor in (("accel", "accelerometer"), ("gyro", "gyroscope"))}
+    original_interpolate = module._interpolate_stream
+
+    def checked_interpolate(times, values, stamp):
+        sensor = "accelerometer" if times[0] == raw["accel"][0]["timestamp_ns"] else "gyroscope"
+        np.testing.assert_allclose(values, expected_values[sensor], rtol=0, atol=1e-12)
+        return original_interpolate(times, values, stamp)
+
+    monkeypatch.setattr(module, "_interpolate_stream", checked_interpolate)
+    input_root, config = materialize_openvins_profile_validation_input(root, report, tmp_path / "out", settings, lambda *_: None)
+    meta = json.loads((input_root / "openvins_input.json").read_text())
+    assert meta["mode"] == "profile_validation" and meta["accepted_for_metric_vio"] is False
+    assert meta["capture_metric_vio_allowed"] is False
+    assert meta["imu_preprocessing"]["application_count"] == 1
+    assert meta["imu_preprocessing"]["applied_before_joint_interpolation"] is True
+    assert meta["imu_preprocessing"]["noise_already_transformed_by_profile"] is True
+    for index, row in enumerate(meta["frame_mapping"]):
+        assert row["capture_time_ns"] == report["short_session"]["source_and_pose_times_ns"][index][0]
+        assert row["pose_time_ns"] == report["short_session"]["source_and_pose_times_ns"][index][1]
+    camera_times = [int(line.split(",")[0]) for line in (input_root / "cam0/data.csv").read_text().splitlines()]
+    assert camera_times == [pair[1] for pair in report["short_session"]["source_and_pose_times_ns"]]
+    assert report == original_report
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == original_files
+    assert "calib_cam_extrinsics: false" in config.read_text()
+    assert "calib_cam_timeoffset: false" in config.read_text()
+    assert "calib_imu_intrinsics: false" in config.read_text()
+    assert "init_dyn_mle_max_threads: 2" in config.read_text()
+    yaml = cv2.FileStorage(str(input_root / "kalibr_imu_chain.yaml"), cv2.FILE_STORAGE_READ)
+    for key, expected in report["manifest"]["imu"]["noise"].items():
+        assert yaml.getNode("imu0").getNode(key).real() == expected
+    yaml.release()
+
+
+def test_short_profile_real_analysis_resize_preserves_D5_pixel_centres_and_dense_cadence(tmp_path):
+    root, report, settings, _ = _short_profile_fixture(tmp_path)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2", "-filter_threads", "2",
+                    "-i", str(root / "walk.mp4"), "-vf", "scale=1600:900:flags=bilinear", "-c:v", "libx264rgb",
+                    "-threads", "2", "-crf", "0", str(root / "large.mp4")], check=True)
+    report["manifest"]["video"]["path"] = "large.mp4"
+    camera = report["manifest"]["camera"]
+    camera.update(resolution_px=[1600, 900], crop={"left": 0, "top": 0, "width": 1600, "height": 900},
+                  intrinsics=[[1100, 0, 801.5], [0, 1101, 447.5], [0, 0, 1]])
+    before = (root / "large.mp4").read_bytes()
+    input_root, _ = materialize_openvins_profile_validation_input(root, report, tmp_path / "out", settings, lambda *_: None)
+    meta = json.loads((input_root / "openvins_input.json").read_text())
+    projection = meta["camera_preprocessing"]
+    scale = np.array([[0.8, 0, -0.1], [0, 0.8, -0.1], [0, 0, 1]])
+    np.testing.assert_allclose(projection["estimator_camera"]["K"], scale @ np.asarray(camera["intrinsics"]))
+    assert projection["estimator_camera"]["resolution_px"] == [1280, 720]
+    assert projection["source_camera"]["distortion"] == camera["distortion"]
+    assert projection["source_camera"]["distortion"][-1] != 0
+    assert projection["rectified"] is True
+    assert len(meta["frame_mapping"]) == 3
+    for row in meta["frame_mapping"]:
+        assert cv2.imread(str(input_root / "cam0/data" / row["filename"])).shape[:2] == (720, 1280)
+    assert (root / "large.mp4").read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", ["admitted_validation", "ordinary_flag", "consumer", "float_time", "wrong_source",
+                                 "reversed_pose", "missing_corrections", "singular_correction", "row_model", "rolling_claim"])
+def test_short_profile_invalid_contract_rejected_before_decode(tmp_path, bad):
+    root, report, settings, _ = _short_profile_fixture(tmp_path)
+    short = report["short_session"]
+    if bad == "admitted_validation":
+        report["metric_vio_allowed"] = True
+    elif bad == "ordinary_flag":
+        short["validation_run"] = False
+    elif bad == "consumer":
+        short["consumer_version"] = "unsupported"
+    elif bad == "float_time":
+        short["source_and_pose_times_ns"][0] = [1e9, 1_007_000_000]
+    elif bad == "wrong_source":
+        pair = short["source_and_pose_times_ns"][0]
+        short["source_and_pose_times_ns"][0] = [pair[0]+1, pair[1]]
+    elif bad == "reversed_pose":
+        pair = short["source_and_pose_times_ns"][0]
+        short["source_and_pose_times_ns"][0] = [pair[0], pair[0]-1]
+    elif bad == "missing_corrections":
+        report["manifest"]["imu"].pop("corrections")
+    elif bad == "singular_correction":
+        report["manifest"]["imu"]["corrections"]["gyroscope_matrix"] = np.zeros((3, 3)).tolist()
+    elif bad == "row_model":
+        short["point_timing"]["qualified"] = False
+    else:
+        short["rolling_shutter_compensated"] = True
+    with pytest.raises(VIOError):
+        materialize_openvins_profile_validation_input(root, report, tmp_path / "out", settings, lambda *_: None)
+    assert not (tmp_path / "out").exists()
+
+
+def _short_native_result(meta, *, validation=True):
+    result = _valid_vio_result()
+    for key in ("capture_id", "camera_sensor_id", "time_domain"):
+        result["frame"][key] = meta[key]
+    result["frame"].update(pose_time_reference=POSE_TIME_REFERENCE, capture_time_reference="original_camera_sensor_timestamp")
+    result.update(schema=VIO_PROFILE_VALIDATION_SCHEMA if validation else "noesis.phone_capture.vio_result.v1",
+                  accepted_for_metric_vio=False, status="provisional" if validation else "pending_runtime_quality_control")
+    if validation:
+        result["scale"] = {"mode": "provisional_metric", "source": "short_session_profile_validation"}
+    result["poses"] = [copy.deepcopy(result["poses"][0]) for _ in meta["frame_mapping"]]
+    for row, mapping in zip(result["poses"], meta["frame_mapping"], strict=True):
+        row.update(capture_time_ns=mapping["capture_time_ns"], pose_time_ns=mapping["pose_time_ns"],
+                   source_frame_index=mapping["source_frame_index"],
+                   prepared_frame_id=f"{meta['capture_id']}:source:{mapping['source_frame_index']}")
+    result["quality"]["reset_count"] = 0
+    result["short_session_consumer"] = {
+        "consumer_version": SHORT_CONSUMER_VERSION, "profile_id": meta["short_session"]["profile_id"],
+        "validation_run": validation, "fixed_camera_imu_calibration": True, "native_imu_corrections": "identity",
+        "dense_frame_mapping_verified": True, "rolling_shutter_compensated": False, "image_motion_model": SHORT_IMAGE_MODEL}
+    result["fixed_calibration"] = copy.deepcopy(meta["fixed_calibration"])
+    mask = meta["camera_preprocessing"]["invalid_ray_mask"]
+    result["camera_mask"] = {"applied": True, "invalid_pixel_count": mask["invalid_pixel_count"],
+                             "resolution_px": meta["camera_preprocessing"]["estimator_camera"]["resolution_px"]}
+    return result
+
+
+@pytest.fixture
+def short_materialized(tmp_path):
+    root, report, settings, _ = _short_profile_fixture(tmp_path)
+    input_root, config = materialize_openvins_profile_validation_input(root, report, tmp_path / "input", settings, lambda *_: None)
+    return root, input_root, replace(settings, config=config, executable=Path(sys.executable)), json.loads((input_root / "openvins_input.json").read_text())
+
+
+def test_profile_validation_runs_fixed_model_never_admits_and_keeps_exact_mapping(tmp_path, monkeypatch, short_materialized):
+    _, input_root, settings, meta = short_materialized
+    output = _short_native_result(meta)
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            assert command[command.index("--mode") + 1] == "profile_validation"
+            assert command[command.index("--short-session-consumer") + 1] == SHORT_CONSUMER_VERSION
+            assert "--calibration-rotation-std-rad" not in command
+            assert kwargs["env"]["OPENBLAS_NUM_THREADS"] == "1"
+            Path(command[command.index("--output") + 1]).write_text(json.dumps(output))
+
+        def wait(self, **_):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    result = run_openvins_profile_validation(input_root, tmp_path / "run", settings, lambda *_: None)
+    assert result["accepted_for_metric_vio"] is False
+    assert result["poses"][0]["pose_time_ns"] != result["poses"][0]["capture_time_ns"]
+    assert validate_vio_profile_validation_result(result)["scale"]["mode"] == "provisional_metric"
+    with pytest.raises(VIOError):
+        validate_vio_result(result)
+    with pytest.raises(VIOError, match="cannot run as admitted"):
+        run_openvins(input_root, tmp_path / "wrong", settings, lambda *_: None, runtime_quality_check=lambda *_: {"accepted": True})
+
+
+@pytest.mark.parametrize("bad", ["config", "camera_yaml", "imu_yaml", "mapping_csv", "mapping_json", "source", "image", "marker"])
+def test_profile_input_tampering_fails_before_native_start(tmp_path, monkeypatch, short_materialized, bad):
+    root, input_root, settings, meta = short_materialized
+    if bad in {"config", "camera_yaml", "imu_yaml", "mapping_csv", "source", "image"}:
+        path = {"config": settings.config, "camera_yaml": input_root / "kalibr_imucam_chain.yaml",
+                "imu_yaml": input_root / "kalibr_imu_chain.yaml", "mapping_csv": input_root / "source_frame_mapping.csv",
+                "source": root / "imu_normalized.json", "image": input_root / "cam0/data/frame-00000000.png"}[bad]
+        path.write_bytes(path.read_bytes() + b" ")
+    else:
+        if bad == "mapping_json":
+            meta["frame_mapping"][0]["pose_time_ns"] += 1
+        else:
+            meta["short_session"]["consumer_version"] = "unsupported"
+        (input_root / "openvins_input.json").write_text(json.dumps(meta))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("native must not start for changed input"))
+    with pytest.raises(VIOError):
+        run_openvins_profile_validation(input_root, tmp_path / "out", settings, lambda *_: None)
+
+
+@pytest.mark.parametrize("bad", ["marker", "pose_time", "source_time", "fixed_calibration", "admission"])
+def test_profile_native_confirmation_is_checked(tmp_path, monkeypatch, short_materialized, bad):
+    _, root, settings, meta = short_materialized
+    output = _short_native_result(meta)
+    if bad == "marker":
+        output["short_session_consumer"]["consumer_version"] = "old"
+    elif bad == "pose_time":
+        output["poses"][0]["pose_time_ns"] += 1
+    elif bad == "source_time":
+        output["poses"][0]["capture_time_ns"] += 1
+    elif bad == "fixed_calibration":
+        output["fixed_calibration"]["T_imu_camera"][0][3] += 0.1
+    else:
+        output["accepted_for_metric_vio"] = True
+
+    class Process:
+        def __init__(self, command, **_):
+            Path(command[command.index("--output") + 1]).write_text(json.dumps(output))
+
+        def wait(self, **_):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    with pytest.raises(VIOError):
+        run_openvins_profile_validation(root, tmp_path / "out", settings, lambda *_: None)
+
+
+@pytest.mark.parametrize("gate", ["pass", "default_parent", "parent_rejects", "coverage", "reset", "motion_envelope"])
+def test_ordinary_short_run_needs_direct_and_parent_quality_gates(tmp_path, monkeypatch, gate):
+    source, report, settings, _ = _short_profile_fixture(tmp_path, validation=False)
+    if gate == "motion_envelope":
+        report["short_session"]["motion_envelope"]["maximum_rotation_during_readout_rad"] = 1
+    root, config = materialize_openvins_input(source, report, tmp_path / "input", settings, lambda *_: None)
+    settings = replace(settings, config=config, executable=Path(sys.executable))
+    meta = json.loads((root / "openvins_input.json").read_text())
+    output = _short_native_result(meta, validation=False)
+    if gate == "coverage":
+        output["poses"].pop()
+    elif gate == "reset":
+        output["segments"][0]["reset"] = True
+    called = []
+
+    class Process:
+        def __init__(self, command, **_):
+            assert "--mode" not in command
+            Path(command[command.index("--output") + 1]).write_text(json.dumps(output))
+
+        def wait(self, **_):
+            return 0
+
+    def parent_quality(result, input_metadata):
+        assert not result["accepted_for_metric_vio"]
+        called.append(True)
+        return {"accepted": gate != "parent_rejects", "policy": "fixture parent envelope check"}
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    if gate in {"pass", "default_parent"}:
+        result = run_openvins(root, tmp_path / "out", settings, lambda *_: None,
+                             runtime_quality_check=None if gate == "default_parent" else parent_quality)
+        assert result["accepted_for_metric_vio"] is True
+        assert result["direct_runtime_quality"]["accepted"]
+        assert result["runtime_quality_control"]["policy"]["version"] == "roomwalk.short_walk_consumer_sanity.v1"
+        persisted = json.loads((tmp_path / "out" / "vio_result.json").read_text())
+        assert validate_vio_result(persisted)["accepted_for_metric_vio"] is True
+        assert bool(called) is (gate == "pass")
+    else:
+        with pytest.raises(VIOError):
+            run_openvins(root, tmp_path / "out", settings, lambda *_: None,
+                         runtime_quality_check=parent_quality)
+        if gate in {"coverage", "reset"}:
+            assert called == []
+
+
+@pytest.mark.parametrize("field", ["direct_runtime_quality", "runtime_quality_control"])
+@pytest.mark.parametrize("proof", [None, [], {}, {"accepted": False}, {"accepted": 1}, {"accepted": "true"}])
+def test_short_metric_result_requires_each_retained_quality_approval(short_materialized, field, proof):
+    _, _, _, meta = short_materialized
+    result = _short_native_result(meta, validation=False)
+    result.update(accepted_for_metric_vio=True, status="completed",
+                  direct_runtime_quality={"accepted": True}, runtime_quality_control={"accepted": True})
+    assert validate_vio_result(result)["accepted_for_metric_vio"] is True
+    if proof is None:
+        del result[field]
+    else:
+        result[field] = proof
+    with pytest.raises(VIOError, match=field):
+        validate_vio_result(result)
+
+
+def test_short_native_pending_result_cannot_be_admitted_by_changing_flag(short_materialized):
+    _, _, _, meta = short_materialized
+    result = _short_native_result(meta, validation=False)
+    result["accepted_for_metric_vio"] = True
+    with pytest.raises(VIOError, match="completed runtime quality admission"):
+        validate_vio_result(result)
+    result["status"] = "completed"
+    with pytest.raises(VIOError, match="direct_runtime_quality"):
+        validate_vio_result(result)
+
+
+def test_short_metric_result_rejects_pending_status_even_with_quality_approvals(short_materialized):
+    _, _, _, meta = short_materialized
+    result = _short_native_result(meta, validation=False)
+    result.update(accepted_for_metric_vio=True, direct_runtime_quality={"accepted": True},
+                  runtime_quality_control={"accepted": True})
+    with pytest.raises(VIOError, match="completed runtime quality admission"):
+        validate_vio_result(result)

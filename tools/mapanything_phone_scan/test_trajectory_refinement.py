@@ -499,8 +499,11 @@ def test_normal_app_vio_adapter_binds_prepared_manifest_to_trajectory(tmp_path: 
     manifest.write_text(json.dumps({"frames": frame_rows}), encoding="utf-8")
 
     native_result = _vio_payload(4, step_m=0.15)
-    for pose in native_result["poses"]:
-        pose.pop("prepared_frame_id", None)
+    for index, pose in enumerate(native_result["poses"]):
+        # Native dense results carry source-frame identities; the application
+        # separately binds their exact times to the selected prepared views.
+        pose["prepared_frame_id"] = f"capture:source:{index}"
+        pose["source_frame_index"] = index
     generated_config = tmp_path / "vio-config.yaml"
     generated_config.write_text("fixture", encoding="utf-8")
 
@@ -520,6 +523,8 @@ def test_normal_app_vio_adapter_binds_prepared_manifest_to_trajectory(tmp_path: 
         VIOSettings(),
         lambda *_args: None,
     )
+    dense = json.loads((scan / "vio/dense_camera_trajectory.json").read_text())
+    assert dense["poses"][0]["prepared_frame_id"] == "capture:source:0"
     vio_path = scan / "vio_result.json"
     vio_path.write_text(json.dumps(adapted), encoding="utf-8")
 
@@ -543,6 +548,48 @@ def test_normal_app_vio_adapter_binds_prepared_manifest_to_trajectory(tmp_path: 
     (frames_root / "frame_0000.jpg").write_bytes(b"changed")
     with pytest.raises(TrajectoryRefinementError, match="digest"):
         _load_prepared_frames(scan)
+
+
+def test_short_profile_edges_preserve_capture_identity_and_distinct_pose_time(tmp_path):
+    from .motion_profile import validate_short_walk_runtime
+    from .trajectory_refinement import _validate_vio_constraints
+    from .vio import SHORT_CONSUMER_VERSION, SHORT_IMAGE_MODEL, POSE_TIME_REFERENCE, _short_runtime_quality
+
+    payload = _vio_payload(4, step_m=0.015)
+    payload["status"] = "completed"
+    payload["quality"]["reset_count"] = 0
+    payload["frame"].update(pose_time_reference=POSE_TIME_REFERENCE,
+                            capture_time_reference="original_camera_sensor_timestamp")
+    payload["short_session_consumer"] = {
+        "consumer_version": SHORT_CONSUMER_VERSION, "validation_run": False,
+        "fixed_camera_imu_calibration": True, "native_imu_corrections": "identity",
+        "dense_frame_mapping_verified": True, "image_motion_model": SHORT_IMAGE_MODEL,
+        "rolling_shutter_compensated": False, "profile_id": "short-test",
+    }
+    frames, mappings = [], []
+    for i, row in enumerate(payload["poses"]):
+        row.update(capture_time_ns=1_000_000_000 + i * 100_000_000,
+                   pose_time_ns=1_007_000_000 + i * 100_000_000)
+        frames.append({"index": i, "frame_id": row["prepared_frame_id"], "capture_time_ns": row["capture_time_ns"]})
+        mappings.append({"pose_time_ns": row["pose_time_ns"]})
+    envelope = {"maximum_rotation_during_exposure_rad": 0.005, "maximum_rotation_during_readout_rad": 0.02}
+    short = {"consumer_version": SHORT_CONSUMER_VERSION, "validation_run": False,
+             "profile_validation_sha256": "a" * 64, "motion_envelope": envelope,
+             "validated_motion_envelope": envelope}
+    metadata = {"short_session": short, "frame_mapping": mappings}
+    payload["runtime_quality_control"] = validate_short_walk_runtime(payload, metadata)
+    payload["direct_runtime_quality"] = _short_runtime_quality(payload, metadata)
+    path = tmp_path / "vio.json"
+    path.write_text(json.dumps(payload))
+    edges, info = _validate_vio_constraints(path, frames)
+    assert len(edges) == 3 and info["pose_time_reference"] == POSE_TIME_REFERENCE
+    assert edges[0]["source_time_ns"] == 1_000_000_000
+    assert edges[0]["source_pose_time_ns"] == 1_007_000_000
+    assert edges[0]["target_pose_time_ns"] == 1_107_000_000
+    payload["poses"][0].pop("pose_time_ns")
+    path.write_text(json.dumps(payload))
+    with pytest.raises(TrajectoryRefinementError, match="pose timestamps"):
+        _validate_vio_constraints(path, frames)
 
 
 def test_matching_uses_retained_rgb_projection_not_resized_capture() -> None:

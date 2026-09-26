@@ -23,3 +23,17 @@ remain outside this plugin package.
 Closed downstream valves must use `drop-mode=1` or `drop-mode=2` so sticky EOS
 continues downstream. A `drop-mode=0` valve must be opened before an EOS
 request; otherwise an accepted event does not prove whole-pipeline quiescence.
+
+Looping DS9.1 `nvurisrcbin` file sources also create an internal terminal
+`nvurisrc_bin__fakesink` upstream of the post-mux bridge. The graph declares
+these exact relative paths in `upstream-sink-paths`, separated by commas. The
+worker resolves every declared terminal sink before emitting EOS, drops late
+shutdown buffers at its upstream pad, and sends that sink standard EOS after
+the main downstream request. Missing, duplicate, disconnected, or nonterminal
+targets fail closed. Resolution is limited to 64 paths, eight path components
+and 8192 characters; an empty declaration preserves the live-source path.
+
+The acknowledgement covers every declared event path. The runtime still
+requires the genuine pipeline EOS callback and `Pipeline.wait()` completion;
+neither a synthetic bus message nor a shortened watchdog substitutes for them.
+Successful shutdown probes remain pad-owned through pipeline teardown.

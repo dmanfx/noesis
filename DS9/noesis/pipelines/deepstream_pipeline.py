@@ -1413,7 +1413,18 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
     shutdown_eos = Component(
         name=pipeline.shutdown_eos_component_name,
         element="noesiseos",
-        config={},
+        config={
+            # DS9.1 nvurisrcbin adds this internal terminal sink only for
+            # looping file sources. It participates in parent-bin EOS but is
+            # upstream of our post-mux bridge, so shutdown must drain it too.
+            "upstream-sink-paths": ",".join(
+                f"{component.name}/nvurisrc_bin__fakesink"
+                for component in pipeline.components.values()
+                if component.element == "nvurisrcbin"
+                and component.config.get("file-loop", False)
+                and str(component.config.get("uri", "")).startswith("file:")
+            ),
+        },
         downstream=[preprocess_component.name if preprocess_component else primary.name],
     )
     pipeline.components[shutdown_eos.name] = shutdown_eos

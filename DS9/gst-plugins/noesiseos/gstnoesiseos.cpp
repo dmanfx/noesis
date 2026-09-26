@@ -3,6 +3,8 @@
 
 #include <gst/base/gstbasetransform.h>
 #include <gst/gst.h>
+#include <cstring>
+#include <vector>
 
 #ifndef PACKAGE
 #define PACKAGE "noesis"
@@ -29,6 +31,7 @@ enum PropertyId : guint {
   kPropertyRequestSequence,
   kPropertyAcceptedSequence,
   kPropertyLastRequestOk,
+  kPropertyUpstreamSinkPaths,
   kPropertyCount,
 };
 
@@ -45,6 +48,7 @@ typedef struct _GstNoesisEos {
   gboolean last_request_ok;
   gint eos_accepted;
   gboolean request_pending;
+  gchar *upstream_sink_paths;
 } GstNoesisEos;
 
 typedef struct _GstNoesisEosClass {
@@ -56,6 +60,7 @@ G_DEFINE_TYPE(GstNoesisEos, gst_noesis_eos, GST_TYPE_BASE_TRANSFORM)
 typedef struct _NoesisEosRequest {
   GstNoesisEos *self;
   guint sequence;
+  gchar *upstream_sink_paths;
 } NoesisEosRequest;
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
@@ -64,19 +69,140 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS_ANY);
 
+struct UpstreamSink {
+  GstElement *element;
+  GstPad *pad;
+  gulong drop_probe;
+};
+
+static void release_upstream_sinks(std::vector<UpstreamSink> &sinks,
+                                   gboolean remove_probes) {
+  for (auto &sink : sinks) {
+    if (remove_probes && sink.drop_probe != 0)
+      gst_pad_remove_probe(sink.pad, sink.drop_probe);
+    gst_object_unref(sink.pad);
+    gst_object_unref(sink.element);
+  }
+  sinks.clear();
+}
+
+static GstPadProbeReturn drop_shutdown_buffer(GstPad *, GstPadProbeInfo *,
+                                               gpointer) {
+  return GST_PAD_PROBE_DROP;
+}
+
+// Looping nvurisrcbin file sources contain an internal fakesink upstream of
+// this bridge. GstBin includes that source bin in global EOS aggregation.
+// Resolve only explicitly declared paths; never infer or manufacture bus EOS.
+static gboolean resolve_upstream_sinks(GstNoesisEos *self, const gchar *paths,
+                                        std::vector<UpstreamSink> &sinks) {
+  if (paths == nullptr || *paths == '\0') return TRUE;
+  if (std::strlen(paths) > 8192) return FALSE;
+  GstObject *parent = gst_object_get_parent(GST_OBJECT(self));
+  if (parent == nullptr) return FALSE;
+  if (!GST_IS_BIN(parent)) {
+    gst_object_unref(parent);
+    return FALSE;
+  }
+  gchar **entries = g_strsplit(paths, ",", -1);
+  gboolean ok = g_strv_length(entries) <= 64;
+  for (guint i = 0; ok && entries[i] != nullptr; ++i) {
+    gchar **parts = g_strsplit(entries[i], "/", -1);
+    ok = g_strv_length(parts) <= 8;
+    GstElement *node = GST_ELEMENT(gst_object_ref(parent));
+    for (guint j = 0; ok && parts[j] != nullptr; ++j) {
+      if (*parts[j] == '\0' || !GST_IS_BIN(node)) {
+        ok = FALSE;
+        break;
+      }
+      GstElement *child = gst_bin_get_by_name(GST_BIN(node), parts[j]);
+      // gst_bin_get_by_name searches recursively; each declared path segment
+      // must instead name an immediate child of the preceding bin.
+      GstObject *child_parent =
+          child != nullptr ? gst_object_get_parent(GST_OBJECT(child)) : nullptr;
+      if (child != nullptr && child_parent != GST_OBJECT(node)) {
+        gst_object_unref(child);
+        child = nullptr;
+      }
+      if (child_parent != nullptr) gst_object_unref(child_parent);
+      gst_object_unref(node);
+      node = child;
+      ok = node != nullptr;
+    }
+    g_strfreev(parts);
+    GstPad *pad = nullptr;
+    if (ok && !GST_IS_BIN(node) &&
+        GST_OBJECT_FLAG_IS_SET(node, GST_ELEMENT_FLAG_SINK)) {
+      GstPad *sink_pad = gst_element_get_static_pad(node, "sink");
+      if (sink_pad != nullptr) {
+        // Drop at its upstream peer before the terminal sink pad's EOS check.
+        pad = gst_pad_get_peer(sink_pad);
+        gst_object_unref(sink_pad);
+      }
+    }
+    ok = ok && pad != nullptr;
+    for (const auto &sink : sinks) {
+      if (sink.element == node) ok = FALSE;
+    }
+    if (ok) {
+      sinks.push_back({node, pad, 0});
+    } else {
+      GST_ERROR_OBJECT(self, "invalid upstream EOS sink path: %s", entries[i]);
+      if (pad != nullptr) gst_object_unref(pad);
+      if (node != nullptr) gst_object_unref(node);
+    }
+  }
+  g_strfreev(entries);
+  gst_object_unref(parent);
+  return ok;
+}
+
 static gpointer gst_noesis_eos_request_worker(gpointer data) {
   auto *request = static_cast<NoesisEosRequest *>(data);
   GstNoesisEos *self = request->self;
   const guint requested_sequence = request->sequence;
 
-  GstEvent *event = gst_event_new_eos();
+  std::vector<UpstreamSink> sinks;
   gboolean request_ok = FALSE;
+  gboolean terminal_started = FALSE;
+  gboolean targets_ready =
+      resolve_upstream_sinks(self, request->upstream_sink_paths, sinks);
+  for (auto &sink : sinks) {
+    if (!targets_ready) break;
+    // After EOS, source decode may still run until Pipeline.wait() sets NULL.
+    // Drop only shutdown buffers so those inputs cannot report a flow error.
+    sink.drop_probe = gst_pad_add_probe(
+        sink.pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER |
+                                             GST_PAD_PROBE_TYPE_BUFFER_LIST),
+        drop_shutdown_buffer, nullptr, nullptr);
+    targets_ready = sink.drop_probe != 0;
+  }
+  GstEvent *event = targets_ready ? gst_event_new_eos() : nullptr;
   if (event != nullptr) {
     // gst_pad_push_event() consumes the event regardless of the result. This
     // may block while asynchronous downstream elements drain, which is why it
     // must never run on the Service Maker/GObject property-setter thread.
     request_ok = gst_pad_push_event(GST_BASE_TRANSFORM_SRC_PAD(self), event);
+    terminal_started = request_ok;
+    if (request_ok) {
+      for (auto &sink : sinks) {
+        // GstBaseSink's element-level send_event does not forward downstream
+        // EOS to its input pad. Use the normal serialized pad event handler;
+        // an element-level TRUE return alone would be a false acknowledgement.
+        GstPad *input = gst_element_get_static_pad(sink.element, "sink");
+        const gboolean accepted =
+            input != nullptr && gst_pad_send_event(input, gst_event_new_eos());
+        if (input != nullptr) gst_object_unref(input);
+        GST_INFO_OBJECT(self, "upstream sink EOS: sink=%s accepted=%d",
+                        GST_ELEMENT_NAME(sink.element), accepted);
+        request_ok = request_ok && accepted;
+      }
+    }
   }
+  // Successful probes are pad-owned and disappear with the pipeline. If EOS
+  // has started, keep terminal drops even on partial failure until watchdog
+  // teardown; admitting buffers into an already ended branch is unsafe.
+  release_upstream_sinks(sinks, !terminal_started);
 
   guint previous_accepted_sequence = 0;
   gboolean previous_request_ok = FALSE;
@@ -90,7 +216,7 @@ static gpointer gst_noesis_eos_request_worker(gpointer data) {
     GST_INFO_OBJECT(self, "accepted orderly EOS request sequence=%u",
                     requested_sequence);
   } else {
-    g_atomic_int_set(&self->eos_accepted, FALSE);
+    if (!terminal_started) g_atomic_int_set(&self->eos_accepted, FALSE);
     GST_ERROR_OBJECT(self,
                      "downstream rejected orderly EOS request sequence=%u",
                      requested_sequence);
@@ -107,6 +233,7 @@ static gpointer gst_noesis_eos_request_worker(gpointer data) {
   }
 
   g_object_unref(self);
+  g_free(request->upstream_sink_paths);
   g_free(request);
   return nullptr;
 }
@@ -117,6 +244,16 @@ static void gst_noesis_eos_set_property(GObject *object, guint property_id,
   auto *self = reinterpret_cast<GstNoesisEos *>(object);
 
   switch (property_id) {
+    case kPropertyUpstreamSinkPaths:
+      g_mutex_lock(&self->lock);
+      if (self->request_sequence == 0) {
+        g_free(self->upstream_sink_paths);
+        self->upstream_sink_paths = g_value_dup_string(value);
+      } else {
+        GST_WARNING_OBJECT(self, "cannot change upstream sinks after EOS request");
+      }
+      g_mutex_unlock(&self->lock);
+      return;
     case kPropertyRequestSequence: {
       const guint requested_sequence = g_value_get_uint(value);
       gboolean previous_request_ok = FALSE;
@@ -148,6 +285,7 @@ static void gst_noesis_eos_set_property(GObject *object, guint property_id,
       request->self =
           reinterpret_cast<GstNoesisEos *>(g_object_ref(G_OBJECT(self)));
       request->sequence = requested_sequence;
+      request->upstream_sink_paths = g_strdup(self->upstream_sink_paths);
       GError *thread_error = nullptr;
       GThread *worker = g_thread_try_new("noesis-eos", gst_noesis_eos_request_worker,
                                          request, &thread_error);
@@ -160,6 +298,7 @@ static void gst_noesis_eos_set_property(GObject *object, guint property_id,
                                                  : "unknown error");
         g_clear_error(&thread_error);
         g_object_unref(request->self);
+        g_free(request->upstream_sink_paths);
         g_free(request);
       } else {
         g_thread_unref(worker);
@@ -185,6 +324,9 @@ static void gst_noesis_eos_get_property(GObject *object, guint property_id,
 
   g_mutex_lock(&self->lock);
   switch (property_id) {
+    case kPropertyUpstreamSinkPaths:
+      g_value_set_string(value, self->upstream_sink_paths);
+      break;
     case kPropertyRequestSequence:
       g_value_set_uint(value, self->request_sequence);
       break;
@@ -217,6 +359,7 @@ static GstFlowReturn gst_noesis_eos_transform_ip(GstBaseTransform *transform,
 static void gst_noesis_eos_finalize(GObject *object) {
   auto *self = reinterpret_cast<GstNoesisEos *>(object);
   g_mutex_clear(&self->lock);
+  g_free(self->upstream_sink_paths);
   G_OBJECT_CLASS(gst_noesis_eos_parent_class)->finalize(object);
 }
 
@@ -227,6 +370,7 @@ static void gst_noesis_eos_init(GstNoesisEos *self) {
   self->last_request_ok = FALSE;
   g_atomic_int_set(&self->eos_accepted, FALSE);
   self->request_pending = FALSE;
+  self->upstream_sink_paths = g_strdup("");
 
   gst_base_transform_set_in_place(GST_BASE_TRANSFORM(self), TRUE);
   gst_base_transform_set_passthrough(GST_BASE_TRANSFORM(self), TRUE);
@@ -258,6 +402,10 @@ static void gst_noesis_eos_class_init(GstNoesisEosClass *klass) {
       "Whether downstream accepted the most recent monotonic EOS request",
       FALSE,
       static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  properties[kPropertyUpstreamSinkPaths] = g_param_spec_string(
+      "upstream-sink-paths", "Upstream sink paths",
+      "Comma-separated relative bin paths to terminal sinks outside the downstream EOS path",
+      "", static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_properties(object_class, kPropertyCount, properties);
 
   gst_element_class_add_static_pad_template(element_class, &sink_template);

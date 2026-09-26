@@ -133,7 +133,14 @@ class EosPluginSourceTests(unittest.TestCase):
 
 
 class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
-    def _build_graph(self, root: Path, *, preprocess: bool):
+    def _build_graph(
+        self,
+        root: Path,
+        *,
+        preprocess: bool,
+        sources: list[dict[str, object]] | None = None,
+        loop_local_mp4: bool = True,
+    ):
         engine_path = root / "fixture.engine"
         engine_path.write_bytes(b"engine-fixture")
         infer_path = root / "fixture.ini"
@@ -146,7 +153,7 @@ class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
         config = {
             "version": 1,
             "batch_size": 1,
-            "sources": [
+            "sources": sources if sources is not None else [
                 {
                     "element": "nvurisrcbin",
                     "uri": "file:///tmp/noesis-ds9-graph-fixture.mp4",
@@ -174,6 +181,12 @@ class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
             "analytics": {"enable": False},
             "sinks": [{"name": "test_sink", "type": "fakesink", "sync": False}],
         }
+        camera_registry_path = root / "camera-secrets.json"
+        camera_registry_path.write_text(
+            json.dumps({"version": 1, "sources": {"fixture-camera": "rtsp://example.invalid/live"}}),
+            encoding="utf-8",
+        )
+        camera_registry_path.chmod(0o600)
         config_path = root / "infer.yaml"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         pipeline_module = _load_ds9_pipeline_builder()
@@ -185,6 +198,8 @@ class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
                 "NOESIS_BUILD_DIR": str(root / "build"),
                 "NOESIS_MOSAIC_RTSP_ENABLED": "0",
                 "NOESIS_MOSAIC_WEBRTC_ENABLED": "0",
+                "NOESIS_DS9_LOOP_LOCAL_MP4": "1" if loop_local_mp4 else "0",
+                "NOESIS_CAMERA_SECRETS_FILE": str(camera_registry_path),
             },
             clear=False,
         ):
@@ -214,6 +229,46 @@ class DS9ShutdownGraphCharacterizationTests(unittest.TestCase):
                     self.assertNotIn(
                         ("streammux", expected_next), graph.ds_pipeline.links
                     )
+
+    def test_only_built_looping_file_sources_declare_hidden_terminal_sinks(self) -> None:
+        sources = [
+            {"element": "nvurisrcbin", "uri": "file:///tmp/auto-loop.mp4"},
+            {"element": "nvurisrcbin", "uri": "file:///tmp/finite.mp4", "file-loop": False},
+            {"element": "nvurisrcbin", "uri": "file:///tmp/explicit-loop.mkv", "file-loop": True},
+            {"element": "nvurisrcbin", "uri_secret": "fixture-camera", "file-loop": True},
+            {"element": "uridecodebin", "uri": "file:///tmp/other-element.mp4"},
+        ]
+        with tempfile.TemporaryDirectory(prefix="ds9-eos-source-sinks-") as raw:
+            for loop_local_mp4, expected in (
+                (True, ["source_0/nvurisrc_bin__fakesink", "source_2/nvurisrc_bin__fakesink"]),
+                (False, ["source_2/nvurisrc_bin__fakesink"]),
+            ):
+                with self.subTest(loop_local_mp4=loop_local_mp4):
+                    graph = self._build_graph(
+                        Path(raw), preprocess=False, sources=sources,
+                        loop_local_mp4=loop_local_mp4,
+                    )
+                    bridge = graph.components[graph.shutdown_eos_component_name]
+                    self.assertEqual(
+                        bridge.config.get("upstream-sink-paths", ""), ",".join(expected)
+                    )
+                    for path in expected:
+                        source = graph.components[path.split("/")[0]]
+                        self.assertEqual(source.element, "nvurisrcbin")
+                        self.assertTrue(source.config["file-loop"])
+                        self.assertTrue(str(source.config["uri"]).startswith("file:"))
+
+    def test_live_and_finite_file_graphs_keep_empty_upstream_sink_default(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds9-eos-no-hidden-sinks-") as raw:
+            graph = self._build_graph(
+                Path(raw), preprocess=False,
+                sources=[
+                    {"element": "nvurisrcbin", "uri_secret": "fixture-camera"},
+                    {"element": "nvurisrcbin", "uri": "file:///tmp/finite.mp4", "file-loop": False},
+                ],
+            )
+        bridge = graph.components[graph.shutdown_eos_component_name]
+        self.assertEqual(bridge.config.get("upstream-sink-paths", ""), "")
 
     def test_every_potentially_closed_ds9_valve_forwards_sticky_eos(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds9-eos-valves-") as raw:
@@ -433,6 +488,208 @@ class EosPluginRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["request"], 7)
         self.assertEqual(payload["upstream_buffers"], [0, 1_000_000_000, 2_000_000_000])
         self.assertEqual(payload["downstream_buffers"], [0])
+
+    @staticmethod
+    def _hidden_sink_program(mode: str, target_paths: str = "") -> str:
+        """Model nvurisrcbin's terminal side branch before the post-mux bridge."""
+        return textwrap.dedent(
+            """
+            import json
+            import threading
+            import time
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+
+            Gst.init(None)
+            MODE = __MODE__
+            TARGET_PATHS = __TARGET_PATHS__
+            pipeline = Gst.Pipeline.new("nested-source-eos")
+            source_bin = Gst.Bin.new("source_0")
+            source = Gst.ElementFactory.make("appsrc", "input")
+            split = Gst.ElementFactory.make("tee", "split")
+            main_output = Gst.ElementFactory.make("identity", "main_output")
+            hidden = Gst.ElementFactory.make("fakesink", "nvurisrc_bin__fakesink")
+            bridge = Gst.ElementFactory.make("noesiseos", "quiesce")
+            main = Gst.ElementFactory.make("fakesink", "main_sink")
+            source.set_property("is-live", True)
+            source.set_property("format", Gst.Format.TIME)
+            source.set_property("caps", Gst.Caps.from_string("application/octet-stream"))
+            for sink in (hidden, main):
+                sink.set_property("sync", False)
+                sink.set_property("async", False)
+                sink.set_property("signal-handoffs", True)
+            for element in (source, split, main_output, hidden):
+                source_bin.add(element)
+            if TARGET_PATHS == "source_0/disconnected_sink":
+                disconnected = Gst.ElementFactory.make("fakesink", "disconnected_sink")
+                disconnected.set_property("async", False)
+                source_bin.add(disconnected)
+            assert source.link(split)
+            assert split.link(hidden)
+            assert split.link(main_output)
+            source_bin.add_pad(Gst.GhostPad.new("src", main_output.get_static_pad("src")))
+            for element in (source_bin, bridge, main):
+                pipeline.add(element)
+            assert source_bin.link(bridge)
+            assert bridge.link(main)
+            if TARGET_PATHS:
+                bridge.set_property("upstream-sink-paths", TARGET_PATHS)
+
+            rendered = {"main": [], "hidden": []}
+            events = {"main": [], "hidden": []}
+            main_eos_entered = threading.Event()
+            release_main_eos = threading.Event()
+            def handoff(_sink, buffer, _pad, name):
+                rendered[name].append(int(buffer.pts))
+            def event_probe(_pad, info, name):
+                event = info.get_event()
+                if event is not None and event.type == Gst.EventType.EOS:
+                    events[name].append("eos")
+                    if name == "main" and MODE == "targeted":
+                        main_eos_entered.set()
+                        assert release_main_eos.wait(3.0)
+                return Gst.PadProbeReturn.OK
+            for name, sink in (("main", main), ("hidden", hidden)):
+                sink.connect("handoff", handoff, name)
+                sink.get_static_pad("sink").add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM, event_probe, name
+                )
+            def buffer(pts):
+                item = Gst.Buffer.new_allocate(None, 16, None)
+                item.pts = pts
+                item.duration = Gst.SECOND
+                return item
+            def await_render(pts):
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if all(pts in values for values in rendered.values()):
+                        return
+                    time.sleep(0.005)
+                raise AssertionError(rendered)
+            assert pipeline.set_state(Gst.State.PLAYING) != Gst.StateChangeReturn.FAILURE
+            assert source.emit("push-buffer", buffer(0)) == Gst.FlowReturn.OK
+            await_render(0)
+            pipeline.get_state(Gst.SECOND)
+            started = time.monotonic()
+            bridge.set_property("request-sequence", 37)
+            setter_elapsed = time.monotonic() - started
+            pending = None
+            late_flows = []
+            if MODE == "targeted":
+                assert main_eos_entered.wait(1.0)
+                pending = [bridge.get_property("accepted-sequence"), bridge.get_property("last-request-ok")]
+                # The hidden sink's terminal guard must already be active while
+                # the main EOS is draining, before hidden EOS is delivered.
+                late_flows.append(int(hidden.get_static_pad("sink").get_peer().push(buffer(Gst.SECOND))))
+                late_flows.append(int(bridge.get_static_pad("sink").chain(buffer(Gst.SECOND))))
+                release_main_eos.set()
+            if MODE == "invalid":
+                # A bad path must roll back before either branch gets EOS.
+                # Rendering proves the rejected request also removed the drop barrier.
+                time.sleep(0.10)
+                assert source.emit("push-buffer", buffer(Gst.SECOND)) == Gst.FlowReturn.OK
+                await_render(Gst.SECOND)
+            else:
+                deadline = time.monotonic() + 2.0
+                while bridge.get_property("accepted-sequence") != 37 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+
+            wait_result = []
+            def wait_for_pipeline_eos():
+                message = pipeline.get_bus().timed_pop_filtered(
+                    (2 * Gst.SECOND if MODE == "targeted" else Gst.SECOND // 4),
+                    Gst.MessageType.EOS | Gst.MessageType.ERROR,
+                )
+                wait_result.append(
+                    "none" if message is None else "eos" if message.type == Gst.MessageType.EOS else "error"
+                )
+            waiter = threading.Thread(target=wait_for_pipeline_eos)
+            waiter.start()
+            waiter.join(3.0)
+            assert not waiter.is_alive()
+            if MODE == "targeted":
+                # Push from the actual terminal branch peer, just as its tee
+                # would. Late buffers/lists must not poison upstream with EOS.
+                late_flows.append(int(hidden.get_static_pad("sink").get_peer().push(buffer(2 * Gst.SECOND))))
+                batch = Gst.BufferList.new()
+                batch.insert(-1, buffer(3 * Gst.SECOND))
+                late_flows.append(int(hidden.get_static_pad("sink").get_peer().push_list(batch)))
+                late_flows.append(int(bridge.get_static_pad("sink").chain(buffer(2 * Gst.SECOND))))
+            payload = {
+                "request": bridge.get_property("request-sequence"),
+                "accepted": bridge.get_property("accepted-sequence"),
+                "ok": bridge.get_property("last-request-ok"),
+                "setter_elapsed_s": setter_elapsed,
+                "pending": pending,
+                "events": events,
+                "rendered": rendered,
+                "late_flows": late_flows,
+                "wait_result": wait_result,
+                "wait_completed_before_null": not waiter.is_alive(),
+            }
+            pipeline.set_state(Gst.State.NULL)
+            print(json.dumps(payload, sort_keys=True))
+            """
+        ).replace("__MODE__", repr(mode)).replace("__TARGET_PATHS__", repr(target_paths))
+
+    def test_hidden_source_sink_blocks_aggregate_eos_with_default_bridge(self) -> None:
+        returncode, output, timed_out = self._run_bounded(
+            self._hidden_sink_program("default"), timeout=8.0
+        )
+        self.assertFalse(timed_out, _safe_output(output))
+        self.assertEqual(returncode, 0, _safe_output(output))
+        payload = self._json_lines(output)[-1]
+        self.assertEqual(payload["accepted"], 37)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["events"], {"main": ["eos"], "hidden": []})
+        self.assertEqual(payload["wait_result"], ["none"])
+        self.assertEqual(payload["rendered"], {"main": [0], "hidden": [0]})
+
+    def test_declared_hidden_sink_completes_aggregate_eos_and_absorbs_late_buffers(self) -> None:
+        returncode, output, timed_out = self._run_bounded(
+            self._hidden_sink_program("targeted", "source_0/nvurisrc_bin__fakesink"),
+            timeout=8.0,
+        )
+        self.assertFalse(timed_out, _safe_output(output))
+        self.assertEqual(returncode, 0, _safe_output(output))
+        payload = self._json_lines(output)[-1]
+        self.assertEqual(payload["request"], 37)
+        self.assertEqual(payload["accepted"], 37)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["pending"], [0, False])
+        self.assertEqual(payload["events"], {"main": ["eos"], "hidden": ["eos"]})
+        self.assertEqual(payload["wait_result"], ["eos"])
+        self.assertTrue(payload["wait_completed_before_null"])
+        self.assertEqual(payload["rendered"], {"main": [0], "hidden": [0]})
+        self.assertEqual(payload["late_flows"], [0, 0, 0, 0, 0])
+        self.assertLess(float(payload["setter_elapsed_s"]), 0.2)
+
+    def test_invalid_hidden_sink_paths_reject_before_eos_and_preserve_flow(self) -> None:
+        for path in (
+            "source_0/missing",
+            "source_0/main_output",
+            "source_0/nvurisrc_bin__fakesink,source_0/missing",
+            "nvurisrc_bin__fakesink",  # Skipping source_0 must not resolve recursively.
+            "source_0/nvurisrc_bin__fakesink,source_0/nvurisrc_bin__fakesink",
+            "source_0/disconnected_sink",
+        ):
+            with self.subTest(path=path):
+                returncode, output, timed_out = self._run_bounded(
+                    self._hidden_sink_program("invalid", path), timeout=8.0
+                )
+                self.assertFalse(timed_out, _safe_output(output))
+                self.assertEqual(returncode, 0, _safe_output(output))
+                payload = self._json_lines(output)[-1]
+                self.assertEqual(payload["request"], 37)
+                self.assertEqual(payload["accepted"], 0)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["events"], {"main": [], "hidden": []})
+                self.assertEqual(payload["wait_result"], ["none"])
+                self.assertEqual(
+                    payload["rendered"], {"main": [0, 1_000_000_000], "hidden": [0, 1_000_000_000]}
+                )
+                self.assertLess(float(payload["setter_elapsed_s"]), 0.2)
 
     def test_offline_eos_failure_rolls_back_terminal_drop(self) -> None:
         program = textwrap.dedent(

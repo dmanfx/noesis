@@ -210,10 +210,10 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: ff96f1af598ce0e07d7d39d42f45a441ae73d3d4cc075c4e2ceb50f372cf9c9b
-      output_sha256: da7a3163702362a05ad84eea87de68ae5d4757557391031612f66917808fb360
-      built_at_utc: "2026-08-12T14:49:13Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
+      source_sha256: f439686765984998cead190bca58408f3bccd99035de0d4413f440faae36edb7
+      output_sha256: 0b3e7270f996972e18ce7b57a6749d7977872dd6105eff01610f8ac3730d31b7
+      built_at_utc: "2026-09-13T14:47:12.477794Z"
+      build_host: "native DS9.1 host (driver 595.71.05)"
       command: NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 ./DS9/gst-plugins/build_noesiseos.sh
   - id: plugin.yolo_seg_tensorrt
     kind: tensorrt_plugin

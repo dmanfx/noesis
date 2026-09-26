@@ -1,33 +1,265 @@
-# RoomWalk Android companion
+# RoomWalk for Android
 
-A native camera/IMU recorder with background LAN uploads for the RoomWalk reconstruction service.
-It uses Camera2, a hardware MediaCodec surface encoder, MediaMuxer, and Android
-sensors. It does not embed the browser recorder. Native 8K availability is
+A single Android workspace for native recording, optional calibration and the
+RoomWalk reconstruction service. The current native integration is RoomWalk
+0.4.2, versionCode 23; it packages the same web UI and 3D viewer as the browser
+application. Native recording still uses Camera2, a hardware
+MediaCodec surface encoder, MediaMuxer, and Android sensors; it never substitutes
+WebView camera capture. Native 8K availability is
 checked on the phone; this application does not assume that a stock-camera 8K
 mode is available to Camera2.
 
+## Current user flow
+
+The workspace has three primary tabs:
+
+- **Capture** chooses the purpose and records the phone evidence. **Reconstruction**
+  means many overlapping room viewpoints; pairing a Noesis camera is optional,
+  and adding views to an existing reconstruction is an explicit retained
+  supplement. **Path refinement** means the same walker holds the phone against
+  their own torso with elbows tucked and stable, then moves their whole body
+  with the phone; it requires a paired Noesis camera and a completed reference
+  reconstruction.
+- **Library** retains the original video, raw capture, selected reconstruction
+  views, supplements, qualified VIO/dense trajectory artifacts, paired
+  references and review exports. Legacy captures are not implicitly relabelled
+  and their raw evidence is unchanged.
+- **Setup** contains the optional advanced camera/lens and camera–IMU
+  calibration workflow; its board, focus, timing and holdout gates remain in
+  force for that protocol, not as the primary normal-walk path.
+
+Ordinary reconstruction and path-refinement capture do not require a saved
+calibration selection or calibration-specific focus lock. RGB reconstruction
+works without calibration. Native 8K/device capability and timing checks still
+apply. Saved timing proofs distinguish automatic normal-walk mode from
+locked-focus board mode: if only a pinned calibration check is retained, the
+phone may need one 10-second automatic-mode timing check, not a new full
+calibration. These bounded checks establish recording-path availability;
+they do not make calibration a prerequisite for reconstruction.
+
+For path processing, choose the entry marked **Noesis PCF** when using a retained
+fused room. The native intent retains its exact revision, camera, manifest and
+frame-binding digests. A changed or incompatible reference cannot silently fall
+back to the original raw reconstruction. These fields survive saved captures,
+packaging and upload. Reconstruction mode remains unchanged.
+
+Choose DA3 before running the visual model, align the walk to its paired static
+camera, then select **Review path**. A selected Noesis PCF room uses its already
+verified registration; an ordinary raw reference needs its own matching world
+alignment. The existing visual-revisit engine tests corrections
+against a reserved late-walk interval and preserves the original path when a
+candidate fails. Qualified VIO runs automatically when its capture already
+admits it; otherwise the raw sensors remain usable for gyro diagnostics, not
+uncalibrated position integration. Scale-changing candidates require fresh
+independent static registration.
+
+Library displays original/reference phone paths, an explicit Noesis lifecycle
+selector, a time slider and JSON/CSV exports. No person is selected automatically.
+Clock and registration limitations remain visible; camera-center versus ground
+separation is not anatomical-position error or certified 10 cm accuracy. The
+retained September 12 comparison is available without relabelling its older
+carry protocol. Dense VIO and original raw recordings stay separate and retained.
+
+RoomWalk 0.4.2/code 23 uses RoomWalk server 1.13.0 or newer. Install it
+over the existing app with the same signing key to retain captures and settings.
+The packaged app and intent boundaries were exercised on an emulator; native
+8K recording and path accuracy still require the physical phone.
+
+The following versioned notes preserve the optional board-calibration protocol.
+In that protocol, version 0.3.4 bound locked-focus preview and recording
+outputs to the measured physical lens using Android's
+[physical output routing](https://developer.android.com/reference/android/hardware/camera2/params/OutputConfiguration#setPhysicalCameraId(java.lang.String)).
+Manual focus alone does not prevent a logical camera from switching lenses.
+The pinned stream uses that physical camera's actual capture-result timestamps
+and controls, retaining separate logical-camera diagnostics. Missing physical
+metadata or an unsupported 8K configuration stops explicitly; there is no
+automatic lens or resolution substitution. Pinned recordings identify the
+physical output camera separately from the logical device, so older logical-
+camera calibration and timing proof cannot silently qualify the new path.
+
+For full calibration takes, focus sharply at the intended working distance
+before locking. Vary the phone's position and angle while keeping the board
+sharp; nearer/farther movement is optional and must remain within that sharp
+range. Do not refocus during the take. Published 0.3.5 prompts state this during
+camera coverage and all moving phases of the 90-second motion sequence.
+Recording settings, physical-lens routing and focus/test bindings are unchanged
+from 0.3.4; installing 0.3.5 does not itself require repeating a matching test or
+calibration. Install over the existing app to retain its settings and captures.
+
+In the optional board-calibration workflow, version 0.3.6 requires an explicit
+qualified camera reference and measured-board confirmation before the guided
+motion capture or processing action. It preserves
+the user's board confirmation with its unchanged saved definition, offers
+**Check phone** when reopening leaves the camera list unloaded, and labels
+connection failures as stale status while retrying with bounded backoff.
+Processing failures lead to the retained take's settings, not an automatic
+request to record again. The current native focus metadata is checked against a
+loaded camera reference before opening motion capture; a retained native guard
+also blocks Record if focus is unlocked or changed inside that viewer. These
+preflights do not replace the backend's exact captured-focus binding. Native
+acquisition and physical routing are unchanged; an app update cannot repair a
+take recorded at a different focus.
+
+For that optional locked-focus board mode, **run a new ten-second test when
+upgrading from 0.3.3 or earlier**, keeping focus locked and moving gently within
+the sharp range. Fixed focus can blur outside that range; it must not silently
+change lenses. Ordinary reconstruction/path-refinement mode uses its automatic-
+mode timing proof when needed and does not require a new full calibration. A
+stopped preview offers **Restart
+preview** in the same viewer. Preview and ongoing camera/encoder acquisition
+also detect five seconds without frames. Early recording stops show the actual
+duration and reason; partial originals remain in Library, not marked as completed
+calibration takes. Device-specific physical-lens 8K support still requires the
+phone test; emulator output/metadata routing checks are not that proof.
+
+The camera-close/save handoff repair is retained: the exact recording stays
+pending until its ZIP is ready, then offers its upload action. **Check/reuse**
+explains missing processed results and lets you resume existing full calibration
+takes from the phone or server. Failed result loading is visible and retryable;
+ten-second timing tests cannot substitute for full calibration takes. Selecting
+a retained recording restores its own calibration settings, not the previous
+take's context. Nothing uploads or processes merely by choosing a recording.
+
+Calibration recording, upload, processing and the next step remain in one
+guided view. A five-second settling countdown precedes stationary
+acquisition; native elapsed time and actual sensor sample counts appear at the
+top without scrolling. Extra settings, measurements and history are collapsed.
+Actionable failures remain visible, and passing results offer the next step.
+The 0.3.1 native refresh acknowledgement repair is retained. Install over the
+existing app with the same signing key to retain captures and settings.
+
+## One workspace
+
+- **Capture:** phone/camera checks, optional server and paired-room selection,
+  native landscape preview, mode-appropriate timing checks, record/stop,
+  stationary IMU recording and background upload controls. Focus lock is a
+  board-calibration control, not a normal-walk prerequisite.
+- **Library:** retained phone artifacts with export/share/repackage/retry, and
+  the existing server scan list, file imports, provider reconstruction, 3D
+  inspection, additional videos, independent static-camera alignment and PCF
+  review workflows. Model computation remains on the Noesis host.
+- **Setup (optional calibration):** editable ChArUco definition, separate Camera/lens and
+  Camera–IMU modes, native recording, imported capture selection, CPU processing,
+  progress/cancellation, qualification results and downloadable evidence.
+
+The packaged UI opens without server connectivity. Native capture and local
+artifact actions remain available subject to their normal gates; paired room
+recording, uploads, calibration computation and reconstruction need the server.
+Reconstruction pairing is optional. Path refinement requires its paired room
+camera and completed reference reconstruction. Calibration board takes
+intentionally do not start a room-camera companion.
+
+### Optional advanced calibration workflow
+
+This section preserves the original calibration controls and qualification gates
+for users who explicitly choose Setup. It is not required to record ordinary
+reconstruction coverage or to make RGB reconstruction available.
+
+If setup was interrupted, open **Check/reuse → Continue camera setup** (or the
+other missing stage). Choose the existing full take, then follow **Upload
+recording → Process recording**; already uploaded takes go directly to
+processing. Refresh recordings before making a replacement. An ordinary room
+walk is not a calibration take and does not need to be repeated to recover setup.
+
+1. Place the board flat and **leave it fixed** throughout both board takes.
+   Move the phone, not the board. Check the phone, choose its camera, focus on
+   the board and **Lock focus** in
+   the native preview. Run the same ten-second timing test if that locked mode
+   is not yet qualified. Camera and Camera–IMU modes reuse the normal recorder,
+   encoded resolution, exact Camera2 association and raw IMU streams.
+2. In **Calibration**, check the board definition. Defaults match the retained
+   target: 10×14 squares, 0.018 m square, 0.0132 m marker, `DICT_4X4_1000`, IDs
+   300–369, legacy pattern off. Physical size/flatness confirmation is an
+   explicit user attestation, not an inferred measurement.
+3. Record the guided **60-second stationary sensor** take. Set the phone on a
+   stable surface during the five-second countdown, then leave it untouched.
+   The countdown is not part of the raw recording. This opens neither camera
+   nor encoder. When saved, follow **Upload recording → Process recording** in
+   the same view. There is no need to find the take in Library.
+   The short model measures white noise and checks held-out stationarity; its
+   conservative drift terms are labelled model priors, not measured long-term
+   random walk. Three-hour stationary recording is not a room-walk prerequisite.
+4. Record the guided **60-second Camera/lens** take. Move the phone so the fixed
+   target visits varied image positions and angles within its sharp range; keep
+   the locked focus unchanged. The preview stops at 60 seconds.
+   If **Record** is disabled, the preview explains whether focus must be locked
+   or the ten-second timing test must pass for that exact focus/mode. Let the
+   test finish saving, then reopen the camera without changing focus. Extra test
+   controls collapse once the required check has passed. Upload and process the
+   full take using the same guided view. A completed job is not necessarily qualified:
+   native geometry stability, blocked heldout reprojection and view coverage
+   are reported separately.
+5. If the user explicitly selects a qualified camera result for **future
+   matching native imports**, that choice is snapshotted on each import. Actual
+   device/lens/focus/crop must match before the existing full-five-coefficient
+   rectification path applies it. Earlier scans are not rewritten; mismatches
+   remain available for uncalibrated RGB reconstruction and display the reason.
+6. For **Camera–IMU**, select that camera result and the short sensor result.
+   Record the guided **90-second** take: an eight-second still start, rotations
+   about all axes, translations, mixed movement, then a still finish. Keep the
+   board fixed and visible. The timed guide stops automatically. Upload and process. The
+   pinned CPU spline solver estimates the camera-to-IMU transform, signed timing
+   offset and IMU scale/misalignment/bias corrections. Missing prerequisites or
+   failed holdouts remain explicit; no identity transform, zero offset or
+   guessed noise is treated as calibrated evidence.
+7. **Check motion profile** runs the fixed OpenVINS consumer on the retained
+   camera–IMU take and compares it with independently withheld visual-only board
+   motion. No calibration or scale is refitted to pass. Only a passing profile
+   exposes **Use for future matching short walks**. Failed jobs keep their inputs
+   and explain which step needs attention; recording longer cannot repair a
+   missing backend or unsupported physical-camera metadata.
+8. Return to **Capture** for ordinary one-to-five-minute walks. Use the
+   automatic-mode timing proof when the phone has only retained a locked-focus
+   board-mode check; no new full calibration is needed. Keep the native 8K,
+   device-availability and timing checks satisfied, then stay still for the
+   first eight seconds, move slowly, revisit the starting area and finish still.
+   Reconstruction pairing remains optional; path refinement uses its required
+   paired room camera and completed reference reconstruction.
+
+Calibration artifacts retain source hashes, units, optical binding, transform
+direction, time-offset sign and rejected evidence. Calibration jobs alone do not
+admit metric VIO. An explicitly selected, passing motion profile is rechecked
+against each future native import and its actual consumer; raw imports and old
+scans are never rewritten. It does not change live Noesis world/tracking calibration. Independent
+static-room alignment remains a separate downstream authority. See the
+[CPU solver contract](../native/roomwalk_calibration/README.md) for build,
+configuration, validation policy and remaining admission gates.
+
+### Android web boundary
+
+Only the packaged app document on the configured HTTPS origin may issue bounded
+native actions. There is no `addJavascriptInterface`, arbitrary-origin bridge,
+cleartext mixed content or TLS bypass. File selection uses Android's document
+picker; same-origin exports stream through verified HTTPS into a user-selected
+document. Backend and static assets must be from compatible versions. Rebuild
+the APK when the shared UI changes; restart only the RoomWalk service when
+deploying changed backend routes, with operational approval.
+
 ## Install and use
 
-Use RoomWalk’s **Install RoomWalk Android companion** link to open the
-download page in the phone’s regular browser. Tap **Prepare APK in browser**,
-then **Save APK to phone**. The page fetches the APK over the current HTTPS
-connection, checks its exact release size and SHA-256, and offers the verified
-bytes for a local browser save. This avoids a second network transfer by the
-download manager. Keep the tab open until the browser finishes saving; normal
-download and installation checks still apply. A direct download link remains
-available. Update the page's filename, byte count, and SHA-256 when publishing
-a different APK.
+When the verified parent handoff publishes the RoomWalk 0.4.0 build, use its
+**Install RoomWalk Android companion** link to open the download page in the
+phone's regular browser. Tap **Prepare APK in browser**, then **Save APK to
+phone**. The page fetches the APK over the current HTTPS connection, checks its
+exact release size and SHA-256, and offers the verified bytes for a local
+browser save. This section documents the handoff procedure only; it does not
+claim that the service or APK publication has completed. Keep the tab open until
+the browser finishes saving; normal download and installation checks still
+apply. Update the page's filename, byte count, and SHA-256 when a verified APK
+is published.
 
 1. Install the signed APK on the Android phone. Android may ask to allow the
    selected browser or file manager to install this app.
 2. Open **RoomWalk**, allow camera access, and tap **Check phone**. Choose a
    supported rear camera. The app requires Android 13 or newer for recording;
    older supported installations can produce a capability report.
-3. **Check connection** loads the available static room cameras. Select the
-   camera for this walk, then tap **Capture** to open the full-screen viewer.
-   Setup and saved-capture screens use portrait; the viewer changes to landscape.
-   Compose the shot using
-   the live preview, then run the **10-second test** first, starting and ending
+3. **Check connection** loads the available static room cameras. For path
+   refinement, select the paired camera and completed reference reconstruction;
+   reconstruction may leave the room camera unselected. Tap **Capture** to open
+   the full-screen viewer. Setup and saved-capture screens use portrait; the
+   viewer changes to landscape. Compose the shot using the live preview, then
+   run the **10-second automatic-mode test** first when the phone needs that
+   timing proof, starting and ending
    with the phone still.
    Inspect the saved timing result. If the companion has not found its 8K mode,
    tap **Upload phone report**. This sends the latest capability report to the
@@ -55,16 +287,18 @@ a different APK.
    Phone and static acquisition clocks stay explicit; HTTP clock observations
    do not establish hardware synchronization or metric VIO admission.
 
-Version 0.1.7 makes paired capture the normal recording path. **Record** first
-starts the selected room-camera recording and tracking observer, waits for both
-to report recording, then starts native phone video and IMU. Every ten seconds a
-bounded worker renews the static lease. Stopping or backgrounding finalizes both
-sides; native frame callbacks perform no companion-service requests. If the
-room stream is lost, the phone stops and retains its partial evidence. Starting
-uses one retained request ID, so a lost response can be retried without creating
-a second session. The exact phone capture, camera, static session, server origin,
-clock observations, and failure state are retained in `companion_capture.json`
-and the capture manifest. **Finalize paired capture** retries the saved session.
+The retained 0.1.7 paired-capture implementation is used when a room-camera
+companion is selected, especially for path refinement; it is not the normal
+reconstruction requirement. **Record** first starts the selected room-camera
+recording and tracking observer, waits for both to report recording, then starts
+native phone video and IMU. Every ten seconds a bounded worker renews the static
+lease. Stopping or backgrounding finalizes both sides; native frame callbacks
+perform no companion-service requests. If the room stream is lost, the phone
+stops and retains its partial evidence. Starting uses one retained request ID,
+so a lost response can be retried without creating a second session. The exact
+phone capture, camera, static session, server origin, clock observations, and
+failure state are retained in `companion_capture.json` and the capture manifest.
+**Finalize paired capture** retries the saved session.
 
 Version 0.1.10 routes the appliance origin `TauntonMainframe.local` directly to
 the fixed LAN address `192.168.3.126`; it never performs DNS for that origin.
@@ -186,9 +420,9 @@ Closing the viewer or pressing Back while recording stops and saves the take;
 backgrounding closes an idle preview or stops an active recording. Closing an
 idle preview does not create a capture.
 
-Version 0.1.6 introduced standalone IMU acquisition and persistent focus lock.
-In 0.1.7, IMU-only acquisition is optional under **Advanced diagnostics** and
-records the same native accelerometer and gyroscope selected by video capture;
+Historical 0.1.6/0.1.7 notes below preserve standalone IMU acquisition and the
+optional board-mode focus control. IMU-only acquisition is optional under
+**Advanced diagnostics** and records the same native accelerometer and gyroscope selected by video capture;
 no camera, preview or encoder is opened. Keep the phone still and the app in the
 foreground for this diagnostic. The screen stays awake and progress reports
 elapsed time, sample counts and stored bytes. **Stop & save IMU**, Back, or
@@ -215,8 +449,8 @@ success. Partial recordings can be retained by the receiver; noise fitting and
 review are separate work. **Export**, **Share**, **Saved captures**, and
 **Package again** also support finalized IMU takes. Uploads preserve local files.
 
-The viewer additionally provides **Lock focus** and **Unlock focus**. Locking
-requires a fresh, settled autofocus result with an actual focus distance and
+In the optional board-calibration mode, the viewer provides **Lock focus** and
+**Unlock focus**. Locking requires a fresh, settled autofocus result with an actual focus distance and
 manual-distance support. It requests AF OFF at that measured distance and saves
 the setting only after a capture result confirms AF mode, stationary lens,
 distance (within 0.01 diopters or 1%, whichever is larger), and active physical
@@ -231,7 +465,10 @@ qualify a mode that was not statically advertised. Focus metadata and recorded
 confirmation counts are included in diagnostics and capture results. The
 viewfinder's control strip scrolls on smaller screens.
 
-After a completed test, use **Upload** to send its video and raw timing bundle.
+Ordinary reconstruction and path-refinement modes retain automatic focus unless
+the user separately selects the board-calibration protocol. Their saved timing
+proof is checked for that automatic mode; a locked-focus board proof is not
+silently reused. After a completed test, use **Upload** to send its video and raw timing bundle.
 If capture fails, **Upload phone report** sends that attempt's diagnostic result
 with the capability report. Original local files are retained in both cases.
 

@@ -3,6 +3,120 @@
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
 
+## Find the relevant decision
+
+| Concern | Decisions |
+| --- | --- |
+| Native runtime, direct validation and performance boundaries | [ADR-001](#adr-001--one-native-deepstream-91-runtime), [ADR-002](#adr-002--direct-application-validation-is-the-default), [ADR-004](#adr-004--gpu-first-graph-with-explicit-cpu-boundaries), [ADR-021](#adr-021--optional-depth-and-persistence-cannot-stall-media) |
+| Canonical publications, spatial authority and identity isolation | [ADR-006](#adr-006--canonical-publication-is-transactional), [ADR-020](#adr-020--one-revision-bound-ground-state-feeds-every-spatial-view), [ADR-023](#adr-023--shadow-identity-is-isolated-from-canonical-publication), [ADR-024](#adr-024--one-universal-uncertainty-aware-person-localization-resolver) |
+| Baseline tracking and explicit MV3DT | [ADR-003](#adr-003--baseline-three-camera-tracking-remains-canonical), [ADR-018](#adr-018--kitchenfamily-mv3dt-is-a-ready-explicit-runtime-option), [ADR-019](#adr-019--live-mv3dt-waits-for-complete-camera-batches) |
+| PCF candidates, alignment and presentation | [ADR-007](#adr-007--prior-conditioned-fusion-is-the-canonical-room-source), [ADR-015](#adr-015--the-room-walk-browser-may-build-review-only-pcf-candidates), [ADR-026](#adr-026--static-camera-pcf-map-lock-is-a-revision-bound-frame-edge), [ADR-028](#adr-028--reconstruction-evidence-and-presentation-remain-revision-bound), [ADR-043](#adr-043--path-capture-binds-the-selected-retained-pcf-version), [raster pairing](#2026-09-23--pcf-raster-format-is-versioned-independently-and-served-as-a-compatible-pair) |
+| Capture, paired static references and calibrated reconstruction | [ADR-030](#adr-030--room-walk-may-retain-one-bounded-static-camera-companion-session), [ADR-033](#adr-033--paired-static-recordings-supply-independent-alignment-references), [ADR-034](#adr-034--fit-only-static-camera-visible-structure-and-retain-replay-diagnostics), [ADR-036](#adr-036--retained-trajectory-refinement-binds-rgb-rays-and-rebuilds-fusion-support), [ADR-037](#adr-037--phone-intrinsics-bind-the-capture-projection-and-provider-geometry), [ADR-041](#adr-041--roomwalk-040-separates-reconstruction-and-path-refinement-capture-intents), [ADR-042](#adr-042--metric-vio-scale-candidates-require-fresh-static-registration) |
+| Agent scope, instruction hierarchy and workflow completion | [Task scope](#2026-09-05--scope-agent-workflows-to-the-authorized-application-task), [local policy](#2026-09-06--keep-agent-policy-local-to-implementation-responsibilities), [evidence and phase boundaries](#2026-09-07--operational-guidance-follows-evidence-and-authorized-phases) |
+
+Accepted decisions define intended authority. Superseded entries retain their
+status; dated tests and runtime observations belong with their evidence and do
+not imply that every permitted runtime option is selected.
+
+## 2026-09-23 — PCF raster format is versioned independently and served as a compatible pair
+
+The `floorplan_contract_version` owns geometry and orientation, not the binary
+packing of presentation rasters. The Scene Prior diagnostic metadata therefore
+declares `raster_encoding_version=1`, and each compact layer declares its own
+`grid_encoding` alongside the existing typed base64 prefix. Existing unprefixed
+float32 grids stay readable. Continuous PCF display grids may use binary16;
+exact masks use packed bits and small categorical grids use uint8. This format
+cannot quantize retained PCF evidence or canonical tracking/world measurements.
+
+The producer, built OAI² frontend, and any Menon grid consumer must be checked
+as one wire-compatible set. Unsupported raster versions or encodings are a
+visible compatibility failure, never an apparently empty room. A Vite source
+smoke does not establish compatibility of the immutable bundle served by Menon;
+production promotion uses a reviewed built artifact and tests it through the
+actual gateway route before switching selectors.
+
+## 2026-09-17 — Optional calibration motion prerequisites fail before detection and stale status recovers
+
+The optional RoomWalk calibration/motion protocol requires an explicit qualified
+camera reference and user-confirmed printed board dimensions. The isolated
+worker repeats these checks before reading video and checks exact captured
+lens/focus/crop binding before native target detection. A completed camera job
+alone is insufficient; this protocol must not silently estimate substitute
+intrinsics. Ordinary reconstruction and path-refinement capture do not require
+this saved calibration reference.
+
+The shared UI requires those explicit choices before guided calibration motion
+capture or processing. It compares available native focus metadata with the
+loaded camera reference without a tolerance (float32 normalization only matches
+Camera2's native type). Native Record additionally checks that the viewer-entry
+focus lock has not changed for that board protocol. These convenience preflights
+do not replace immutable recorded metadata or the backend's exact
+binding/admission checks. Unknown offline reference metadata cannot establish a
+match.
+
+The user's board confirmation is retained only with its saved definition;
+editing dimensions clears it and a retained take restores its own attestation.
+Processing failures lead to that saved take's settings rather than implicitly
+requesting recapture. Status-fetch failures visibly mark progress stale and
+retry, one request at a time, with 8–30-second backoff while the panel is open.
+No retry creates another calibration job or repeats an upload.
+
+## 2026-09-17 — Motion preflight distinguishes unsupported controls and native sensor precision
+
+RoomWalk's point-time mapper may use Camera2's unsupported-distortion-control
+active-array contract only for a directly pinned physical output with explicit
+negative request/result capabilities, a retained null/empty mode list, equal
+zero-origin active/pre-correction arrays, matching physical/software identities
+and unchanged per-frame controls. This is separate evidence from camera-fitting
+qualification. Missing capabilities or logical-camera inference still fail;
+raw null values are not replaced by OFF. The mathematical row-time equation,
+independent motion holdouts and downstream admission checks are unchanged.
+The [solver contract](../tools/mapanything_phone_scan/native/roomwalk_calibration/README.md)
+records the Android/AOSP references and required evidence.
+
+Android sensor range/resolution identity uses exact float32 equality, matching
+the native getter types. Different JSON decimal renderings of the same native
+float must not invalidate stationary/video reuse. This is not a tolerance:
+different sensor IDs, software revisions, units, or even one float32 ULP still
+reject reuse. Original noise coefficients, provenance and artifact hashes remain.
+
+Offline camera/motion job children explicitly bound OpenCV to two threads.
+Dense 90-second motion detection retains native pixels, the 10 Hz target cadence
+and 900-view cap, with a 25-minute worker budget below the parent's 30-minute
+deadline. The camera-fit budget remains 20 minutes. No appliance restart,
+quality/cadence reduction, implicit profile selection or runtime admission is
+part of this repair.
+
+## 2026-09-17 — Native camera corner refinement is image-scale and geometry bounded
+
+RoomWalk's offline ChArUco detector localizes chess corners from four opposing
+checker half-edges. Their midlines locate the intended intersection when white
+gutters or softened edges bias a single gradient-intersection estimate. Local
+board orientation and support size come from nearby detected corner geometry,
+not a camera model. Support is bounded to 64 pixels inside a 193 × 193 native-
+pixel patch; marker polygons and image borders are masked with gradient-support
+clearance. This replaces the initial image-resolution-scaled subpixel policy,
+which improved but did not qualify the retained September 16 phone take.
+
+No fitted camera residual, heldout membership or calibration error threshold
+selects the image measurement. Original points, support size, edge spread,
+opposing gaps, displacement and failure reasons remain in the observations
+artifact. An unsafe, weak or nonconvergent corner rejects its whole view rather
+than silently removing individual high-error points. Known-geometry synthetic
+tests cover gutters, blur, rotation, shear, noise and detector-to-hull plumbing.
+
+Separate temporal and pose/scoring-corner holdouts, native-pixel acceptance
+limits, original capture retention and review-only authority remain unchanged.
+Reprocessing creates a separate job; a successful synthetic test or completed
+job does not establish qualified phone calibration or metric VIO.
+
+Optional board-calibration guidance keeps fixed focus but explicitly limits
+angle/translation changes to the target's sharp range. Moving closer/farther is
+not a requirement when it defocuses the target; changing focus mid-take would
+change the bound camera configuration. Native prompt changes require a
+subsequent APK build; editing guidance does not update an installed phone
+application. This focus rule does not gate ordinary automatic-mode walks.
+
 ## ADR-001 — One native DeepStream 9.1 runtime
 
 **Accepted:** 2026-08-15
@@ -922,18 +1036,19 @@ in-box geometry and corroborates detector-silhouette motion only. The metric
 range path samples one trimmed torso-core capsule through a bounded native
 statistic. Torso range may become a registered-depth hypothesis only for an
 already trusted lifecycle with exact-current depth, sufficient person
-confidence, and seated or active lower-body-occlusion context; lying and
-ordinary upright/dropout rows remain excluded. Torso range is never verified
+confidence, and seated, lying, or active lower-body-occlusion context; ordinary
+upright/dropout rows remain excluded. A lying body projection is typed as
+`couch`, not as visible floor contact. Torso range is never verified
 ground contact, cannot seed the weak floor-consensus path or learned height,
 and cannot suppress an independently eligible `bbox_bottom` floor ray. Floor
-support is a semantic authority tier, not a confidence-score hint: when any
-valid floor-supported hypothesis exists, it ranks ahead of non-floor body,
-seat, couch, or unknown support. Covariance intersection is allowed only among
-equal support states, and the hook independently requires every selected and
-contributing metric hypothesis to be floor-supported. A precise torso/body
-range therefore remains diagnostic even when it is spatially compatible with
-the selected floor point; it cannot pull the metric result, steer the bounded
-process posterior, or replace the accepted image origin.
+support remains the semantic authority tier for standing and unknown posture.
+For explicit sitting or lying posture, a typed exact-current body footprint
+(`seat` or `couch`) ranks ahead of an ankle/floor ray because a visible ankle
+may belong to a tucked leg, furniture edge, or overlapping person rather than
+the non-upright person's support location. Untyped body/torso range still ranks
+behind floor support. Covariance intersection remains limited to equal support
+states, so body and foot geometry are never averaged into a plausible-looking
+compromise.
 
 Hidden physical contact does not make a visible person unlocalizable. A typed
 `pose_scale` ground-footprint lane projects exact-current body observations
@@ -962,9 +1077,25 @@ image-motion continuation may keep the existing dot visible; the projective
 integrator preserves but never increments the pending metric consensus.
 
 The seated form projects an exact torso observation to the support footprint
-with broad height uncertainty. It is typed as seat support rather than visible
-foot contact, may use stationary hold when current geometry is temporarily
-absent, and does not disappear merely because ankles are hidden. Upright body
+only from lifecycle-local geometry: exact-current registered range measures the
+same pose-torso anchor. The prior standing footprint is never used to derive a
+seated plane because that circular construction would reproduce the old
+standing coordinate by definition. Population body heights, fixed
+seated-height fractions, and room/camera offsets are forbidden as canonical
+position authority. Until registered depth establishes the physical reference,
+the pose-only seated candidate is unavailable. It is typed as seat support
+rather than visible foot contact and ranks ahead of simultaneous ankle-floor
+evidence. The lying form uses only an exact-current registered body projection,
+typed as couch support. Both may use
+stationary hold when current geometry is temporarily absent and do not
+disappear merely because ankles are hidden. Trusted non-upright body updates
+use a tight 0.10 m lock deadzone and a minimum 0.30 posterior gain so an old
+foot-derived coordinate converges to the body footprint without retaining the
+broader seated-jitter deadzone. Existing physical innovation, output-speed,
+and three-sample reanchor gates remain authoritative. Exact registered body
+rows and pose rows projected from their measured plane share that one
+reacquisition family, so intermittent DAv2 cadence cannot strand a seated dot
+at its prior standing footprint. Upright body
 projection and learned-height gravity reconstruction are alternative uses of
 the same current body evidence and are never co-fused on one row. Neither rule
 depends on camera or room identity.
@@ -1244,6 +1375,25 @@ authority, timing uncertainty, and phone-only reconstruction responsibilities
 explicit.
 
 
+## 2026-09-05 — Scope agent workflows to the authorized application task
+
+**Decision:** Existing-runtime diagnosis preserves selected pipeline quality and
+outputs and uses bounded measurements. New graph generation and new detector
+imports have separate skill routes; existing-engine and non-detector maintenance
+follow the native host contract. Generator questions resolve checkout and host
+facts first. Import reports are conditional; vendor encoder fallbacks are not
+an execution route. AMC and SOP skill selection is explicit-only, without lifting
+AMC deferment or the native-runtime boundary.
+
+Audits remain read-only until implementation is requested. Independent
+investigations may use up to two subagents, enforced by project Codex config;
+shared-file edits and runtime operations have one owner. This is optional
+investigation parallelism, not an independent release-review requirement.
+
+**Why:** Separate task modes prevent general vendor workflows from widening a
+bounded repair or overriding the canonical application contract. Focused docs
+checks now include the detector importer, generator, and requirement reference.
+
 ## ADR-031 — Phone frame selection preserves gaps and removes adjacent repeats
 
 **Accepted:** 2026-09-06
@@ -1453,6 +1603,48 @@ recordings would change the projection without evidence. Camera intrinsics
 alone cannot establish synchronized IMU data, camera/IMU extrinsics, surveyed
 room scale, or a static/world camera pose. The operational import and use steps
 are in the [phone reconstruction guide](../tools/mapanything_phone_scan/README.md#measured-phone-camera-calibration).
+
+## 2026-09-06 — Keep agent policy local to implementation responsibilities
+
+**Decision:** Root agent guidance owns repository invariants, task scope, branch
+rules, and completion criteria. Subtree files inherit those rules and add local
+implementation constraints and task-specific reading. Core world contracts,
+identity, and phone-walk reconstruction now have scoped entrypoints beside their
+implementation; the root also routes cross-boundary edits to those entrypoints.
+Identity plan guidance retains acceptance work without automatically loading an
+entire workstream checklist for an ordinary edit.
+
+DS9 smoke requirements use the root's practicality and documentation exceptions.
+Shared publication guidance names the exact tracking/world/BEV cohort separately
+from optional depth/diagnostic freshness. Artifact guidance distinguishes the
+checked-in manifest from realization under the selected external artifact root.
+
+**Why:** Repeated policy wording had diverged, and specialized rules under a
+sibling planning directory were not a reliable entrypoint for implementation
+work. Relative Markdown links and docs-check coverage now include all ten active
+repository instruction files. These changes preserve native runtime, evidence,
+identity, geometry, and authority-admission requirements.
+
+## 2026-09-07 — Operational guidance follows evidence and authorized phases
+
+Generator delivery reports actual failed/skipped checks instead of formatting
+an incomplete graph as validated. New detector imports derive engine profiles
+from the consumer contract, keep capacity experiments bounded and optional, and
+validate detections against known positive/negative fixture expectations rather
+than an assumed occupancy fraction. Utility environments require only the
+packages their selected phase uses.
+
+PCF candidate generation/evaluation ends with review-only evidence. Sealing,
+authored Scene Prior binding and activation retain their existing gates in the
+separately authorized later phases. Profiling starts with existing-pipeline
+diagnosis; new-graph construction has its own reference and preserves selected
+quality, ordered publication and required outputs.
+
+Indexed documentation distinguishes checked-out wiring, configured conditional
+identity permits, accepted contracts and dated observations. Section navigation
+routes to existing definitions without duplicating them in instruction files.
+These are workflow/documentation changes, not runtime activation or new model,
+geometry, identity or quality authority.
 
 ## 2026-09-07 — Require explicit browser 8K geometry and preserve timing limits
 
@@ -1689,3 +1881,273 @@ surveyed height. No numerical floor/extrinsic correction or replacement depth
 mapping follows from those observations. Qualified independent controls and
 heldout agreement remain prerequisites for those changes. Partial provider
 outputs, failed windows and missing coverage remain explicit review evidence.
+
+
+## ADR-038 — Orderly EOS includes looping source-owned terminal sinks
+
+Date: 2026-09-13. Status: accepted for the native DS9.1 graph.
+
+DS9.1 `nvurisrcbin` creates an internal fakesink for looping local files.
+That makes the source bin participate in GStreamer EOS aggregation even
+though its sink is upstream of the post-mux orderly-EOS bridge. An occupied
+hybrid replay confirmed every normal output sink posted EOS while `source_0`
+did not, causing the runtime watchdog to terminate the process.
+
+The graph declares the exact internal sink paths to the repository-owned
+`noesiseos` bridge. Its bounded worker resolves all targets before sending
+standard EOS, guards late buffers at their upstream pads, and acknowledges
+only when the main path and all declared sinks accept their events. Missing
+or invalid targets fail closed. The runtime retains its independent pipeline
+EOS, wait-thread completion and callback-resource drain requirements. Normal
+file looping, replay pacing, models and output cadence are unchanged. See
+[the native bridge contract](../DS9/gst-plugins/noesiseos/README.md).
+
+External replay controllers must allow the configured native shutdown grace
+plus a supervisor margin and distinguish orderly exit from watchdog or forced
+termination. Observation completion alone is not a successful replay shutdown.
+
+## ADR-039 — RoomWalk shares one Android workspace with evidence-gated calibration
+
+Date: 2026-09-14. Status: accepted for the RoomWalk application; not live world
+or metric-VIO admission.
+
+The Android APK packages the browser workspace and 3D viewer. A bounded,
+main-document/same-origin native action channel preserves Camera2/MediaCodec
+capture, exact acquisition timestamp association, focus/timing gates, paired
+static recording, retained phone artifacts and background uploads. The WebView
+does not replace the recorder with browser camera APIs. Computation stays on the
+existing Noesis host; an offline shell is not an offline reconstruction engine.
+
+Camera/lens and camera–IMU calibration use that same native recorder and an
+explicit ChArUco board definition. One bounded CPU child processes each job,
+retaining original evidence, source hashes, independent checks and rejected fits.
+Stationary IMU noise is measured separately from moving-board recordings.
+Execution completion, camera quality, inertial quality and downstream admission
+are distinct states; null covariance and missing prerequisites stay explicit.
+
+An advanced user may optionally select qualified camera intrinsics for future
+matching native imports. Each such import snapshots the choice and verifies its
+actual device, physical lens, locked focus, crop, stabilization and native image
+geometry before applying the existing full-D5 rectification. Mismatches cannot
+fall through to a different calibration; old scans are not rewritten. Ordinary
+reconstruction and path-refinement capture do not require this saved selection
+or locked-focus binding. This does not activate camera–IMU corrections, admit
+metric VIO, publish PCF or alter Noesis tracking/world frames.
+Independent static-camera alignment remains authoritative for those tasks.
+
+See the [Android workflow](../tools/mapanything_phone_scan/android_companion/README.md)
+and [CPU calibration contract](../tools/mapanything_phone_scan/native/roomwalk_calibration/README.md).
+
+## ADR-040 — Short RoomWalk motion profiles require fixed-consumer evidence
+
+Date: 2026-09-15. Status: accepted for the offline RoomWalk application; physical
+phone calibration and live world admission remain distinct.
+
+The locked-focus and fixed-board behavior in this decision applies to the
+optional calibration/profile protocol. It does not make a paired room camera or
+locked focus a normal reconstruction prerequisite.
+
+The practical setup uses 60 seconds of stationary sensors, 60 seconds of
+camera/lens coverage and 90 seconds of camera–IMU motion. The board stays fixed;
+the phone moves. Native timed prompts and automatic board-take stops guide
+acquisition. A short recording measures white noise, not long-term random walk;
+drift coefficients remain explicitly conservative model priors. Full Allan
+characterization is optional and separate, not a three-hour room-walk gate.
+
+The guided UI keeps each take's recording, upload, processing and next action
+in place, binding upload receipts and jobs to that exact take. A five-second
+settling countdown precedes stationary acquisition; native elapsed time and
+actual sample counts remain visible without touching the phone. Optional
+settings and measurements are collapsed, while actionable failures stay visible.
+Navigation and completed acquisition never imply qualification. The exact-mode
+focus/timing prerequisites and all processing acceptance gates remain intact.
+
+Recovery identifies each retained take by its capture ID and original calibration
+intent; short timing tests are not full calibration takes. Native camera closure
+must keep finalization busy, and the UI waits for that exact capture's packaged
+artifact before offering upload. Missing processed prerequisites and failed
+result loading are explicit states, not blank disabled selectors. Choosing an
+existing phone/server take only restores its next action; upload, processing and
+profile selection remain explicit, with unchanged backend qualification gates.
+
+For board-calibration recording, locked-focus native capture pins both preview
+and encoder outputs to the measured physical camera. Focus distance on an
+unpinned logical stream does not prevent automatic lens switching. The selected
+physical capture result supplies
+the output's actual sensor timestamp and controls; logical results are retained
+separately and cannot substitute for missing physical evidence. Manifest camera
+identity names the physical output while recorder metadata separately names the
+logical device. This distinguishes the projection from older logical-output
+calibration. The preflight also binds the output-routing policy, so the new path
+requires its own exact-timing test. Rejected physical 8K configurations do not
+fall back to another lens or resolution. Preview recovery waits for confirmed
+camera release before reopening in place. Five seconds without preview frames
+or ongoing camera/encoder progress triggers an explicit bounded stop rather than
+leaving a frozen display. Interrupted acquisitions remain visible partial
+evidence rather than completed calibration takes.
+
+Existing camera, measured transform, signed offset, physical scale and independent
+holdout requirements remain intact. A separate job runs the fixed OpenVINS
+consumer with actual sensor corrections, then compares its camera trajectory
+with withheld visual-only target motion. It never refits calibration or scale.
+The versioned check is a bounded application capability, not surveyed accuracy.
+
+Only a passing profile may be explicitly selected for future matching native
+walk imports, with a five-minute scope. Reuse binds optical/sensor identities,
+the checked motion envelope and native executable/configuration hashes. Derived
+reports do not overwrite raw captures, and later selections do not rewrite old
+scans. Ordinary VIO also needs direct coverage/gap/reset and motion sanity checks.
+Failed checks retain evidence and RGB reconstruction with actionable explanations.
+
+VIO-only image analysis may scale to 1280 pixels using explicit pixel-centre
+intrinsic/full-D5 mapping; source 8K recordings, reconstruction images, dense
+cadence and prepared-frame identities remain unchanged. Source `capture_time_ns`
+and centre-exposure `pose_time_ns` are separate. This is an exposure-centred
+global-shutter approximation within its tested motion envelope, not rolling-
+shutter compensation. Physical capture results are used only when their own ID,
+controls and timestamp bind the exact recorded exposure.
+
+MapAnything plus DA3 consensus and independent static-camera alignment remain
+the reconstruction workflow. Nothing here publishes PCF, changes live Noesis
+tracking/world calibration or converts a camera trajectory into a person track.
+See the [guided workflow](../tools/mapanything_phone_scan/android_companion/README.md)
+and [profile policy](../tools/mapanything_phone_scan/native/roomwalk_calibration/README.md).
+
+## ADR-041 — RoomWalk 0.4.0 separates reconstruction and path-refinement capture intents
+
+Date: 2026-09-19. Status: accepted for the current RoomWalk application
+contract. Application validation and delivery are recorded in the upgrade history.
+The capture contract remains current; the original export-only path processing
+below is superseded by the executable review and registration rules in ADR-042.
+
+RoomWalk presents two explicit capture purposes. **Reconstruction** builds room
+geometry from many overlapping viewpoints. Its Noesis-camera pairing is
+optional, and adding views to an existing completed reconstruction is an
+explicit supplement. **Path refinement** is a separate same-walker protocol:
+the walker holds the phone against their own torso with elbows tucked and stable
+and moves their whole body with the phone. It requires a paired Noesis camera
+and a completed reference reconstruction. These purposes are exposed through
+the Capture, Library and Setup workspace tabs.
+
+Ordinary reconstruction and path-refinement capture bypass saved
+calibration-specific focus as a prerequisite. RGB reconstruction remains usable
+without calibration. Native 8K/device capability and timing checks remain. A
+saved locked-focus board-mode timing proof does not substitute for the
+automatic-mode proof used by an ordinary walk; when that proof is absent, one
+10-second automatic-mode timing check may be required, but no new full
+calibration is implied. Device-availability checks are bounded evidence about
+the recording path. The original board calibration controls, focus binding,
+camera/IMU prerequisites and independent holdouts remain available under
+optional Setup for users who select that protocol.
+
+The native 0.4.0 integration is versionCode 21. Installing the verified build
+over the existing app with the same signing key retains captures and settings.
+Older captures are not implicitly relabelled. Their raw files, prepared
+identities and original calibration bindings remain unchanged unless the user
+explicitly starts a new review or supplement.
+
+The retained-capture supplement endpoint
+`POST /api/scans/{scan_id}/supplements/from-scan?source_scan_id=<id>` hard-links
+the source video and safe raw-capture members into a new supplement directory.
+This is an explicit additive revision, not a rewrite of the source evidence.
+The path-review endpoint
+`POST /api/scans/{scan_id}/path-review?target_scan_id=<id>` requires the
+completed reference reconstruction and exports original camera poses, an IMU
+rotation-only diagnostic when eligible, and retained paired references. It does
+not correct inertial position, establish body ground truth, or certify the
+desired 10 cm result. The user considers twenty centimetres noticeable;
+neither physical-position error bound has been demonstrated.
+
+Existing qualified VIO remains available. Its newly retained dense camera
+trajectory is a separate artifact from the reconstruction's selected views and
+does not become a person trajectory. The retained
+`trajectory_motion_review` on
+`data/mapanything_phone_scans/20260912-210621-2f755956`, using an existing
+external modern127-pose DA3 artifact, found 123 supported rotation intervals,
+with 0.2925° median rotation error and 0.9899 median `rho`. This supports sensor
+usability for rotation diagnostics, not positional accuracy or path/body
+alignment.
+
+## ADR-042 — Metric-VIO scale candidates require fresh static registration
+
+Date: 2026-09-21. Status: accepted for the current RoomWalk path-review
+implementation; review-only and not live-world or person-position admission.
+
+RoomWalk 0.4.1/server 1.12.0 connects path mode to executable refinement and a
+paired Noesis comparison, replacing the export-only behavior described in
+ADR-041. The original prepared identities and raw captures remain unchanged.
+An ordered partial DA3 output retains its original prepared-index subset rather
+than reindexing or rewriting the parent scan. The existing visual-revisit engine
+uses a bounded 256-view/2-GiB input budget and a final-30-percent temporal holdout;
+rejected corrections remain diagnostics rather than replacing the source path.
+
+Phone paths and the selected reconstruction must independently register to the
+same explicit backend-world revision and transform binding. Comparison never
+fits registration to the Noesis people it evaluates. Native HTTP probes support
+an explicitly approximate callback-clock join; an explicit retained light-cue
+timeline must match the original archive and exact recorded cohort. Missing
+world positions, held/predicted outputs, revision mismatches and path gaps are
+excluded from current-measurement comparisons. Library presents selectable
+lifecycle tracks and a time slider without assigning the phone carrier by
+proximity. Horizontal phone-optical-center/ground-footprint separation is a
+diagnostic, not body-position accuracy.
+
+When the path-review API worker sees `capture.metric_vio_allowed` and no
+completed VIO result, it runs the existing qualified VIO worker before invoking
+the existing trajectory-refinement engine. The adapter passes an optional
+`revalidate_scaled_carrier` callback through the path-review layers; it does not
+replace the refinement engine or relax its temporal holdout and deformation
+gates. The [path-review adapter](../tools/mapanything_phone_scan/path_review.py)
+and [trajectory refinement](../tools/mapanything_phone_scan/trajectory_refinement.py)
+retain the original capture and write review artifacts to a new output
+directory.
+
+If qualified VIO produces a non-unit metric scale change, the candidate raw
+geometry, poses and output manifest are materialized together. After the
+temporal holdout passes, the API callback runs the existing
+`run_noesis_alignment` registration again over that materialized candidate,
+using a fresh output directory and the saved target-world settings. The
+revalidation must pass its static-registration quality gate and produce a
+valid unit-scale world transform. A missing callback, missing target evidence,
+or failed/malformed registration rejects the scaled candidate; the original
+registration is not reused as a fallback.
+
+Path comparison validates the exact candidate manifest and its registration's
+world binding, then applies the candidate registration transform to the
+candidate poses. It does not apply the original walk transform (`W`) to scaled
+candidate geometry. The offline CLI has no configured revalidation callback,
+so it explicitly rejects non-unit scale candidates rather than silently
+conditioning them with the old registration. Existing retained no-VIO or
+unit-scale review paths are unchanged.
+
+This remains a review diagnostic: it does not establish phone-to-person ground
+truth, a 10 cm accuracy result, hardware synchronization, or live Noesis-world
+publication. See [path comparison](../tools/mapanything_phone_scan/path_comparison.py)
+for the candidate-manifest and world-binding checks.
+
+## ADR-043 — Path capture binds the selected retained PCF version
+
+Status: accepted, 2026-09-21.
+
+A source phone scan and its later fused reconstruction are distinct artifacts.
+Selecting a room whose configured Noesis Scene Prior comes from PCF must not
+silently select that scan's original provider output or failed raw alignment.
+RoomWalk reads the bounded configured catalog and marks the exact available
+PCF choice. The optional `walk_intent.target_reference` records the prior ID,
+camera, manifest digest and frame-binding digest at capture time. Native saved
+metadata and upload preserve it without changing legacy intent or normal
+reconstruction behavior.
+
+The [reference resolver](../tools/mapanything_phone_scan/path_reference.py)
+checks the existing catalog, manifest, quality, source-scan identity and point
+artifact. Path review verifies this selected room's calibration/world edge
+against the walk's independent static-camera registration. It consumes the
+already registered PCF artifact directly, not fabricated provider poses or the
+original scan's unrelated registration. Missing, changed, ambiguous or
+incompatible references fail explicitly; the raw reconstruction is never a
+fallback. Review retains the exact selected manifest, points and binding.
+
+This is read-only reference selection, not inference, a new room admission,
+live catalog mutation, or promotion. The new walk still needs its own passed
+static-camera registration and retained timing evidence; choosing PCF does not
+certify body position or improve a path merely by changing its label.

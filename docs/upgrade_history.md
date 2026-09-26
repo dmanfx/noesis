@@ -3,6 +3,351 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-09-23 — PCF raster compatibility and built-dashboard validation
+
+- Scene Prior responses now declare a separate raster-format version and
+  per-layer byte encoding, while preserving legacy unprefixed float32 reads.
+  OAI² reports an incompatible PCF raster visibly instead of leaving an empty
+  BEV/depth canvas. Menon's separate room-grid decoder accepts the same compact
+  formats without changing world or person-placement authority.
+- A producer-pinned binary fixture is decoded by the browser test and checked
+  against Python's encoder. Focused producer/consumer tests and isolated OAI²
+  and Menon production builds passed. The built OAI² preview rendered all three
+  live PCF BEVs and room height maps through Menon's local API/WS proxy.
+- This source-and-preview milestone does not change the active immutable Menon
+  release or restart the native Noesis process. Normal dashboard promotion
+  requires an explicit reviewed release delta, selector admission and focused
+  live smoke; the temporary preview is not the deployed service.
+
+## 2026-09-21 — RoomWalk selects the exact retained Noesis PCF reference
+
+- Android **0.4.2/code 23** and server **1.13.0** label the configured PCF
+  reconstruction in the path-room selector and preserve its exact prior ID,
+  camera, manifest digest and frame-binding digest through native capture,
+  saved metadata, upload and review. Reconstruction mode and legacy captures
+  keep their existing semantics; an older native app cannot drop a selected
+  PCF identity silently.
+- Review consumes the verified, already registered PCF artifact rather than
+  the original phone scan's raw model or failed alignment. It checks the edge
+  against the new walk's independent static-camera registration, rejects stale
+  or incompatible references, and exports the selected points, manifest and
+  binding. No source scan, calibration, Scene Prior catalog or live Noesis
+  process was changed.
+- The retained September 12 path produced **101 paired comparison samples**
+  using Living Room PCF `sceneprior_living-room_20260802T202254Z_9380ed8099bb`.
+  The original August 2 raw alignment remains failed and untouched; it was not
+  used as the PCF registration. This verifies reference selection, not a new
+  physical-accuracy result.
+- Validation: **83 focused Python tests**, **61 JavaScript/browser checks**
+  with no skips, **34 Android instrumentation checks**, a same-key emulator
+  upgrade, and a live 412-pixel-wide selector with no errors or overflow.
+  The signed APK is 894,931 bytes, SHA-256
+  `734872e65c4e7661587f8b2d4e4447b35f072eb5d2ae4b975fb9c28eebca2806`.
+  The existing installer now supplies this update; install over the old app.
+
+## 2026-09-21 — RoomWalk executes path refinement and paired-track comparison
+
+- Android **0.4.1/code 22** and RoomWalk server **1.12.0** connect path review to
+  the existing bounded visual-revisit pose graph and admitted OpenVINS results.
+  Qualified VIO runs automatically when needed; scale-changing candidates must
+  pass fresh independent static-geometry registration. Final-30-percent visual
+  holdouts, source identities, calibration and registration gates are preserved.
+- The Library now shows independently registered original/reference phone paths
+  against explicitly selected Noesis lifecycle tracks, with a time selector and
+  JSON/CSV downloads. Missing world positions, prediction/hold samples, frame
+  conflicts and gaps are not turned into measurements. Native HTTP clock joins
+  remain callback-time estimates; an explicit offline light-cue timeline binds
+  exact saved tracking cohorts. Neither route certifies anatomical position.
+- Reused native scan `20260912-210621-2f755956` and its retained partial 127-view
+  DA3 result without changing original prepared identities or raw captures. Ten
+  training constraints produced a candidate with a maximum 0.153 m pose change;
+  six withheld constraints rejected it (0.417 m p80 residual versus the existing
+  0.350 m limit). The original path remains the reference. Saved light timing
+  supports **101 matched samples** across separately selectable lifecycles;
+  these separations are not physical path-accuracy estimates. The review is
+  retained in that walk's Library without relabelling its unknown carry protocol
+  or replacing its original processing state.
+- Validation: **195 focused Python tests**, **5 path-comparison JavaScript/Chrome
+  checks**, **37 existing Chrome workflows**, and **56 packaged Android WebView
+  assertions**. A live 412-pixel-wide review had no page errors or horizontal
+  overflow. The same-key APK is 890,835 bytes, SHA-256
+  `7d40639eeec3041fa3afeccd6f35088399503129df62ac1f40fe3abc9b9cabe0`;
+  the trusted-HTTPS download matches the signed artifact. Original recordings
+  and the previous installer artifact remain retained. Only the idle RoomWalk
+  service was refreshed; canonical Noesis perception stayed running. No physical
+  handset/8K or 10 cm accuracy claim is made.
+
+## 2026-09-19 — RoomWalk separates reconstruction and body-held path capture
+
+- Published same-key Android **0.4.0/code 21** with Capture, Library and optional
+  Setup. Reconstruction supports overlapping room coverage and explicit retained
+  add-view supplements. Path refinement requires a completed reference room and
+  the acknowledged paired Noesis camera; the same walker carries the phone
+  against their own torso and moves their whole body. Ordinary modes do not
+  require board calibration or its saved focus lock. Automatic-mode and
+  locked-focus recording proofs remain separate.
+- RoomWalk server **1.11.0** adds retained intent, hard-linked video/IMU
+  supplements, bounded path-review jobs and downloadable original trajectories
+  with eligible IMU diagnostics. Existing qualified VIO keeps a separate dense
+  trajectory. Raw recordings and legacy calibration evidence remain unchanged;
+  unknown older carry protocols are not invented. Path walks cannot receive
+  reconstruction supplements. No live tracking/world authority is published.
+- Passed **181 focused Python tests**, **40 JavaScript checks**, **37 real Chrome
+  workflows**, and **101 Android emulator assertions** (27 walk-mode, 56 packaged
+  WebView and 18 focus-routing). The served trusted-HTTPS APK matches SHA-256
+  `5f731b57c837fd3e1c41c39fafc13832b6b0f20aa4c360eb5e9a3d7e31038f16`
+  at 878,465 bytes. The idle RoomWalk service was refreshed; the canonical
+  Noesis perception process remained running unchanged. No handset was attached.
+- Reused native scan `20260912-210621-2f755956` and its retained 127-view DA3
+  result without changing source files. A separate motion review admitted 123
+  rotation intervals, with 0.2925 degree median absolute increment difference
+  and 0.9899 rank correlation. This demonstrates retained sensor usability,
+  **not** metric position accuracy. The 10 cm desired error bound, phone-to-body
+  offset, common-room registration and cross-device timing remain unqualified.
+
+## 2026-09-17 — RoomWalk motion prerequisites, focus guards and status recovery
+
+- Published same-key companion **0.3.6** with explicit motion-reference and
+  board-confirmation checks, missing phone-check guidance, native focus metadata,
+  and a Record guard against changing focus inside the motion viewer. Processing
+  failures keep the saved take in the workflow. A transient status failure now
+  displays stale progress and retries instead of silently stopping polling.
+- Missing references/board confirmation are rejected before job creation; each
+  worker independently rechecks prerequisites and rejects captured focus mismatch
+  before target detection. The idle RoomWalk service was restarted to load the
+  submission check; Noesis perception was not restarted. A real invalid submission
+  returned HTTP 422 without adding a job; the original remains calibration-ready.
+- Passed 113 focused Python checks (six optional native tests skipped), 35
+  JavaScript checks, 30 browser workflows, 18 Android focus/routing checks and 53
+  packaged WebView checks. Same-key APK signature and trusted-HTTPS byte hash
+  agree. Emulator checks are not physical-phone 8K capture validation.
+- The retained motion take `20260917-192150-b8ea0d08` uses 3.4364262 diopters,
+  unlike the earlier qualified camera's 2.631579. A camera recovery assessment
+  confined to its first 60 seconds preserved the later motion holdout but was
+  rejected: reverse RMS 2.0241 px and tilt span 12.9185 degrees fail unchanged
+  2 px / 15 degree limits. The rejected result is retained separately; no camera
+  profile, motion fit or metric admission was created from it. Reuse requires a
+  separately qualified camera at the recorded focus and explicit board scale.
+
+## 2026-09-17 — RoomWalk motion prerequisites and focus guidance repaired
+
+- The shared calibration UI now names the missing phone-session check and
+  offers **Check phone** when the camera list is empty after reopening the app,
+  preserving selected calibration references and requiring a separate capture
+  action. This UI correction was source-only at 0.3.5 and is included in 0.3.6
+  above; the earlier Capture-tab **Check phone** action already unblocked capture.
+- Rechecked the retained physical-camera-5 take without rewriting it: all
+  1,827 exact encoded/Camera2 frames now pass the separately verified
+  unsupported-control row-timing contract. Image-centre times stay ordered;
+  active-array crop is 382.5 rows from the top with 2,295 active rows covered.
+  Qualified camera job `cal-20260917-215430-7b59a5563c34` still matches exactly.
+- Noise job `cal-20260916-223747-a816d709d473` is reusable for the same phone's
+  video sensors after exact float32 identity normalization. The only prior
+  mismatch was decimal serialization of native range/resolution values. It
+  remains a usable short-session model, not measured long-term Allan drift.
+- Native rolling-row solver tests exercised both explicit-OFF and verified
+  unsupported-control inputs, including independent translation/time holdouts
+  and deliberate wrong estimates. Focused rejection tests cover missing or
+  contradictory capabilities, geometry, routing, software and controls; a
+  one-ULP sensor change remains rejected. A 12-view native-8K motion-cadence
+  detection smoke completed in 17.18 seconds with two OpenCV threads.
+- Published signed companion **0.3.5** with corrected sharp-range prompts for
+  camera/motion captures. Physical routing, focus settings and retained test
+  bindings are unchanged from 0.3.4. The installer checksum and HTTPS-served
+  APK agree. This publication does not install it on the phone.
+- Motion fitting still requires the new 90-second take. The prior camera
+  observations are sampled sparsely for camera fitting, not a substitute motion
+  sequence. Neither these prerequisite checks nor publication qualify a motion
+  profile or admit metric VIO. Source recordings/results and profile selections
+  were left unchanged; new calibration subprocesses load the repaired backend.
+
+## 2026-09-17 — Existing RoomWalk camera take recovered without recapture
+
+- Bounded opposing-checker-edge localization replaces the initial scaled
+  gradient-intersection refinement. It measures four visible half-edges without
+  K/D or calibration residuals, masks markers/borders, retains raw measurements
+  and rejects an entire view when an image measurement is unsafe or unresolved.
+- Normal server job `cal-20260917-215430-7b59a5563c34` qualified the original
+  `20260916-213706-10346be4` 8K recording: heldout RMS/p95 **1.737/3.129 px**,
+  reverse **1.652/2.900 px**, against unchanged **2/4 px** limits. All 52 original
+  heldout views and their 1,821 scoring-corner identities remain; one training
+  view was rejected by image-local convergence before fitting. No residual-based
+  view selection or source-image modification was used. The profile is exported
+  but not selected automatically; camera–IMU, motion-profile and metric-VIO
+  admission remain separate.
+- Passed 156 focused Python checks (five optional native IMU-solver tests
+  skipped), 15 calibration-UI tests and the Java capture-guide assertions.
+  The checks include 81 known-pixel blur/gutter/rotation/shear/noise fixtures,
+  generated-board detection and the real decoder/refinement/hull consumer. A
+  direct native 8K frame matched the offline experiment exactly; the complete
+  server rerun reproduced its qualification metrics.
+- Camera/motion prompts now limit movement to the locked focus's sharp range;
+  closer/farther movement must not defocus the board. This native wording is a
+  source correction at this milestone, subsequently published in 0.3.5 above.
+  Existing captures/results, selected calibration and live Noesis are unchanged.
+
+## 2026-09-17 — RoomWalk native-resolution corner refinement
+
+- Offline camera calibration adds image-scale-aware, marker/border/neighbor-
+  bounded chess-corner refinement. Per-view artifacts retain original points,
+  actual window sizes, displacements and explicit failures; unsafe views remain
+  retained and rejected. Camera fitting and qualification limits are unchanged.
+- Focused calibration/job checks passed (75 tests; five optional native-solver
+  tests skipped). Independent known-geometry tests cover pixel conventions,
+  resolution scaling, geometry bounds, failure evidence and a softened checker
+  with a bright gap that traps the original ten-pixel refinement window.
+- This is a localization implementation correction, not a qualified phone fit.
+  Existing recordings/results are preserved; revised phone results require a
+  new calibration job and the same independent acceptance checks.
+
+## 2026-09-16 — RoomWalk locked-lens capture and in-place recovery
+
+- RoomWalk 0.3.4 pins preview and encoder outputs to the measured physical lens
+  when focus is locked. The actual physical capture result supplies timestamps,
+  focus controls and camera identity; logical metadata is retained separately.
+  Old logical-output calibration/timing evidence cannot qualify the new path.
+  Missing physical evidence or rejected 8K support is explicit, with no lens,
+  resolution or timestamp fallback. A fresh ten-second phone test is required.
+- Preview failures expose an in-place restart after confirmed camera release.
+  Five seconds without ongoing preview/camera/encoder frames stops explicitly;
+  interrupted takes show their actual duration and reason, retain originals and
+  cannot appear as completed calibration acquisitions.
+- Passed 14 Android output-routing/stall checks, 15 actual preview/recovery
+  checks (including a deliberately stopped preview stream), 49 packaged WebView
+  checks, 32 JavaScript checks, 26 browser workflows and 20 focused import/binding
+  tests. Phone-width interrupted-capture presentation was inspected. Physical
+  Samsung 8K lens routing remains unverified until the handset test; emulator
+  checks do not establish that capability or calibration quality.
+- The same-key APK and trusted-HTTPS served checksum were verified. Installation
+  preserves saved data; no backend or Noesis service restart was needed. Earlier
+  recordings and qualification thresholds are unchanged.
+
+## 2026-09-16 — RoomWalk save handoff and calibration recovery
+
+- RoomWalk 0.3.3 repairs the camera-close snapshot that could consume the pending
+  save handoff before the ZIP existed. Native finalization stays busy; the shared
+  UI completes only the acquired capture's new artifact and offers its upload.
+- Check/reuse names missing processed sources and failed result loading instead
+  of showing empty disabled selectors. Recovery resumes existing full camera or
+  motion takes from the phone/server, restores their own capture-bound settings,
+  and excludes short timing tests. Upload, processing and profile selection remain
+  explicit; no qualification gate or raw recording changed.
+- All 32 focused JavaScript checks, 25 browser workflows and 47 packaged Android
+  checks passed, including actual native stop ordering and retained-take context.
+  Phone-width layouts were inspected. Android acquisition was exercised in an
+  emulator, not on the physical 8K phone. The same-key APK and served HTTPS
+  checksum were verified; backend and Noesis services did not need restarting.
+
+## 2026-09-15 — In-place RoomWalk calibration workflow
+
+- RoomWalk 0.3.2 keeps each calibration take's save, upload, processing and next
+  action in the same view. Receipt and job identities bind the exact take;
+  rejected results retain evidence and explain the corrective action. Optional
+  settings, measurements and history begin collapsed.
+- Stationary acquisition follows a five-second settling countdown. Native
+  duration and actual accelerometer/gyroscope counts appear at the top without
+  scrolling. Preparation is cancellable and is not counted as recorded data.
+  Camera controls explain the locked-focus/exact-mode timing-test prerequisite;
+  optional repeats collapse once that check has passed. Quality gates are unchanged.
+- All 30 focused JavaScript checks, 20 browser workflows and 42 packaged Android
+  WebView checks passed. Android sensor recording/packaging and the rendered
+  countdown, telemetry and saved-next-action screens were exercised in the
+  emulator, not on the user's physical 8K camera. No backend or Noesis runtime
+  restart was needed. The same-key APK update preserves installed data.
+
+## 2026-09-15 — RoomWalk native refresh acknowledgement repair
+
+- RoomWalk 0.3.1 acknowledges explicit native commands even when their result
+  matches the last published status. Background updates remain deduplicated;
+  real busy/capture gates remain authoritative. This repairs stationary capture
+  controls left disabled after **Refresh phone** or a foreground refresh.
+- The new Android regression reproduced the unchanged-refresh failure on the
+  delivered 0.3.0 APK. The corrected APK passed 35 WebView checks, including
+  repeated refresh, foreground notification, actual emulator sensor start/stop,
+  retained packaging and unchanged error replies. All 29 focused JavaScript
+  checks passed. Emulator acquisition is not physical-phone calibration proof.
+- The same-key update preserves installed data. No backend or Noesis perception
+  restart is required. See the [companion guide](../tools/mapanything_phone_scan/android_companion/README.md).
+
+## 2026-09-15 — Guided short RoomWalk calibration and checked motion profiles
+
+- RoomWalk 0.3.0 adds a numbered setup with 60-second stationary sensors,
+  60-second camera coverage and 90-second camera–IMU motion. The board remains
+  fixed while the phone moves. Native timed prompts and automatic board-take
+  stops guide acquisition; ordinary walks retain manual stopping.
+- Short noise processing retains measured white noise and explicitly modelled
+  drift. Existing camera/extrinsic/time gates are unchanged. A fixed OpenVINS
+  profile check compares independent heldout board motion without rescaling or
+  refitting calibration. Passing profiles can be selected for future matching
+  native walks up to five minutes; earlier scans and raw evidence are unchanged.
+- The CPU VIO consumer applies the actual correction matrices and signed timing,
+  preserves separate source/centre-exposure timestamps, and bounds only its own
+  full-D5 image analysis to 1280 pixels. Direct tracking coverage/gap/reset and
+  slow-walk sanity checks remain required. This is not rolling-shutter
+  compensation, physical-phone calibration proof or Noesis world admission.
+- Focused profile/API/native-adapter tests and three native EuRoC functional
+  checks passed. The signed APK, shared browser UI and 25 Android WebView checks
+  passed; the packaged guided screen was visually inspected. EuRoC/emulator
+  evidence is not phone 8K calibration or room-accuracy validation.
+- With existing operational approval and no active jobs/captures, only RoomWalk
+  restarted at 23:25 UTC with backend 1.10.0 and the rebuilt bridge. Health and
+  motion-selection endpoints were verified. The Noesis perception supervisor
+  retained its PID/start time. See the
+  [guided workflow](../tools/mapanything_phone_scan/android_companion/README.md)
+  and [consumer policy](../tools/mapanything_phone_scan/native/roomwalk_calibration/README.md).
+
+## 2026-09-14 — Unified Android RoomWalk workspace and calibration processing
+
+- RoomWalk 0.2.0 packages the shared web UI and 3D viewer into Android, replacing
+  the separate native form screen with Capture, Library and Calibration tabs.
+  Native Camera2/MediaCodec timing, paired static capture, saved artifacts,
+  export/share and background uploads remain native capabilities.
+- Added same-recorder ChArUco Camera/lens and Camera–IMU recording intent,
+  editable board defaults, bounded offline jobs, cancellation, retained reports
+  and separate stationary IMU noise processing. Qualified camera intrinsics may
+  be explicitly selected for future exactly matching native walk imports.
+  Earlier scans, live world calibration and metric-VIO admission are unchanged.
+- The signed APK and served installer checksum were verified. Focused capture,
+  noise, calibration-job and intrinsic-consumer tests passed, alongside rendered
+  browser UI tests and Android WebView, preview-orientation and paired-lifecycle
+  instrumentation. Emulator evidence is not physical-phone 8K validation.
+- The retained September 14 native board capture produced a real full-resolution
+  fit, with 31 training and 35 heldout views. It remained rejected for changing/
+  unlocked focus, missing distortion-mode evidence and heldout error. The new
+  recorder exports physical-sensor geometry and per-frame sensor pixel mode;
+  metadata presence alone does not admit rolling-shutter correction.
+- With user approval, the RoomWalk service was restarted at 20:14 UTC and
+  backend 1.9.0 became active. Verified HTTPS health, calibration/history/profile
+  endpoints, the configured pinned camera–IMU solver, 10 retained scans and
+  three available room cameras. No active captures or processing jobs were
+  interrupted; the Noesis perception process and its start time were unchanged.
+  The served APK checksum still matched. See the
+  [calibration contract](../tools/mapanything_phone_scan/native/roomwalk_calibration/README.md)
+  for solver validation and the separate physical-device/admission limits.
+
+## 2026-09-13 — Looping replay shutdown and depth-test maintenance
+
+- The native EOS bridge now drains the declared internal terminal sinks of
+  looping `nvurisrcbin` file sources, using exact bounded path resolution and
+  shutdown-only late-buffer guards. It still requires real pipeline EOS and
+  wait completion. The affected DS9.1 plugin was rebuilt and its source/binary
+  provenance refreshed; engine realizations were preserved.
+- Two matched occupied replays reproduced watchdog termination near 75 s.
+  With the correction, an 86 s occupied replay exited normally in 1.62 s from
+  its interrupt, completed native finalization and decoded 197 WebRTC frames.
+  Controllers now allow configured native grace plus a margin and report a
+  failed shutdown separately from successful observation.
+- Fourteen existing depth-adapter failures were stale fixtures or superseded
+  expectations. Updated tests preserve queue-admitted metric authority, typed
+  body evidence and shallow-ray rejection; 46 depth tests pass. Native EOS and
+  control/graph checks also pass, including invalid target rejection and safe
+  late-buffer/list handling.
+- Calibration follow-up confirmed that current target-frame ray geometry and
+  configured height disagree, while the existing depth plateau was fitted from
+  learned references. No independent physical correction is qualified; the
+  required survey, heldout reprojection and same-anchor depth protocol is
+  documented in the task's retained diagnostic report.
+
 ## 2026-09-13 — Walk-derived identity repair and independent trajectory review
 
 - The native baseline now reserves tracking lifecycle identity before StableID
@@ -263,6 +608,24 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   passed and rejected static fits, comparison figures, and an aligned consensus
   GLB with its exact transform and source bindings. The existing walk stays intact.
 
+## 2026-09-07 — Scope operational guidance and correct indexed behavior
+
+- Made generator delivery reflect failed/skipped checks, detector engine builds
+  follow the consumer profile, and detection checks use known positive/negative
+  fixture expectations. Benchmarking is bounded and optional; utility setup
+  installs only phase-relevant dependencies.
+- Split PCF candidate/evaluation work from authorized admission, binding and
+  activation while retaining all existing authority gates. Shortened profiling
+  routing and moved new-graph procedures into a selected reference.
+- Corrected pose/StableID wiring, conditional identity topology and browser
+  camera/motion capture descriptions against source/config evidence. Added
+  section navigation to the major contracts and phone guide, and included the
+  changed operational references in the documentation checker.
+- Documentation consistency passed across 104 active Markdown files; 83 new
+  navigation/reference fragments and 22 shell examples passed focused checks.
+- This milestone changes guidance and documentation. It does not claim a live
+  perception run, engine build, runtime cutover or performance improvement.
+
 ## 2026-09-07 — Phone calibration import and calibrated reconstruction geometry
 
 - Imported the supplied `roomwalk_phone_video` 8K handoff after checking all
@@ -342,6 +705,22 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   The reloaded phone service passes health and retains the existing passing
   alignment. Independent room measurements and new connector observations
   remain outstanding; intrinsic and metric-VIO work was explicitly deferred.
+
+## 2026-09-06 — Agent instruction hierarchy aligned with implementation
+
+- Centralized inherited policy at the root and kept existing subtree files
+  focused on local responsibilities and task-specific references.
+- Added scoped core-contract, identity, and phone-walk guidance, with root
+  routing for changes that cross directory boundaries.
+- Clarified practical DS9 validation, exact canonical publication cohorts,
+  and the external artifact-realization location.
+- Added all ten repository instruction files to local-link and stale-reference
+  checks. Documentation and instruction validation does not imply a runtime
+  or model-performance change.
+- Five read-only instruction scenarios resolved the intended scopes: DS9 docs,
+  occupied-recording repair without live service, identity integration, capture
+  UI/metric-VIO admission, and world-revision mismatch. These check guidance
+  interpretation, not application execution.
 
 ## 2026-09-06 — Room fitting uses visible structure and a reusable replay procedure
 
@@ -444,6 +823,18 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   as the cause of its existing cross-window alignment failure, and that failed
   run was preserved.
 
+## 2026-09-05 — Agent workflow and skill routing clarified
+
+- Split existing-pipeline diagnosis from new-graph profiling presets; preserved
+  canonical quality, outputs, and ordered publication requirements.
+- Routed new detector imports separately from existing-engine and non-detector
+  maintenance, made full reports conditional, and excluded encoder fallbacks.
+- Resolved generator requirements from checkout and host evidence before questions.
+- Made AMC/SOP skills explicit-only and added bounded investigation delegation
+  with a project limit of two concurrent subagents.
+- Expanded docs-consistency coverage to the importer, generator, and requirement
+  reference. These are agent setup changes; runtime behavior is unchanged.
+
 ## 2026-09-05 — Room Walk gets a trusted LAN HTTPS origin
 
 - Kept the existing phone-scan HTTP listener on port 8788 for known consumers
@@ -512,6 +903,37 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   [`WO-3`](../plans/reconstruction_work_orders/WO-3.md),
   [`WO-4`](../plans/reconstruction_work_orders/WO-4.md), and
   [`WO-5`](../plans/reconstruction_work_orders/WO-5.md).
+
+## 2026-09-02 — Non-upright body footprints take BEV authority
+
+- Removed the population-average seated-torso height and standing-height
+  fraction from canonical localization. Pose-only seated projection now exists
+  only after exact registered pose-torso depth measures that lifecycle's anchor
+  height. Removed the circular standing-to-sitting calculation that forced the
+  current torso ray through the prior standing footprint and therefore could
+  preserve that stale point by construction. References reset with posture,
+  tracker lifecycle, or world-frame revision. No room/camera offset or
+  floorplan-side correction was introduced.
+- Made typed seated and lying body footprints outrank simultaneous ankle/floor
+  rays for the same non-upright observation. Standing/unknown behavior is
+  unchanged, untyped torso ranges remain non-authoritative, and mixed support
+  states are still never fused.
+- Extended exact-current registered body projection to lying posture with an
+  explicit `couch` support type, while retaining floor/process continuation
+  when no trustworthy body measurement exists.
+- Tightened only the trusted non-upright body-update deadzone to 0.10 m and set
+  its minimum posterior gain to 0.30. This closes stale foot-derived residuals
+  quickly while preserving the existing physical jump, output-speed,
+  same-basis reacquisition, stationary lock, and trail rules.
+- Made exact registered non-upright body depth explicit relocation proof and
+  grouped its intermittent DAv2 rows with pose interpolation from the same
+  measured torso plane. Three mutually consistent rows can now reanchor from
+  the stale standing footprint even after image motion has stopped.
+- Restarted the native producer and confirmed the pipeline, all source
+  progress, and BEV healthy with always-on DAv2 frames advancing at the
+  configured every-other-frame cadence. The focused standing-to-seated trace
+  reached the measured couch footprint across intervening no-depth rows. No
+  camera calibration, identity, Menon, or room-specific policy changed.
 
 ## 2026-08-31 — Living Room BEV uses its full PCF-derived camera pose
 

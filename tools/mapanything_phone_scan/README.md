@@ -21,6 +21,98 @@ silently mixed into phone-only inference or fusion.
 This tool saves review candidates. It does not automatically publish them into
 the live native DS9.1 depth, tracking, floorplan, or virtual-twin contracts.
 
+## Current RoomWalk 0.4.2 overview
+
+The current capture UI separates two user purposes:
+
+- **Reconstruction** builds a room from many sharp, overlapping viewpoints.
+  Pairing a Noesis room camera is optional. After a reconstruction completes,
+  **Add views** is an explicit supplement action; it never silently replaces the
+  retained room scan.
+- **Path refinement** is a different protocol. The same walker holds the phone
+  against their own torso with elbows tucked and stable, then turns and moves
+  their whole body with the phone. It requires a native paired Noesis camera and
+  a completed reference reconstruction before review.
+
+The packaged workspace is organized as **Capture**, **Library**, and **Setup**.
+Capture chooses the purpose and records the native evidence; Library retains
+the original capture, selected reconstruction views, supplements, VIO outputs,
+paired references and review exports; Setup contains the optional advanced
+camera/IMU calibration workflow. Ordinary reconstruction and path-refinement
+capture do not require a saved calibration selection or calibration-specific
+focus lock. RGB reconstruction remains available without calibration. Native
+8K/device capability and timing checks still apply, including a possible
+10-second automatic-mode timing check when only a locked-focus board-mode proof
+is retained; that check does not require a new full calibration. A bounded device
+availability check is evidence about the phone's recording path, not a reason to
+make focus the primary user workflow.
+
+Path processing uses RoomWalk server 1.13.0 or newer. The path-room selector
+explicitly marks a retained **Noesis PCF** version when the configured Scene
+Prior catalog binds that exact source scan. Its revision, camera, manifest digest
+and frame-binding digest travel with the native capture as `target_reference`.
+Review verifies the retained fused artifact and the walk's matching calibrated
+world binding; it never falls back to the source scan's original raw model or
+failed alignment. The selected manifest, points and binding are retained in the
+review downloads. Missing, changed or mismatched references stop explicitly.
+The read-only catalog defaults to `data/scene_priors/catalog.json` and can be
+configured with `NOESIS_PHONE_SCAN_SCENE_PRIOR_CATALOG`; selection does not change
+that catalog or live Noesis.
+
+Choose **DA3** when processing a path walk and align it to its paired static
+camera before selecting **Review path**. An explicitly selected PCF reference
+already has its own verified registration; do not re-align its original raw
+scan. An ordinary reference without a PCF selection still needs its own passed
+alignment to the same calibrated Noesis world. The review runs
+the existing bounded visual-revisit pose graph and reserves the final 30 percent
+for a temporal check. It retains accepted corrections separately; a rejected
+candidate never replaces the original path. A completed MapAnything trajectory
+can be compared, but this correction adapter requires DA3.
+
+If the capture already admits metric VIO, path review runs the qualified
+OpenVINS worker when needed and uses its validated relative constraints. A scale
+change additionally requires fresh independent static-geometry registration;
+the candidate uses that new transform. Missing calibration never authorizes raw
+accelerometer integration. The gyro consistency diagnostic remains available
+separately, and dense VIO evidence is retained alongside selected-view results.
+
+Older captures are not implicitly relabelled: their raw files and original
+intent remain unchanged when intent was not recorded. The retained-capture
+supplement API (`POST /api/scans/{scan_id}/supplements/from-scan` with an
+explicit `source_scan_id`) hard-links the source video and safe raw-capture
+members into a new supplement directory before preparation. Path review is
+also explicit (`POST /api/scans/{scan_id}/path-review`): Library shows the
+registered original/reference phone paths against an explicitly selected Noesis
+lifecycle, with a time selector and JSON/CSV downloads. It never chooses the
+walker by whichever track fits best. Missing world positions, prediction/hold,
+revision conflicts and path gaps remain excluded from measured comparisons.
+The normal native clock bridge uses recorded HTTP probes and Noesis callback
+times, not verified acquisition synchronization. The displayed horizontal
+camera-center/ground-point separation is not body-position error. The 10 cm
+value remains the desired validation target; the user considers 20 cm noticeable.
+Neither physical-position error bound has been independently demonstrated.
+
+An explicit offline review can reuse retained external outputs without changing
+the scan's prepared IDs, raw files, intent or processing state:
+
+```bash
+python3 -m tools.mapanything_phone_scan.path_review \
+  --scan-dir "$SCAN_DIR" --source-output-manifest "$DA3_OUTPUT/scan_outputs_manifest.json" \
+  --source-alignment-dir "$ALIGNMENT_DIR" --companion-dir "$COMPANION_DIR" \
+  --temporal-alignment "$LIGHT_REVIEW/temporal_alignment.json" \
+  --output-dir "$NEW_REVIEW_DIR"
+```
+
+The optional light-timing input must bind the exact phone archive and recorded
+tracking cohorts; it is not silently substituted by a clock fit. Partial DA3
+outputs preserve omitted prepared indices. On the retained September 12 walk,
+127 camera poses and 123 supported gyro intervals produced ten fitting
+constraints, but six withheld constraints rejected the proposed correction
+(0.417 m p80 constraint residual versus the existing 0.350 m limit). The
+original path remains available with 101 light-timed paired samples. Its
+original carry protocol is unknown, and neither those residuals nor the paired
+separations establish physical path accuracy.
+
 The [canonical end-to-end Prior-Conditioned Fusion (PCF) operating and handoff
 runbook](../../docs/PCF_Workflow.md) carries the process from capture through
 the sealed evidence bundle, immutable Scene Prior, runtime binding, and
@@ -30,11 +122,27 @@ detail are in
 
 ## Find the relevant workflow
 
+The RoomWalk Android companion packages this complete web workspace inside
+[RoomWalk for Android](android_companion/README.md#one-workspace), alongside
+native Camera2/IMU recording and background transfers. Its optional Setup section
+records and processes ChArUco camera/lens or camera–IMU evidence using that same
+recorder. Computation remains on this host. The
+[calibration solver contract](native/roomwalk_calibration/README.md) describes
+the CPU dependency, evidence checks and separate metric-VIO admission boundary.
+
+For the optional board-calibration protocol, keep focus fixed and the board
+sharp. Focus at the intended working distance before locking, then vary
+position/angle only within the sharp range; do not pursue closer/farther views
+that defocus the target.
+Offline corner measurement uses bounded opposing-edge localization, preserves
+rejected evidence, and does not use fitted residuals to choose image points.
+Qualification still requires the independent native-pixel holdout checks.
+
 | Task | Section |
 | --- | --- |
 | Start the browser/service and inspect configuration | [Service](#start-the-service), [configuration](#configuration) |
 | Import measured phone calibration | [Phone-camera calibration](#measured-phone-camera-calibration) |
-| Capture/upload a walk and pair static evidence | [Capture workflow](#capture-and-single-provider-workflow), [paired static capture](#paired-static-camera-capture) |
+| Capture/upload a reconstruction or required paired path refinement | [Capture workflow](#capture-and-single-provider-workflow), [paired static capture](#paired-static-camera-capture) |
 | Browser motion recording versus native metric-VIO prerequisites | [Browser camera/IMU](#browser-camera--imu-capture), [synchronized capture](#synchronized-camera--imu-capture), [native timing preflight](#native-timing-preflight-before-a-new-room-walk) |
 | Extend a retained walk or inspect provider inputs | [Add video](#adding-another-video-to-an-existing-walk), [provider semantics](#provider-semantics) |
 | Fuse and diagnose phone-only geometry | [Consensus fusion](#consensus-fusion-workflow), [diagnostic views](#heatmap-style-diagnostic-views) |
@@ -320,9 +428,9 @@ remain separate.
 
 ## Paired static-camera capture
 
-The native RoomWalk companion is the selected phone route. Version 0.1.11 pairs
-its Camera2 video and both IMU streams with the chosen static camera. In the app,
-select the room camera, open **Capture**, and use **Record**. Static encoded
+The native RoomWalk companion is the selected phone route. For path refinement
+(and optional reconstruction pairing), select the room camera, open **Capture**,
+and use **Record**. Static encoded
 video and canonical tracking must be ready before the phone recording starts.
 **Stop and save** closes both recordings; **Upload** sends the
 phone bundle with the exact saved static-session reference. Interrupted uploads
@@ -453,7 +561,9 @@ back to exact prepared frames. The result contract is
 `noesis.phone_capture.vio_result.v1`; its camera axes are OpenCV
 `x_right_y_down_z_forward`, its estimator world is z-up/gravity-up, and its
 covariance convention is declared in the result. OpenVINS is a conventional
-fixed estimator; VI3 remains deferred.
+fixed estimator; VI3 remains deferred. The qualified VIO result remains an
+independent dense trajectory artifact; it does not replace the selected
+reconstruction views or turn the camera path into a person's path.
 
 Native captures also use IMU motion during ordinary reconstruction preparation,
 without requiring metric VIO. For each exact Camera2 frame, the processor retains
@@ -499,15 +609,15 @@ run commands, and the public EuRoC monocular execution/evaluation evidence are
 recorded in [`native/README.md`](native/README.md) and
 [`plans/reconstruction_work_orders/WO-2.md`](../../plans/reconstruction_work_orders/WO-2.md).
 
-### Native calibration recordings
+### Optional/protocol-specific calibration recordings
 
-Normal room walks always retain both IMU streams. Companion 0.1.7 places its
-separate sensor-only recorder under advanced diagnostics, defaults to one minute,
-and caps it at five minutes. It opens neither camera nor encoder. Completion,
-early stop, backgrounding and resource limits retain the acquired samples and
-stop reason. These short recordings can check sensor behavior; they do not
-measure long-term bias random walk. The former three-hour default is withdrawn
-from the room-walk workflow.
+All native room walks retain both IMU streams. The separate sensor-only recorder
+is an optional advanced diagnostic: it defaults to one minute, caps at five
+minutes, and opens neither camera nor encoder. Completion, early stop,
+backgrounding and resource limits retain the acquired samples and stop reason.
+These short recordings can check sensor behavior; they do not measure long-term
+bias random walk. The former three-hour default is withdrawn from the normal
+room-walk workflow.
 
 The archive contains exactly `imu_capture_manifest.json`, `accel.csv`, and
 `gyro.csv`. It retains native integer timestamps, SI units, Android device axes,
@@ -519,11 +629,13 @@ The receiver verifies each stream's counts, hashes, sizes, timestamp counters,
 and declared units before saving the original ZIP, CSVs, manifest and receipt.
 A partial recording remains evidence. Uploading never marks IMU noise calibrated.
 
-If an offline camera/IMU calibration recording is explicitly needed, select the same lens, 8K mode,
-zoom and orientation as room walks. In the live viewer, focus on the calibration
-target, then use **Lock focus** to retain the actual reported lens setting.
+If the optional camera/IMU calibration protocol is explicitly needed, select the
+same lens, 8K mode, zoom and orientation as the intended calibrated import. In
+the live viewer, focus on the calibration target, then use **Lock focus** to
+retain the actual reported lens setting.
 The explicit lock is camera-bound and persists across preview and recording;
-keep it for subsequent room walks using that calibration. Unsupported manual
+keep it for subsequent native imports only when that optional calibration is
+explicitly selected. Unsupported manual
 focus or an unavailable lens reading fails the lock instead of guessing a
 setting. **Unlock focus** returns to automatic focus and ends that matching
 calibration configuration. Keep stabilization off and verify actual capture
@@ -540,9 +652,48 @@ plausible trajectory. The imported Android report recomputes full admission
 only after exact camera/encoder timing, actual OIS/EIS settings, required
 calibration, geometry and IMU coverage have all been checked.
 
+#### Short reusable motion profile
+
+The optional motion-profile protocol guides three bounded takes: 60 seconds of stationary sensors
+(camera off), 60 seconds of camera/lens coverage, and 90 seconds of camera–IMU
+motion. Both board recordings keep the board fixed and move the phone; the
+native preview shows timed prompts and stops automatically. Ordinary one-to-five
+minute walks start with eight seconds still, move slowly, and revisit the start
+before a still finish. These are acquisition instructions, not quality badges.
+
+The short sensor model checks training/heldout stationarity and measures white
+noise. Its conservative drift coefficients retain `kind: model_prior` and
+`imu_noise_calibrated: false`; the optional full Allan method remains separate.
+Camera/extrinsic/offset gates are unchanged. **Check motion profile** runs the
+fixed OpenVINS consumer and compares it with the camera–IMU job's independent
+visual-only target holdout, without scale fitting or calibration refitting.
+Passing means the versioned short-profile check passed, not certified room
+accuracy or a long-duration drift measurement.
+
+`POST /api/calibration/motion-profile-jobs` accepts exactly
+`camera_calibration_id`, `imu_calibration_id`, and `noise_calibration_id`.
+`GET/POST /api/calibration/motion-selection` reads/sets a passing job using
+`motion_calibration_id` (or null to clear). Only future native walk imports
+snapshot it, together with its associated camera intrinsics. Binding mismatch,
+changed consumer/configuration, missing physical exposure metadata, excessive
+duration or camera motion keeps metric VIO blocked with an explanation; RGB
+reconstruction remains available. Raw imports and earlier scans are not changed.
+
+The consumer applies `matrix * raw - bias` once before asynchronous interpolation,
+transforms scalar noise conservatively, and uses measured signed timing/extrinsics.
+It bounds VIO-only image analysis to a 1280-pixel maximum side with explicit
+pixel-centre K/full-D5 mapping, retaining every dense frame and the unchanged 8K
+recording/reconstruction path. Image-centre exposure time is `pose_time_ns`;
+`capture_time_ns` remains the exact original Camera2 acquisition identity.
+This is a tested global-shutter approximation within the profile's observed
+rotation/exposure envelope, not rolling-shutter compensation. Normal-walk VIO
+tracking and static alignment still need their own checks. No profile publishes
+Noesis world calibration or mixes static frames into phone-only consensus.
+
 The OpenVINS input adapter handles a five-coefficient Brown-Conrady camera by
 rectifying every dense encoded image with all five supplied coefficients,
-preserving the supplied K and encoded dimensions. It carries a hashed mask for
+preserving the supplied K and encoded dimensions for the original input mode;
+the short-profile mode uses the explicit VIO-only scaling above. It carries a hashed mask for
 invalid border pixels into the native bridge and requires confirmation that
 those pixels were excluded. It never truncates the fifth coefficient. Models
 outside the explicit supported pinhole/fisheye contracts remain rejected.
@@ -550,10 +701,18 @@ outside the explicit supported pinhole/fisheye contracts remain rejected.
 ## Adding another video to an existing walk
 
 After the first reconstruction completes, select **Add Video** to record another
-pass or **Use saved video** to upload one already on the phone. The upload and
-its prepared frames are immediately auto-saved below
+pass or **Use saved video** to upload one already on the phone. This is an
+explicit additive reconstruction supplement, not an implicit relabeling of the
+source capture. The upload and its prepared frames are immediately auto-saved below
 `<scan-id>/supplements/<addition-id>/`; the original video, prepared views, and
 reconstruction outputs are never overwritten.
+
+For a retained capture already in the Library, the server endpoint
+`POST /api/scans/{scan_id}/supplements/from-scan?source_scan_id=<id>` creates
+the supplement by hard-linking the source video and safe raw-capture members.
+The links avoid a multi-gigabyte copy while retaining the original evidence;
+preparation and integration still create a new versioned supplement revision
+under the target scan.
 
 An addition uses the provider selected for the original reconstruction. Before
 using the GPU, the service searches the current reconstruction's retained RGB
@@ -584,6 +743,18 @@ transform is composed into a Noesis-world derivative of the merged revision.
 If Noesis registration happens later, that derivative is generated when the
 alignment completes. Deleting an addition is allowed only from the newest end
 of a dependent revision chain.
+
+### Path-refinement review
+
+After the path-refinement visual reconstruction is complete, **Review path**
+calls `POST /api/scans/{scan_id}/path-review` with the recorded
+`target_scan_id`. The reference must be a completed reconstruction. Each run
+creates a new review directory and exports the original provider camera poses,
+the native IMU rotation-consistency diagnostic when eligible, and retained
+paired Noesis references. It does not modify the raw capture or apply inertial
+position correction. A phone optical-center path is not a body ground-truth
+trajectory, and the review does not certify the desired 10 cm target (a 20 cm
+error is noticeable; the target remains unachieved).
 
 The browser runs one base provider per scan. A completed, quality-gated DA3
 alignment exposes the optional PCF action, which runs conditioned MapAnything
@@ -1077,6 +1248,13 @@ unvalidated transform is not sufficient for live tracking.
 The [trajectory motion reviewer](trajectory_motion_review.py) compares saved
 provider camera poses with native gyro and accelerometer evidence. Run it in
 the Room Walk environment with an explicit split reserved for heldout review:
+
+The retained review of `data/mapanything_phone_scans/20260912-210621-2f755956`
+used an existing external modern127-pose DA3 artifact and found 123 supported
+rotation intervals, with a 0.2925° median rotation error and 0.9899 median
+rotation correlation (`rho`). This demonstrates sensor usability for the
+rotation diagnostic only; it does not demonstrate positional accuracy, body
+offset, or the desired 10 cm path result.
 
 ```bash
 python3 -m tools.mapanything_phone_scan.trajectory_motion_review \

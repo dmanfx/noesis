@@ -75,7 +75,9 @@ CANONICAL_SIZE = "m"
 CANONICAL_TRACKING_MODE = "baseline"
 PIPELINE_CONFIG = "DS9/config/infer.yaml"
 CAMERAS_CONFIG = "config/cameras.yaml"
-OPT_IN_TRACKING_MODES = (CANONICAL_TRACKING_MODE, "mv3dt")
+OPT_IN_TRACKING_MODES = (CANONICAL_TRACKING_MODE, "v3dt", "mv3dt")
+V3DT_PIPELINE_CONFIG = "DS9/config/infer_v3dt.yaml"
+V3DT_CAMERAS_CONFIG = "DS9/config/cameras_v3dt.yaml"
 MV3DT_PROFILE = "yolo26"
 MV3DT_SIZE = "m"
 MV3DT_PIPELINE_CONFIG = "DS9/config/infer_mv3dt.yaml"
@@ -266,6 +268,15 @@ def _runtime_lane(tracking_mode: str) -> dict[str, str]:
             "pipeline_config": PIPELINE_CONFIG,
             "cameras_config": CAMERAS_CONFIG,
         }
+    if mode == "v3dt":
+        return {
+            "name": "v3dt",
+            "tracking_mode": "v3dt",
+            "pgie_profile": CANONICAL_PROFILE,
+            "model_size": CANONICAL_SIZE,
+            "pipeline_config": V3DT_PIPELINE_CONFIG,
+            "cameras_config": V3DT_CAMERAS_CONFIG,
+        }
     if mode == "mv3dt":
         return {
             "name": "mv3dt",
@@ -355,7 +366,7 @@ def build_health_context_env(
         state_release_id=state_release_id,
         runtime_family="ds9",
         runtime_variant=(
-            "ds9:v3dt" if selected_mode == "mv3dt" else "ds9:baseline"
+            "ds9:v3dt" if selected_mode in {"v3dt", "mv3dt"} else "ds9:baseline"
         ),
         software_revision=software_revision,
         boot_id=boot_id,
@@ -983,8 +994,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=OPT_IN_TRACKING_MODES,
         default=CANONICAL_TRACKING_MODE,
         help=(
-            "Runtime tracking lane. Baseline remains the default; mv3dt is an "
-            "explicit Kitchen/Family Room opt-in."
+            "Runtime tracking lane. Baseline remains the default; v3dt opts in "
+            "to per-camera 3D tracking, and mv3dt adds Kitchen/Family Room peers."
         ),
     )
     parser.add_argument(

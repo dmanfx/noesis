@@ -54,8 +54,14 @@ default_pgie = SimpleNamespace(
     size=None,
 )
 assert runtime._resolve_pgie_selection(default_pgie, "baseline") == ("yolo26", "m")
-assert runtime._resolve_pgie_selection(default_pgie, "v3dt") == ("yolo26_seg", "s")
+assert runtime._resolve_pgie_selection(default_pgie, "v3dt") == ("yolo26", "m")
 assert runtime._resolve_pgie_selection(default_pgie, "mv3dt") == ("yolo26", "m")
+explicit_seg = SimpleNamespace(
+    pgie_profile="yolo26_seg", _pgie_profile_explicit=True, size=None,
+)
+assert runtime._resolve_pgie_selection(explicit_seg, "v3dt") == ("yolo26_seg", "s")
+assert runtime._resolve_pgie_selection(explicit_seg, "baseline") == ("yolo26_seg", "m")
+assert runtime._resolve_pgie_selection(explicit_seg, "mv3dt") == ("yolo26_seg", "s")
 
 try:
     runtime._v3dt_profile_for_tracking_mode("baseline")

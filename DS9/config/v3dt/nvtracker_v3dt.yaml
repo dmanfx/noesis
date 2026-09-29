@@ -62,15 +62,16 @@ ObjectModelProjection:
   - DS9/config/v3dt/caminfo_baseline/camInfo_family-room.yml
   objectModelType: 0
 VisualTracker:
-  visualTrackerType: 2
-  vpiBackend4DcfTracker: 1
+  # Occupied replay: native NvDCF with the baseline visual feature preset.
+  # The 3D estimator, pose, association and lifecycle gates remain enabled.
+  visualTrackerType: 1
   useColorNames: 1
-  useHog: 1
-  featureImgSizeLevel: 5
-  featureFocusOffsetFactor_y: -0.1054
-  filterLr: 0.0767
-  filterChannelWeightsLr: 0.0339
-  gaussianSigma: 0.5687
+  useHog: 0
+  featureImgSizeLevel: 2
+  featureFocusOffsetFactor_y: -0.1
+  filterLr: 0.075
+  filterChannelWeightsLr: 0.015
+  gaussianSigma: 0.75
 ReID:
   reidType: 2
   batchSize: 32

@@ -120,17 +120,20 @@ def test_canonical_command_uses_host_storage_and_baseline_lane(tmp_path: Path) -
     assert argv[argv.index("--rest-port") + 1] == "8080"
 
 
-def test_mv3dt_command_is_an_explicit_native_host_lane(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tracking_mode", ["v3dt", "mv3dt"])
+def test_3d_command_is_an_explicit_native_host_lane(tmp_path: Path, tracking_mode: str) -> None:
     storage = tmp_path / "depth"
     argv = host.canonical_runtime_arguments(
         storage_base=storage,
-        tracking_mode="mv3dt",
+        tracking_mode=tracking_mode,
     )
-    assert argv[argv.index("--pipeline-config") + 1] == "DS9/config/infer_mv3dt.yaml"
+    assert argv[argv.index("--pipeline-config") + 1] == f"DS9/config/infer_{tracking_mode}.yaml"
     assert argv[argv.index("--cameras-config") + 1] == "DS9/config/cameras_v3dt.yaml"
     assert argv[argv.index("--pgie-profile") + 1] == "yolo26"
     assert argv[argv.index("--size") + 1] == "m"
-    assert argv[argv.index("--tracking-mode") + 1] == "mv3dt"
+    assert argv[argv.index("--tracking-mode") + 1] == tracking_mode
+    assert host._parse_args(["check", "--tracking-mode", tracking_mode]).tracking_mode == tracking_mode
+    assert host._parse_args(["run", "--tracking-mode", tracking_mode]).tracking_mode == tracking_mode
 
 
 def test_baseline_replay_can_use_an_explicit_config_without_changing_quality(tmp_path: Path) -> None:
@@ -147,11 +150,12 @@ def test_baseline_replay_can_use_an_explicit_config_without_changing_quality(tmp
     assert argv[argv.index("--tracking-mode") + 1] == "baseline"
 
 
-def test_mv3dt_rejects_a_pipeline_override(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tracking_mode", ["v3dt", "mv3dt"])
+def test_3d_rejects_a_pipeline_override(tmp_path: Path, tracking_mode: str) -> None:
     with pytest.raises(host.NativeRuntimeError, match="baseline lane"):
         host.canonical_runtime_arguments(
             storage_base=tmp_path / "depth",
-            tracking_mode="mv3dt",
+            tracking_mode=tracking_mode,
             pipeline_config=tmp_path / "infer-replay.yaml",
         )
 
@@ -193,19 +197,20 @@ def test_run_environment_strips_selector_and_docker(tmp_path: Path) -> None:
     assert built["NOESIS_CPU_MATH_THREADS"] == "1"
 
 
-def test_mv3dt_run_environment_preserves_explicit_opt_in(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tracking_mode", ["v3dt", "mv3dt"])
+def test_3d_run_environment_preserves_explicit_opt_in(tmp_path: Path, tracking_mode: str) -> None:
     env = _config_env(tmp_path)
     with mock.patch.dict(os.environ, env, clear=False):
         config = host.load_native_config(env)
         built = host.build_run_environment(
             config,
-            session_id="sess-mv3dt",
+            session_id=f"sess-{tracking_mode}",
             storage_base=tmp_path / "state",
             evidence_root=tmp_path / "evidence",
             build_root=tmp_path / "build",
-            tracking_mode="mv3dt",
+            tracking_mode=tracking_mode,
         )
-    assert built["NOESIS_TRACKING_MODE"] == "mv3dt"
+    assert built["NOESIS_TRACKING_MODE"] == tracking_mode
     assert built["NOESIS_PGIE_PROFILE"] == "yolo26"
     context = json.loads(built["NOESIS_APPLIANCE_RUNTIME_CONTEXT"])
     assert context["runtime_variant"] == "ds9:v3dt"

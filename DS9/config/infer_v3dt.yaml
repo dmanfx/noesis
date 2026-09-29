@@ -108,7 +108,7 @@ models:
   pose:
     enable: true
     name: yolo26_pose
-    config-file-path: DS9/pipelines/config_infer_secondary_yolo26_pose.ini
+    config-file-path: DS9/pipelines/config_infer_secondary_yolo26_pose_v3dt.ini
     engine: DS9/models/engines/yolo26n-pose_b3_fp16.engine
     batch_size: 3
     gie_id: 4

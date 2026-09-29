@@ -91,5 +91,19 @@ def apply_osd_from_pgie_ini(
         else Path("")
     )
     ini_props = parse_ini_section(ini_path) if ini_raw.strip() else {}
-    merged["osd"] = derive_osd_policy_from_ini(ini_props)
+    osd_policy = derive_osd_policy_from_ini(ini_props)
+    tracking_mode = str(pipeline_cfg.get("tracking_mode", "") or "").strip().lower()
+    configured_osd = pipeline_cfg.get("osd")
+    if tracking_mode == "v3dt" and isinstance(configured_osd, Mapping):
+        configured_display_bbox = configured_osd.get("display-bbox")
+        try:
+            display_bbox = int(configured_display_bbox)
+        except (TypeError, ValueError):
+            display_bbox = None
+        if display_bbox in (0, 1):
+            # Keep V3DT's explicit 2D-rectangle choice while still deriving
+            # mask and GPU OSD capabilities from the selected PGIE. Native
+            # SV3DT cuboid display metadata is independent of this rectangle.
+            osd_policy["display-bbox"] = display_bbox
+    merged["osd"] = osd_policy
     return merged

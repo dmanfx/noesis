@@ -209,8 +209,10 @@ bev:
     reset_after_s: 1.25
 
 osd:
-  process-mode: 0
+  process-mode: 1
   display-mask: 1
+  # Native tracker DisplayMeta supplies the full 3D cuboid. The separate
+  # tracked 2D rectangle can follow only the visible portion of a person.
   display-bbox: 0
   display-text: 1
 

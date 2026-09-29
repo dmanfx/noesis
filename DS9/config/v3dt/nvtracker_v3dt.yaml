@@ -50,6 +50,9 @@ StateEstimator:
   measurementNoiseVar4Detector: 0.01
   measurementNoiseVar4Tracker: 0.02933238
 ObjectModelProjection:
+  # NVIDIA SV3DT sample gate: weak/inferred head, waist or foot keypoints must
+  # not resize the full-body model when furniture hides the lower body.
+  minPoseConfidence: 0.925
   outputFootLocation: 1
   outputVisibility: 1
   outputConvexHull: 0
@@ -118,6 +121,7 @@ PoseEstimator:
   netScaleFactor: 0.00392156
   onnxFile: DS9/models/onnx/bodypose3dnet_accuracy.onnx
   modelEngineFile: DS9/models/engines/bodypose3dnet_accuracy_b1_fp16.engine
-  # Interval 4 cuts BodyPose3DNet GPU load ~2x vs every-other-frame while
-  # keeping usable pose for StableID / floor anchors (household default).
+  # Revisit height at the existing cadence, but only with the confidence gate
+  # above. First-frame-only (-1) can lock an occluded entry pose/default height.
+  # This is the tracker's internal model; downstream YOLO pose is independent.
   poseInferenceInterval: 4

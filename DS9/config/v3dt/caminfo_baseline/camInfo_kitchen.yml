@@ -3,14 +3,27 @@ projectionMatrix_3x4_w2p:
 - 914.1001344489305
 - -327.605386229604
 - 8022.378568520152
-- 74.02707011595093
-- 704.3205245614465
-- 396.3883838775334
-- -2058.666252688241
+- 31.59785253906567
+- 300.6334850274534
+- -789.2289232337646
+- 1292.252079587617
 - 0.09758572731851303
 - 0.9284661752387182
 - -0.35836794954530016
 - -0.7184407653953737
 modelInfo:
-  height: 2.2
+  height: 1.7
   radius: 0.35
+noesis_frame_binding:
+  world_frame_id: backend_world_m
+  world_frame_revision: sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483
+  frame_transform_sha256: af1290aa956661c7ece73215f4fe3ee0fc25a7fbef0c246fed2de66f12abd844
+  camera_calibration_sha256: 9b34e3ea8a3808475584a55383afcff96373a9e0845d33dc026a6659c975be93
+  image_size:
+  - 1920
+  - 1080
+  floor_y: -0.0
+  projection_pixel_space: tracker
+  tracker_image_size:
+  - 1920
+  - 1088

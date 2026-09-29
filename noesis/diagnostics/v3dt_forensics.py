@@ -4,6 +4,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,58 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _projection_in_mux_pixels(
+    projection: Optional[np.ndarray],
+    *,
+    matrix_type: str,
+    caminfo: Mapping[str, Any],
+    pixel_space: str,
+    mux_size: Tuple[int, int],
+    tracker_size: Tuple[int, int],
+    profile: str,
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Normalize a validated tracker-space camInfo P for public mux-pixel data."""
+    if projection is None:
+        return None, None
+    binding = caminfo.get("noesis_frame_binding") or {}
+    if not isinstance(binding, Mapping):
+        binding = {}
+
+    declared_space = binding.get("projection_pixel_space", "mux")
+    if pixel_space == "mux":
+        if declared_space != "mux":
+            return None, "camInfo projection pixel space differs from mux profile"
+        return projection, None
+    if pixel_space != "tracker":
+        return None, "v3dt.caminfo_pixel_space must be mux or tracker"
+    if profile != "sv3dt":
+        return None, "tracker-pixel camInfo is supported only by the SV3DT profile"
+    if matrix_type != "projectionMatrix_3x4_w2p":
+        return None, "tracker-pixel camInfo requires projectionMatrix_3x4_w2p"
+    if declared_space != "tracker":
+        return None, "camInfo projection lacks tracker pixel-space provenance"
+
+    try:
+        ds9_root = str(Path(__file__).resolve().parents[2] / "DS9")
+        if ds9_root not in sys.path:
+            sys.path.insert(0, ds9_root)
+        from noesis.v3dt_raster import scale_projection_matrix, validate_raster
+
+        mux_raster = validate_raster(mux_size, "streammux")
+        tracker_raster = validate_raster(tracker_size, "tracker")
+        binding_mux = validate_raster(binding.get("image_size"), "camInfo image_size")
+        binding_tracker = validate_raster(
+            binding.get("tracker_image_size"), "camInfo tracker_image_size"
+        )
+        if binding_mux != mux_raster:
+            return None, "camInfo provenance raster differs from streammux"
+        if binding_tracker != tracker_raster:
+            return None, "camInfo tracker raster differs from tracker configuration"
+        return scale_projection_matrix(projection, tracker_raster, mux_raster), None
+    except (ImportError, TypeError, ValueError) as exc:
+        return None, f"invalid tracker-space camInfo raster binding: {exc}"
 
 
 def _scale_intrinsics(
@@ -226,6 +279,13 @@ def build_snapshot(
     tracker_cfg = pipeline_cfg.get("tracker", {}) if isinstance(pipeline_cfg, dict) else {}
     tracker_w = _safe_int(tracker_cfg.get("tracker-width", tracker_cfg.get("tracker_width", stream_w)), stream_w)
     tracker_h = _safe_int(tracker_cfg.get("tracker-height", tracker_cfg.get("tracker_height", stream_h)), stream_h)
+    v3dt_cfg = pipeline_cfg.get("v3dt", {}) if isinstance(pipeline_cfg, dict) else {}
+    caminfo_pixel_space = (
+        str(v3dt_cfg.get("caminfo_pixel_space", "mux"))
+        if isinstance(v3dt_cfg, Mapping)
+        else "mux"
+    )
+    v3dt_profile = str(v3dt_cfg.get("profile", "")) if isinstance(v3dt_cfg, Mapping) else ""
     tracker_cfg_path = tracker_config_path
     if tracker_cfg_path is None:
         tracker_cfg_value = str(
@@ -301,7 +361,32 @@ def build_snapshot(
 
         caminfo_path = caminfo_dir / f"camInfo_{cam_name}.yml"
         caminfo = _load_caminfo(caminfo_path)
+        caminfo_binding = caminfo.get("noesis_frame_binding")
+        if not isinstance(caminfo_binding, Mapping):
+            caminfo_binding = {}
         caminfo_type, P_caminfo = _projection_from_caminfo(caminfo)
+        P_caminfo_mux, pixel_space_error = _projection_in_mux_pixels(
+            P_caminfo,
+            matrix_type=caminfo_type,
+            caminfo=caminfo,
+            pixel_space=caminfo_pixel_space,
+            mux_size=(stream_w, stream_h),
+            tracker_size=(tracker_w, tracker_h),
+            profile=v3dt_profile,
+        )
+        if pixel_space_error:
+            issues.append({
+                "camera": cam_name,
+                "level": "error",
+                "code": "caminfo_pixel_space_binding",
+                "message": pixel_space_error,
+                "data": {
+                    "configured_pixel_space": caminfo_pixel_space,
+                    "projection_pixel_space": caminfo_binding.get(
+                        "projection_pixel_space", "mux"
+                    ),
+                },
+            })
 
         use_w2p = caminfo_type.endswith("w2p")
         K_full = np.array([[fx_s, 0.0, cx_s], [0.0, fy_s, cy_s], [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -313,11 +398,11 @@ def build_snapshot(
         caminfo_diff = None
         caminfo_diff_flip = None
         t_ratio = None
-        if P_caminfo is not None:
-            caminfo_diff = float(np.linalg.norm(P_caminfo - P_expected))
-            caminfo_diff_flip = float(np.linalg.norm(P_caminfo - P_expected_flip))
+        if P_caminfo_mux is not None:
+            caminfo_diff = float(np.linalg.norm(P_caminfo_mux - P_expected))
+            caminfo_diff_flip = float(np.linalg.norm(P_caminfo_mux - P_expected_flip))
             try:
-                Rt = np.linalg.inv(K) @ P_caminfo
+                Rt = np.linalg.inv(K) @ P_caminfo_mux
                 t_caminfo = Rt[:, 3]
                 t_E = np.array(E, dtype=np.float64).reshape((4, 4), order="F")[:3, 3]
                 ratios = []
@@ -396,6 +481,15 @@ def build_snapshot(
                 "type": caminfo_type,
                 "modelInfo": caminfo.get("modelInfo"),
                 "projectionMatrix": P_caminfo.tolist() if P_caminfo is not None else None,
+                "projectionMatrix_mux": (
+                    P_caminfo_mux.tolist() if P_caminfo_mux is not None else None
+                ),
+                "projection_pixel_space": caminfo_binding.get(
+                    "projection_pixel_space", "mux"
+                ),
+                "configured_pixel_space": caminfo_pixel_space,
+                "image_size": caminfo_binding.get("image_size"),
+                "tracker_image_size": caminfo_binding.get("tracker_image_size"),
                 "diff_to_expected": caminfo_diff,
                 "diff_to_expected_yflip": caminfo_diff_flip,
                 "translation_ratio": t_ratio,
@@ -427,6 +521,8 @@ def build_snapshot(
         "pipeline": {
             "streammux": {"width": stream_w, "height": stream_h},
             "tracker": {"width": tracker_w, "height": tracker_h},
+            "caminfo_pixel_space": caminfo_pixel_space,
+            "v3dt_profile": v3dt_profile,
         },
         "units": {"floor_y": floor_y, "unit_scale": unit_scale},
         "cameras": per_camera,
@@ -444,10 +540,12 @@ def render_snapshot_markdown(snapshot: Mapping[str, Any]) -> str:
     pipeline = snapshot.get("pipeline", {})
     streammux = (pipeline.get("streammux") or {}) if isinstance(pipeline, Mapping) else {}
     tracker = (pipeline.get("tracker") or {}) if isinstance(pipeline, Mapping) else {}
+    pixel_space = pipeline.get("caminfo_pixel_space", "mux") if isinstance(pipeline, Mapping) else "mux"
     lines.append("## Pipeline")
     lines.append("")
     lines.append(f"- streammux: {streammux.get('width')}x{streammux.get('height')}")
     lines.append(f"- tracker: {tracker.get('width')}x{tracker.get('height')}")
+    lines.append(f"- camInfo projection pixels: {pixel_space}")
     lines.append("")
 
     issues = snapshot.get("issues", []) or []
@@ -596,18 +694,67 @@ def analyze_tracking_log(
     warnings: List[Dict[str, Any]] = []
 
     snapshot_cams = (snapshot or {}).get("cameras", {}) if isinstance(snapshot, Mapping) else {}
+    snapshot_pipeline = (snapshot or {}).get("pipeline", {}) if isinstance(snapshot, Mapping) else {}
+    mux_cfg = snapshot_pipeline.get("streammux", {}) if isinstance(snapshot_pipeline, Mapping) else {}
+    tracker_cfg = snapshot_pipeline.get("tracker", {}) if isinstance(snapshot_pipeline, Mapping) else {}
+    mux_size = (
+        _safe_int(mux_cfg.get("width"), 0),
+        _safe_int(mux_cfg.get("height"), 0),
+    ) if isinstance(mux_cfg, Mapping) else (0, 0)
+    tracker_size = (
+        _safe_int(tracker_cfg.get("width"), 0),
+        _safe_int(tracker_cfg.get("height"), 0),
+    ) if isinstance(tracker_cfg, Mapping) else (0, 0)
     proj_by_camera: Dict[str, Optional[np.ndarray]] = {}
     fy_by_camera: Dict[str, float] = {}
     if snapshot_cams:
         for cam_id, cam_snap in snapshot_cams.items():
             caminfo = cam_snap.get("caminfo", {}) if isinstance(cam_snap, Mapping) else {}
-            P_list = caminfo.get("projectionMatrix")
+            P_mux_list = caminfo.get("projectionMatrix_mux")
+            P_list = P_mux_list if P_mux_list is not None else caminfo.get("projectionMatrix")
             P = None
             if isinstance(P_list, list):
                 if len(P_list) == 12:
                     P = np.array(P_list, dtype=np.float64).reshape((3, 4))
                 elif len(P_list) == 3 and all(isinstance(row, list) and len(row) == 4 for row in P_list):
                     P = np.array(P_list, dtype=np.float64).reshape((3, 4))
+            if P_mux_list is None and P is not None:
+                pipeline_pixel_space = (
+                    snapshot_pipeline.get("caminfo_pixel_space", "mux")
+                    if isinstance(snapshot_pipeline, Mapping)
+                    else "mux"
+                )
+                pixel_space = caminfo.get(
+                    "configured_pixel_space",
+                    caminfo.get("projection_pixel_space", pipeline_pixel_space),
+                )
+                binding = {
+                    "projection_pixel_space": caminfo.get(
+                        "projection_pixel_space", "mux"
+                    ),
+                    "image_size": caminfo.get("image_size"),
+                    "tracker_image_size": caminfo.get("tracker_image_size"),
+                }
+                P, pixel_error = _projection_in_mux_pixels(
+                    P,
+                    matrix_type=str(caminfo.get("type", "")),
+                    caminfo={"noesis_frame_binding": binding},
+                    pixel_space=str(pixel_space),
+                    mux_size=mux_size,
+                    tracker_size=tracker_size,
+                    profile=str(snapshot_pipeline.get("v3dt_profile", ""))
+                    if isinstance(snapshot_pipeline, Mapping)
+                    else "",
+                )
+                if pixel_error:
+                    warnings.append({
+                        "camera": str(cam_id),
+                        "level": "warn",
+                        "code": "caminfo_pixel_space_binding",
+                        "message": pixel_error,
+                    })
+            if P is not None and not np.isfinite(P).all():
+                P = None
             proj_by_camera[str(cam_id)] = P
             intrinsics = cam_snap.get("intrinsics_scaled") or {}
             fy = _safe_float(intrinsics.get("fy"), float("nan"))

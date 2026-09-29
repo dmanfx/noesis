@@ -24,8 +24,10 @@ def test_ds9_hooks_enforce_fail_closed_v3dt_axis_contract(
 ) -> None:
     code = r'''
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+import yaml
 
 adapter = Path(sys.argv[1]).resolve()
 repo = Path(sys.argv[2]).resolve()
@@ -72,7 +74,32 @@ image_base = active._image_base_from_bbox3d(
     {"xCentre": 2.0, "yCentre": 4.0, "zCentre": 1.0, "zLen": 2.0},
     (1920, 1080),
 )
-assert image_base == [0.5, 0.5], image_base
+assert image_base == [0.5, 0.0], image_base
+assert image_base == list(active._project_point(
+    active._v3dt_caminfo_cache[0][1], (2.0, 4.0, 0.0)
+)), image_base
+assert active._image_base_from_bbox3d(
+    0,
+    {"xCentre": 2.0, "yCentre": 4.0, "zCentre": 1.0, "zLen": -2.0},
+    (1920, 1080),
+) is None
+
+# A tracker-pixel camInfo must produce public anchors in the unchanged mux raster.
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "camInfo.yml"
+    path.write_text(yaml.safe_dump({
+        "projectionMatrix_3x4_w2p": [480,0,0,0, 0,272,0,0, 0,0,0,1],
+        "noesis_frame_binding": {
+            "projection_pixel_space": "tracker",
+            "tracker_image_size": [960,544], "image_size": [1920,1080],
+        },
+    }))
+    resized = processor({"world_frame": "backend_world_m", "caminfo_world_axes": "xzy", "caminfo_pixel_space": "tracker"})
+    resized._v3dt_caminfo_paths = {0: path}
+    anchor = resized._image_base_from_bbox3d(
+        0, {"xCentre": 1, "yCentre": 1, "zCentre": 1, "zLen": 2}, (1920,1080)
+    )
+    assert anchor == [960,540], anchor
 
 stale = {
     "bbox3d": {"xCentre": 1.0},

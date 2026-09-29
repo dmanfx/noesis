@@ -10,9 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import yaml
 
 from noesis_core.strict_json import strict_json_loads
+from noesis_core.v3dt_validation import V3DTAxisMap, V3DTAxisMapError
+from noesis.v3dt_raster import scale_projection_matrix, validate_raster
 
 
 DS9_ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +130,10 @@ MV3DT_KITCHEN_FAMILY_ASSOCIATOR_OVERRIDES = {
     "minPeerTrackletMatchScore": 0.18,
 }
 EXPECTED_STREAM_SIZE = (1920, 1080)
-EXPECTED_OBJECT_MODEL_HEIGHT_M = 2.2
+# A generic adult prior, not measured stature. The former 2.2 m prior exceeded
+# an indoor camera's height and its adaptive lower bound excluded short bodies.
+# A 1.7 m prior permits the SDK's observed 0.7-1.3 height range (1.19-2.21 m).
+EXPECTED_OBJECT_MODEL_HEIGHT_M = 1.7
 MV3DT_KITCHEN_FAMILY_OBJECT_MODEL_HEIGHT_M = 1.7
 EXPECTED_OBJECT_MODEL_RADIUS_M = 0.35
 EXPECTED_BODYPOSE_INPUTS = {
@@ -182,6 +188,123 @@ class V3DTAssetBundle:
     tracker_reid_engine: Path
     bodypose_source: Path
     bodypose_engine: Path
+
+
+def validate_sv3dt_calibration_binding(
+    bundle: V3DTAssetBundle,
+    *,
+    pipeline_config: Mapping[str, Any],
+    calibration_provider: Any,
+    camera_labels: Mapping[int, str],
+) -> None:
+    """Bind the SDK's static projection to the active world producer at startup.
+
+    ``world_snapshot`` already applies the revision-bound calibration-to-world
+    transform. Comparing against the raw snapshot would accept camera models
+    whose output is silently labelled as a different world frame downstream.
+    The accepted MV3DT profile has its own geometry contract and is not handled
+    here. No calibration or projection is changed by this check.
+    """
+
+    if bundle.profile != "sv3dt":
+        raise V3DTAssetError("SV3DT calibration binding requires the sv3dt profile")
+    profile = pipeline_config.get("v3dt", {})
+    try:
+        axes = V3DTAxisMap.parse(profile.get("caminfo_world_axes"))
+    except (AttributeError, V3DTAxisMapError) as exc:
+        raise V3DTAssetError(f"SV3DT calibration axis binding is invalid: {exc}") from exc
+    # The current native bbox contract uses tracker Z-up with its floor at Z=0.
+    if axes.columns[2] != (1, 1):
+        raise V3DTAssetError("SV3DT tracker Z must map to canonical positive Y")
+    axis_transform = np.eye(4, dtype=np.float64)
+    axis_transform[:3, :3] = 0.0
+    for tracker_axis, (world_axis, sign) in enumerate(axes.columns):
+        axis_transform[world_axis, tracker_axis] = sign
+
+    try:
+        mux = pipeline_config["streammux"]
+        tracker = pipeline_config["tracker"]
+        raster = validate_raster((mux["width"], mux["height"]), label="streammux")
+        tracker_raster = validate_raster(
+            (tracker["tracker-width"], tracker["tracker-height"]), label="tracker"
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise V3DTAssetError("SV3DT calibration requires explicit mux/tracker raster") from exc
+    pixel_space = profile.get("caminfo_pixel_space", "mux")
+    if pixel_space not in ("mux", "tracker"):
+        raise V3DTAssetError("SV3DT caminfo_pixel_space must be mux or tracker")
+    if pixel_space == "mux" and tracker_raster != raster:
+        raise V3DTAssetError("SV3DT calibration mux and tracker raster must match")
+    order = tuple(profile.get("camera_order", ()))
+    if len(order) != len(bundle.camera_models) or not order:
+        raise V3DTAssetError("SV3DT calibration camera order does not match camInfo files")
+
+    errors: list[str] = []
+    for source_id, (camera_id, path) in enumerate(zip(order, bundle.camera_models)):
+        try:
+            if camera_labels.get(source_id) != camera_id:
+                raise ValueError("source camera identity does not match camInfo order")
+            snapshot = calibration_provider.world_snapshot(source_id, camera_id)
+            if snapshot is None or snapshot.camera_id != camera_id:
+                raise ValueError("active target-frame calibration is unavailable")
+            if tuple(snapshot.image_size) != raster:
+                raise ValueError("active calibration raster does not match mux raster")
+            if not math.isfinite(float(snapshot.floor_y)) or not math.isclose(
+                float(snapshot.floor_y), 0.0, abs_tol=1e-8
+            ):
+                raise ValueError("active target floor must be Y=0 for the SDK Z=0 ground")
+            if not np.allclose(snapshot.floor_plane_normal, (0.0, 1.0, 0.0), atol=1e-8, rtol=0):
+                raise ValueError("active target floor must be horizontal and positive Y-up")
+            if not math.isclose(float(snapshot.floor_plane_offset_m), 0.0, abs_tol=1e-8):
+                raise ValueError("active target floor plane must pass through Y=0")
+            if snapshot.world_frame_id != profile.get("world_frame"):
+                raise ValueError("active world frame does not match the SV3DT output frame")
+
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            binding = payload.get("noesis_frame_binding")
+            if not isinstance(binding, Mapping):
+                raise ValueError("camInfo lacks noesis_frame_binding provenance")
+            for field in (
+                "world_frame_id", "world_frame_revision", "frame_transform_sha256",
+                "camera_calibration_sha256",
+            ):
+                expected = getattr(snapshot, field)
+                if not isinstance(expected, str) or not expected or binding.get(field) != expected:
+                    raise ValueError(f"camInfo {field} differs from active calibration")
+            if binding.get("image_size") != list(raster):
+                raise ValueError("camInfo provenance raster differs from active calibration")
+            if not math.isclose(float(binding.get("floor_y", math.nan)), float(snapshot.floor_y), abs_tol=1e-8):
+                raise ValueError("camInfo provenance floor differs from active calibration")
+            if not math.isclose(float(payload.get("groundPlaneHeight", 0.0)), 0.0, abs_tol=1e-8):
+                raise ValueError("camInfo groundPlaneHeight differs from the SDK Z=0 contract")
+
+            k = np.asarray(snapshot.intrinsics, dtype=np.float64).reshape(3, 3)
+            e = np.asarray(snapshot.extrinsics_col_major, dtype=np.float64).reshape(4, 4, order="F")
+            expected_projection = k @ (e @ axis_transform)[:3, :]
+            actual_projection = np.asarray(payload["projectionMatrix_3x4_w2p"], dtype=np.float64).reshape(3, 4)
+            if binding.get("projection_pixel_space", "mux") != pixel_space:
+                raise ValueError("camInfo projection pixel space differs from pipeline")
+            if pixel_space == "tracker":
+                if binding.get("tracker_image_size") != list(tracker_raster):
+                    raise ValueError("camInfo tracker raster differs from pipeline")
+                actual_projection = scale_projection_matrix(
+                    actual_projection, tracker_raster, raster
+                )
+            if not np.isfinite(expected_projection).all() or not np.isfinite(actual_projection).all():
+                raise ValueError("camInfo and calibration projections must be finite")
+            expected_norm = float(np.linalg.norm(expected_projection))
+            actual_norm = float(np.linalg.norm(actual_projection))
+            if min(expected_norm, actual_norm) <= 0.0 or not np.allclose(
+                actual_projection / actual_norm,
+                expected_projection / expected_norm,
+                atol=1e-9,
+                rtol=1e-7,
+            ):
+                raise ValueError("camInfo projection differs from active target-frame K @ E @ axes")
+        except (AttributeError, KeyError, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+            errors.append(f"{camera_id}: {exc}")
+    if errors:
+        raise V3DTAssetError("SV3DT calibration binding failed: " + "; ".join(errors))
 
 
 def _sha256(path: Path) -> str:
@@ -415,6 +538,8 @@ def _validate_caminfo(
     errors: list[str],
     *,
     expected_height_m: float = EXPECTED_OBJECT_MODEL_HEIGHT_M,
+    pixel_space: str = "mux",
+    tracker_raster: tuple[int, int] | None = None,
 ) -> None:
     try:
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -424,6 +549,18 @@ def _validate_caminfo(
     if not isinstance(payload, Mapping):
         errors.append(f"camera model must be a mapping: {path}")
         return
+    binding = payload.get("noesis_frame_binding") or {}
+    if not isinstance(binding, Mapping):
+        errors.append(f"camera model frame binding must be a mapping: {path}")
+        binding = {}
+    if binding.get("projection_pixel_space", "mux") != pixel_space:
+        errors.append(f"camera model projection pixel space differs from pipeline: {path}")
+    if pixel_space == "tracker" and (
+        tracker_raster is None
+        or binding.get("tracker_image_size") != list(tracker_raster)
+        or binding.get("image_size") != list(EXPECTED_STREAM_SIZE)
+    ):
+        errors.append(f"camera model tracker/mux raster binding differs from pipeline: {path}")
     matrix = payload.get("projectionMatrix_3x4_w2p")
     if (
         not isinstance(matrix, Sequence)
@@ -857,10 +994,19 @@ def validate_v3dt_assets(
         errors.append(
             f"tracker.ll-lib-file must bind explicitly to DeepStream 9.1: {ll_lib!r}"
         )
-    if (
-        tracker.get("tracker-width"),
-        tracker.get("tracker-height"),
-    ) != EXPECTED_STREAM_SIZE:
+    pixel_space = profile_config.get("caminfo_pixel_space", "mux")
+    if pixel_space not in ("mux", "tracker") or (
+        profile != "sv3dt" and pixel_space != "mux"
+    ):
+        errors.append("tracker camInfo pixel space is an SV3DT-only opt-in")
+    try:
+        tracker_raster = validate_raster(
+            (tracker.get("tracker-width"), tracker.get("tracker-height")), label="tracker"
+        )
+    except ValueError as exc:
+        tracker_raster = None
+        errors.append(str(exc))
+    if pixel_space != "tracker" and tracker_raster != EXPECTED_STREAM_SIZE:
         errors.append(
             f"tracker width/height must be {EXPECTED_STREAM_SIZE[0]}x{EXPECTED_STREAM_SIZE[1]}"
         )
@@ -958,6 +1104,8 @@ def validate_v3dt_assets(
             _validate_caminfo(
                 path,
                 errors,
+                pixel_space=pixel_space,
+                tracker_raster=tracker_raster,
                 expected_height_m=(
                     MV3DT_KITCHEN_FAMILY_OBJECT_MODEL_HEIGHT_M
                     if profile == "mv3dt"
@@ -1371,4 +1519,5 @@ __all__ = [
     "materialize_v3dt_tracker_build_config",
     "materialize_v3dt_tracker_config",
     "validate_v3dt_assets",
+    "validate_sv3dt_calibration_binding",
 ]

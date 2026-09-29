@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
-"""Generate SV3DT/MV3DT camInfo YAMLs from Noesis calibration data.
+"""Generate camInfo YAMLs from the runtime's revision-bound world calibration.
 
 Usage:
   python3 scripts/generate_v3dt_caminfo.py
 
-This writes camInfo_<camera-name>.yml files under config/v3dt/ by default.
+This writes camInfo_<camera-name>.yml files under
+DS9/config/v3dt/caminfo_baseline/ by default.
 
-Units:
-  - `config/camera_calibration.json` extrinsics are stored in METERS.
-  - SV3DT camInfo is generated in METERS by default (`NOESIS_V3DT_CAMINFO_WORLD_SCALE=1`).
-    You may set `NOESIS_V3DT_CAMINFO_WORLD_SCALE=100` if you want SV3DT world units
-    in centimeters, but then you must retune SV3DT world-space noise/thresholds.
-  - Baseline defaults (working across all cameras):
+Contract:
+  - The pipeline's existing accepted frame bindings select the target world
+    revision and horizontal floor through the same CalibrationManager as DS9.
+  - Projection and model dimensions use meters. Tracker Z=0 is target floor Y=0.
+  - Required conventions for the rectified OpenCV pixel frame:
     - `NOESIS_V3DT_CAMINFO_MATRIX_TYPE=w2p`
-    - `NOESIS_V3DT_CAMINFO_INVERT_E=1`
-    - `NOESIS_V3DT_CAMINFO_Y_FLIP=1`
+    - `NOESIS_V3DT_CAMINFO_INVERT_E=0` (PoseV1 produces world-to-camera E)
+    - `NOESIS_V3DT_CAMINFO_Y_FLIP=0` (image Y already increases downward)
     - `NOESIS_V3DT_CAMINFO_WORLD_AXES=xzy` (swap Y/Z; SV3DT Z-up)
-  - `NOESIS_V3DT_CAMINFO_WORLD_AXES` can remap world axes (e.g., `xzy` swaps Y/Z)
-    to align calibration conventions with DeepStream's SV3DT world frame.
+  - Legacy projection overrides that violate these conventions are rejected.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import yaml
@@ -35,84 +33,17 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(REPO_ROOT / "DS9") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "DS9"))
 
-from noesis.calibration.pose_v1 import normalize_pose_v1, pose_to_E_col_major
+from noesis.calibration.manager import create_calibration_manager
+from noesis_core.scene_prior import ScenePriorSet
+from noesis.v3dt_raster import scale_projection_matrix, validate_raster
 
 
 def _load_yaml(path: Path) -> Dict:
     with path.open("r") as handle:
         return yaml.safe_load(handle) or {}
-
-
-def _load_streammux_size(path: Path) -> Tuple[int, int]:
-    data = _load_yaml(path)
-    streammux = data.get("streammux") or {}
-    width = int(streammux.get("width", 1920) or 1920)
-    height = int(streammux.get("height", 1080) or 1080)
-    return width, height
-
-
-def _intrinsics_from_model(models: Dict, model_name: str) -> Dict:
-    model = models.get(model_name)
-    if not model:
-        raise KeyError(f"Intrinsics model '{model_name}' not found in cameras.yaml")
-    intrinsics = model.get("intrinsics") or {}
-    required = ("fx", "fy", "cx", "cy")
-    if not all(key in intrinsics for key in required):
-        raise KeyError(f"Intrinsics model '{model_name}' missing one of {required}")
-    return intrinsics
-
-
-def _resolution_from_model(model: Optional[Dict]) -> Optional[Tuple[int, int]]:
-    if not isinstance(model, dict):
-        return None
-    res = model.get("resolution")
-    if isinstance(res, (list, tuple)) and len(res) >= 2:
-        try:
-            w = int(res[0])
-            h = int(res[1])
-            if w > 0 and h > 0:
-                return w, h
-        except Exception:
-            pass
-    intr = model.get("intrinsics") or {}
-    res = intr.get("resolution")
-    if isinstance(res, (list, tuple)) and len(res) >= 2:
-        try:
-            w = int(res[0])
-            h = int(res[1])
-            if w > 0 and h > 0:
-                return w, h
-        except Exception:
-            pass
-    return None
-
-
-def _scale_intrinsics(
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-    target_w: int,
-    target_h: int,
-    base_res: Optional[Tuple[int, int]] = None,
-) -> Tuple[float, float, float, float]:
-    # Intrinsics in config/cameras.yaml are specified at the camera's native calibrated
-    # pixel resolution. If available, use the explicit base resolution;
-    # otherwise infer from the principal point:
-    #   base_w ≈ 2*cx, base_h ≈ 2*cy
-    # then scale to the streammux output size (target_w/target_h).
-    #
-    # This keeps scaling consistent when a source is upscaled (e.g., 1280×720 → 1920×1080).
-    if base_res:
-        base_w = float(base_res[0])
-        base_h = float(base_res[1])
-    else:
-        base_w = 2.0 * float(cx) if cx else 0.0
-        base_h = 2.0 * float(cy) if cy else 0.0
-    scale_x = float(target_w) / base_w if base_w else 1.0
-    scale_y = float(target_h) / base_h if base_h else 1.0
-    return fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y
 
 
 def _projection_matrix(k: np.ndarray, e_col_major: list, target_h: int, invert_e: bool = False) -> np.ndarray:
@@ -142,11 +73,13 @@ def _projection_matrix(k: np.ndarray, e_col_major: list, target_h: int, invert_e
     rt = e_mat[:3, :]
     p = k @ rt
     
-    # Optional image-space Y-flip (default: off). Keep this as an escape hatch for
-    # coordinate-system mismatches, but do not enable it by default.
+    # PoseV1 already produces OpenCV camera coordinates (image Y down), matching
+    # the rectified nvdewarper surface. A second flip inverts the person's
+    # vertical model and makes the tracker infer its ground point above its head.
+    # Retain the explicit override for callers with a different image contract.
     #
     # Formula: y_flipped = h - y_original, achieved via: P_flip = [[1,0,0],[0,-1,h],[0,0,1]] @ P
-    y_flip_env = str(os.environ.get("NOESIS_V3DT_CAMINFO_Y_FLIP", "1") or "").strip().lower()
+    y_flip_env = str(os.environ.get("NOESIS_V3DT_CAMINFO_Y_FLIP", "0") or "").strip().lower()
     y_flip = y_flip_env in ("1", "true", "yes", "y", "on")
     if y_flip:
         # Apply image-space Y-flip: new_row1 = -row1 + h*row2
@@ -190,7 +123,15 @@ def _axis_mapping_from_env() -> Optional[np.ndarray]:
     return np.stack(cols, axis=1)
 
 
-def _write_caminfo(output_dir: Path, camera_name: str, proj: np.ndarray, model_height: float, model_radius: float) -> None:
+def _write_caminfo(
+    output_dir: Path,
+    camera_name: str,
+    proj: np.ndarray,
+    model_height: float,
+    model_radius: float,
+    *,
+    frame_binding: Optional[Dict[str, Any]] = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # World scale: 1.0 = meters (Noesis canonical), 100.0 = centimeters (NVIDIA SV3DT samples).
     scale_env = str(os.environ.get("NOESIS_V3DT_CAMINFO_WORLD_SCALE", "1") or "").strip()
@@ -214,23 +155,73 @@ def _write_caminfo(output_dir: Path, camera_name: str, proj: np.ndarray, model_h
         key: proj.flatten(order="C").tolist(),
         "modelInfo": {"height": float(height), "radius": float(radius)},
     }
+    if frame_binding is not None:
+        caminfo["noesis_frame_binding"] = frame_binding
     output_path = output_dir / f"camInfo_{camera_name}.yml"
     with output_path.open("w") as handle:
         yaml.safe_dump(caminfo, handle, sort_keys=False)
     print(f"Wrote {output_path}")
 
 
+def _projection_calibration(
+    pipeline_path: Path,
+    cameras_path: Path,
+    calibration_path: Path,
+    alignment_path: Path,
+    *,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+):
+    """Use the exact revision-bound calibration authority used by DS9."""
+
+    pipeline = _load_yaml(pipeline_path)
+    streammux = dict(pipeline.get("streammux") or {})
+    if target_width is not None:
+        streammux["width"] = int(target_width)
+    if target_height is not None:
+        streammux["height"] = int(target_height)
+    pipeline["streammux"] = streammux
+    scene_priors = pipeline.get("scene_priors")
+    bindings = None
+    if scene_priors is not None:
+        if not isinstance(scene_priors, dict) or not scene_priors.get("path"):
+            raise ValueError("scene_priors.path is required when scene priors are configured")
+        raw_path = str(scene_priors["path"])
+        catalog_path = Path(raw_path)
+        if not catalog_path.is_absolute():
+            if raw_path.startswith("DS9/"):
+                catalog_path = REPO_ROOT / catalog_path
+            elif raw_path.startswith(("config/", "pipelines/", "build/")):
+                scope = REPO_ROOT / "DS9" if (REPO_ROOT / "DS9") in pipeline_path.resolve().parents else REPO_ROOT
+                catalog_path = scope / catalog_path
+            else:
+                catalog_path = pipeline_path.parent / catalog_path
+        bindings = ScenePriorSet.load(catalog_path.resolve()).frame_bindings()
+    return create_calibration_manager(
+        cameras_yaml_path=cameras_path,
+        pipeline_config=pipeline,
+        camera_calibration_json_path=calibration_path,
+        ply_alignment_json_path=alignment_path,
+        scene_prior_frame_bindings=bindings,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate SV3DT camInfo YAMLs from Noesis calibration.")
     parser.add_argument(
         "--cameras-config",
-        default=str(REPO_ROOT / "config" / "cameras.yaml"),
+        default=str(REPO_ROOT / "DS9" / "config" / "cameras_v3dt.yaml"),
         help="Path to cameras.yaml",
     )
     parser.add_argument(
         "--calibration",
-        default=str(REPO_ROOT / "config" / "camera_calibration.json"),
+        default=os.environ.get("NOESIS_CAMERA_CALIBRATION_FILE") or str(REPO_ROOT / "config" / "camera_calibration.json"),
         help="Path to camera_calibration.json",
+    )
+    parser.add_argument(
+        "--alignment",
+        default=os.environ.get("NOESIS_PLY_ALIGNMENT_FILE") or str(REPO_ROOT / "config" / "ply_alignment.json"),
+        help="Path to the runtime's ply_alignment.json",
     )
     default_pipeline = REPO_ROOT / "DS9" / "config" / "infer_v3dt.yaml"
     if not default_pipeline.exists():
@@ -242,7 +233,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(REPO_ROOT / "config" / "v3dt"),
+        default=str(REPO_ROOT / "DS9" / "config" / "v3dt" / "caminfo_baseline"),
         help="Output directory for camInfo_*.yml",
     )
     parser.add_argument("--model-height", type=float, default=1.7, help="Model height in meters")
@@ -251,69 +242,68 @@ def main() -> None:
     parser.add_argument("--target-height", type=int, default=None, help="Override target height (defaults to streammux height)")
     args = parser.parse_args()
 
-    cameras_cfg = _load_yaml(Path(args.cameras_config))
-    intrinsics_models = cameras_cfg.get("intrinsics_models") or {}
-    cameras = cameras_cfg.get("cameras") or {}
-
-    with Path(args.calibration).open("r") as handle:
-        calibration = json.load(handle).get("cameras") or {}
-
-    stream_w, stream_h = _load_streammux_size(Path(args.pipeline_config))
-    # Override with explicit target dimensions if provided (e.g., for tracker resolution)
-    if args.target_width is not None:
-        stream_w = args.target_width
-    if args.target_height is not None:
-        stream_h = args.target_height
-
-    ordered = sorted(cameras.items(), key=lambda item: int(item[0]))
-    axis_spec = str(os.environ.get("NOESIS_V3DT_CAMINFO_WORLD_AXES", "xzy") or "").strip().lower()
-    if axis_spec and axis_spec != "xyz":
-        print(f"Applying world-axis map for camInfo: {axis_spec}")
-    for _, cam_info in ordered:
-        name = cam_info.get("name")
-        model_name = cam_info.get("model")
-        if not name or not model_name:
-            continue
-
-        intr = _intrinsics_from_model(intrinsics_models, model_name)
-        base_res = _resolution_from_model(intrinsics_models.get(model_name))
-        fx, fy, cx, cy = (float(intr["fx"]), float(intr["fy"]), float(intr["cx"]), float(intr["cy"]))
-        fx, fy, cx, cy = _scale_intrinsics(fx, fy, cx, cy, stream_w, stream_h, base_res)
-
-        # NVIDIA’s tracker-3d sample config uses `projectionMatrix_3x4` (not `_w2p`).
-        # That variant assumes a zero-centered principal point and DeepStream internally
-        # shifts by (img_w/2, img_h/2). Our camera models use a centered principal point
-        # (cx≈w/2, cy≈h/2), so we can set (cx,cy) to (0,0) for `projectionMatrix_3x4`.
-        matrix_type_env = str(os.environ.get("NOESIS_V3DT_CAMINFO_MATRIX_TYPE", "w2p") or "").strip().lower()
-        use_w2p = matrix_type_env in ("w2p", "3x4_w2p", "projectionmatrix_3x4_w2p")
-        cx_use = cx if use_w2p else 0.0
-        cy_use = cy if use_w2p else 0.0
-        k = np.array([[fx, 0.0, cx_use], [0.0, fy, cy_use], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-        calib = calibration.get(name)
-        if not calib:
-            print(f"Warning: no calibration for camera '{name}', skipping")
-            continue
-        pose = normalize_pose_v1(calib.get("pose")) if isinstance(calib, dict) else None
-        e_col_major = pose_to_E_col_major(pose) if pose is not None else None
-        if e_col_major is None:
-            e_col_major = calib.get("E")
-        if not e_col_major:
-            print(f"Warning: calibration for '{name}' missing E, skipping")
-            continue
-
-        # Per-camera invert_e flag from calibration, fallback to env var
-        invert_e_cam = calib.get("invert_e")
-        if invert_e_cam is None:
-            # Menon sends `E` as World→Camera (extrinsics). SV3DT expects World→Camera in camInfo
-            # when building `P = K @ E[:3,:]` (for either `projectionMatrix_3x4` or `_w2p`).
-            # Do NOT invert by default.
-            invert_env = str(os.environ.get("NOESIS_V3DT_CAMINFO_INVERT_E", "0") or "").strip().lower()
-            invert_e_cam = invert_env in ("1", "true", "yes", "y", "on")
-        print(f"Generating camInfo for {name} (invert_e={invert_e_cam})")
-
-        proj = _projection_matrix(k, e_col_major, stream_h, invert_e=invert_e_cam)
-        _write_caminfo(Path(args.output_dir), name, proj, args.model_height, args.model_radius)
+    # The published bbox3d contract is target-frame meters with x,z,y axes and
+    # tracker Z=0 on the target floor. Reject legacy projection overrides rather
+    # than labeling their coordinates with the canonical revision below.
+    expected_env = {
+        "NOESIS_V3DT_CAMINFO_WORLD_AXES": {"xzy"},
+        "NOESIS_V3DT_CAMINFO_WORLD_SCALE": {"1", "1.0"},
+        "NOESIS_V3DT_CAMINFO_MATRIX_TYPE": {"w2p", "3x4_w2p", "projectionmatrix_3x4_w2p"},
+        "NOESIS_V3DT_CAMINFO_INVERT_E": {"0", "false", "off", "no"},
+        "NOESIS_V3DT_CAMINFO_Y_FLIP": {"0", "false", "off", "no"},
+    }
+    for name, admitted in expected_env.items():
+        if name in os.environ and os.environ[name].strip().lower() not in admitted:
+            raise ValueError(f"{name} conflicts with the canonical camInfo frame contract")
+    manager = _projection_calibration(
+        Path(args.pipeline_config), Path(args.cameras_config),
+        Path(args.calibration), Path(args.alignment),
+        target_width=args.target_width, target_height=args.target_height,
+    )
+    cameras = _load_yaml(Path(args.cameras_config)).get("cameras") or {}
+    pipeline = _load_yaml(Path(args.pipeline_config))
+    pixel_space = (pipeline.get("v3dt") or {}).get("caminfo_pixel_space", "mux")
+    if pixel_space not in ("mux", "tracker"):
+        raise ValueError("caminfo_pixel_space must be mux or tracker")
+    tracker = pipeline.get("tracker") or {}
+    tracker_raster = None
+    if pixel_space == "tracker":
+        if (pipeline.get("v3dt") or {}).get("profile") != "sv3dt":
+            raise ValueError("tracker camInfo pixel space requires the sv3dt profile")
+        tracker_raster = validate_raster(
+            (tracker.get("tracker-width"), tracker.get("tracker-height")), label="tracker"
+        )
+    pending = []
+    for source_id, camera in sorted(cameras.items(), key=lambda item: int(item[0])):
+        name = str(camera["name"])
+        snapshot = manager.world_snapshot(int(source_id), name)
+        if snapshot is None:
+            raise ValueError(f"{name}: canonical world calibration is unavailable")
+        if not np.isclose(snapshot.floor_y, 0.0, atol=1e-9):
+            raise ValueError(f"{name}: tracker Z=0 requires target floor_y=0")
+        proj = _projection_matrix(
+            snapshot.intrinsics, snapshot.extrinsics_col_major,
+            target_h=int(snapshot.image_size[1]),
+        )
+        binding = {
+            "world_frame_id": snapshot.world_frame_id,
+            "world_frame_revision": snapshot.world_frame_revision,
+            "frame_transform_sha256": snapshot.frame_transform_sha256,
+            "camera_calibration_sha256": snapshot.camera_calibration_sha256,
+            "image_size": list(snapshot.image_size),
+            "floor_y": float(snapshot.floor_y),
+        }
+        if tracker_raster is not None:
+            proj = scale_projection_matrix(proj, snapshot.image_size, tracker_raster)
+            binding["projection_pixel_space"] = "tracker"
+            binding["tracker_image_size"] = list(tracker_raster)
+        pending.append((name, proj, binding))
+    # Validate every camera before replacing any file.
+    for name, proj, binding in pending:
+        _write_caminfo(
+            Path(args.output_dir), name, proj, args.model_height, args.model_radius,
+            frame_binding=binding,
+        )
 
 
 if __name__ == "__main__":

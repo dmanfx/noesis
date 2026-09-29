@@ -62,6 +62,7 @@ from noesis.identity_v2_osd import (
 from noesis_core.v3dt_validation import (
     V3DTAxisMap,
     V3DTAxisMapError,
+    v3dt_bbox3d_tracker_foot,
     v3dt_bbox3d_world_foot,
 )
 from noesis_core.mapanything_lifecycle import MapAnythingIdleReceipt
@@ -11052,6 +11053,18 @@ class _AnalyticsTelemetryProcessor:
         if not isinstance(data, list) or len(data) != 12:
             return None
         P = [data[0:4], data[4:8], data[8:12]]
+        profile = (getattr(self.pipeline, "config", {}) or {}).get("v3dt") or {}
+        if not self._tracking_mode_is_mv3dt() and profile.get("caminfo_pixel_space") == "tracker":
+            # The SDK receives tracker-pixel P. Public image anchors use mux
+            # pixels, matching nvtracker's own inverse-scaled image metadata.
+            from noesis.v3dt_raster import scale_projection_matrix
+
+            binding = caminfo.get("noesis_frame_binding") or {}
+            if key != "projectionMatrix_3x4_w2p" or binding.get("projection_pixel_space") != "tracker":
+                raise ValueError("SV3DT tracker projection lacks its pixel-space binding")
+            P = scale_projection_matrix(
+                P, binding.get("tracker_image_size"), binding.get("image_size")
+            ).tolist()
         cached = (key, P)
         self._v3dt_caminfo_cache[int(source_id)] = cached
         return cached
@@ -11100,21 +11113,13 @@ class _AnalyticsTelemetryProcessor:
             return None
         key, P = proj
         try:
-            x = float(bbox3d.get("xCentre"))
-            y = float(bbox3d.get("yCentre"))
-            z = float(bbox3d.get("zCentre"))
-            z_len = float(bbox3d.get("zLen"))
-        except Exception:
+            foot = v3dt_bbox3d_tracker_foot(bbox3d)
+        except V3DTAxisMapError:
             return None
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(z_len)):
-            return None
-        # The xzy camInfo lane places the tracker ground endpoint at
-        # zCentre-0.5*zLen. NVIDIA's image-foot meta follows that model point,
-        # while the opposite vertical endpoint aligns with the visible detector
-        # base in the validated three-camera lane. Publish that projected point
-        # as image_base; canonical world still uses the ground endpoint.
-        z_image_base = z + 0.5 * z_len
-        uv = self._project_point(P, (x, y, z_image_base))
+        # Image and world anchors describe the same physical cuboid endpoint.
+        # Projecting its top hid the old camInfo image-Y inversion and made the
+        # published image anchor disagree with canonical world geometry.
+        uv = self._project_point(P, foot)
         if uv is None:
             return None
         u, v = uv

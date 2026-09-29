@@ -4,15 +4,71 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def projection_in_mux_pixels(
+    projection: np.ndarray,
+    matrix_key: str,
+    caminfo: Mapping[str, Any],
+    pipeline: Mapping[str, Any],
+) -> Tuple[np.ndarray, str, Optional[Tuple[int, int]]]:
+    """Return camInfo P in streammux pixels, validating explicit tracker-space P."""
+    profile = pipeline.get("v3dt") or {}
+    pixel_space = profile.get("caminfo_pixel_space", "mux")
+    if pixel_space == "mux":
+        binding = caminfo.get("noesis_frame_binding") or {}
+        if isinstance(binding, Mapping) and binding.get("projection_pixel_space", "mux") != "mux":
+            raise ValueError("camInfo projection pixel space differs from the mux pipeline")
+        return np.asarray(projection, dtype=np.float64), "mux", None
+    if pixel_space != "tracker":
+        raise ValueError("v3dt.caminfo_pixel_space must be mux or tracker")
+    if profile.get("profile") != "sv3dt":
+        raise ValueError("tracker-pixel camInfo is supported only by the SV3DT profile")
+    if matrix_key != "projectionMatrix_3x4_w2p":
+        raise ValueError("tracker-pixel camInfo requires projectionMatrix_3x4_w2p")
+
+    streammux = pipeline.get("streammux") or {}
+    tracker = pipeline.get("tracker") or {}
+    binding = caminfo.get("noesis_frame_binding")
+    if not isinstance(binding, Mapping) or not binding:
+        raise ValueError("tracker-pixel camInfo requires noesis_frame_binding provenance")
+
+    ds9_root = str(REPO_ROOT / "DS9")
+    if ds9_root not in sys.path:
+        sys.path.insert(0, ds9_root)
+    from noesis.v3dt_raster import scale_projection_matrix, validate_raster
+
+    mux_raster = validate_raster(
+        (streammux.get("width"), streammux.get("height")), "streammux"
+    )
+    tracker_raster = validate_raster(
+        (tracker.get("tracker-width"), tracker.get("tracker-height")), "tracker"
+    )
+    binding_mux_raster = validate_raster(binding.get("image_size"), "camInfo image_size")
+    binding_tracker_raster = validate_raster(
+        binding.get("tracker_image_size"), "camInfo tracker_image_size"
+    )
+    if binding.get("projection_pixel_space") != "tracker":
+        raise ValueError("camInfo projection lacks tracker pixel-space provenance")
+    if binding_mux_raster != mux_raster:
+        raise ValueError("camInfo provenance raster differs from streammux")
+    if binding_tracker_raster != tracker_raster:
+        raise ValueError("camInfo tracker raster differs from tracker configuration")
+    return (
+        scale_projection_matrix(projection, tracker_raster, mux_raster),
+        "tracker",
+        tracker_raster,
+    )
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -323,6 +379,18 @@ def main() -> int:
                 return 1
             continue
 
+        caminfo_data = load_yaml(caminfo_path)
+        try:
+            P_match, projection_pixel_space, tracker_raster = projection_in_mux_pixels(
+                P_caminfo, key, caminfo_data, pipe
+            )
+        except (TypeError, ValueError, ImportError) as exc:
+            print(f"FAIL: invalid camInfo pixel-space binding: {exc}")
+            failures += 1
+            if args.fail_fast:
+                return 1
+            continue
+
         if not np.all(np.isfinite(P_caminfo)):
             print("FAIL: camInfo projection contains NaN/Inf")
             failures += 1
@@ -366,8 +434,10 @@ def main() -> int:
             for axes in axes_opts:
                 for yf in yflip_opts:
                     for sc in scale_opts:
-                        P_cand, E_eff = build_projection_candidate(K, E_col, target_h, inv, axes, yf, sc)
-                        rel, alpha = best_scale_match_error(P_cand, P_caminfo)
+                        P_cand, E_eff = build_projection_candidate(
+                            K, E_col, target_h, inv, axes, yf, sc
+                        )
+                        rel, alpha = best_scale_match_error(P_cand, P_match)
                         if best is None or rel < best.rel_err:
                             best = Candidate(inv, axes, yf, sc, rel, alpha)
                             best_P = P_cand
@@ -378,6 +448,13 @@ def main() -> int:
         # Print core facts.
         print(f"camInfo: {caminfo_path}")
         print(f"matrix:  {key}  (assume w2p={use_w2p})")
+        if tracker_raster is None:
+            print(f"projection pixels: {projection_pixel_space} ({target_w}x{target_h})")
+        else:
+            print(
+                f"projection pixels: tracker {tracker_raster[0]}x{tracker_raster[1]} "
+                f"(compared in mux {target_w}x{target_h})"
+            )
         print(f"intrinsics model: {intr['model']}  base_res={base_res if base_res else 'inferred'}")
         print(f"K@{target_w}x{target_h}: fx={fx_s:.3f} fy={fy_s:.3f} cx={cx_use:.3f} cy={cy_use:.3f}")
         print(
@@ -388,7 +465,7 @@ def main() -> int:
 
         # Camera center consistency check.
         C_from_Eeff = camera_center_from_E_world_to_cam(best_Eeff)
-        C_from_P = nullspace_camera_center(P_caminfo)
+        C_from_P = nullspace_camera_center(P_match)
 
         if C_from_P is None:
             print("WARN: could not compute camera center from P nullspace")

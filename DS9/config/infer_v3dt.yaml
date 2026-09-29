@@ -141,7 +141,8 @@ tracker:
   config-file: DS9/config/v3dt/nvtracker_v3dt.yaml
   ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
   tracker-width: 1920
-  tracker-height: 1080
+  # Native NvDCF requires multiples of 32; public mux pixels stay 1920x1080.
+  tracker-height: 1088
 
 analytics:
   enable: true
@@ -256,4 +257,5 @@ v3dt:
   profile: sv3dt
   world_frame: backend_world_m
   caminfo_world_axes: xzy
+  caminfo_pixel_space: tracker
   camera_order: [living-room, kitchen, family-room]

@@ -180,6 +180,7 @@ from noesis.v3dt_assets import (
     V3DTAssetBundle,
     V3DTAssetError,
     materialize_v3dt_tracker_config,
+    validate_sv3dt_calibration_binding,
     validate_v3dt_assets,
 )
 from noesis.server.websocket import (
@@ -1834,13 +1835,8 @@ def _maybe_autogen_v3dt_caminfo(
         return False
     output_dir = next(iter(output_dirs))
 
-    # Use the streammux output resolution for camInfo generation.
-    #
-    # Even if `nvtracker` internally rescales frames for tracking, SV3DT’s camInfo projection
-    # matrix is consumed in the pixel coordinate system of the frames flowing through the
-    # pipeline (i.e., streammux output). Using `tracker-width/height` here can introduce
-    # non-uniform scaling (e.g., 1920×1056 vs 1920×1080) and distort SV3DT’s projected 3D
-    # object model, which in practice can cause sporadic tracks and “stretched line” cuboids.
+    # Build calibration in public mux pixels. The generator separately applies
+    # an explicit SV3DT tracker-pixel projection when that profile requests it.
     streammux_cfg = pipeline_cfg.get("streammux") or {}
     try:
         target_w = int((streammux_cfg or {}).get("width") or 1920)
@@ -1871,7 +1867,15 @@ def _maybe_autogen_v3dt_caminfo(
         "--model-radius",
         str(EXPECTED_OBJECT_MODEL_RADIUS_M),
         "--calibration",
-        str(REPO_ROOT / "config" / "camera_calibration.json"),
+        str(Path(
+            os.environ.get("NOESIS_CAMERA_CALIBRATION_FILE", "")
+            or REPO_ROOT / "config" / "camera_calibration.json"
+        ).expanduser().resolve()),
+        "--alignment",
+        str(Path(
+            os.environ.get("NOESIS_PLY_ALIGNMENT_FILE", "")
+            or REPO_ROOT / "config" / "ply_alignment.json"
+        ).expanduser().resolve()),
     ]
     logger.warning("V3DT autogen camInfo enabled; running: %s", " ".join(cmd))
     try:
@@ -5476,6 +5480,20 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         ),
     )
     setattr(pipeline, "bev_calibration", calibration_provider)
+    if tracking_mode == "v3dt":
+        try:
+            if v3dt_bundle is None:
+                raise V3DTAssetError("SV3DT asset bundle is unavailable")
+            validate_sv3dt_calibration_binding(
+                v3dt_bundle,
+                pipeline_config=pipeline.config,
+                calibration_provider=calibration_provider,
+                camera_labels=camera_labels,
+            )
+        except Exception as exc:
+            logger.error("SV3DT active calibration binding failed: %s", exc)
+            return _abort_startup("sv3dt_calibration_binding_invalid")
+        logger.info("SV3DT camInfo matches the active canonical world calibration")
     if calibration_provider.pose_only_enabled():
         pose_errors = calibration_provider.validate_pose_coverage()
         if pose_errors:

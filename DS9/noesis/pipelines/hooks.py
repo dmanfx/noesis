@@ -11438,7 +11438,16 @@ class _AnalyticsTelemetryProcessor:
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
                 pose_anchor_start_ns = time.perf_counter_ns()
-                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                pose_current_evidence: Dict[str, bool] = {}
+                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(
+                    obj_meta,
+                    raw.get("bbox") or [],
+                    current_cohort=(
+                        (source_id, track_id, frame_id, temporal_contract.get("media_pts_ns"))
+                        if self._tracking_mode == "v3dt" else None
+                    ),
+                    current_cohort_status=pose_current_evidence,
+                )
                 _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
                 depth_extract_start_ns = time.perf_counter_ns()
                 depth_result = self._extract_object_depth_result(obj_meta)
@@ -11541,6 +11550,7 @@ class _AnalyticsTelemetryProcessor:
                     public_track,
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
+                    pose_is_current=bool(pose_current_evidence.get("current")),
                     depth_result=depth_result,
                     world_now_ts=float(world_now_ts),
                 )
@@ -12022,7 +12032,16 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
-                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                pose_current_evidence: Dict[str, bool] = {}
+                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(
+                    obj_meta,
+                    raw.get("bbox") or [],
+                    current_cohort=(
+                        (source_id, track_id, frame_id, temporal_contract.get("media_pts_ns"))
+                        if self._tracking_mode == "v3dt" else None
+                    ),
+                    current_cohort_status=pose_current_evidence,
+                )
                 depth_result = self._extract_object_depth_result(obj_meta)
                 self._augment_track_with_world(
                     sensor_id,
@@ -12030,6 +12049,7 @@ class _AnalyticsTelemetryProcessor:
                     public_track,
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
+                    pose_is_current=bool(pose_current_evidence.get("current")),
                     depth_result=depth_result,
                     world_now_ts=float(world_now_ts),
                 )
@@ -14509,14 +14529,29 @@ class _AnalyticsTelemetryProcessor:
         self,
         obj_meta: Any,
         bbox: Sequence[float],
+        *,
+        current_cohort: Optional[Tuple[int, int, int, Optional[int]]] = None,
+        current_cohort_status: Optional[Dict[str, bool]] = None,
     ) -> Optional[np.ndarray]:
         payload = self._extract_pose_payload_for_anchor(obj_meta)
+        if current_cohort_status is not None:
+            # The pose-feature cache rewrites frame/PTS after transporting old
+            # joints with the current box. That is useful presentation metadata,
+            # but cannot independently corroborate a current SDK world point.
+            current_cohort_status["current"] = bool(
+                current_cohort is not None
+                and self._pose_payload_is_current(payload, current_cohort)
+            )
         if payload is not None:
             keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
             if keypoints_abs is not None:
                 _increment_core_counter("detection_wake.pose_anchor_payload_hit")
                 return keypoints_abs
 
+        if current_cohort_status is not None:
+            # The fallback can still serve existing pose consumers, but must
+            # not inherit provenance from a payload whose joints were invalid.
+            current_cohort_status["current"] = False
         if obj_meta is not None and noesis_pose_meta_ext is not None:
             if int(self._pose_anchor_native_remaining) <= 0:
                 _increment_core_counter("detection_wake.pose_anchor_native_budget_skipped")
@@ -14543,6 +14578,28 @@ class _AnalyticsTelemetryProcessor:
 
         _increment_core_counter("detection_wake.pose_anchor_missing")
         return None
+
+    @staticmethod
+    def _pose_payload_is_current(
+        payload: Optional[Mapping[str, Any]],
+        cohort: Tuple[int, int, int, Optional[int]],
+    ) -> bool:
+        if not isinstance(payload, Mapping):
+            return False
+        try:
+            source_id, tracker_id, frame_id, media_pts_ns = cohort
+            return bool(
+                not payload.get("pose_cache_reused", False)
+                and int(payload.get("pose_cache_age_frames", 0)) == 0
+                and int(payload["source_id"]) == int(source_id)
+                and int(payload["object_id"]) == int(tracker_id)
+                and int(payload["frame_id"]) == int(frame_id)
+                and media_pts_ns is not None
+                and int(media_pts_ns) > 0
+                and int(payload["ts_us"]) == int(media_pts_ns) // 1_000
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
 
     def _keypoints_abs_from_pose_payload(
         self,
@@ -19063,6 +19120,92 @@ class _AnalyticsTelemetryProcessor:
             and width_px / height_px < 0.85
         )
 
+    def _v3dt_pose_reacquire_support(
+        self,
+        camera_id: str,
+        track: Dict[str, Any],
+        *,
+        calib: Any,
+        measurement: np.ndarray,
+        pose_kpts_abs: Optional[np.ndarray],
+        pose_is_current: bool,
+    ) -> Optional[str]:
+        """Corroborate an SDK point without replacing it with a pose solve."""
+
+        track["world_v3dt_pose_support"] = False
+        track["world_v3dt_pose_support_reason"] = "current_pose_missing"
+        if not pose_is_current or pose_kpts_abs is None:
+            return None
+        image_size = self._normalize_image_size(track.get("image_size"))
+        calibrated_size = self._normalize_image_size(calib.image_size)
+        bbox = self._scale_bbox_to_image_size(
+            track.get("bbox") or [], image_size, calibrated_size
+        )
+        if not bbox or calibrated_size is None:
+            track["world_v3dt_pose_support_reason"] = "image_geometry_missing"
+            return None
+        keypoints = self._scale_pose_keypoints_to_image_size(
+            pose_kpts_abs, image_size, calibrated_size
+        )
+        if (
+            keypoints is None or keypoints.ndim != 2
+            or keypoints.shape[0] < 17 or keypoints.shape[1] < 3
+            or not np.all(np.isfinite(keypoints[15:17, :3]))
+            or np.any(keypoints[15:17, 2] > 1.0)
+        ):
+            track["world_v3dt_pose_support_reason"] = "pose_contact_nonfinite"
+            return None
+        posture = classify_posture(
+            kpts_abs=keypoints, bbox=bbox, height_ref_scene=None,
+            config=self._human_ground_cfg,
+        )
+        if posture in {"sitting", "lying"}:
+            track["world_v3dt_pose_support_reason"] = "upright_contact_unproven"
+            return None
+        anchor = self._resolve_pose_floor_anchor(keypoints, posture=posture)
+        if anchor is None or str(anchor.source) != "pose_ankle_floor":
+            track["world_v3dt_pose_support_reason"] = "observed_ankle_pair_missing"
+            return None
+        u, v = float(anchor.u), float(anchor.v)
+        if not (0 <= u < calibrated_size[0] and 0 <= v < calibrated_size[1]):
+            track["world_v3dt_pose_support_reason"] = "pose_contact_outside_image"
+            return None
+        flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+        pose_ground = self._project_pixel_to_floor_world(
+            calib, u, v, flip_u=flip_u, flip_v=flip_v,
+        )
+        if pose_ground is None:
+            track["world_v3dt_pose_support_reason"] = "pose_floor_projection_invalid"
+            return None
+        # Keep corroboration diagnostics separate from the SDK measurement's
+        # own calibrated range admission. No pose point enters the filter.
+        diagnostics: Dict[str, Any] = {}
+        if not self._admit_floor_ray_range(
+            camera_id, calib=calib, floor_candidate=pose_ground,
+            track=diagnostics, anchor_uv=(u, v), bbox=bbox,
+            flip_u=flip_u, flip_v=flip_v,
+        ):
+            track["world_v3dt_pose_support_reason"] = str(
+                diagnostics.get("world_floor_rejection_reason")
+                or "pose_floor_geometry_rejected"
+            )
+            return None
+        disagreement_m = float(np.linalg.norm(
+            (np.asarray(pose_ground) - np.asarray(measurement))[[0, 2]]
+        ))
+        agreement_limit_m = min(
+            float(self._human_ground_cfg.max_jump_m),
+            float(self._world_resolver_max_disagreement_m),
+        )
+        track["world_v3dt_pose_support_disagreement_m"] = disagreement_m
+        track["world_v3dt_pose_support_limit_m"] = agreement_limit_m
+        if not math.isfinite(disagreement_m) or disagreement_m > agreement_limit_m:
+            track["world_v3dt_pose_support_reason"] = "pose_sdk_ground_disagreement"
+            return None
+        track["world_v3dt_pose_support"] = True
+        track["world_v3dt_pose_support_reason"] = "current_ankle_pair_agrees"
+        return "bbox3d:pose_ankle_floor"
+
     def _refine_seeded_world_with_ground_state(
         self,
         sensor_id: int,
@@ -19071,6 +19214,8 @@ class _AnalyticsTelemetryProcessor:
         *,
         world_source_label: str,
         world_now_ts: Optional[float] = None,
+        pose_kpts_abs: Optional[np.ndarray] = None,
+        pose_is_current: bool = False,
     ) -> None:
         """Adapt a pre-seeded SDK world observation into shared human state."""
         if self.bev_calibration is None:
@@ -19267,6 +19412,30 @@ class _AnalyticsTelemetryProcessor:
                         reason=rejection_reason,
                     )
             else:
+                support_basis = None
+                pending_support = None
+                pending_fields = (
+                    "reacquire_candidate_x", "reacquire_candidate_z",
+                    "reacquire_candidate_ts", "reacquire_candidate_basis",
+                    "reacquire_candidate_exact_basis", "reacquire_count",
+                    "reacquire_unavailable_rows",
+                )
+                if self._tracking_mode == "v3dt" and world_source_label == "bbox3d":
+                    support_basis = self._v3dt_pose_reacquire_support(
+                        camera_id, track, calib=calib, measurement=metric_candidate,
+                        pose_kpts_abs=pose_kpts_abs, pose_is_current=pose_is_current,
+                    )
+                    if (
+                        state is not None
+                        and state.reacquire_candidate_basis == "bbox3d:pose_ankle_floor"
+                        and state.reacquire_count > 0
+                        and 0.0 <= now_ts - state.reacquire_candidate_ts
+                        <= float(self._human_ground_cfg.reacquire_max_gap_s)
+                        and track.get("world_v3dt_pose_support_reason") in {
+                            "current_pose_missing", "observed_ankle_pair_missing",
+                        }
+                    ):
+                        pending_support = tuple(getattr(state, key) for key in pending_fields)
                 hit = self._update_track_world_state(
                     track,
                     state,
@@ -19276,6 +19445,8 @@ class _AnalyticsTelemetryProcessor:
                     alpha=float(self._world_smooth_alpha_good),
                     beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
                     quality="good",
+                    contact_basis=support_basis,
+                    verified_reacquire_support=bool(support_basis),
                     media_pts_ns=self._valid_world_media_pts_ns(
                         track.get("media_pts_ns")
                     ),
@@ -19283,6 +19454,12 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if state.measurement_accepted:
                     state.post_ghost_position_support_required = False
+                elif pending_support is not None:
+                    # Sparse pose cadence may leave current SDK-only rows
+                    # between proofs. They neither count nor renew the last
+                    # proof's timestamp. A contradictory current pose clears it.
+                    for key, value in zip(pending_fields, pending_support):
+                        setattr(state, key, value)
 
             bounded_process_origin: Optional[str] = None
             if state is not None and not state.measurement_accepted:
@@ -19290,12 +19467,14 @@ class _AnalyticsTelemetryProcessor:
                     reason = (
                         "restored_short_ghost_requires_current_position_evidence"
                     )
-                    mark_world_measurement_unavailable(
-                        state,
-                        reason=reason,
-                        now_ts=now_ts,
-                        config=self._human_ground_cfg,
-                    )
+                    if not (
+                        state.reacquire_candidate_basis == "bbox3d:pose_ankle_floor"
+                        and state.reacquire_count > 0
+                    ):
+                        mark_world_measurement_unavailable(
+                            state, reason=reason, now_ts=now_ts,
+                            config=self._human_ground_cfg,
+                        )
                     state.trail_append_allowed = False
                     track["world_estimator_evaluated"] = True
                     self._invalidate_world_track(track, reason)
@@ -19523,9 +19702,8 @@ class _AnalyticsTelemetryProcessor:
                     track.pop("world_prediction_provenance", None)
 
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
-            # V3DT already publishes ``image_base`` from the opposite cuboid
-            # endpoint in the tracker/camInfo frame.  Preserve that diagnostic
-            # while the canonical world point is filtered.
+            # Preserve the SDK ground endpoint diagnostic while filtering the
+            # canonical point; it is not independent reacquisition evidence.
             if "image_base" not in track:
                 self._set_track_image_base_from_world(
                     track,
@@ -19673,6 +19851,7 @@ class _AnalyticsTelemetryProcessor:
         *,
         obj_meta: Any | None = None,
         pose_kpts_abs: Optional[np.ndarray] = None,
+        pose_is_current: bool = False,
         depth_result: Optional[ObjectDepthResult] = None,
         world_now_ts: Optional[float] = None,
     ) -> None:
@@ -19692,6 +19871,8 @@ class _AnalyticsTelemetryProcessor:
                         track,
                         world_source_label="bbox3d",
                         world_now_ts=world_now_ts,
+                        pose_kpts_abs=pose_kpts_abs,
+                        pose_is_current=pose_is_current,
                     )
                 else:
                     self._invalidate_world_track(

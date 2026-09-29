@@ -72,6 +72,13 @@ config/cameras.yaml
 Normal operation is through systemd. Direct `run` is for an explicitly isolated
 development session after the managed service is stopped; never run both.
 
+An explicit `--tracking-mode v3dt` on both supervisor `check` and `run` selects
+`DS9/config/infer_v3dt.yaml`, `DS9/config/cameras_v3dt.yaml`, and YOLO26-m.
+This enables per-camera native 3D tracking with health variant `ds9:v3dt`;
+`--tracking-mode mv3dt` separately selects the accepted Kitchen/Family peer
+profile. Omitting the flag continues to select baseline. The selected profile's
+native engines and camera models are checked by the existing V3DT preflight.
+
 ## Lifecycle and readiness
 
 - Systemd owns restart-on-failure and bounded stop timing.

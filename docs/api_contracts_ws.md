@@ -1348,8 +1348,10 @@ The exact design is in
   `world_frame="backend_world_m"`; missing/invalid bbox or axis metadata fails
   closed.
 - In V3DT mode, `image_foot` is the native tracker ground-foot observation and
-  `image_base` is the independently projected opposite cuboid endpoint. This
-  distinction is intentional and is covered by the global-world v2 gate.
+  `image_base` projects the same lower cuboid endpoint through the validated
+  camInfo matrix. They are correlated diagnostics, not independent evidence
+  of position accuracy. SV3DT startup verifies that the camera projection and
+  its revision/digests match the active canonical target floor frame.
 - This per-camera SV3DT contract makes no MV3DT overlap, time-sync, peer-ID, or
   fused-position claim.
 

@@ -3,6 +3,119 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-09-27 — SV3DT occlusion box and pose-confidence correction
+
+- Fixed a V3DT OSD policy override that enabled the separate tracked 2D
+  rectangle over NVIDIA's native cuboid. Explicit V3DT bbox-off now survives
+  detector/segmentation selection; native cuboid lines and GPU OSD remain.
+  Baseline and MV3DT behavior are unchanged.
+- Raised native height-estimation pose confidence to NVIDIA's sample value
+  0.925. Kept interval 4 so a reliable later pose can correct an occluded entry
+  estimate. First-frame-only inference was tested and rejected because it
+  reduced accepted-world coverage for the recorded child.
+- In a matched Living Room replay, adult native height range changed from
+  1.252–1.983 m to 1.651–1.700 m. Height jumps over 5 cm within 250 ms fell
+  from 24 to zero. Adult/child image-match coverage improved from
+  98.5%/89.4% to 99.6%/98.9%; total lifecycles fell from 9 to 7.
+- Phone-center separation on 184 common image matches worsened from
+  0.358/0.702 m median/p90 to 0.370/0.868 m. This diagnostic is not person
+  ground truth; the result supports box stability, not improved positional
+  accuracy. The exact new couch/table/chair walk remains a live visual check.
+- Validation: 27 focused config/profile tests, successful native replay and
+  WebRTC decoding, and decoded frames retaining native cuboids with the 2D
+  rectangle suppressed. Evidence is storage-relative
+  `tmp/v3dt-occlusion-20260927/report.md` and the named replay folders.
+- Restarted the managed V3DT runtime with the selected settings. All three
+  source counters advanced and the live WebRTC smoke decoded 245 frames.
+  No people were present during that smoke; occupied validation is from the
+  recorded replay. V3DT remains enabled for the exact furniture-occlusion test.
+
+## 2026-09-27 — Managed V3DT live visual test
+
+- The native supervisor now accepts explicit `--tracking-mode v3dt` in both
+  `check` and `run`, selecting the tested per-camera YOLO26-m profile. Baseline
+  remains the default; the existing MV3DT selection is unchanged.
+- At the user's request, the managed service was restarted with this option.
+  The existing Menon health binding was changed only from baseline to V3DT,
+  with a matching content digest in native health configuration. This was
+  required by the deployed gateway's exact variant check; existing software
+  and state-release bindings were retained, with the previous binding saved.
+- V3DT asset preflight, 22 supervisor tests, native producer readiness, gateway
+  readiness and the appliance guard passed. No competing pipeline was active;
+  the unrelated phone-scan process was preserved.
+- A live metadata probe confirmed progress on all three sources, native 3D
+  boxes and accepted Kitchen world output. Family Room observations in that
+  short window had 3D boxes without accepted world output. A separate WebRTC
+  smoke decoded 244 frames and passed. V3DT was left enabled for visual review.
+
+## 2026-09-27 — SV3DT fragmentation and occupied-load comparison
+
+- The opt-in profile now defaults to YOLO26-m detection, native NvDCF with the
+  baseline color-feature preset, and a V3DT-only 32-pixel minimum pose crop.
+  The pose engine/cadence, native 3D estimator, tracker ReID and lifecycle/world
+  safeguards remain enabled. Explicit segmentation selection remains available.
+- Native NvDCF uses a 1920x1088 tracker raster while public pixels remain
+  1920x1080. Camera-model generation, startup validation, projection consumers
+  and diagnostics explicitly bind and invert that raster transform without
+  changing world calibration, the floor or published coordinate authority.
+- The Living Room recording improved from 37 lifecycles in the previous
+  segmentation run (33 with the same detector and old visual preset) to 7.
+  The selected screening run matched the original baseline's two adult and
+  four child lifecycles. An active-media repeat retained seven total, but a
+  one-cohort child ID takeover added a matched child lifecycle. A brief adult
+  partial-box reset also remains; aggregate parity is not uniform identity parity.
+- A matched synthetic stress replay fed the recording to three private camera
+  routes. V3DT produced 11 total source0 lifecycles versus baseline's 25, with
+  adult reference-box coverage 89.2% versus 80.8% and child coverage 79.4%
+  versus 68.2%. World availability was 91.6% versus 86.5%. Only Living Room
+  has the corresponding physical calibration; copied streams test load, not
+  real multi-camera accuracy or identity. Both profiles degraded under this load.
+- On 132 common image-matched phone poses in that stress pair, median/p90
+  horizontal phone-center separation was 0.344/0.661 m for V3DT versus
+  0.361/0.930 m for baseline. Individual time blocks remain worse. The handset
+  reference is not surveyed person-ground truth; body offset and timing remain
+  unmeasured, and arm observations may be up to 240 ms apart.
+- Over occupied replay seconds 25–120, V3DT averaged 3.96 CPU cores, 2,158 MiB
+  RSS and 6,714 MiB GPU allocation; baseline averaged 4.38 cores, 2,001 MiB and
+  6,216 MiB. Board GPU utilization averaged 68.4% versus 46.0%. Source progress
+  was about 26.4 versus 23.7 fps; separate 120-second WebRTC clients decoded
+  27.1 versus 25.1 fps. Measured feeder/gateway drops were zero, which does not
+  prove absence of source or pre-encode frame losses or end-to-end latency.
+- Validation: 134 focused tests, then 47 profile/binding/generator checks after
+  selecting the canonical raster. Baseline/MV3DT config files remain unchanged.
+  The production baseline, readiness, gateway and guard were restored healthy;
+  unrelated phone-scan work was preserved. Evidence is storage-relative
+  `tmp/v3dt-continuity-20260927/continuity_report.md` and its retained run folders.
+
+## 2026-09-27 — SV3DT rectified projection, target-floor binding and supported recovery
+
+- Corrected the opt-in SV3DT camera models' extra image-Y flip and raw-floor
+  mismatch. Generation now uses the same revision-bound world calibration as
+  baseline localization; startup rejects mismatched projection/provenance.
+  Image and world anchors use the same lower cuboid endpoint.
+- The nominal cylinder prior is 1.7 m with adaptive height retained. Fresh,
+  exact-cohort paired ankles can corroborate an SDK point for the existing
+  bounded reacquisition process. Cached pose, duplicate cohorts and
+  contradictory pose cannot authorize recovery. No pose coordinate replaces
+  the SDK measurement, and successful recovery breaks the trail.
+- On the 143-second Living Room companion recording from September 22, all
+  99 originally matched phone-path samples were recovered. Median horizontal
+  separation from the independently aligned phone optical center improved
+  from 6.072 m to 0.371 m (detection baseline: 0.297 m); p90 improved from
+  21.060 m to 0.686 m. Final world availability was 1,314/1,405 observations
+  (93.5%), with 14 supported recoveries and no valid points beyond 20 m from
+  the world origin. This is a diagnostic comparison, not surveyed person-ground
+  truth; phone/body offset, timing and phone drift remain limitations.
+- A fresh detection-baseline replay yielded 168 matched phone poses: median
+  separation was 0.408 m for corrected SV3DT versus 0.341 m for detection;
+  p90 was 0.698 m versus 0.692 m. SV3DT is significantly closer to baseline,
+  but has not demonstrated a positional-accuracy win. Detection retained
+  stronger continuity (7 tracker lifecycles versus 37). The original 99-pose
+  comparison and fresh-baseline pairing are retained separately.
+- Ninety-seven focused tests passed. Baseline remains the default; accepted
+  Kitchen/Family Room MV3DT assets were not changed. Evidence and comparison
+  artifacts are under storage-relative `tmp/v3dt-alignment-20260927/`.
+
 ## 2026-09-23 — PCF raster compatibility and built-dashboard validation
 
 - Scene Prior responses now declare a separate raster-format version and

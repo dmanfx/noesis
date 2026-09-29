@@ -18,6 +18,80 @@ Accepted decisions define intended authority. Superseded entries retain their
 status; dated tests and runtime observations belong with their evidence and do
 not imply that every permitted runtime option is selected.
 
+## 2026-09-27 — SV3DT visual continuity and tracker raster are explicitly bound
+
+SV3DT's video shows the native projected 3D cuboid. Its explicit
+`osd.display-bbox: 0` survives PGIE policy derivation, suppressing the separate
+tracked 2D rectangle without suppressing NVIDIA's cuboid DisplayMeta lines.
+The internal BodyPose3DNet height estimator requires
+`ObjectModelProjection.minPoseConfidence: 0.925`, matching NVIDIA's single-view
+sample. The existing inference interval remains 4: reliable later poses may
+refine an initially occluded target, while low-confidence pose estimates must
+not resize the body model. The downstream YOLO pose SGIE remains independent.
+This improves native dimension stability; it does not establish better world
+position accuracy or permit bypassing world validity/recovery gates.
+
+The native host supervisor exposes `--tracking-mode v3dt` for this per-camera
+profile in both `check` and `run`, using the existing V3DT asset preflight and
+`ds9:v3dt` health variant. Baseline remains the default and MV3DT remains a
+separate explicit peer-tracking selection.
+
+The opt-in SV3DT profile uses YOLO26-m detection and native NvDCF visual
+tracking with the baseline color-feature preset. Native 3D state estimation,
+BodyPose3D, tracker ReID and the existing association/lifecycle gates remain
+enabled. Explicit segmentation selection remains available. The V3DT-only
+pose SGIE configuration admits person crops from 32 pixels wide; the shared
+64-pixel threshold excluded current pose evidence for the recorded child.
+The pose model, engine and inference cadence are unchanged.
+
+Native NvDCF requires tracker dimensions divisible by 32. SV3DT therefore
+uses a 1920x1088 tracker raster while keeping 1920x1080 mux/public pixels.
+`v3dt.caminfo_pixel_space: tracker` explicitly binds native projection to
+`diag(tracker_width/mux_width, tracker_height/mux_height, 1) @ K @ E @ axes`.
+Camera models retain the calibrated mux image size and additionally declare
+the projection pixel space and tracker image size. Startup inverse-scales the
+projection and validates it against the active world calibration. Public
+projection consumers and diagnostics use mux pixels; SDK image metadata is
+already inverse-scaled by nvtracker and must not be scaled a second time.
+No world transform, floor, camera intrinsics or detector resolution changes.
+MV3DT retains its existing raster and geometry contract.
+
+Continuity comparisons use reviewed people separately from unmatched
+detections, and distinguish canonical identities from provisional labels.
+Equal aggregate lifecycle counts alone cannot establish identity parity.
+Short ambiguous native associations still pass through the existing lifecycle
+and physical-position safeguards; tuning must not hide them or retain stale
+world authority merely to improve a fragmentation count.
+
+## 2026-09-27 — SV3DT solves in the same revision-bound floor frame as canonical localization
+
+The opt-in SV3DT camera model is generated from the calibration manager's
+`world_snapshot`, including its existing calibration-to-target frame edge and
+horizontal target floor. Its public-pixel projection is `K @ E_target @ axes`, in rectified
+top-left-origin pixels, with canonical Y-up mapped to tracker Z-up. No second
+image-Y flip is applied. The published image foot and world foot refer to the
+same lower cuboid endpoint.
+
+Before preparing the native pipeline, SV3DT checks camera order, raster, floor,
+projection, world revision, transform digest and calibration digest against the
+active calibration snapshot. Stale camera models fail startup rather than
+publishing coordinates under a different world revision. Generation uses the
+same configured calibration, alignment and Scene Prior frame bindings as the
+runtime; it does not fit a phone trajectory or infer a new frame edge.
+
+Baseline remains the default. Accepted Kitchen/Family Room MV3DT uses its
+separate geometry contract and assets. Native cuboid observations continue
+through the existing physical-motion admission checks. SV3DT uses a nominal
+1.7 m cylinder with adaptive pose height; this is a model prior, not a measured
+person stature.
+
+A quarantined SV3DT track can reacquire only through the existing bounded
+consensus after fresh, exact-cohort paired ankle observations independently
+agree with its SDK ground estimate. Cached pose and the cuboid's own projected
+foot cannot supply this proof. Missing proof neither counts nor renews a prior
+proof, and contradictory current pose clears the pending consensus. The SDK
+point remains the measurement, and successful reacquisition breaks the trail.
+
 ## 2026-09-23 — PCF raster format is versioned independently and served as a compatible pair
 
 The `floorplan_contract_version` owns geometry and orientation, not the binary

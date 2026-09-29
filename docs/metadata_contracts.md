@@ -441,7 +441,7 @@ binding still prevents canonical measurement admission.
   already active in that frame and is not cross-camera ReID.
 - `dwell_time` is derived per track by `_AnalyticsTelemetryProcessor` using zone entry timestamps; it is null when no zone is available.
 - `bbox3d` and `velocity3d` are attached when `NVDS_OBJ_3D_META` (SV3DT/MV3DT) is present. In the locked V3DT profile they retain the tracker tuple for diagnostics; consumers must not reinterpret them directly as canonical world coordinates.
-- In baseline mode, `image_foot` is the active current-frame image anchor chosen by the backend estimator and `image_base` is the canonical image reprojection of the filtered world state. In V3DT mode, `image_foot` is the native tracker ground-foot metadata, while `image_base` is the separately derived projection of the opposite cuboid endpoint. Keeping both prevents a self-referential reprojection check.
+- In baseline mode, `image_foot` is the active current-frame image anchor chosen by the backend estimator and `image_base` is the canonical image reprojection of the filtered world state. In V3DT mode, `image_foot` is native tracker ground-foot metadata and `image_base` projects the same lower cuboid endpoint through camInfo. These correlated diagnostics cannot independently verify world accuracy or authorize reacquisition.
 - In baseline mode, one universal resolver builds independently valid
   `floor_ray`, `registered_depth`, optional `pose_scale`, and
   `gravity_reconstruction` hypotheses in the exact current track cohort. It
@@ -508,6 +508,19 @@ binding still prevents canonical measurement admission.
   they miss the pulse frame. Source hysteresis is committed only after the
   physical gate accepts the observation.
 - In `v3dt` mode, `world`/`world_source="bbox3d"` come from the bbox ground endpoint only after the profile's required `xzy` tracker-to-world conversion. The public result is Y-up meters in `world_frame="backend_world_m"`; absent/invalid bbox or axis metadata leaves world invalid instead of selecting a ray-plane fallback.
+- SV3DT camInfo is generated in the active target floor frame and checked
+  against the calibration manager's world snapshot before startup. Its stored
+  world revision, transform/calibration digests, floor and raster must agree
+  with that snapshot; attaching the current revision to an old calibration
+  projection is invalid.
+- SV3DT's optional `world_v3dt_pose_support` and
+  `world_v3dt_pose_support_reason` diagnose independent current paired-ankle
+  corroboration of the SDK ground estimate. Where evaluated,
+  `world_v3dt_pose_support_disagreement_m` and
+  `world_v3dt_pose_support_limit_m` describe that gate. Cached or mismatched
+  source/object/frame/PTS pose cannot authorize reacquisition. The ordinary
+  bounded consensus and trail-break rules still apply, and the pose point
+  never replaces the SDK measurement.
 - The current V3DT contract does not permit `world_frame="camera_local"`. Shared-world SV3DT output does not by itself prove MV3DT overlap fusion or cross-camera ID propagation.
 - `world_frame_revision` and `world_transform_sha256` identify the exact
   active calibrated/Scene Prior world edge used for the track. A renderer or

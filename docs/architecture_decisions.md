@@ -2252,8 +2252,8 @@ not establish feature identity or independent physical accuracy.
 The strict artifact binds catalog/PCF metadata, calibrated rays, authored
 model/parent, measured levels and frozen solve. Extraction stays offline;
 startup replays compact evidence, and publication checks current bindings.
-Explicitly retained rooms preserve actual local floor/wall geometry, allowing
-only independently checked adjacent measured slab-top derivation. New scale
+Every room now requires structural evidence; inherited-marker retention is
+retired. New scale
 must preserve measured rise relative to the actual lower planes. No generic
 zero-height floor or camera-marker Y is authority.
 
@@ -2264,6 +2264,13 @@ and `structurally_qualified: false` status remain intact. This is presentation
 selection, not physical qualification or changed localization authority.
 See the [workflow](structural_scene_registration.md) and
 [assessment](../plans/structural_registration_results.md).
+
+The 2026-10-04 Kitchen investigation adds an offline image-region lane for
+recovering connected support from exact admitted PCF points. It retains the
+original observed seed, measured tilt, source/frame proof and quality gates;
+it neither uses authored positions to select evidence nor admits a new mapping.
+Support extents are not architectural endpoints or independent holdouts. See
+the [Kitchen evidence review](../plans/kitchen_structural_evidence_review.md).
 
 ## ADR-047 — Independent RGB PCF presentation replays recorded room frames
 
@@ -2292,3 +2299,22 @@ loosening browser CSP. Existing low-mesh gap triangles retain their coarse
 presentation-prior role; added texture resolution and polygon count do not
 qualify room registration or independent physical accuracy. Variant replacement
 is atomic and preserves view, renderer preferences and canonical playout.
+
+## ADR-048 — Structural-only room presentation on the updated authored model
+
+Status: owner-selected intermediate, 2026-10-04; not structurally qualified.
+
+All three current rooms use reviewed structural mappings. Explicit semantic
+rebinding accommodates the owner's corrected export without changing admitted
+PCF manifests or calibration/world edges. Reviewed actual mesh-face/vertex
+selectors and retained normal-supported carrier proof extend evidence coverage,
+not localization authority. Model-only refits reverify authored correspondence
+and math without requiring the old authored solve to remain unchanged.
+
+Remove inherited camera-marker builders and runtime fallback for every room.
+Historical alignment bytes remain immutable frame-fingerprint evidence, but
+their marker metadata is neither loaded nor published. Menon consumes exact
+revision-owned matrices without a global marker dependency and clears revoked
+presentation state on complete authoritative bundles. Missing mappings reject.
+Measured foyer rise remains 0.1905 m; Family/Kitchen window failures stay recorded
+under explicit owner selection. No quality threshold or person position changes.

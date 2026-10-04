@@ -54,10 +54,8 @@ from noesis.calibration.pose_v1 import (
     normalize_pose_v1 as _normalize_pose_v1,
     pose_to_E_col_major as _pose_to_E_col_major,
 )
-from noesis.calibration.scene_registration import camera_anchor_state_sha256
 from noesis.calibration.presentation_registration import (
     PresentationRegistrationError,
-    derive_entry as derive_scene_presentation_entry,
     load_registration as load_scene_presentation_registration,
 )
 
@@ -418,204 +416,6 @@ def _world_to_scene_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise CalibrationValidationError("scene_similarity must be a mapping")
-
-    out: Dict[str, Any] = {}
-    col_major = payload.get("world_to_scene_col_major")
-    row_major = payload.get("matrix_row_major") or payload.get("world_to_scene_row_major")
-
-    if isinstance(col_major, list) and len(col_major) == 16:
-        col_values = [float(x) for x in col_major]
-        row_values = _col_major_to_row_major(col_values)
-    elif isinstance(row_major, list) and len(row_major) == 16:
-        row_values = [float(x) for x in row_major]
-        col_values = _row_major_to_col_major(row_values)
-    else:
-        raise CalibrationValidationError("scene_similarity requires a 4x4 transform")
-
-    _validate_align_matrix(row_values)
-    out["world_to_scene_col_major"] = col_values
-    out["matrix_row_major"] = row_values
-
-    # A target-owned registration is independent of the legacy source-space
-    # similarity above.  It is optional for v1 deployments, but when present
-    # it is the only authored mapping against which an explicit v2
-    # presentation may be checked.  Do not derive it from a camera edge.
-    target_col_major = payload.get("target_world_to_scene_col_major")
-    target_row_major = payload.get("target_world_to_scene_row_major")
-    if isinstance(target_col_major, list) and len(target_col_major) == 16:
-        try:
-            target_values = [float(value) for value in target_col_major]
-        except (TypeError, ValueError) as exc:
-            raise CalibrationValidationError(
-                "scene_similarity.target_world_to_scene_col_major must be numeric"
-            ) from exc
-        target_rows = _col_major_to_row_major(target_values)
-    elif isinstance(target_row_major, list) and len(target_row_major) == 16:
-        try:
-            target_rows = [float(value) for value in target_row_major]
-        except (TypeError, ValueError) as exc:
-            raise CalibrationValidationError(
-                "scene_similarity.target_world_to_scene_row_major must be numeric"
-            ) from exc
-        target_values = _row_major_to_col_major(target_rows)
-    elif target_col_major is not None or target_row_major is not None:
-        raise CalibrationValidationError(
-            "target authored registration requires a 16-value transform"
-        )
-    else:
-        target_values = None
-        target_rows = None
-    if target_values is not None:
-        _validate_align_matrix(target_rows)
-        out["target_world_to_scene_col_major"] = target_values
-        out["target_world_to_scene_row_major"] = target_rows
-        target_registration_sha256 = str(
-            payload.get("target_registration_sha256") or ""
-        ).strip().lower()
-        if target_registration_sha256:
-            if len(target_registration_sha256) != 64 or any(
-                char not in "0123456789abcdef" for char in target_registration_sha256
-            ):
-                raise CalibrationValidationError(
-                    "scene_similarity.target_registration_sha256 must be a lowercase SHA-256 digest"
-                )
-            out["target_registration_sha256"] = target_registration_sha256
-
-    for key in ("source", "residual_units"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            out[key] = value.strip()
-
-    for key in ("camera_count", "sample_count"):
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = int(value)
-        except Exception as exc:
-            raise CalibrationValidationError(f"scene_similarity.{key} must be an integer") from exc
-        out[key] = parsed
-
-    for key in (
-        "mean_residual",
-        "max_residual",
-        "position_rmse_scene_units",
-        "position_rmse_m",
-        "max_residual_m",
-        "anchor_residual_limit_m",
-        "scene_per_m",
-        "s_obj_to_m",
-    ):
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = float(value)
-        except Exception as exc:
-            raise CalibrationValidationError(f"scene_similarity.{key} must be numeric") from exc
-        if not math.isfinite(parsed):
-            raise CalibrationValidationError(f"scene_similarity.{key} must be finite")
-        out[key] = parsed
-
-    for key in ("anchor_state_sha256", "camera_calibration_sha256"):
-        value = str(payload.get(key) or "").strip().lower()
-        if value:
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                raise CalibrationValidationError(f"scene_similarity.{key} must be a lowercase SHA-256 digest")
-            out[key] = value
-
-    if "scene_per_m" not in out:
-        out["scene_per_m"] = _extract_similarity_scale(row_values)
-    if "s_obj_to_m" not in out:
-        scene_per_m = float(out.get("scene_per_m", 1.0) or 1.0)
-        out["s_obj_to_m"] = float(1.0 / scene_per_m) if scene_per_m > 1e-9 else 1.0
-    computed_world_digest = _world_to_scene_sha256(
-        out["world_to_scene_col_major"], out["s_obj_to_m"]
-    )
-    supplied_world_digest = str(
-        payload.get("world_to_scene_sha256") or ""
-    ).strip().lower()
-    if supplied_world_digest and supplied_world_digest != computed_world_digest:
-        raise CalibrationValidationError(
-            "scene_similarity.world_to_scene_sha256 does not match its transform and scale"
-        )
-    out["world_to_scene_sha256"] = computed_world_digest
-
-    rotation = payload.get("rotation_row_major")
-    if isinstance(rotation, list) and len(rotation) == 9:
-        out["rotation_row_major"] = [float(x) for x in rotation]
-
-    correspondences = payload.get("correspondences")
-    if isinstance(correspondences, list):
-        normalized_corr = []
-        for item in correspondences:
-            if not isinstance(item, dict):
-                continue
-            corr: Dict[str, Any] = {}
-            camera_id = item.get("camera_id")
-            if isinstance(camera_id, str) and camera_id.strip():
-                corr["camera_id"] = camera_id.strip()
-            anchor_id = item.get("anchor_id")
-            if isinstance(anchor_id, str) and anchor_id.strip():
-                corr["anchor_id"] = anchor_id.strip()
-            for coord_key in ("world_position_m", "scene_position"):
-                coord_value = item.get(coord_key)
-                if isinstance(coord_value, list) and len(coord_value) == 3:
-                    corr[coord_key] = [float(x) for x in coord_value]
-            residual = item.get("residual_scene_units", item.get("residual"))
-            if residual is not None:
-                try:
-                    corr["residual_scene_units"] = float(residual)
-                except Exception:
-                    pass
-            if corr:
-                normalized_corr.append(corr)
-        if normalized_corr:
-            out["correspondences"] = normalized_corr
-
-    if out.get("source") == "menon_virtual_device_camera_similarity_v1":
-        required = {
-            "anchor_state_sha256",
-            "camera_calibration_sha256",
-            "position_rmse_m",
-            "max_residual_m",
-            "anchor_residual_limit_m",
-            "correspondences",
-        }
-        missing = sorted(required - set(out))
-        if missing:
-            raise CalibrationValidationError(
-                f"scene_similarity anchor fit is missing required fields: {missing}"
-            )
-        correspondences = out["correspondences"]
-        if len(correspondences) < 3 or any(not item.get("anchor_id") for item in correspondences):
-            raise CalibrationValidationError(
-                "scene_similarity anchor fit requires at least three identified camera anchors"
-            )
-        try:
-            actual_anchor_sha256 = camera_anchor_state_sha256(correspondences)
-        except ValueError as exc:
-            raise CalibrationValidationError(
-                f"scene_similarity camera-anchor state is invalid: {exc}"
-            ) from exc
-        if actual_anchor_sha256 != out["anchor_state_sha256"]:
-            raise CalibrationValidationError(
-                "scene_similarity camera-anchor state does not match anchor_state_sha256"
-            )
-        limit_m = float(out["anchor_residual_limit_m"])
-        if limit_m <= 0.0 or limit_m > 0.25:
-            raise CalibrationValidationError(
-                "scene_similarity.anchor_residual_limit_m must be within (0, 0.25]"
-            )
-        if float(out["position_rmse_m"]) > limit_m or float(out["max_residual_m"]) > limit_m:
-            raise CalibrationValidationError(
-                "scene_similarity camera-anchor registration exceeds its residual limit"
-            )
-
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -768,197 +568,22 @@ class CalibrationManager:
         with self._lock:
             if self._scene_presentation_registration is not None:
                 return self._registered_world_frame_presentations()
-            similarity = self._align.get("scene_similarity")
-            base_values = (
-                similarity.get("world_to_scene_col_major")
-                if isinstance(similarity, Mapping)
-                else None
-            )
-            base = None
-            if isinstance(base_values, list) and len(base_values) == 16:
-                try:
-                    base = np.asarray(base_values, dtype=np.float64).reshape(
-                        (4, 4), order="F"
-                    )
-                    if not np.isfinite(base).all():
-                        raise ValueError("scene similarity is non-finite")
-                except (TypeError, ValueError) as exc:
-                    raise CalibrationValidationError(
-                        f"world-to-scene presentation is invalid: {exc}"
-                    ) from exc
-
-            grouped: dict[str, dict[str, Any]] = {}
+            # No marker-derived source similarity may become person-placement
+            # authority. A v2 target binding is already strict, revision-owned
+            # evidence; otherwise only a structural artifact can supply a map.
+            grouped = {}
             for camera_id, contract in sorted(self._frame_contracts.items()):
-                target_revision = contract.target_frame.revision
                 binding = self._scene_prior_frame_bindings.get(camera_id)
-                explicit = (
-                    binding.presentation
-                    if binding is not None and binding.contract_version == 2
-                    else None
-                )
-                if explicit is not None:
-                    explicit_values = tuple(
-                        float(value) for value in explicit.world_to_scene_col_major
-                    )
-                    target_values = (
-                        similarity.get("target_world_to_scene_col_major")
-                        if isinstance(similarity, Mapping)
-                        else None
-                    )
-                    if isinstance(target_values, list) and len(target_values) == 16:
-                        try:
-                            target_registration = np.asarray(
-                                target_values, dtype=np.float64
-                            )
-                        except (TypeError, ValueError) as exc:
-                            raise CalibrationValidationError(
-                                f"{camera_id}: target authored presentation is malformed"
-                            ) from exc
-                        if not np.allclose(
-                            np.asarray(explicit_values, dtype=np.float64),
-                            target_registration,
-                            atol=1e-9,
-                            rtol=0.0,
-                        ):
-                            raise CalibrationValidationError(
-                                f"{camera_id}: explicit scene presentation is stale for the current target authored registration"
-                            )
-                        target_provenance = str(
-                            similarity.get("target_registration_sha256") or ""
-                        ).strip().lower()
-                        if not target_provenance:
-                            raise CalibrationValidationError(
-                                f"{camera_id}: target authored presentation registration provenance is missing"
-                            )
-                        if explicit.provenance.sha256 != target_provenance:
-                            raise CalibrationValidationError(
-                                f"{camera_id}: explicit scene presentation provenance is stale"
-                            )
-                    elif base is not None:
-                        try:
-                            derived_values = tuple(
-                                float(value)
-                                for value in (
-                                    base @ np.linalg.inv(contract.matrix)
-                                ).flatten(order="F")
-                            )
-                        except np.linalg.LinAlgError as exc:
-                            raise CalibrationValidationError(
-                                f"{camera_id}: target frame transform is singular"
-                            ) from exc
-                        if not np.allclose(
-                            np.asarray(explicit_values, dtype=np.float64),
-                            np.asarray(derived_values, dtype=np.float64),
-                            atol=1e-9,
-                            rtol=0.0,
-                        ):
-                            raise CalibrationValidationError(
-                                f"{camera_id}: explicit scene presentation is stale for the current authored scene"
-                            )
-                        expected_scene_revision = scene_revision_sha256(
-                            contract.target_frame,
-                            "menon_scene",
-                            derived_values,
-                        )
-                        if explicit.scene_revision_id != expected_scene_revision:
-                            raise CalibrationValidationError(
-                                f"{camera_id}: explicit scene presentation revision is stale"
-                            )
-                    values = explicit_values
-                else:
-                    if base is None:
-                        continue
-                    try:
-                        values = tuple(
-                            float(value)
-                            for value in (
-                                base @ np.linalg.inv(contract.matrix)
-                            ).flatten(order="F")
-                        )
-                    except np.linalg.LinAlgError as exc:
-                        raise CalibrationValidationError(
-                            f"{camera_id}: target frame transform is singular"
-                        ) from exc
-                existing = grouped.get(target_revision)
-                if existing is not None:
-                    if not np.allclose(
-                        np.asarray(existing["values"], dtype=np.float64),
-                        np.asarray(values, dtype=np.float64),
-                        atol=1e-9,
-                        rtol=0.0,
-                    ):
-                        raise CalibrationValidationError(
-                            "world frame revision maps to conflicting scene transforms"
-                        )
-                    if existing["scene_revision_id"] != (
-                        explicit.scene_revision_id
-                        if explicit is not None
-                        else scene_revision_sha256(
-                            contract.target_frame,
-                            "menon_scene",
-                            values,
-                        )
-                    ):
-                        raise CalibrationValidationError(
-                            "world frame revision maps to conflicting scene revisions"
-                        )
-                    existing["source_transform_sha256s"].add(
-                        contract.transform_sha256
-                    )
+                explicit = binding.presentation if binding is not None and binding.contract_version == 2 else None
+                if explicit is None:
                     continue
-                grouped[target_revision] = {
-                    "frame": contract.target_frame,
-                    "values": values,
-                    "source_transform_sha256s": {contract.transform_sha256},
-                    "scene_revision_id": (
-                        explicit.scene_revision_id
-                        if explicit is not None
-                        else scene_revision_sha256(
-                            contract.target_frame,
-                            "menon_scene",
-                            values,
-                        )
-                    ),
-                    "provenance": (
-                        explicit.provenance
-                        if explicit is not None
-                        else ArtifactFingerprint(
-                            role="world_to_scene_presentation",
-                            sha256=self._world_alignment_sha256,
-                            version="noesis.calibration.world_to_scene_presentation.v1",
-                            producer="noesis.calibration.manager",
-                        )
-                    ),
-                }
-
-            output: dict[str, dict[str, Any]] = {}
-            for revision, item in sorted(grouped.items()):
-                frame = item["frame"]
-                frame_ref = ScenePriorFrameRef(
-                    frame_id=frame.frame_id,
-                    revision=frame.revision,
-                )
-                values = tuple(item["values"])
-                presentation = ScenePriorWorldToScenePresentation(
-                    contract="noesis.scene_prior.world_to_scene_presentation",
-                    contract_version=1,
-                    world_frame=frame_ref,
-                    render_frame="menon_scene",
-                    world_to_scene_col_major=values,
-                    world_to_scene_sha256=world_to_scene_presentation_sha256(
-                        frame_ref,
-                        "menon_scene",
-                        values,
-                    ),
-                    scene_revision_id=item["scene_revision_id"],
-                    source_transform_sha256s=tuple(
-                        sorted(item["source_transform_sha256s"])
-                    ),
-                    provenance=item["provenance"],
-                    accepted=True,
-                )
-                output[revision] = presentation.model_dump(mode="json")
-            return output
+                revision = contract.target_frame.revision
+                prior = grouped.get(revision)
+                if prior is not None and prior.world_to_scene_col_major != explicit.world_to_scene_col_major:
+                    raise CalibrationValidationError("world frame revision maps to conflicting scene transforms")
+                grouped[revision] = explicit
+            return {revision: presentation.model_dump(mode="json")
+                    for revision, presentation in grouped.items()}
 
     def _registered_world_frame_presentations(self) -> Dict[str, Dict[str, Any]]:
         artifact = self._scene_presentation_registration
@@ -982,7 +607,6 @@ class CalibrationManager:
                     calibration_revision=self._camera_calibration_sha256,
                     camera_projection=projections,
                     scene_prior_bindings=self._scene_prior_frame_bindings,
-                    prior_similarity=self._align.get("scene_similarity"),
                 )
             except (ValueError, KeyError, TypeError) as exc:
                 raise CalibrationValidationError(f"structural scene presentation cannot be reproduced: {exc}") from exc
@@ -992,124 +616,7 @@ class CalibrationManager:
                 ):
                     raise CalibrationValidationError(f"{camera_id}: explicit frame presentation conflicts with structural registration")
             return output
-        support_camera = artifact["support_camera_id"]
-        measured_set = self._support_surfaces.get(support_camera)
-        measured_surface = next((
-            surface for surface in measured_set.surfaces
-            if surface.surface_id == artifact["support_surface_id"]
-        ), None) if measured_set is not None else None
-        support_contract = self._frame_contracts.get(support_camera)
-        if (
-            measured_set is None or measured_surface is None or support_contract is None
-            or measured_set.authority != "measured_calibration"
-            or measured_set.evidence_sha256 != artifact["support_surface_evidence_sha256"]
-            or measured_set.calibration_revision != self._camera_calibration_sha256
-            or measured_set.calibration_revision != artifact["support_calibration_revision"]
-            or measured_set.world_transform_sha256 != support_contract.transform_sha256
-            or measured_set.world_transform_sha256 != artifact["support_world_transform_sha256"]
-            or measured_surface.revision != artifact["support_surface_revision"]
-            or list(measured_surface.normal_world) != artifact["support_surface_normal_world"]
-            or measured_surface.offset_m != artifact["support_surface_offset_m"]
-        ):
-            raise CalibrationValidationError(
-                "scene presentation measured support plane is missing or changed"
-            )
-        similarity = self._align.get("scene_similarity")
-        entries = artifact.get("presentations")
-        if not isinstance(similarity, Mapping) or not isinstance(entries, Mapping):
-            raise CalibrationValidationError("scene presentation source evidence is missing")
-        correspondences = similarity.get("correspondences")
-        if not isinstance(correspondences, list):
-            raise CalibrationValidationError("scene presentation camera anchors are missing")
-        by_camera = {
-            str(item.get("camera_id")): item
-            for item in correspondences
-            if isinstance(item, Mapping)
-        }
-        if set(by_camera) != set(self._frame_contracts):
-            raise CalibrationValidationError("scene presentation camera anchors changed")
-        output: Dict[str, Dict[str, Any]] = {}
-        for camera_id, contract in sorted(self._frame_contracts.items()):
-            revision = contract.target_frame.revision
-            stored = entries.get(revision)
-            if not isinstance(stored, Mapping):
-                raise CalibrationValidationError(
-                    f"{camera_id}: scene presentation is missing for target revision"
-                )
-            binding = {
-                "calibration_frame": {
-                    "frame_id": contract.source_frame.frame_id,
-                    "revision": contract.source_frame.revision,
-                },
-                "world_frame": {
-                    "frame_id": contract.target_frame.frame_id,
-                    "revision": contract.target_frame.revision,
-                },
-                "target_from_calibration_col_major": list(
-                    contract.target_from_source_col_major
-                ),
-                "transform_sha256": contract.transform_sha256,
-                "world_floor_plane": {
-                    "normal": list(contract.target_floor_plane.normal),
-                    "offset_m": contract.target_floor_plane.offset_m,
-                },
-            }
-            try:
-                expected = derive_scene_presentation_entry(
-                    camera_id=camera_id,
-                    binding=binding,
-                    similarity=similarity,
-                    correspondence=by_camera[camera_id],
-                    calibration_revision=self._camera_calibration_sha256,
-                    support_surface_revision=(
-                        measured_surface.revision
-                        if camera_id == support_camera
-                        else None
-                    ),
-                )
-            except (PresentationRegistrationError, KeyError) as exc:
-                raise CalibrationValidationError(
-                    f"{camera_id}: scene presentation cannot be reproduced: {exc}"
-                ) from exc
-            if dict(stored) != expected:
-                raise CalibrationValidationError(
-                    f"{camera_id}: scene presentation evidence is stale or altered"
-                )
-            binding_prior = self._scene_prior_frame_bindings.get(camera_id)
-            if binding_prior is not None and binding_prior.presentation is not None:
-                if tuple(binding_prior.presentation.world_to_scene_col_major) != tuple(
-                    expected["world_to_scene_col_major"]
-                ):
-                    raise CalibrationValidationError(
-                        f"{camera_id}: explicit frame presentation conflicts with measured registration"
-                    )
-            frame_ref = ScenePriorFrameRef(
-                frame_id=contract.target_frame.frame_id,
-                revision=revision,
-            )
-            mapping = ScenePriorWorldToScenePresentation(
-                contract="noesis.scene_prior.world_to_scene_presentation",
-                contract_version=1,
-                world_frame=frame_ref,
-                render_frame="menon_scene",
-                world_to_scene_col_major=tuple(expected["world_to_scene_col_major"]),
-                world_to_scene_sha256=expected["world_to_scene_sha256"],
-                scene_revision_id=expected["scene_revision_id"],
-                source_transform_sha256s=(contract.transform_sha256,),
-                provenance=ArtifactFingerprint(
-                    role="world_to_scene_presentation",
-                    sha256=artifact["registration_sha256"],
-                    version=f"{artifact['contract']}.v{artifact['contract_version']}",
-                    producer="noesis.calibration.presentation_registration",
-                ),
-                accepted=True,
-                authored_scene_sha256=artifact["authored_scene_sha256"],
-                registration_sha256=artifact["registration_sha256"],
-            )
-            output[revision] = mapping.model_dump(mode="json")
-        if set(output) != set(entries):
-            raise CalibrationValidationError("scene presentation has stale target revisions")
-        return output
+        raise CalibrationValidationError("inherited camera-marker registration is retired")
 
     def set_on_extrinsics_changed(self, callback: Optional[Callable[[str], None]]) -> None:
         """Set callback to invoke when extrinsics change (for V3DT camInfo regeneration)."""
@@ -1747,10 +1254,7 @@ class CalibrationManager:
                     return {"ok": False, "error": "invalid_s_obj_to_m"}
 
         if "scene_similarity" in align_update:
-            try:
-                _normalize_scene_similarity_payload(align_update.get("scene_similarity"))
-            except CalibrationValidationError as exc:
-                return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "camera_marker_presentation_retired"}
 
         if self._scene_prior_frame_bindings:
             return {
@@ -2043,14 +1547,10 @@ class CalibrationManager:
             if isinstance(s, (int, float)) and float(s) > 0:
                 default["units"] = {"s_obj_to_m": float(s)}
 
-        scene_similarity = data.get("scene_similarity")
-        if scene_similarity is None and isinstance(data.get("align"), dict):
-            scene_similarity = data["align"].get("scene_similarity")
-        if scene_similarity is not None:
-            try:
-                default["scene_similarity"] = _normalize_scene_similarity_payload(scene_similarity)
-            except CalibrationValidationError as exc:
-                _LOGGER.warning("Invalid scene similarity at load time: %s", exc)
+        # Historical files remain byte-bound to admitted frame identities.
+        # Their camera-marker presentation metadata is deliberately not loaded
+        # or published; changing those bytes would also change legacy frame
+        # fingerprints even though physical camera geometry is unchanged.
 
         self._align = default
 
@@ -2172,7 +1672,7 @@ class CalibrationManager:
                     current["units"] = {"s_obj_to_m": float(s)}
 
             if "scene_similarity" in align_update:
-                current["scene_similarity"] = _normalize_scene_similarity_payload(align_update["scene_similarity"])
+                return False
 
             return _write_json(str(self._ply_alignment_path), current)
         except Exception:

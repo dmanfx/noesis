@@ -1,0 +1,14 @@
+{
+  "contract": "noesis.authored_scene.room_group_map",
+  "contract_version": 1,
+  "release_id": "owner_model_20261004",
+  "authored_scene_sha256": "260b819f1c8753af84f40b7cb853851d18783a31bc862404896663d5d954cc42",
+  "review_basis": "Owner updated Sweet Home 3D export. Room identity follows corresponding actual floor footprints and retained architectural features, not camera markers. Foyer remains separately derived from measured support rise.",
+  "rooms": {
+    "Living Room": ["room_71_431"],
+    "Kitchen": ["room_61_421"],
+    "Family Room": ["room_68_428"],
+    "Foyer": ["room_63_423"],
+    "Kitchen2": ["room_66_426", "room_67_427"]
+  }
+}

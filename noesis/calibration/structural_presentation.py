@@ -304,9 +304,10 @@ def _verify_geometry_features(
     image_evidence: list[dict[str, Any]], authored_selectors: list[dict[str, Any]],
     root: Path, support: SupportSurfaceSet | None,
     source_feature_evidence: Mapping[str, Any] | None = None,
+    authored_wall_selectors: list[dict[str, Any]] | None = None,
 ) -> None:
     """Offline proof of feature provenance, separate from optimization replay."""
-    from noesis.calibration.authored_structures import extract_authored_structures
+    from noesis.calibration.authored_structures import extract_authored_structures, selected_mesh_wall_face
     from noesis.calibration.structural_registration import (
         verify_authored_segments, verify_pcf_source_segments,
     )
@@ -318,12 +319,19 @@ def _verify_geometry_features(
     else:
         if image_evidence != source_feature_evidence.get("point_evidence"):
             raise PresentationRegistrationError("carrier image evidence differs from the verified source feature proof")
-        from noesis.calibration.structural_carrier_evidence import verify_source_feature_evidence
-        verify_source_feature_evidence(candidate, points_path, source_feature_evidence, root, offline=True,
-                                       binding=bundle["cameras"]["frame_bindings"][camera])
+        _verify_source_features(candidate, points_path, source_feature_evidence, root, offline=True,
+                                binding=bundle["cameras"]["frame_bindings"][camera])
     extracted = extract_authored_structures(geometry, groups,
         initial_scene_units_per_meter=inputs["scene_per_m_hint"])
-    verify_authored_segments(extracted.wall_segments, inputs["authored_segments"],
+    mesh_walls = [selected_mesh_wall_face(geometry, row) for row in (authored_wall_selectors or [])]
+    mesh_ids = {row["segment_id"] for row in mesh_walls}
+    if len(mesh_ids) != len(mesh_walls) or not mesh_ids.issubset({row["segment_id"] for row in inputs["authored_segments"]}):
+        raise PresentationRegistrationError("mesh wall selectors are duplicate or not used by the solve")
+    from noesis.calibration.structural_registration import _compare_replay, _segments
+    for wall in mesh_walls:
+        _compare_replay(next(row for row in inputs["authored_segments"] if row["segment_id"] == wall["segment_id"]),
+                        _segments([wall], label="authored_segments", minimum_length=0.4 * inputs["scene_per_m_hint"])[0], path="selected mesh wall")
+    verify_authored_segments(extracted.wall_segments, [row for row in inputs["authored_segments"] if row["segment_id"] not in mesh_ids],
                             scene_per_m_hint=inputs["scene_per_m_hint"])
     if len(authored_selectors) != len(inputs["authored_points"]):
         raise PresentationRegistrationError("every authored point requires an exact structural selector")
@@ -334,7 +342,7 @@ def _verify_geometry_features(
     point_matches = {m["authored_id"]: m["source_id"] for m in inputs["point_correspondences"]}
     source_points = {p["point_id"]: p for p in inputs["source_points"]}
     matched_wall_planes = {m["source_id"]: authored_walls[m["authored_id"]].plane_id
-                           for m in inputs["correspondences"]}
+                           for m in inputs["correspondences"] if m["authored_id"] in authored_walls}
     floor_vertices = {i for t in geometry.walkable_triangles
                       if t.authority_group in groups for i in t.triangle.vertex_indices}
     wall_triangle_ids = {int(ref.rsplit("#triangle:", 1)[1])
@@ -345,7 +353,23 @@ def _verify_geometry_features(
     for point, selector in zip(inputs["authored_points"], authored_selectors):
         if selector["point_id"] != point["point_id"] or selector["kind"] != point["kind"]:
             raise PresentationRegistrationError("authored point identity differs from its selector")
-        if selector.get("selector_type") == "wall_segment_endpoint":
+        if selector.get("selector_type") == "wall_vertex":
+            _exact_keys(selector, {"point_id", "kind", "selector_type", "segment_id", "wall_group", "vertex_index", "identity_review"}, label="authored wall vertex")
+            wall = authored_walls.get(selector["segment_id"])
+            index = selector["vertex_index"]
+            source_point = source_points.get(point_matches.get(point["point_id"]))
+            if (wall is None or type(index) is not int or not 1 <= index <= len(geometry.vertices)
+                    or source_point is None or not any(matched_wall_planes.get(s) == wall.plane_id for s in source_point["source_wall_ids"])
+                    or not any(selector["wall_group"] in t.groups and index - 1 in t.vertex_indices for t in geometry.triangles)
+                    or not any(ref.startswith(selector["wall_group"] + "#") for ref in wall.source_refs)):
+                raise PresentationRegistrationError("authored wall vertex is not bound to its matched architectural wall")
+            vertex = geometry.vertices[index - 1]
+            expected = (vertex[0], vertex[2])
+            tangent = np.asarray(wall.end_xz) - wall.start_xz
+            line_normal = np.asarray((-tangent[1], tangent[0])) / np.linalg.norm(tangent)
+            if abs(line_normal @ (np.asarray(expected) - wall.start_xz)) > 1e-3 * inputs["scene_per_m_hint"]:
+                raise PresentationRegistrationError("authored vertex is outside its matched wall plane")
+        elif selector.get("selector_type") == "wall_segment_endpoint":
             _exact_keys(selector, {"point_id", "kind", "selector_type", "segment_id", "endpoint", "identity_review"},
                         label="authored wall endpoint")
             wall = authored_walls.get(selector["segment_id"])
@@ -379,6 +403,37 @@ def _verify_geometry_features(
             raise PresentationRegistrationError("authored structural identity has not been reviewed")
         if not np.allclose(expected, point["xz"], atol=1e-8, rtol=0):
             raise PresentationRegistrationError("authored point differs from measured OBJ structure")
+
+
+def _verify_source_features(candidate, points_path, evidence, root, *, offline, binding):
+    if evidence.get("kind") == "retained_carrier_normal_supported_pcf_roi":
+        from noesis.calibration.structural_roi_evidence import verify_source_feature_evidence
+    else:
+        from noesis.calibration.structural_carrier_evidence import verify_source_feature_evidence
+    verify_source_feature_evidence(candidate, points_path, evidence, root, offline=offline, binding=binding)
+
+
+def _authored_groups(manifest, room_map, rebinding, root):
+    """Keep PCF/frame bytes unchanged when an owner re-exports the home model."""
+    labels = list(manifest.semantic_binding.room_labels)
+    groups = sorted({g for label in labels for g in room_map.get("rooms", {}).get(label, [])})
+    if not groups:
+        raise PresentationRegistrationError("authored room map omits the admitted room labels")
+    if rebinding is None:
+        if (room_map.get("authored_scene_sha256") != manifest.authored_scene.sha256
+                or groups != sorted(manifest.semantic_binding.authored_groups)):
+            raise PresentationRegistrationError("semantic room map and PCF authored parent disagree")
+    else:
+        _exact_keys(rebinding, {"source_room_group_map", "identity_review"}, label="authored room rebinding")
+        if not isinstance(rebinding["identity_review"], str) or not rebinding["identity_review"].strip():
+            raise PresentationRegistrationError("authored room identities have not been reviewed")
+        ref = rebinding["source_room_group_map"]
+        old_map = _read_json(_verified_file(ref, root, maximum=256 * 1024))
+        if (ref["sha256"] != manifest.semantic_binding.room_group_map.sha256
+                or old_map.get("authored_scene_sha256") != manifest.authored_scene.sha256
+                or sorted({g for label in labels for g in old_map.get("rooms", {}).get(label, [])}) != sorted(manifest.semantic_binding.authored_groups)):
+            raise PresentationRegistrationError("authored rebinding lost the original PCF semantic identity")
+    return groups
 
 
 def _projection_evidence(bundle: Mapping[str, Any], camera: str) -> dict[str, Any]:
@@ -462,6 +517,7 @@ def build_structural_presentation(
     retained_authored_obj_path: str | Path | None = None,
     parent_authored_obj_path: str | Path | None = None,
     owner_selection: Mapping[str, Any] | None = None,
+    authored_room_rebinding: Mapping[str, Any] | None = None,
     root: Path = REPO_ROOT,
 ) -> dict[str, Any]:
     """Build from passed room solves; explicitly retain untouched room entries.
@@ -478,16 +534,8 @@ def build_structural_presentation(
     retained = None
     retained_ref = None
     retained_geometry = None
-    if retained_registration_path is not None:
-        if retained_authored_obj_path is None:
-            raise PresentationRegistrationError("retained mapping requires its exact original authored geometry")
-        from noesis.calibration.presentation_registration import load_registration
-        retained = load_registration(retained_registration_path, authored_obj_path=retained_authored_obj_path)
-        if retained["contract"] != "noesis.scene_presentation.registration":
-            raise PresentationRegistrationError("retained mappings must be explicit original registrations, not chained fallbacks")
-        retained_ref = {"registration": _relative_file(retained_registration_path, root),
-                        "authored_scene": _relative_file(retained_authored_obj_path, root)}
-        retained_geometry = AuthoredSceneGeometry.from_obj(retained_authored_obj_path)
+    if retained_registration_path is not None or retained_authored_obj_path is not None:
+        raise PresentationRegistrationError("inherited camera-marker retention is retired; solve every current room")
     parent_ref = None
     if geometry.source_sha256 != room_map.get("authored_scene_sha256"):
         if parent_authored_obj_path is None:
@@ -523,15 +571,7 @@ def build_structural_presentation(
         if frame.revision in entries:
             raise PresentationRegistrationError("one target frame requires one jointly solved presentation")
         if camera not in room_solutions:
-            previous = (retained or {}).get("presentations", {}).get(frame.revision)
-            if not isinstance(previous, Mapping) or previous.get("camera_id") != camera:
-                raise PresentationRegistrationError(f"{camera}: neither a passed structural solve nor explicit retained mapping exists")
-            groups = list(admitted.semantic_binding.authored_groups)
-            _unchanged_room(retained_geometry, geometry, groups, previous["constraints"]["scene_per_m"],
-                            measured_adjacent_groups)
-            entries[frame.revision] = {"kind": "retained", "entry": dict(previous),
-                                      "source_manifest": manifest_ref, "room_groups": groups}
-            continue
+            raise PresentationRegistrationError(f"{camera}: a structural solve is required; marker retention is retired")
         solution = room_solutions[camera]
         manifest_path = Path(solution["manifest_path"])
         if manifest_path.absolute() != admitted_path.absolute():
@@ -540,9 +580,7 @@ def build_structural_presentation(
         if (manifest.prior_id != frame.revision or manifest.preview.reference_camera_id != camera
                 or manifest.preview.camera_calibration.sha256 != binding["camera_calibration_sha256"]):
             raise PresentationRegistrationError("structural source is not the admitted camera/PCF revision")
-        if room_map.get("authored_scene_sha256") != manifest.authored_scene.sha256:
-            raise PresentationRegistrationError("semantic room map and PCF authored parent disagree")
-        groups = list(manifest.semantic_binding.authored_groups)
+        groups = _authored_groups(manifest, room_map, authored_room_rebinding, root)
         labels = list(manifest.semantic_binding.room_labels)
         if sorted(groups) != sorted({g for name in labels for g in room_map.get("rooms", {}).get(name, [])}):
             raise PresentationRegistrationError("selected structural room groups disagree with semantic binding")
@@ -560,10 +598,11 @@ def build_structural_presentation(
         image_evidence = list(solution.get("source_image_evidence", []))
         authored_selectors = list(solution.get("authored_point_selectors", []))
         source_feature_evidence = solution.get("source_feature_evidence")
+        authored_wall_selectors = solution.get("authored_wall_selectors", [])
         _verify_geometry_features(candidate=candidate, points_path=points_path, geometry=geometry,
             groups=groups, bundle=bundle, camera=camera, image_evidence=image_evidence,
             authored_selectors=authored_selectors, root=root, support=sets.get(camera),
-            source_feature_evidence=source_feature_evidence)
+            source_feature_evidence=source_feature_evidence, authored_wall_selectors=authored_wall_selectors)
         stability = _annotation_stability(candidate=candidate, bundle=bundle, camera=camera,
                                           image_evidence=image_evidence, root=root)
         if selection is not None:
@@ -609,6 +648,8 @@ def build_structural_presentation(
         entries[frame.revision] = {"kind": "structural", "entry": entry}
         if source_feature_evidence is not None:
             entry["source_feature_evidence"] = source_feature_evidence
+        if authored_wall_selectors:
+            entry["authored_wall_selectors"] = authored_wall_selectors
     result = {
         "contract": OWNER_SELECTED_CONTRACT if selection else CONTRACT, "contract_version": CONTRACT_VERSION,
         "authored_scene_sha256": geometry.source_sha256,
@@ -622,6 +663,8 @@ def build_structural_presentation(
     }
     if selection is not None:
         result["owner_selection"] = selection
+    if authored_room_rebinding is not None:
+        result["authored_room_rebinding"] = dict(authored_room_rebinding)
     result["registration_sha256"] = _canonical_sha256(result)
     if len(json.dumps(result, allow_nan=False).encode("utf-8")) > MAX_BYTES:
         raise PresentationRegistrationError("structural presentation exceeds its startup bound")
@@ -639,6 +682,8 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
                        "authored_parent", "support_sets", "retained_registration", "presentations", "registration_sha256"}
     if selected_by_owner:
         expected_root.add("owner_selection")
+    if "authored_room_rebinding" in result:
+        expected_root.add("authored_room_rebinding")
     _exact_keys(result, expected_root, label="structural presentation")
     if result["contract"] not in (CONTRACT, OWNER_SELECTED_CONTRACT) or result["contract_version"] != CONTRACT_VERSION:
         raise PresentationRegistrationError("unsupported structural presentation contract")
@@ -678,15 +723,7 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
     retained = None
     retained_geometry = None
     if result["retained_registration"] is not None:
-        from noesis.calibration.presentation_registration import load_registration
-        ref = result["retained_registration"]
-        _exact_keys(ref, {"registration", "authored_scene"}, label="retained registration evidence")
-        original_path = _verified_file(ref["registration"], root, maximum=256 * 1024)
-        original_obj = _verified_file(ref["authored_scene"], root, maximum=64 * 1024 * 1024)
-        retained = load_registration(original_path, authored_obj_path=original_obj)
-        retained_geometry = AuthoredSceneGeometry.from_obj(original_obj)
-        if retained["contract"] != "noesis.scene_presentation.registration":
-            raise PresentationRegistrationError("retained presentation cannot chain structural registrations")
+        raise PresentationRegistrationError("inherited camera-marker retention is retired")
     for revision, item in entries.items():
         expected_keys = {"kind", "entry", "source_manifest", "room_groups"} if item.get("kind") == "retained" else {"kind", "entry"}
         _exact_keys(item, expected_keys, label="structural presentation selection")
@@ -696,14 +733,7 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
         prior, _, manifest_ref, admitted = _catalog_manifest(catalog_path, catalog, entry["camera_id"], root)
         if result["scene_prior_bindings"].get(entry["camera_id"]) != prior.model_dump(mode="json"):
             raise PresentationRegistrationError("structural admitted frame metadata changed")
-        if item["kind"] == "retained":
-            if not isinstance(retained, Mapping) or retained.get("presentations", {}).get(revision) != entry:
-                raise PresentationRegistrationError("retained mapping does not match its original registration")
-            if item["source_manifest"] != manifest_ref or item["room_groups"] != list(admitted.semantic_binding.authored_groups):
-                raise PresentationRegistrationError("retained room lost its admitted semantic geometry")
-            _unchanged_room(retained_geometry, geometry, item["room_groups"], entry["constraints"]["scene_per_m"],
-                            measured_adjacent_groups)
-        elif item["kind"] == "structural":
+        if item["kind"] == "structural":
             entry_keys = {"camera_id", "world_frame", "calibration_frame_revision", "calibration_revision",
                 "source_transform_sha256", "source_manifest", "source_points", "room_labels", "room_groups",
                 "world_floor_plane", "authored_floor_y", "candidate", "candidate_sha256", "measured_levels",
@@ -712,6 +742,8 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
                 "world_to_scene_col_major", "world_to_scene_sha256", "scene_revision_id"}
             if "source_feature_evidence" in entry:
                 entry_keys.add("source_feature_evidence")
+            if "authored_wall_selectors" in entry:
+                entry_keys.add("authored_wall_selectors")
             _exact_keys(entry, entry_keys, label="structural room entry")
             manifest_path = _verified_file(entry["source_manifest"], root, maximum=1024 * 1024)
             if entry["source_manifest"] != manifest_ref:
@@ -721,12 +753,12 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
             points = next((a for a in manifest.artifacts if a.role == "points_glb"), None)
             if (manifest.prior_id != revision or manifest.preview.reference_camera_id != entry["camera_id"]
                     or manifest.preview.camera_calibration.sha256 != entry["calibration_revision"]
-                    or list(manifest.semantic_binding.authored_groups) != entry["room_groups"]
+                    or _authored_groups(manifest, room_map, result.get("authored_room_rebinding"), root) != entry["room_groups"]
                     or list(manifest.semantic_binding.room_labels) != entry["room_labels"]
                     or points is None or points.sha256 != entry["source_points"]["sha256"]
                     or points.size_bytes != entry["source_points"]["size_bytes"]
                     or manifest_path.parent / points.relative_path != points_path
-                    or manifest.semantic_binding.room_group_map.sha256 != result["room_group_map"]["sha256"]):
+                    or (result.get("authored_room_rebinding") is None and manifest.semantic_binding.room_group_map.sha256 != result["room_group_map"]["sha256"])):
                 raise PresentationRegistrationError("structural evidence does not match admitted PCF/semantic identity")
             _sha(entry["candidate_sha256"], label="candidate SHA")
             if entry["candidate_sha256"] != _canonical_sha256(entry["candidate"]):
@@ -755,8 +787,7 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
             if feature_proof is not None:
                 if entry["source_image_evidence"] != feature_proof.get("point_evidence"):
                     raise PresentationRegistrationError("carrier rays differ from their verified source feature proof")
-                from noesis.calibration.structural_carrier_evidence import verify_source_feature_evidence
-                verify_source_feature_evidence(entry["candidate"], points_path, feature_proof, root, offline=False, binding=binding)
+                _verify_source_features(entry["candidate"], points_path, feature_proof, root, offline=False, binding=binding)
             elif any(row.get("kind") == "retained_carrier_pcf_roi_plane" for row in entry["source_image_evidence"]):
                 raise PresentationRegistrationError("carrier rays require their measured PCF feature proof")
             measured = SupportSurfaceSet.model_validate(sets[camera]) if camera in sets else None
@@ -771,6 +802,13 @@ def load_structural_presentation(path: str | Path, *, authored_obj_path: str | P
             _verify_image_points(candidate=entry["candidate"], bundle=frozen_bundle,
                 camera=camera, image_evidence=entry["source_image_evidence"],
                 root=root, support=measured)
+            if entry.get("authored_wall_selectors"):
+                from noesis.calibration.authored_structures import selected_mesh_wall_face
+                from noesis.calibration.structural_registration import _compare_replay, _segments
+                walls = {w["segment_id"]: w for w in entry["candidate"]["inputs"]["authored_segments"]}
+                for selector in entry["authored_wall_selectors"]:
+                    _compare_replay(walls[selector["segment_id"]], _segments([selected_mesh_wall_face(geometry, selector)],
+                        label="authored_segments", minimum_length=0.4 * entry["candidate"]["inputs"]["scene_per_m_hint"])[0], path="selected mesh wall")
             stability = _annotation_stability(candidate=entry["candidate"], bundle=frozen_bundle, camera=camera,
                                               image_evidence=entry["source_image_evidence"], root=root)
             if selection is not None:
@@ -818,7 +856,6 @@ def current_structural_presentations(
     prior_similarity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Cheap current-input admission. No file I/O or extraction at publication."""
-    from noesis.calibration.presentation_registration import derive_entry
     current_bindings = {camera: value.model_dump(mode="json") for camera, value in scene_prior_bindings.items()}
     if current_bindings != artifact["scene_prior_bindings"]:
         raise PresentationRegistrationError("structural admitted PCF metadata or frame binding changed")
@@ -855,14 +892,7 @@ def current_structural_presentations(
             if current is None or current.get("K") != projection["K"] or current.get("E") != projection["E"]:
                 raise PresentationRegistrationError("structural presentation current camera rays changed")
         else:
-            if not isinstance(prior_similarity, Mapping):
-                raise PresentationRegistrationError("explicit retained presentation evidence is unavailable")
-            anchors = {row["camera_id"]: row for row in prior_similarity["correspondences"]}
-            expected = derive_entry(camera_id=camera, binding=binding, similarity=prior_similarity,
-                                    correspondence=anchors[camera], calibration_revision=calibration_revision,
-                                    support_surface_revision=entry["support_surface_revision"])
-            if expected != entry:
-                raise PresentationRegistrationError("explicit retained presentation evidence changed")
+            raise PresentationRegistrationError("inherited camera-marker retention is retired")
         frame = ScenePriorFrameRef(frame_id=contract.target_frame.frame_id, revision=revision)
         presentation = ScenePriorWorldToScenePresentation(
             contract="noesis.scene_prior.world_to_scene_presentation", contract_version=1,

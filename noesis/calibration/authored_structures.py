@@ -15,11 +15,67 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+import numpy as np
+
 from noesis.validation.authored_scene import AuthoredSceneGeometry, ObjTriangle
 
 
 Point2 = tuple[float, float]
 Interval = tuple[float, float]
+
+
+def selected_mesh_wall_face(geometry: AuthoredSceneGeometry, selector: dict) -> dict:
+    """Measure an explicitly reviewed face that a floor-boundary search omits.
+
+    Architectural projections can lie inside a broad floor slab. Exact mesh
+    triangles, group and oriented normal select the face; no camera location,
+    inferred room edge or invented offset participates.
+    """
+    if set(selector) != {"segment_id", "group", "triangle_indices", "normal_xyz", "identity_review"}:
+        raise ValueError("mesh wall selector has missing or unknown fields")
+    if any(not isinstance(selector[k], str) or not selector[k].strip()
+           for k in ("segment_id", "group", "identity_review")):
+        raise ValueError("mesh wall identity has not been reviewed")
+    indices = selector["triangle_indices"]
+    if (not isinstance(indices, list) or not 1 <= len(indices) <= 128
+            or any(type(i) is not int or i < 0 for i in indices) or len(set(indices)) != len(indices)):
+        raise ValueError("mesh wall triangle selection is invalid or unbounded")
+    normal = np.asarray(selector["normal_xyz"], dtype=float)
+    if (normal.shape != (3,) or not np.isfinite(normal).all()
+            or not np.isclose(np.linalg.norm(normal), 1, atol=1e-8)
+            or abs(normal[1]) > 1e-6):
+        raise ValueError("mesh wall selector requires a unit vertical-plane normal")
+    by_id = {t.index: t for t in geometry.triangles}
+    triangles = [by_id[i] for i in indices if i in by_id]
+    if len(triangles) != len(indices) or any(selector["group"] not in t.groups
+            or not np.allclose(t.normal, normal, atol=1e-6, rtol=0) for t in triangles):
+        raise ValueError("mesh wall selector differs from its actual face")
+    points = np.asarray([geometry.vertices[i] for t in triangles for i in t.vertex_indices])
+    offset = float(np.mean(points @ normal))
+    if np.max(np.abs(points @ normal - offset)) > 1e-5:
+        raise ValueError("selected mesh wall is not coplanar")
+    # Require one connected face, including coincident vertices with separate
+    # OBJ indices. Disconnected parallel patches must be reviewed separately.
+    vertices = [set(_point_key(geometry.vertices[i]) for i in t.vertex_indices) for t in triangles]
+    reached = {0}
+    while True:
+        added = {i for i, p in enumerate(vertices) if i not in reached
+                 and any(len(p & vertices[j]) >= 2 for j in reached)}
+        if not added:
+            break
+        reached |= added
+    if len(reached) != len(triangles):
+        raise ValueError("selected mesh wall face is disconnected")
+    horizontal = normal[[0, 2]]
+    tangent = np.asarray((-horizontal[1], horizontal[0]))
+    coordinates = points[:, [0, 2]] @ tangent
+    start = offset * horizontal + coordinates.min() * tangent
+    end = offset * horizontal + coordinates.max() * tangent
+    if np.linalg.norm(end - start) <= 1e-6 or np.ptp(points[:, 1]) <= 1e-6:
+        raise ValueError("selected mesh wall has no length or height")
+    return {"segment_id": selector["segment_id"], "start_xz": start.tolist(), "end_xz": end.tolist(),
+            "support_count": len(triangles), "vertical_span": [float(points[:, 1].min()), float(points[:, 1].max())],
+            "source_refs": [f"{'+'.join(t.groups)}#triangle:{t.index}" for t in triangles]}
 
 
 @dataclass(frozen=True)

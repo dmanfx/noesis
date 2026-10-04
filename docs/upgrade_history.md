@@ -1,5 +1,35 @@
 # Noesis upgrade history
 
+## 2026-10-04 — Updated-model all-room structural presentation
+
+- Selected the reviewed updated-model Living, Family and Kitchen fits. The
+  matching derived model preserves the measured 0.1905 m foyer rise. Exact
+  matrices and failed holdouts are recorded in
+  `config/structural_scene_alignment_20261004.json`; the combined selection
+  remains `structurally_qualified: false`.
+- Removed inherited camera-marker builders, admission and publication fallback.
+  Historical fingerprinted file bytes remain inactive; camera K/E, admitted
+  PCF revisions/world edges, measured support, baseline tracking and BEV are
+  unchanged. Added explicit authored semantic rebinding and reviewed façade/
+  wall-vertex controls with strict source proof.
+- Menon now renders through target-revision-owned mappings without requiring
+  the retired global marker matrix, and complete runtime bundles clear stale
+  presentation state. Private evidence and concurrent localization work are
+  excluded from these scoped source commits.
+
+## 2026-10-04 — Kitchen offline structural evidence extraction
+
+- Recovered image-identified stone, portrait and TV wall support from the exact
+  admitted PCF; the previous global extraction exposed only parallel candidates.
+  Connected support preserves measured normals and rejects the weak cabinet
+  backing. Nine focused component checks and the retained-source run pass.
+- Saved fixed-camera and top-down support comparisons with explicit provenance
+  and limits. This is offline evidence improvement, not an admitted registration
+  or physical-accuracy pass. Runtime, authored model, active room mappings,
+  calibration and localization remain unchanged; no commit or push was made.
+- See the [Kitchen review](../plans/kitchen_structural_evidence_review.md) for
+  results and the corrected-SH3D/independent-feature prerequisites to a new fit.
+
 ## 2026-10-04 — Latest owner-selected structural presentation activated
 
 - Activated the exact latest Living two-wall/opening and Family opaque-face

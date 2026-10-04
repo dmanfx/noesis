@@ -47,10 +47,10 @@ presentation remains unchanged, including XYZ, velocity and covariance.
    agree. A preview is not live admission.
 6. Run `build` with the review, model, catalog, room map, support sets and
    measured floor-group mapping (camera → surface ID → authored group list).
-   Every current measured level must appear at the fitted scale. Retaining
-   unchanged rooms requires both their exact old registration and old OBJ.
-   Actual local floor/wall-support geometry must remain unchanged; only an
-   independently validated adjacent measured slab's top-Y derivation may differ.
+   Every current measured level must appear at the fitted scale. Every room
+   requires its own structural evidence; inherited camera-marker registrations
+   and omitted-room retention are retired. An updated authored export may use
+   explicit reviewed semantic rebinding without changing admitted PCF manifests.
 7. Check coordinates and corresponding source/BEV/model views, including
    occupied retained cohorts. Only after acceptance explicitly select the
    matching model and registration through existing scene/runtime controls.
@@ -66,11 +66,10 @@ python scripts/register_structural_presentation.py build \
   --room-group-map "$ROOM_MAP" --scene-prior-catalog "$CATALOG" \
   --parent-authored-scene "$PARENT_MODEL" --support-surfaces "$MEASURED_SUPPORTS" \
   --measured-floor-groups "$MEASURED_GROUPS" \
-  --retained-registration "$PREVIOUS_REGISTRATION" \
-  --retained-authored-scene "$PREVIOUS_MODEL" --output "$REGISTRATION"
+  --output "$REGISTRATION"
 ```
 
-Omit support/retention arguments only when genuinely inapplicable; omitting
+Omit support arguments only when genuinely inapplicable; omitting
 current measured supports fails publication rather than creating a fallback.
 
 ## Admission and cost
@@ -133,3 +132,28 @@ silently treated as an aperture corner. Carrier points without their matching
 room evidence, changed geometry, different revisions and substituted images
 fail closed. Byte/ray agreement still cannot establish semantic correspondence
 or independently correct physical scale.
+
+## Updated authored model and retirement of marker alignment
+
+The owner's corrected export is mapped by
+`config/authored_scene_room_groups_20261004.json`. An
+`--authored-room-rebinding` record binds the previous semantic map and reviewed
+room identities; it does not replace PCF geometry, world edges or camera K/E.
+Exact reviewed mesh-face and wall-vertex selectors may identify an exposed
+architectural face omitted by floor-boundary extraction. Retained carrier
+source proof survives model-only refits, but every new authored correspondence
+and solve is verified independently.
+
+The all-room selection is recorded in
+`config/structural_scene_alignment_20261004.json`. Living passes the current
+structural checks; Family and Kitchen retain explicitly accepted heldout-window
+failures. The combined owner-selected presentation remains unqualified. The
+derived foyer top preserves the measured 0.1905 m rise at the fitted Living
+scale, without using the flattened parent floor to determine horizontal fit.
+
+Marker builders and their runtime fallback are removed. Historical alignment
+file bytes remain because admitted frame bindings fingerprint them; their
+`scene_similarity` metadata is ignored and never published or used. Camera
+device objects and calibrated camera rays remain diagnostic presentation only.
+Menon consumes exact revision-owned room mappings without requiring a global
+marker matrix; a missing or mismatched mapping fails closed.

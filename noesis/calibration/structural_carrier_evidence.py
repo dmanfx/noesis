@@ -323,18 +323,24 @@ def verify_source_feature_evidence(candidate: Mapping[str, Any], points_path: st
     diagnostic_hashes = diagnostic.get("input_sha256", {})
     selected_trial = diagnostic.get(diagnostic_key) if isinstance(diagnostic_key, str) else None
     selected_inputs = selected_trial.get("inputs", {}) if isinstance(selected_trial, Mapping) else {}
-    selected_solution = selected_trial.get("solution", {}) if isinstance(selected_trial, Mapping) else {}
     candidate_inputs = candidate.get("inputs", {})
     if (not isinstance(diagnostic_key, str) or not diagnostic_key
             or selected_inputs.get("source_segments") != candidate_inputs.get("source_segments")
             or selected_inputs.get("source_points") != candidate_inputs.get("source_points")
-            or selected_solution.get("matrix_col_major") != candidate.get("solution", {}).get("matrix_col_major")
+            or selected_inputs.get("scene_per_m_hint") != candidate_inputs.get("scene_per_m_hint")
+            or [(r["source_id"], r["role"]) for r in selected_inputs.get("correspondences", [])]
+                != [(r["source_id"], r["role"]) for r in candidate_inputs.get("correspondences", [])]
+            or [(r["source_id"], r["role"]) for r in selected_inputs.get("point_correspondences", [])]
+                != [(r["source_id"], r["role"]) for r in candidate_inputs.get("point_correspondences", [])]
             or diagnostic.get("source_manifest_alignment") != source_manifest.get("alignment")
             or diagnostic_hashes.get("source_manifest") != evidence["source_manifest"]["sha256"]
             or diagnostic_hashes.get("admitted_pcf_manifest") != sha256_file(admitted_manifest_path)
             or len(point_rows) != 1
             or diagnostic_hashes.get("admitted_pcf_glb") != point_rows[0].get("sha256")):
         _fail("carrier proof does not reproduce the selected diagnostic trial")
+    # This proof owns source measurements and their roles, not the authored
+    # model's old solution. Updated model targets are independently extracted
+    # and the complete new solve is replayed by structural presentation.
     if (bundle_manifest.get("schema") != "noesis.reference.room_scan_bundle_manifest.v1"
             or bundle_manifest.get("bundle_id") != admitted_manifest.get("source", {}).get("bundle_id")
             or len(bundle_rows) != 1

@@ -149,6 +149,7 @@ def main() -> int:
     parser.add_argument("--support-surfaces", type=Path, action="append", default=[])
     parser.add_argument("--measured-floor-groups", type=Path, help="Camera -> measured surface ID -> authored group list")
     parser.add_argument("--owner-selection", type=Path, help="Explicit exact-matrix selection receipt; never structural qualification")
+    parser.add_argument("--authored-room-rebinding", type=Path, help="Reviewed new-model room identities, preserving the original PCF semantic binding")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
@@ -177,6 +178,7 @@ def main() -> int:
             retained_authored_obj_path=args.retained_authored_scene,
             parent_authored_obj_path=args.parent_authored_scene,
             owner_selection=_read_json(args.owner_selection) if args.owner_selection else None,
+            authored_room_rebinding=_read_json(args.authored_room_rebinding) if args.authored_room_rebinding else None,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")

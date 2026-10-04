@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from noesis.calibration.authored_structures import extract_authored_structures
+from noesis.calibration.authored_structures import extract_authored_structures, selected_mesh_wall_face
 from noesis.validation.authored_scene import AuthoredSceneGeometry
 
 
@@ -19,6 +19,23 @@ def _write_obj(path: Path, faces: list[tuple[str, list[tuple[float, float, float
         vertex_index += len(points)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def test_reviewed_interior_mesh_face_does_not_need_a_floor_boundary(tmp_path):
+    path = _write_obj(tmp_path / "projection.obj", [
+        ("room", [(0,0,0),(0,0,8),(8,0,8),(8,0,0)]),
+        ("facade", [(3,0,2),(3,3,2),(3,3,5),(3,0,5)]),
+    ])
+    geometry = AuthoredSceneGeometry.from_obj(path)
+    triangles = [t for t in geometry.triangles if "facade" in t.groups]
+    selector = {"segment_id":"reviewed-face", "group":"facade",
+        "triangle_indices":[t.index for t in triangles], "normal_xyz":list(triangles[0].normal),
+        "identity_review":"Reviewed architectural projection inside broad floor slab"}
+    measured = selected_mesh_wall_face(geometry, selector)
+    assert sorted([measured["start_xz"], measured["end_xz"]]) == [[3,2],[3,5]]
+    selector["normal_xyz"] = [-v for v in selector["normal_xyz"]]
+    with pytest.raises(ValueError,match="actual face"):
+        selected_mesh_wall_face(geometry, selector)
 
 
 def _quad(

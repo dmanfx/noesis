@@ -1,0 +1,224 @@
+{
+  "contract": "noesis.structural_scene.selection_record",
+  "contract_version": 1,
+  "scene_release_id": "home_owner_model_all_structural_20261004_v3",
+  "registration_path": "data/virtual_twin/owner-model-all-structural-20261004/presentation-registration.json",
+  "registration_sha256": "57b72ac1d33860c1e0c075851baed6465e33a2381336b299ab5ba65c7af626cf",
+  "authored_scene_sha256": "84bfecdb07904141fcf713d40140a748ec806d432ef89d155b4b8a85ff07d5aa",
+  "structurally_qualified": false,
+  "owner_authorization": "Activate this alignment and commit; delete inherited camera marker alignment for all rooms.",
+  "rooms": {
+    "family-room": {
+      "world_frame": {
+        "frame_id": "backend_world_m",
+        "revision": "sceneprior_family-room_20260811T015847Z_8b80dc69a7c4"
+      },
+      "world_to_scene_col_major": [
+        88.1076476359557,
+        0.0,
+        57.27082741225053,
+        0.0,
+        0.0,
+        105.08522847872348,
+        0.0,
+        0.0,
+        -57.27082741225053,
+        0.0,
+        88.1076476359557,
+        0.0,
+        748.6596658465555,
+        0.0,
+        -823.7160342255914,
+        1.0
+      ],
+      "source_transform_sha256": "5bec221621ad20d64d5fc8477945b3d33ca90b75264184ea59194575167de217",
+      "solver_status": "rejected",
+      "reason_codes": [
+        "heldout_point_residual"
+      ],
+      "measurements": [
+        {
+          "source_id": "front_opaque_at_support_y",
+          "authored_id": "wall-plane-0240-segment-0000",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 4.3274145897540346e-15,
+          "angle_deg": 2.3766045060950964,
+          "overlap_m": 2.167734134367914
+        },
+        {
+          "source_id": "tv_opaque_at_support_y",
+          "authored_id": "wall-plane-1104-segment-0000",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 6.4911218846310514e-15,
+          "angle_deg": 0.36975818685326917,
+          "overlap_m": 3.1405452636682187
+        },
+        {
+          "source_id": "window_opaque_at_support_y",
+          "authored_id": "wall-plane-1294-segment-0004",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 2.1637072948770173e-15,
+          "angle_deg": 1.5513294456622901,
+          "overlap_m": 0.6708912175022635
+        },
+        {
+          "source_id": "kitchen_panel_edge",
+          "authored_id": "authored_kitchen_panel",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.05143463024405386
+        },
+        {
+          "source_id": "window_left_jamb",
+          "authored_id": "authored_window_left",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.39697587710221455
+        },
+        {
+          "source_id": "window_right_jamb",
+          "authored_id": "authored_window_right",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.08345132539768696
+        }
+      ]
+    },
+    "kitchen": {
+      "world_frame": {
+        "frame_id": "backend_world_m",
+        "revision": "sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483"
+      },
+      "world_to_scene_col_major": [
+        94.63018872884415,
+        0.0,
+        29.566094606454183,
+        0.0,
+        0.0,
+        99.14144728182285,
+        0.0,
+        0.0,
+        -29.566094606454183,
+        0.0,
+        94.63018872884415,
+        0.0,
+        -32.13162859054481,
+        0.0,
+        -379.3407705184826,
+        1.0
+      ],
+      "source_transform_sha256": "af1290aa956661c7ece73215f4fe3ee0fc25a7fbef0c246fed2de66f12abd844",
+      "solver_status": "rejected",
+      "reason_codes": [
+        "heldout_point_residual"
+      ],
+      "measurements": [
+        {
+          "source_id": "stone_facade",
+          "authored_id": "obj-wall_54_376-exposed-positive-x-face",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 5.380265151766129e-11,
+          "angle_deg": 1.6431002590049122,
+          "overlap_m": 2.3467142100504397
+        },
+        {
+          "source_id": "portrait_wall",
+          "authored_id": "wall-plane-0216-segment-0000",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 2.429369922051649e-11,
+          "angle_deg": 1.5917723799845,
+          "overlap_m": 2.8199062095135314
+        },
+        {
+          "source_id": "tv_wall",
+          "authored_id": "wall-plane-0231-segment-0004",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 3.0572081149462234e-11,
+          "angle_deg": 0.027996305005443277,
+          "overlap_m": 1.3647065138954977
+        },
+        {
+          "source_id": "tv_wall_large_window_right_contact",
+          "authored_id": "authored_tv_wall_large_window_right_contact",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.7282909218021856
+        },
+        {
+          "source_id": "tv_wall_slider_left_contact",
+          "authored_id": "authored_tv_wall_slider_left_contact",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.011015398013680322
+        }
+      ]
+    },
+    "living-room": {
+      "world_frame": {
+        "frame_id": "backend_world_m",
+        "revision": "sceneprior_living-room_20260802T202254Z_9380ed8099bb"
+      },
+      "world_to_scene_col_major": [
+        107.65497447441778,
+        0.0,
+        10.026641370447265,
+        0.0,
+        0.0,
+        108.12089097976907,
+        0.0,
+        0.0,
+        -10.026641370447265,
+        0.0,
+        107.65497447441778,
+        0.0,
+        -64.16366691341689,
+        0.0,
+        -91.58286698099874,
+        1.0
+      ],
+      "source_transform_sha256": "006952a2f835e2cf9f85082eed831f2de466cc0734e5e56cb5d32efbfdfda643",
+      "solver_status": "accepted",
+      "reason_codes": [],
+      "measurements": [
+        {
+          "source_id": "pcf_plane_04",
+          "authored_id": "wall-plane-1070-segment-0002",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 0.01068642804313678,
+          "angle_deg": 1.2249940566149342,
+          "overlap_m": 3.563594582693611
+        },
+        {
+          "source_id": "pcf_plane_00",
+          "authored_id": "wall-plane-0216-segment-0000",
+          "role": "fit",
+          "kind": "wall",
+          "perpendicular_m": 8.430889901479118e-05,
+          "angle_deg": 1.5473379645924579,
+          "overlap_m": 4.214213709508139
+        },
+        {
+          "source_id": "window_left_top_jamb",
+          "authored_id": "obj_window_left_jamb",
+          "role": "heldout",
+          "kind": "point",
+          "error_m": 0.15581217786140414
+        },
+        {
+          "source_id": "window_right_top_jamb",
+          "authored_id": "obj_window_right_jamb",
+          "role": "fit",
+          "kind": "point",
+          "error_m": 0.010686873491219771
+        }
+      ]
+    }
+  }
+}

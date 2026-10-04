@@ -212,6 +212,34 @@ authority, or makes a rejected join canonical. Menon exposes this route only to
 the single-owner review capability and presents it as a toggleable sidecar over
 the unchanged authored model.
 
+### Independent RGB PCF tracking view
+
+The Room Walk service also supports an explicitly configured, read-only metric
+tracking review, separate from the authored-model sidecar:
+
+- `GET /api/v1/scenes/current/review-assemblies/whole-home/tracking` publishes
+  `noesis.pcf.tracking_review` v1. The descriptor binds each canonical target
+  frame to its RGB mesh owner's recorded reconstruction transform. It includes
+  the exact current calibration frame binding, source geometry digests,
+  transform digest, and RGB artifact digest and length.
+- `GET /api/v1/scenes/current/review-assemblies/whole-home/tracking/artifacts/multiroom_surface_mesh_glb`
+  serves only those verified RGB surface-mesh bytes. Both routes require the
+  frozen source recipe configured by `NOESIS_PCF_TRACKING_REVIEW_BINDING_PATH`.
+  Missing configuration is 404; changed or incompatible source bindings are 409.
+- `GET /api/v1/scenes/current/review-assemblies/whole-home/tracking/high` publishes
+  the optional high-detail v2 descriptor; its `/artifacts/multiroom_surface_mesh_glb`
+  child serves the verified high-detail RGB mesh. These require
+  `NOESIS_PCF_TRACKING_REVIEW_HIGH_MESH_MANIFEST_PATH` as well as the unchanged
+  low-view binding. Low and high variants preserve identical room transforms;
+  source atlases and full-report provenance are checked before serving bytes.
+
+This standalone presentation remains metric and does not use hand-placed
+authored camera markers. It verifies that current prior geometry is the same
+geometry used to build the mesh before replaying its recorded room transforms.
+It neither approves rejected room joins nor changes world localization, scene
+release selection, or calibration. Menon exposes the two GET routes only to
+owners; canonical snapshots remain the sole people authority.
+
 ## 1. Depth API
 
 **Module:** `noesis/server/depth_api.py`

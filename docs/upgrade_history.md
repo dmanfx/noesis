@@ -18,6 +18,26 @@
   scoped changes; unrelated localization work and private evidence remain
   outside those commits. No push.
 
+## 2026-10-04 UTC — Photo-detail PCF review and measured-dimension investigation
+
+- Added a selectable photo-detail mesh to the served temporary Menon viewer,
+  retaining the original RGB mesh and exact current canonical room bindings.
+  The final artifact contains 1,097,926 triangles, exact saved phone atlases and
+  source-supported low-prior gap geometry; holes and seams remain and no
+  photorealistic or new physical-accuracy claim is made.
+- Preserved strict embedded-image decoding and source/provenance gates. Four
+  focused provider contract checks pass. The served view loads both variants
+  and retains top-down framing during switches. Menon commits are `0bec7a3`,
+  `9928e12` and `0b64dd4`; no push or Noesis commit was made.
+- Direct current consumers accept 1,099 retained occupied snapshots with exact
+  declared position, velocity and covariance transform parity. The records
+  contain 1,097 measured and two predicted entities, no held entities or support
+  references, and therefore do not prove upper-floor playback or new occupancy.
+- Recorded the owner's clarified 4.6736 m by 6.6294 m lower-Living tape spans.
+  Two dimension-driven model derivatives fail independent window/step checks
+  and alter neighboring geometry. Obscured source floor contacts prevent a
+  qualified replacement; the already owner-selected intermediate remains active.
+
 ## 2026-10-03 — Owner-reviewed intermediate scene alignment
 
 - Selected the exact improved Living/Family structural-preview matrices at the
@@ -28,6 +48,20 @@
   matrices/model digest and unchanged camera K/E and world-frame bindings.
 - Preserved the configured native baseline runtime and all producer model,
   measured support and depth-registration selections during its approved restart.
+
+## 2026-10-03 — Temporary RGB PCF tracking presentation
+
+- Added an owner-only metric-frame review descriptor and exact RGB mesh route
+  to the existing Room Walk service. Current prior geometry must match the
+  recorded mesh source before the room transforms are replayed.
+- Menon's served temporary view uses the same canonical person renderer,
+  independent trails/playout and 3D/top-down controls. Retained occupied window
+  and hearth snapshots pass the direct consumer; the served page rendered a
+  live person and its RGB geometry and controls were visually checked.
+- Rejected reconstruction joins remain review-only. The running baseline
+  perception process, localization, calibration, measured surfaces and BEV were
+  not changed or restarted. Menon source commits are `1164967` and `185efbd`;
+  no push or Noesis commit was made.
 
 ## 2026-10-03 — Structural scene-registration workflow, not live alignment admission
 

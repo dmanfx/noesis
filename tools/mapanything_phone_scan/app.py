@@ -56,6 +56,7 @@ from .browser_capture import BROWSER_CAPTURE_SCHEMA
 from .walk_intent import effective_walk_intent, validate_walk_intent
 from .path_review import build_path_review
 from .path_reference import PcfPathReferences
+from .tracking_review import build_tracking_review, build_high_detail_tracking_review, PcfTrackingReviewError
 from .companion_capture import (
     COMPANION_SESSION_PATTERN,
     CompanionCaptureBusy,
@@ -402,6 +403,8 @@ class PhoneScanSettings:
     pcf_storage_root: Path | None = None
     pcf_pause_appliance: bool = False
     scene_prior_catalog: Path | None = None
+    pcf_tracking_review_binding_path: Path | None = None
+    pcf_tracking_review_high_mesh_manifest_path: Path | None = None
     capture_limits: CaptureImportLimits = CaptureImportLimits()
     vio: VIOSettings = VIOSettings()
     companion_limits: CompanionCaptureLimits = CompanionCaptureLimits()
@@ -583,6 +586,16 @@ class PhoneScanSettings:
             scene_prior_catalog=_resolve_root(
                 os.environ.get("NOESIS_PHONE_SCAN_SCENE_PRIOR_CATALOG"),
                 REPO_ROOT / "data" / "scene_priors" / "catalog.json",
+            ),
+            pcf_tracking_review_binding_path=(
+                _resolve_root(os.environ["NOESIS_PCF_TRACKING_REVIEW_BINDING_PATH"], REPO_ROOT)
+                if os.environ.get("NOESIS_PCF_TRACKING_REVIEW_BINDING_PATH", "").strip()
+                else None
+            ),
+            pcf_tracking_review_high_mesh_manifest_path=(
+                _resolve_root(os.environ["NOESIS_PCF_TRACKING_REVIEW_HIGH_MESH_MANIFEST_PATH"], REPO_ROOT)
+                if os.environ.get("NOESIS_PCF_TRACKING_REVIEW_HIGH_MESH_MANIFEST_PATH", "").strip()
+                else None
             ),
             capture_limits=CaptureImportLimits(
                 max_archive_bytes=_env_int(
@@ -3829,6 +3842,65 @@ def create_app(
             )
         except CompanionCaptureError as exc:
             raise _companion_error(exc) from exc
+
+    @app.get("/api/v1/scenes/current/review-assemblies/whole-home/tracking")
+    def current_whole_home_tracking_review() -> JSONResponse:
+        if configured.pcf_tracking_review_binding_path is None or configured.scene_prior_catalog is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No metric-bound PCF tracking review is configured")
+        # The standalone view is bound to canonical metric frames, not to the
+        # authored scene. The ordinary authored overlay retains its exact
+        # scene-release admission below.
+        manifest, _ = _current_review_assembly(service.pcf_storage_root, alignment_release_id=None)
+        try:
+            payload = build_tracking_review(
+                configured.pcf_tracking_review_binding_path,
+                catalog_path=configured.scene_prior_catalog,
+                current_descriptor=manifest,
+                current_descriptor_path=service.pcf_storage_root / "review-assemblies" / "current.json",
+                repo_root=REPO_ROOT,
+            )
+        except (PcfTrackingReviewError, ValueError, OSError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "PCF metric-frame review binding is invalid") from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/scenes/current/review-assemblies/whole-home/tracking/artifacts/{artifact_role}")
+    def current_tracking_review_artifact(artifact_role: str) -> FileResponse:
+        # Reuse the exact metric admission; do not borrow the authored overlay's
+        # stale or current scene release as authority for this independent view.
+        current_whole_home_tracking_review()
+        manifest, artifact_path = _current_review_assembly(service.pcf_storage_root, alignment_release_id=None)
+        artifact = manifest["artifact"]
+        if artifact_role != artifact["role"]:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "The requested RGB tracking review artifact is not active")
+        return FileResponse(artifact_path, media_type="model/gltf-binary", headers={
+            "Cache-Control": "no-store", "X-Noesis-Artifact-Sha256": artifact["sha256"],
+            "X-Noesis-Review-Assembly": manifest["assembly_id"],
+        })
+
+    def _high_tracking_review() -> tuple[dict[str, Any], Path]:
+        if configured.pcf_tracking_review_high_mesh_manifest_path is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No high-detail PCF mesh is configured")
+        low = json.loads(current_whole_home_tracking_review().body)
+        try:
+            return build_high_detail_tracking_review(configured.pcf_tracking_review_high_mesh_manifest_path,
+                recipe_path=configured.pcf_tracking_review_binding_path, low_descriptor=low, repo_root=REPO_ROOT)
+        except (PcfTrackingReviewError, ValueError, OSError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "High-detail PCF source binding is invalid") from exc
+
+    @app.get("/api/v1/scenes/current/review-assemblies/whole-home/tracking/high")
+    def current_high_tracking_review() -> JSONResponse:
+        payload, _ = _high_tracking_review()
+        return JSONResponse(payload, headers={"Cache-Control":"no-store"})
+
+    @app.get("/api/v1/scenes/current/review-assemblies/whole-home/tracking/high/artifacts/{artifact_role}")
+    def current_high_tracking_review_artifact(artifact_role: str) -> FileResponse:
+        payload, path = _high_tracking_review()
+        if artifact_role != "multiroom_surface_mesh_glb":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "The requested high-detail artifact is not configured")
+        return FileResponse(path, media_type="model/gltf-binary", headers={
+            "Cache-Control":"no-store", "X-Noesis-Artifact-Sha256":payload["artifact"]["sha256"],
+            "X-Noesis-Review-Assembly":payload["assembly_id"],
+        })
 
     @app.get("/api/v1/scenes/current/review-assemblies/whole-home")
     async def current_whole_home_review_assembly() -> JSONResponse:

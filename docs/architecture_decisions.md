@@ -2264,3 +2264,31 @@ and `structurally_qualified: false` status remain intact. This is presentation
 selection, not physical qualification or changed localization authority.
 See the [workflow](structural_scene_registration.md) and
 [assessment](../plans/structural_registration_results.md).
+
+## ADR-047 — Independent RGB PCF presentation replays recorded room frames
+
+Status: accepted for temporary owner review, 2026-10-03.
+
+A standalone Menon view presents the selected RGB PCF mesh with canonical
+people, independently of the authored home model. Its descriptor replays the
+exact transforms used to build each mesh owner and verifies current prior
+geometry identity, calibration frame bindings, revisions and digests. It does
+not estimate a new room join or anchor geometry to hand-placed camera devices.
+Rejected cross-room joins stay labelled review-only; no world or scene
+authority changes. The existing authenticated gateway serves the bounded
+descriptor and exact RGB artifact only to owners.
+
+The same person renderer runs in an independent scene with its own playout,
+trails and resources. Position, velocity, covariance and measured support
+geometry cross the single declared presentation edge, while user preferences
+and the main renderer remain unchanged. An opaque producer calibration version
+label is not a camera-calibration digest; unavailable version text is retained,
+not substituted with a guessed digest.
+
+An optional high-detail variant preserves identical verified room edges and
+offers captured photo atlases plus source-supported mesh geometry. Original RGB
+remains selectable. Embedded textures decode from verified bytes without
+loosening browser CSP. Existing low-mesh gap triangles retain their coarse
+presentation-prior role; added texture resolution and polygon count do not
+qualify room registration or independent physical accuracy. Variant replacement
+is atomic and preserves view, renderer preferences and canonical playout.

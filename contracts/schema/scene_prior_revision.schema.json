@@ -353,6 +353,17 @@
           ],
           "default": null
         },
+        "camera_pose_anchor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactFingerprint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "camera_position_world_m": {
           "maxItems": 3,
           "minItems": 3,

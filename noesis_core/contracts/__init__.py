@@ -32,6 +32,7 @@ from .scene_prior import (
     world_to_scene_presentation_sha256,
 )
 from .world import WorldEvent, WorldSnapshot
+from .support_surface import SupportSurface, SupportSurfaceReference, SupportSurfaceSet
 from .world_measurement import (
     MeasurementKind,
     MeasurementKindName,
@@ -68,6 +69,7 @@ CONTRACT_MODELS = {
     "scene_release": SceneRelease,
     "scene_prior_catalog": ScenePriorCatalog,
     "scene_prior_revision": ScenePriorRevision,
+    "support_surfaces": SupportSurfaceSet,
     "state_baseline": StateBaseline,
     "state_release": StateRelease,
     "websocket_deployment_health": WebSocketDeploymentHealth,
@@ -95,6 +97,7 @@ CONTRACT_MODELS_BY_NAME = {
     "noesis.scene.release": SceneRelease,
     "noesis.scene_prior.catalog": ScenePriorCatalog,
     "noesis.scene_prior.revision": ScenePriorRevision,
+    "noesis.support_surfaces": SupportSurfaceSet,
     "noesis.appliance.state_baseline": StateBaseline,
     "noesis.appliance.state_release": StateRelease,
     "noesis.ws.health": WebSocketDeploymentHealth,
@@ -143,6 +146,9 @@ __all__ = [
     "MeasurementStatus",
     "PostureKind",
     "SupportState",
+    "SupportSurface",
+    "SupportSurfaceReference",
+    "SupportSurfaceSet",
     "ResolvedGroundMeasurement",
     "WorldMeasurementCandidateDiagnostic",
     "WorldMeasurementCohort",

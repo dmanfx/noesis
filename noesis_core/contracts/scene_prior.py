@@ -581,9 +581,13 @@ class ScenePriorWorldToScenePresentation(ContractModel):
     )
     provenance: ArtifactFingerprint
     accepted: bool
+    authored_scene_sha256: Sha256 | None = None
+    registration_sha256: Sha256 | None = None
 
     @model_validator(mode="after")
     def _valid_presentation_mapping(self) -> "ScenePriorWorldToScenePresentation":
+        if (self.authored_scene_sha256 is None) != (self.registration_sha256 is None):
+            raise ValueError("authored scene and presentation registration digests must travel together")
         if self.world_frame.frame_id != BACKEND_WORLD_FRAME_ID:
             raise ValueError("presentation mapping must target backend_world_m")
         values = tuple(float(value) for value in self.world_to_scene_col_major)

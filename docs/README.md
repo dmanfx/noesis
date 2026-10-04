@@ -20,6 +20,7 @@ document and live source/config win.
 | Run or reproduce Prior-Conditioned Fusion (PCF) | [`PCF_Workflow.md`](PCF_Workflow.md) |
 | Join overlapping accepted PCF rooms | [`PCF_Multiroom_Registration.md`](PCF_Multiroom_Registration.md) |
 | PCF coordinate/orientation contract and flip audit | [`PCF_Coordinate_Orientation_Audit.md`](PCF_Coordinate_Orientation_Audit.md) |
+| Structural PCF-to-Menon scene registration | [`structural_scene_registration.md`](structural_scene_registration.md) |
 | WebSocket contract | [`api_contracts_ws.md`](api_contracts_ws.md) |
 | REST contract | [`api_contracts_rest.md`](api_contracts_rest.md) |
 | Metadata contracts | [`metadata_contracts.md`](metadata_contracts.md) |

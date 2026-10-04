@@ -39,6 +39,7 @@ from noesis_core.coordinate_frames import (
     revisioned_transform_sha256,
 )
 from noesis_core.contracts.base import ArtifactFingerprint
+from noesis_core.contracts.support_surface import SupportSurfaceSet
 from noesis_core.contracts.scene_prior import (
     ScenePriorFrameBinding,
     ScenePriorFrameRef,
@@ -54,6 +55,11 @@ from noesis.calibration.pose_v1 import (
     pose_to_E_col_major as _pose_to_E_col_major,
 )
 from noesis.calibration.scene_registration import camera_anchor_state_sha256
+from noesis.calibration.presentation_registration import (
+    PresentationRegistrationError,
+    derive_entry as derive_scene_presentation_entry,
+    load_registration as load_scene_presentation_registration,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_RAW_AUDIT_DIR = Path("~/.local/state/noesis/calibration/raw")
@@ -640,6 +646,10 @@ class CalibrationManager:
         scene_prior_frame_bindings: Mapping[
             str, ScenePriorFrameBinding
         ] | None = None,
+        support_surfaces: Mapping[str, SupportSurfaceSet] | None = None,
+        camera_labels: Mapping[int, str] | None = None,
+        scene_presentation_registration_path: Path | None = None,
+        presentation_authored_obj_path: Path | None = None,
     ) -> None:
         self._cameras_yaml_path = Path(cameras_yaml_path)
         self._camera_calibration_path = Path(camera_calibration_json_path)
@@ -660,7 +670,12 @@ class CalibrationManager:
         # Cached data
         self._extrinsics: Dict[str, Any] = {}
         self._align: Dict[str, Any] = {}
-        self._camera_labels: Dict[int, str] = {}  # source_id -> camera_name
+        # Structural registration validates live K/E at construction. The
+        # configured source-to-camera identities must exist before that check,
+        # not only after create_calibration_manager calls set_camera_labels.
+        self._camera_labels: Dict[int, str] = {
+            int(source_id): str(camera_id) for source_id, camera_id in (camera_labels or {}).items()
+        }
         self._bundle_cache: Optional[Dict[str, Any]] = None
         self._snapshot_cache: Dict[Tuple[int, str], CalibrationSnapshot] = {}
         self._world_snapshot_cache: Dict[Tuple[int, str], WorldCalibrationSnapshot] = {}
@@ -671,6 +686,8 @@ class CalibrationManager:
                 scene_prior_frame_bindings or {}
             ).items()
         }
+        self._support_surfaces = dict(support_surfaces or {})
+        self._scene_presentation_registration: dict[str, Any] | None = None
         self._frame_contracts: Dict[str, RevisionedFrameTransform] = {}
         self._camera_calibration_sha256 = ""
         self._world_alignment_sha256 = ""
@@ -683,6 +700,23 @@ class CalibrationManager:
         self._load_alignment()
         self._load_extrinsics()
         self._load_frame_contracts()
+        if scene_presentation_registration_path is not None:
+            if presentation_authored_obj_path is None:
+                raise CalibrationValidationError(
+                    "scene presentation registration requires the exact authored OBJ path"
+                )
+            try:
+                self._scene_presentation_registration = load_scene_presentation_registration(
+                    scene_presentation_registration_path,
+                    authored_obj_path=presentation_authored_obj_path,
+                )
+                # Validate against every live camera/frame/scale before the
+                # first bundle may be published.
+                self.world_frame_presentations()
+            except (OSError, ValueError) as exc:
+                raise CalibrationValidationError(
+                    f"scene presentation registration is invalid: {exc}"
+                ) from exc
 
         # Optional callback for derived artifact regeneration (V3DT camInfo)
         self._on_extrinsics_changed: Optional[Callable[[str], None]] = None
@@ -732,6 +766,8 @@ class CalibrationManager:
         """
 
         with self._lock:
+            if self._scene_presentation_registration is not None:
+                return self._registered_world_frame_presentations()
             similarity = self._align.get("scene_similarity")
             base_values = (
                 similarity.get("world_to_scene_col_major")
@@ -923,6 +959,157 @@ class CalibrationManager:
                 )
                 output[revision] = presentation.model_dump(mode="json")
             return output
+
+    def _registered_world_frame_presentations(self) -> Dict[str, Dict[str, Any]]:
+        artifact = self._scene_presentation_registration
+        assert artifact is not None
+        if artifact["contract"] in ("noesis.scene_presentation.structural_registration",
+                                   "noesis.scene_presentation.owner_selected_structural_registration"):
+            from noesis.calibration.structural_presentation import current_structural_presentations
+            projections: dict[str, dict[str, Any]] = {}
+            for source_id, camera_id in self._camera_labels.items():
+                snapshot = self.snapshot(source_id, camera_id)
+                if snapshot is not None:
+                    K = snapshot.intrinsics
+                    projections[camera_id] = {
+                        "K": [float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])],
+                        "E": list(snapshot.extrinsics_col_major),
+                    }
+            try:
+                output = current_structural_presentations(
+                    artifact, frame_contracts=self._frame_contracts,
+                    support_surfaces=self._support_surfaces,
+                    calibration_revision=self._camera_calibration_sha256,
+                    camera_projection=projections,
+                    scene_prior_bindings=self._scene_prior_frame_bindings,
+                    prior_similarity=self._align.get("scene_similarity"),
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise CalibrationValidationError(f"structural scene presentation cannot be reproduced: {exc}") from exc
+            for camera_id, prior in self._scene_prior_frame_bindings.items():
+                if prior.presentation is not None and tuple(prior.presentation.world_to_scene_col_major) != tuple(
+                    output[prior.target_frame.revision]["world_to_scene_col_major"]
+                ):
+                    raise CalibrationValidationError(f"{camera_id}: explicit frame presentation conflicts with structural registration")
+            return output
+        support_camera = artifact["support_camera_id"]
+        measured_set = self._support_surfaces.get(support_camera)
+        measured_surface = next((
+            surface for surface in measured_set.surfaces
+            if surface.surface_id == artifact["support_surface_id"]
+        ), None) if measured_set is not None else None
+        support_contract = self._frame_contracts.get(support_camera)
+        if (
+            measured_set is None or measured_surface is None or support_contract is None
+            or measured_set.authority != "measured_calibration"
+            or measured_set.evidence_sha256 != artifact["support_surface_evidence_sha256"]
+            or measured_set.calibration_revision != self._camera_calibration_sha256
+            or measured_set.calibration_revision != artifact["support_calibration_revision"]
+            or measured_set.world_transform_sha256 != support_contract.transform_sha256
+            or measured_set.world_transform_sha256 != artifact["support_world_transform_sha256"]
+            or measured_surface.revision != artifact["support_surface_revision"]
+            or list(measured_surface.normal_world) != artifact["support_surface_normal_world"]
+            or measured_surface.offset_m != artifact["support_surface_offset_m"]
+        ):
+            raise CalibrationValidationError(
+                "scene presentation measured support plane is missing or changed"
+            )
+        similarity = self._align.get("scene_similarity")
+        entries = artifact.get("presentations")
+        if not isinstance(similarity, Mapping) or not isinstance(entries, Mapping):
+            raise CalibrationValidationError("scene presentation source evidence is missing")
+        correspondences = similarity.get("correspondences")
+        if not isinstance(correspondences, list):
+            raise CalibrationValidationError("scene presentation camera anchors are missing")
+        by_camera = {
+            str(item.get("camera_id")): item
+            for item in correspondences
+            if isinstance(item, Mapping)
+        }
+        if set(by_camera) != set(self._frame_contracts):
+            raise CalibrationValidationError("scene presentation camera anchors changed")
+        output: Dict[str, Dict[str, Any]] = {}
+        for camera_id, contract in sorted(self._frame_contracts.items()):
+            revision = contract.target_frame.revision
+            stored = entries.get(revision)
+            if not isinstance(stored, Mapping):
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene presentation is missing for target revision"
+                )
+            binding = {
+                "calibration_frame": {
+                    "frame_id": contract.source_frame.frame_id,
+                    "revision": contract.source_frame.revision,
+                },
+                "world_frame": {
+                    "frame_id": contract.target_frame.frame_id,
+                    "revision": contract.target_frame.revision,
+                },
+                "target_from_calibration_col_major": list(
+                    contract.target_from_source_col_major
+                ),
+                "transform_sha256": contract.transform_sha256,
+                "world_floor_plane": {
+                    "normal": list(contract.target_floor_plane.normal),
+                    "offset_m": contract.target_floor_plane.offset_m,
+                },
+            }
+            try:
+                expected = derive_scene_presentation_entry(
+                    camera_id=camera_id,
+                    binding=binding,
+                    similarity=similarity,
+                    correspondence=by_camera[camera_id],
+                    calibration_revision=self._camera_calibration_sha256,
+                    support_surface_revision=(
+                        measured_surface.revision
+                        if camera_id == support_camera
+                        else None
+                    ),
+                )
+            except (PresentationRegistrationError, KeyError) as exc:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene presentation cannot be reproduced: {exc}"
+                ) from exc
+            if dict(stored) != expected:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene presentation evidence is stale or altered"
+                )
+            binding_prior = self._scene_prior_frame_bindings.get(camera_id)
+            if binding_prior is not None and binding_prior.presentation is not None:
+                if tuple(binding_prior.presentation.world_to_scene_col_major) != tuple(
+                    expected["world_to_scene_col_major"]
+                ):
+                    raise CalibrationValidationError(
+                        f"{camera_id}: explicit frame presentation conflicts with measured registration"
+                    )
+            frame_ref = ScenePriorFrameRef(
+                frame_id=contract.target_frame.frame_id,
+                revision=revision,
+            )
+            mapping = ScenePriorWorldToScenePresentation(
+                contract="noesis.scene_prior.world_to_scene_presentation",
+                contract_version=1,
+                world_frame=frame_ref,
+                render_frame="menon_scene",
+                world_to_scene_col_major=tuple(expected["world_to_scene_col_major"]),
+                world_to_scene_sha256=expected["world_to_scene_sha256"],
+                scene_revision_id=expected["scene_revision_id"],
+                source_transform_sha256s=(contract.transform_sha256,),
+                provenance=ArtifactFingerprint(
+                    role="world_to_scene_presentation",
+                    sha256=artifact["registration_sha256"],
+                    version=f"{artifact['contract']}.v{artifact['contract_version']}",
+                    producer="noesis.calibration.presentation_registration",
+                ),
+                accepted=True,
+                authored_scene_sha256=artifact["authored_scene_sha256"],
+                registration_sha256=artifact["registration_sha256"],
+            )
+            output[revision] = mapping.model_dump(mode="json")
+        if set(output) != set(entries):
+            raise CalibrationValidationError("scene presentation has stale target revisions")
+        return output
 
     def set_on_extrinsics_changed(self, callback: Optional[Callable[[str], None]]) -> None:
         """Set callback to invoke when extrinsics change (for V3DT camInfo regeneration)."""
@@ -1280,6 +1467,24 @@ class CalibrationManager:
             if has_v2_binding:
                 bundle["meta"]["world_frame_presentation_contract"] = (
                     "target_owned_world_to_scene_v1"
+                )
+            if self._scene_presentation_registration is not None:
+                bundle["meta"]["world_frame_presentation_contract"] = (
+                    "owner_selected_structural_scene_presentation_v1"
+                    if self._scene_presentation_registration["contract"] == "noesis.scene_presentation.owner_selected_structural_registration"
+                    else
+                    "structural_scene_presentation_registration_v1"
+                    if self._scene_presentation_registration["contract"] == "noesis.scene_presentation.structural_registration"
+                    else "measured_scene_presentation_registration_v1"
+                )
+                if self._scene_presentation_registration["contract"] == "noesis.scene_presentation.owner_selected_structural_registration":
+                    bundle["meta"]["structurally_qualified"] = False
+                    bundle["meta"]["scene_presentation_selection_id"] = self._scene_presentation_registration["owner_selection"]["selection_id"]
+                bundle["meta"]["authored_scene_sha256"] = (
+                    self._scene_presentation_registration["authored_scene_sha256"]
+                )
+                bundle["meta"]["registration_sha256"] = (
+                    self._scene_presentation_registration["registration_sha256"]
                 )
 
             self._bundle_cache = bundle
@@ -1738,6 +1943,22 @@ class CalibrationManager:
                         f"{camera_id}: presentation mapping does not admit its bound transform"
                     )
             contracts[camera_id] = contract
+        for camera_id, surface_set in self._support_surfaces.items():
+            contract = contracts.get(camera_id)
+            if contract is None or camera_id not in cameras:
+                raise CalibrationValidationError(
+                    f"{camera_id}: support surfaces have no camera calibration"
+                )
+            if (
+                surface_set.camera_id != camera_id
+                or surface_set.world_frame != contract.target_frame.frame_id
+                or surface_set.world_frame_revision != contract.target_frame.revision
+                or surface_set.calibration_revision != self._camera_calibration_sha256
+                or surface_set.world_transform_sha256 != contract.transform_sha256
+            ):
+                raise CalibrationValidationError(
+                    f"{camera_id}: support surfaces do not match active calibration binding"
+                )
         self._frame_contracts = contracts
 
     def _frame_contract_for_camera(
@@ -2080,12 +2301,57 @@ def create_calibration_manager(
     if len(set(labels.values())) != len(labels):
         raise CalibrationValidationError("calibration authority camera names must be unique")
 
+    support_sets: dict[str, SupportSurfaceSet] = {}
+    support_config = pipeline_config.get("support_surfaces")
+    if support_config is not None:
+        if not isinstance(support_config, Mapping) or not isinstance(support_config.get("path"), str):
+            raise CalibrationValidationError("support_surfaces requires a path")
+        support_path = Path(support_config["path"])
+        try:
+            payload = json.loads(support_path.read_text(encoding="utf-8"))
+            if isinstance(payload, Mapping) and "camera_id" in payload:
+                payloads = [payload]
+            elif isinstance(payload, Mapping) and isinstance(payload.get("sets"), list):
+                payloads = payload["sets"]
+            else:
+                raise ValueError("expected one SupportSurfaceSet or a sets list")
+            if len(payloads) > len(labels):
+                raise ValueError("more surface sets than calibrated cameras")
+            for row in payloads:
+                surface_set = SupportSurfaceSet.model_validate(row)
+                if surface_set.camera_id not in labels.values() or surface_set.camera_id in support_sets:
+                    raise ValueError("unknown or repeated surface-set camera")
+                support_sets[surface_set.camera_id] = surface_set
+        except (OSError, ValueError) as exc:
+            raise CalibrationValidationError(
+                f"support surface artifact is invalid: {support_path}: {exc}"
+            ) from exc
+
+    registration_path_raw = str(os.environ.get(
+        "NOESIS_SCENE_PRESENTATION_REGISTRATION_PATH", ""
+    ) or "").strip()
+    authored_path_raw = str(os.environ.get(
+        "NOESIS_SCENE_PRESENTATION_AUTHORED_OBJ_PATH", ""
+    ) or "").strip()
+    if bool(registration_path_raw) != bool(authored_path_raw):
+        raise CalibrationValidationError(
+            "scene presentation activation requires both registration and authored OBJ paths"
+        )
+
     manager = CalibrationManager(
         cameras_yaml_path=cameras_path,
         camera_calibration_json_path=extrinsics_path,
         ply_alignment_json_path=alignment_path,
         streammux_size=streammux_size_from_pipeline_config(pipeline_config),
         scene_prior_frame_bindings=scene_prior_frame_bindings,
+        support_surfaces=support_sets,
+        camera_labels=labels,
+        scene_presentation_registration_path=(
+            Path(registration_path_raw) if registration_path_raw else None
+        ),
+        presentation_authored_obj_path=(
+            Path(authored_path_raw) if authored_path_raw else None
+        ),
     )
     manager.set_camera_labels(labels)
     return manager

@@ -3,6 +3,17 @@
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
 
+## Owner-selected structural intermediate — 2026-10-03
+
+An explicit owner-reviewed intermediate scene mapping may retain failed
+heldout-quality evidence without claiming structural qualification. The separate
+owner-selection artifact binds exact matrices, model and current calibration/PCF
+sources; validity, metric, revision and measured-support gates are unchanged.
+This presentation-only selection cannot change localization or BEV. The native
+calibration factory supplies configured camera identities before checking rays.
+High-detail RGB review surfaces remain separate selectable presentation assets,
+with the original mesh and exact metric room edges preserved.
+
 ## Find the relevant decision
 
 | Concern | Decisions |
@@ -2225,3 +2236,31 @@ This is read-only reference selection, not inference, a new room admission,
 live catalog mutation, or promotion. The new walk still needs its own passed
 static-camera registration and retained timing evidence; choosing PCF does not
 certify body position or improve a path merely by changing its label.
+
+## ADR-046 — Admit structural scene registration only after observed geometry passes
+
+Status: implementation accepted, 2026-10-03; current home registration not
+structurally qualified. The separately authorized owner-selected intermediate
+is described at the top of this document.
+
+Scene-only correction uses a proper uniform similarity fitted to exact PCF
+and reviewed authored architectural features, not camera markers, people or
+phone optical centres. Fit observations alone choose orientation. Independent
+holdouts and joint raster-ambiguity checks reject weak fits; provenance does
+not establish feature identity or independent physical accuracy.
+
+The strict artifact binds catalog/PCF metadata, calibrated rays, authored
+model/parent, measured levels and frozen solve. Extraction stays offline;
+startup replays compact evidence, and publication checks current bindings.
+Explicitly retained rooms preserve actual local floor/wall geometry, allowing
+only independently checked adjacent measured slab-top derivation. New scale
+must preserve measured rise relative to the actual lower planes. No generic
+zero-height floor or camera-marker Y is authority.
+
+The original Living/Family/Kitchen candidate evidence failed structural
+admission. The owner subsequently selected the exact displayed Living/Family
+intermediate under a separate explicit selection contract; its failed checks
+and `structurally_qualified: false` status remain intact. This is presentation
+selection, not physical qualification or changed localization authority.
+See the [workflow](structural_scene_registration.md) and
+[assessment](../plans/structural_registration_results.md).

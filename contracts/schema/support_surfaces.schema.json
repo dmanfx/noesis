@@ -1,0 +1,174 @@
+{
+  "$defs": {
+    "SupportSurface": {
+      "additionalProperties": false,
+      "description": "One observed finite plane in the bound world frame.\n\nThe plane is ``normal_world dot (x, y, z) + offset_m = 0``. Its residual\nsigma measures local fit scatter; it does not bound global calibration,\nregistration, or depth scale error.",
+      "properties": {
+        "extent_xz": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "maxItems": 64,
+          "minItems": 3,
+          "title": "Extent Xz",
+          "type": "array"
+        },
+        "normal_world": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Normal World",
+          "type": "array"
+        },
+        "offset_m": {
+          "title": "Offset M",
+          "type": "number"
+        },
+        "residual_sigma_m": {
+          "exclusiveMinimum": 0.0,
+          "title": "Residual Sigma M",
+          "type": "number"
+        },
+        "revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Revision",
+          "type": "string"
+        },
+        "source_artifact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Artifact Sha256",
+          "type": "string"
+        },
+        "source_kind": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "source_observation_count": {
+          "maximum": 1000000000,
+          "minimum": 3,
+          "title": "Source Observation Count",
+          "type": "integer"
+        },
+        "surface_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Surface Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "surface_id",
+        "revision",
+        "normal_world",
+        "offset_m",
+        "extent_xz",
+        "residual_sigma_m",
+        "source_observation_count",
+        "source_kind",
+        "source_artifact_sha256"
+      ],
+      "title": "SupportSurface",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One camera and world-revision binding for a small surface collection.",
+  "properties": {
+    "authority": {
+      "default": "review_only",
+      "enum": [
+        "review_only",
+        "measured_calibration"
+      ],
+      "title": "Authority",
+      "type": "string"
+    },
+    "calibration_revision": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Calibration Revision",
+      "type": "string"
+    },
+    "camera_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Camera Id",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.support_surfaces",
+      "default": "noesis.support_surfaces",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "evidence_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Evidence Sha256",
+      "type": "string"
+    },
+    "surfaces": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SupportSurface"
+      },
+      "maxItems": 16,
+      "title": "Surfaces",
+      "type": "array"
+    },
+    "world_frame": {
+      "const": "backend_world_m",
+      "default": "backend_world_m",
+      "title": "World Frame",
+      "type": "string"
+    },
+    "world_frame_revision": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "World Frame Revision",
+      "type": "string"
+    },
+    "world_transform_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "World Transform Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "camera_id",
+    "world_frame_revision",
+    "calibration_revision",
+    "world_transform_sha256",
+    "evidence_sha256"
+  ],
+  "title": "SupportSurfaceSet",
+  "type": "object"
+}

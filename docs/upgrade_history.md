@@ -1,5 +1,44 @@
 # Noesis upgrade history
 
+## 2026-10-04 — Latest owner-selected structural presentation activated
+
+- Activated the exact latest Living two-wall/opening and Family opaque-face
+  fits from the reviewed top-down comparison, with matching authored geometry
+  and measured foyer elevation. Kitchen, camera K/E, current world bindings,
+  baseline localization, depth registration and BEV remain unchanged.
+- Added reproducible retained-carrier source verification and exact authored
+  wall-endpoint selectors. Source/revision/support gates remain intact; failed
+  independent quality checks and `structurally_qualified: false` are retained.
+- Existing configured Noesis and Menon services serve the matching model and
+  calibration. Forty-one focused structural tests pass. Current strict Menon
+  consumers accept all 1,099 retained occupied snapshots with exact position,
+  velocity and covariance parity; 1,097 are measured and two predicted. Current
+  live readback is empty, so this is not a new occupied physical-accuracy pass.
+- Structural source and selectable RGB mesh/provider work are committed in
+  scoped changes; unrelated localization work and private evidence remain
+  outside those commits. No push.
+
+## 2026-10-03 — Owner-reviewed intermediate scene alignment
+
+- Selected the exact improved Living/Family structural-preview matrices at the
+  owner's request, while retaining failed quality checks and explicit
+  `structurally_qualified: false` metadata.
+- Derived the foyer model elevation from its measured rise at the selected
+  Living scale. Direct running-producer/served-scene readback confirms matching
+  matrices/model digest and unchanged camera K/E and world-frame bindings.
+- Preserved the configured native baseline runtime and all producer model,
+  measured support and depth-registration selections during its approved restart.
+
+## 2026-10-03 — Structural scene-registration workflow, not live alignment admission
+
+- Added generic structural extraction/fitting, strict artifact and current
+  binding checks, and the CalibrationManager presentation connection.
+- Added measured relative floor preview and joint raster-ambiguity checks;
+  localization, BEV and served geometry were not changed.
+- Living/Family/Kitchen remain rejected or underdetermined. No new physical
+  accuracy or live correction is claimed. See the
+  [workflow](structural_scene_registration.md).
+
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 

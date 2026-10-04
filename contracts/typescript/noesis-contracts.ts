@@ -638,7 +638,7 @@ export type ScenePriorFloorPlane = {
 
 export type ScenePriorFrameBinding = {
   readonly contract: "noesis.scene_prior.frame_binding";
-  readonly contract_version: 1;
+  readonly contract_version: 1 | 2;
   readonly source_frame: ScenePriorFrameRef;
   readonly target_frame: ScenePriorFrameRef;
   readonly source_camera_calibration_sha256: string;
@@ -649,6 +649,11 @@ export type ScenePriorFrameBinding = {
   readonly target_from_source_sha256: string;
   readonly source_floor_plane: ScenePriorFloorPlane;
   readonly target_floor_plane: ScenePriorFloorPlane;
+  readonly metric_frame?: ScenePriorMetricFrame | null;
+  readonly artifact_revision_id?: string | null;
+  readonly source_camera_calibration_physical_sha256?: string | null;
+  readonly source_world_alignment_physical_sha256?: string | null;
+  readonly presentation?: ScenePriorWorldToScenePresentation | null;
 };
 
 export type ScenePriorFrameRef = {
@@ -666,6 +671,16 @@ export type ScenePriorGrid = {
   readonly columns: number;
 };
 
+export type ScenePriorMetricFrame = {
+  readonly contract: "noesis.scene_prior.metric_frame";
+  readonly contract_version: 1;
+  readonly frame: ScenePriorFrameRef;
+  readonly units: "meters";
+  readonly floor_plane: ScenePriorFloorPlane;
+  readonly physical_provenance: ReadonlyArray<ArtifactFingerprint>;
+  readonly accepted: boolean;
+};
+
 export type ScenePriorPreview = {
   readonly coordinate_frame: "camera_local_ground_m";
   readonly units: "meters";
@@ -674,6 +689,7 @@ export type ScenePriorPreview = {
   readonly camera_calibration: ArtifactFingerprint;
   readonly target_revision_metadata: ArtifactFingerprint;
   readonly camera_map_lock?: ScenePriorCameraMapLock | null;
+  readonly camera_pose_anchor?: ArtifactFingerprint | null;
   readonly camera_position_world_m: readonly [number, number, number];
   readonly camera_right_world_xz: readonly [number, number];
   readonly camera_forward_world_xz: readonly [number, number];
@@ -732,6 +748,21 @@ export type ScenePriorSource = {
   readonly capture_id: string;
   readonly captured_at_us: number;
   readonly model: string;
+};
+
+export type ScenePriorWorldToScenePresentation = {
+  readonly contract: "noesis.scene_prior.world_to_scene_presentation";
+  readonly contract_version: 1;
+  readonly world_frame: ScenePriorFrameRef;
+  readonly render_frame: "menon_scene";
+  readonly world_to_scene_col_major: ReadonlyArray<number>;
+  readonly world_to_scene_sha256: string;
+  readonly scene_revision_id: string;
+  readonly source_transform_sha256s: ReadonlyArray<string>;
+  readonly provenance: ArtifactFingerprint;
+  readonly accepted: boolean;
+  readonly authored_scene_sha256?: string | null;
+  readonly registration_sha256?: string | null;
 };
 
 export type SceneRelease = {
@@ -840,6 +871,39 @@ export type SubjectRef = {
   readonly resident_uuid?: string | null;
   readonly display_name?: string | null;
   readonly stable_id?: number | null;
+};
+
+export type SupportSurface = {
+  readonly surface_id: string;
+  readonly revision: string;
+  readonly normal_world: readonly [number, number, number];
+  readonly offset_m: number;
+  readonly extent_xz: ReadonlyArray<readonly [number, number]>;
+  readonly residual_sigma_m: number;
+  readonly source_observation_count: number;
+  readonly source_kind: string;
+  readonly source_artifact_sha256: string;
+};
+
+export type SupportSurfaceReference = {
+  readonly surface_id: string;
+  readonly revision: string;
+  readonly normal_world: readonly [number, number, number];
+  readonly offset_m: number;
+  readonly extent_xz: ReadonlyArray<readonly [number, number]>;
+};
+
+export type SupportSurfaceSet = {
+  readonly contract?: "noesis.support_surfaces";
+  readonly contract_version?: 1;
+  readonly camera_id: string;
+  readonly world_frame?: "backend_world_m";
+  readonly world_frame_revision: string;
+  readonly calibration_revision: string;
+  readonly world_transform_sha256: string;
+  readonly evidence_sha256: string;
+  readonly authority?: "review_only" | "measured_calibration";
+  readonly surfaces?: ReadonlyArray<SupportSurface>;
 };
 
 export type TrackletRef = {

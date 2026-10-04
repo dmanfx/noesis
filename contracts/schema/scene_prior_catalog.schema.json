@@ -1,5 +1,53 @@
 {
   "$defs": {
+    "ArtifactFingerprint": {
+      "additionalProperties": false,
+      "description": "Content identity for an input that can change product semantics.",
+      "properties": {
+        "producer": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer"
+        },
+        "role": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "role",
+        "sha256"
+      ],
+      "title": "ArtifactFingerprint",
+      "type": "object"
+    },
     "ScenePriorCameraBinding": {
       "additionalProperties": false,
       "properties": {
@@ -140,15 +188,66 @@
       "additionalProperties": false,
       "description": "Immutable raw-to-active world revision edge for one camera binding.",
       "properties": {
+        "artifact_revision_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Revision Id"
+        },
         "contract": {
           "const": "noesis.scene_prior.frame_binding",
           "title": "Contract",
           "type": "string"
         },
         "contract_version": {
-          "const": 1,
+          "enum": [
+            1,
+            2
+          ],
           "title": "Contract Version",
           "type": "integer"
+        },
+        "metric_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScenePriorMetricFrame"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "presentation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScenePriorWorldToScenePresentation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_camera_calibration_physical_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Camera Calibration Physical Sha256"
         },
         "source_camera_calibration_sha256": {
           "pattern": "^[0-9a-f]{64}$",
@@ -160,6 +259,19 @@
         },
         "source_frame": {
           "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "source_world_alignment_physical_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source World Alignment Physical Sha256"
         },
         "source_world_alignment_sha256": {
           "pattern": "^[0-9a-f]{64}$",
@@ -237,6 +349,157 @@
         "revision"
       ],
       "title": "ScenePriorFrameRef",
+      "type": "object"
+    },
+    "ScenePriorMetricFrame": {
+      "additionalProperties": false,
+      "description": "Accepted metric coordinate identity independent of scene artifacts.",
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "contract": {
+          "const": "noesis.scene_prior.metric_frame",
+          "title": "Contract",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "floor_plane": {
+          "$ref": "#/$defs/ScenePriorFloorPlane"
+        },
+        "frame": {
+          "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "physical_provenance": {
+          "items": {
+            "$ref": "#/$defs/ArtifactFingerprint"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Physical Provenance",
+          "type": "array"
+        },
+        "units": {
+          "const": "meters",
+          "title": "Units",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract",
+        "contract_version",
+        "frame",
+        "units",
+        "floor_plane",
+        "physical_provenance",
+        "accepted"
+      ],
+      "title": "ScenePriorMetricFrame",
+      "type": "object"
+    },
+    "ScenePriorWorldToScenePresentation": {
+      "additionalProperties": false,
+      "description": "Renderer mapping owned by a validated target metric frame revision.",
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "authored_scene_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Authored Scene Sha256"
+        },
+        "contract": {
+          "const": "noesis.scene_prior.world_to_scene_presentation",
+          "title": "Contract",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "provenance": {
+          "$ref": "#/$defs/ArtifactFingerprint"
+        },
+        "registration_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Registration Sha256"
+        },
+        "render_frame": {
+          "const": "menon_scene",
+          "title": "Render Frame",
+          "type": "string"
+        },
+        "scene_revision_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Scene Revision Id",
+          "type": "string"
+        },
+        "source_transform_sha256s": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Source Transform Sha256S",
+          "type": "array"
+        },
+        "world_frame": {
+          "$ref": "#/$defs/ScenePriorFrameRef"
+        },
+        "world_to_scene_col_major": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 16,
+          "minItems": 16,
+          "title": "World To Scene Col Major",
+          "type": "array"
+        },
+        "world_to_scene_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "World To Scene Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract",
+        "contract_version",
+        "world_frame",
+        "render_frame",
+        "world_to_scene_col_major",
+        "world_to_scene_sha256",
+        "scene_revision_id",
+        "source_transform_sha256s",
+        "provenance",
+        "accepted"
+      ],
+      "title": "ScenePriorWorldToScenePresentation",
       "type": "object"
     }
   },

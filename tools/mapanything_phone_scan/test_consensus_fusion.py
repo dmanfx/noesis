@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tools.mapanything_phone_scan.build_consensus_fusion import (
     Consistency,
@@ -147,6 +148,51 @@ def test_fusion_preserves_one_sharp_rgb_projection_for_landmarks() -> None:
     np.testing.assert_array_equal(fused["depth"], depth)
     assert fused["mask"].all()
     assert metrics["rgb_projection_source"] == "reference-rgb"
+
+
+@pytest.mark.parametrize(
+    ("pose_carrier", "use_refinement", "expected_graph_used"),
+    [("da3", False, False), ("joint", False, True), ("joint", True, False)],
+)
+def test_build_pose_graph_provenance_matches_saved_carrier(
+    tmp_path, monkeypatch, pose_carrier, use_refinement, expected_graph_used,
+) -> None:
+    from tools.mapanything_phone_scan import build_consensus_fusion as fusion
+
+    sequence = _sequence(np.full((3, 8, 12), 2.0, dtype=np.float32))
+    sequence.poses[:, 0, 3] = [0.0, 0.01, 0.02]
+    graph_poses = sequence.poses.copy()
+    graph_poses[:, 1, 3] += 0.1
+    refined_poses = graph_poses.copy()
+    refined_poses[:, 1, 3] += 0.2
+    monkeypatch.setattr(fusion, "_load_sequence", lambda *_: sequence)
+    monkeypatch.setattr(
+        fusion, "_pose_graph", lambda *_: (graph_poses, {"solver_success": True})
+    )
+    monkeypatch.setattr(
+        fusion, "_load_refined_consensus_poses",
+        lambda *_: (refined_poses, {"status": "passed"}),
+    )
+    # Keep the real fusion and saved pose/raw consumers, without rendering
+    # optional visual artifacts for this metadata regression test.
+    for name in ("_write_support_diagnostics", "_write_reconstruction_glb", "_collaboration_sheet"):
+        monkeypatch.setattr(fusion, name, lambda *_: None)
+    output = tmp_path / "output"
+    metrics = fusion.build(
+        tmp_path / "scan", output, pose_carrier=pose_carrier,
+        evidence_relationship="same_capture_distinct_estimators",
+        trajectory_refinement_report=tmp_path / "refinement.json" if use_refinement else None,
+    )
+    assert metrics["pose_graph_output_used"] is expected_graph_used
+    expected_poses = (
+        sequence.poses if pose_carrier == "da3"
+        else refined_poses if use_refinement else graph_poses
+    )
+    with np.load(output / "camera_solution.npz", allow_pickle=False) as saved:
+        np.testing.assert_allclose(saved["camera_poses"], expected_poses, atol=1e-8)
+    for index in range(len(expected_poses)):
+        with np.load(output / "raw" / f"view_{index:04d}.npz", allow_pickle=False) as saved:
+            np.testing.assert_allclose(saved["camera_pose"], expected_poses[index], atol=1e-8)
 
 
 def test_confidence_cdf_is_an_uncalibrated_rank_score() -> None:

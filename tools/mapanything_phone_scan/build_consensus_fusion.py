@@ -1770,7 +1770,7 @@ def build(
         },
         "trajectory_alignment": sim3,
         "pose_graph": pose_graph_metrics,
-        "pose_graph_output_used": trajectory_refinement is None,
+        "pose_graph_output_used": pose_carrier == "joint" and trajectory_refinement is None,
         "trajectory_refinement": trajectory_refinement,
         "confidence_rank_scores": {
             "mapanything": map_confidence_metrics,

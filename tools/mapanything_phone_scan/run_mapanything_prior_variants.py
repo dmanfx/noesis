@@ -1062,6 +1062,94 @@ def _conditioned_overlap_scale_and_gate(
     return scale, metrics
 
 
+def _top_up_preprocessed_depth_priors(
+    processed: list[dict[str, Any]],
+    raw_views: list[dict[str, Any]],
+    *,
+    reliable_depth_priors: list[np.ndarray] | None,
+    preprocess_inputs: Any,
+    global_start: int,
+    random_seed: int,
+    minimum_per_view: int = 500,
+) -> list[dict[str, Any]]:
+    """Restore a sparse minimum after the official nearest-depth resize/crop.
+
+    The raw-grid minimum is not sufficient: a crop can discard valid samples.
+    Replay the identical batch with already-qualified reliable DA3 depths, and
+    select only missing pixels from that processed grid. Never interpolate a
+    depth, change an existing sample, camera, RGB, or reliability threshold.
+    """
+    counts = [int(np.count_nonzero(_numpy_from_processed(row["depth_z"])))
+              for row in processed]
+    deficient = [index for index, count in enumerate(counts)
+                 if count < minimum_per_view]
+    if not deficient:
+        return []
+    if (reliable_depth_priors is None
+            or len(reliable_depth_priors) != len(raw_views)
+            or len(processed) != len(raw_views)):
+        raise MapAnythingScanError(
+            "a conditioned MapAnything window has fewer than "
+            f"{minimum_per_view} processed depth-prior samples, without reliable top-up evidence"
+        )
+    replay_inputs = [
+        {**view, "depth_z": reliable_depth_priors[index]}
+        if index in deficient else view
+        for index, view in enumerate(raw_views)
+    ]
+    replay = preprocess_inputs(replay_inputs, verbose=False)
+    if len(replay) != len(processed):
+        raise MapAnythingScanError("reliable prior preprocessing lost views")
+    changes: list[tuple[int, np.ndarray]] = []
+    reports: list[dict[str, Any]] = []
+    for index in deficient:
+        row, evidence = processed[index], replay[index]
+        for key in ("img", "intrinsics", "camera_poses"):
+            if key in row and (key not in evidence or not np.array_equal(
+                    _numpy_from_processed(row[key]),
+                    _numpy_from_processed(evidence[key]))):
+                raise MapAnythingScanError(f"reliable prior replay changed {key}")
+        original = _numpy_from_processed(row["depth_z"])
+        reliable = _numpy_from_processed(evidence["depth_z"])
+        if original.shape != reliable.shape:
+            raise MapAnythingScanError("reliable prior replay changed depth shape")
+        existing = np.isfinite(original) & (original > 0.0)
+        valid = np.isfinite(reliable) & (reliable > 0.0)
+        if not np.all(np.isfinite(original)) or np.any(original < 0.0):
+            raise MapAnythingScanError("processed sparse prior contains invalid depth")
+        if not np.array_equal(original[existing], reliable[existing]):
+            raise MapAnythingScanError("reliable prior replay changed existing sampled depths")
+        candidates = np.flatnonzero((valid & ~existing).reshape(-1))
+        needed = minimum_per_view - int(existing.sum())
+        if candidates.size < needed:
+            raise MapAnythingScanError(
+                f"view {global_start + index} has fewer than {minimum_per_view} "
+                "reliable depths after official preprocessing"
+            )
+        rng = np.random.default_rng(np.random.SeedSequence([random_seed, global_start + index]))
+        chosen = rng.choice(candidates, size=needed, replace=False)
+        updated = original.copy()
+        updated.reshape(-1)[chosen] = reliable.reshape(-1)[chosen]
+        changes.append((index, updated))
+        reports.append({
+            "global_view_index": global_start + index,
+            "samples_before": counts[index],
+            "processed_reliable_sample_count": int(valid.sum()),
+            "added_reliable_samples": int(needed),
+            "samples_after": int(np.count_nonzero(updated)),
+            "existing_samples_rgb_and_camera_unchanged": True,
+        })
+    # Fail closed for the entire batch before mutating any prior.
+    import torch
+    for index, updated in changes:
+        value = processed[index]["depth_z"]
+        processed[index]["depth_z"] = (
+            torch.as_tensor(updated, dtype=value.dtype, device=value.device)
+            if isinstance(value, torch.Tensor) else updated
+        )
+    return reports
+
+
 def _run_conditioned_mapanything_windows(
     model: Any,
     raw_views: list[dict[str, Any]],
@@ -1072,6 +1160,8 @@ def _run_conditioned_mapanything_windows(
     max_joint_views: int,
     window_overlap_views: int,
     require_depth_prior: bool,
+    reliable_depth_priors: list[np.ndarray] | None = None,
+    random_seed: int = 8_675_309,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     from tools.mapanything_phone_scan.windowed_inference import _window_ranges
 
@@ -1096,15 +1186,24 @@ def _run_conditioned_mapanything_windows(
             raise MapAnythingScanError(
                 "conditioned MapAnything windows do not share one image shape"
             )
+        prior_top_up: list[dict[str, Any]] = []
         if require_depth_prior:
             prior_counts = [
                 int(np.count_nonzero(_numpy_from_processed(view["depth_z"])))
                 for view in processed
             ]
             if min(prior_counts) < 500:
-                raise MapAnythingScanError(
-                    "a conditioned MapAnything window has fewer than 500 depth-prior "
-                    "samples in a view"
+                prior_top_up = _top_up_preprocessed_depth_priors(
+                    processed,
+                    raw_views[start:end],
+                    reliable_depth_priors=(
+                        reliable_depth_priors[start:end]
+                        if reliable_depth_priors is not None
+                        else None
+                    ),
+                    preprocess_inputs=preprocess_inputs,
+                    global_start=start,
+                    random_seed=random_seed,
                 )
         with torch.inference_mode():
             predicted = model.infer(
@@ -1149,6 +1248,7 @@ def _run_conditioned_mapanything_windows(
                 "view_count": end - start,
                 "depth_scale_to_base": window_scale,
                 "duplicate_depth_gate": overlap_metrics,
+                "processed_sparse_prior_top_up": prior_top_up,
             }
         )
         del predicted, window, processed
@@ -1359,6 +1459,20 @@ def main() -> int:
                 sparse,
                 static,
             )
+            reliable_depth_priors = None
+            if VARIANT_SPECS[variant]["use_depth"]:
+                reliable_depth_priors = [
+                    (
+                        static.depth_z
+                        if source["fixed_camera_anchor"] and static is not None
+                        else np.where(
+                            sparse.reliability_mask[source["phone_frame_index"]],
+                            da3.depth[source["phone_frame_index"]],
+                            0.0,
+                        ).astype(np.float32)
+                    )
+                    for source in source_rows
+                ]
             print(
                 f"[{variant}] running overlap-gated inference over {len(raw_views)} views",
                 flush=True,
@@ -1378,6 +1492,8 @@ def main() -> int:
                         require_depth_prior=bool(
                             VARIANT_SPECS[variant]["use_depth"]
                         ),
+                        reliable_depth_priors=reliable_depth_priors,
+                        random_seed=args.random_seed,
                     )
                 )
                 del raw_views

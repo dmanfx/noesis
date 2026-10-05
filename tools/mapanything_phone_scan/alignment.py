@@ -374,18 +374,49 @@ def _level_phone_floor(
     camera_up = _normalize(-np.mean(poses[:, :3, 1], axis=0), name="phone camera up")
     o3d.utility.random.seed(settings.random_seed)
     cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points[::3]))
-    plane, inliers = cloud.segment_plane(
-        distance_threshold=settings.floor_distance_threshold_m,
-        ransac_n=3,
-        num_iterations=1_600,
-    )
-    normal_raw = np.asarray(plane[:3], dtype=np.float64)
-    normal_length = float(np.linalg.norm(normal_raw))
-    normal = _normalize(normal_raw, name="phone floor normal")
-    offset = float(plane[3]) / normal_length
-    if float(np.dot(normal, camera_up)) < 0.0:
-        normal = -normal
-        offset = -offset
+    # The largest room plane can be a wall. Camera-to-wall distance can also
+    # accidentally satisfy the height check, so it is not evidence of a floor.
+    # Search a finite set of measured planes and require agreement with the
+    # pose-derived up direction before attempting independent room alignment.
+    remaining = cloud
+    candidates: list[dict[str, Any]] = []
+    selected = None
+    minimum_up_cosine = math.cos(math.radians(35.0))
+    for candidate_index in range(8):
+        if len(remaining.points) < 3:
+            break
+        plane, inliers = remaining.segment_plane(
+            distance_threshold=settings.floor_distance_threshold_m,
+            ransac_n=3,
+            num_iterations=1_600,
+        )
+        if not inliers:
+            break
+        normal_raw = np.asarray(plane[:3], dtype=np.float64)
+        normal_length = float(np.linalg.norm(normal_raw))
+        candidate_normal = _normalize(normal_raw, name="phone floor normal")
+        candidate_offset = float(plane[3]) / normal_length
+        if float(np.dot(candidate_normal, camera_up)) < 0.0:
+            candidate_normal = -candidate_normal
+            candidate_offset = -candidate_offset
+        up_cosine = float(np.dot(candidate_normal, camera_up))
+        heights = poses[:, :3, 3] @ candidate_normal + candidate_offset
+        fraction = float(len(inliers) / max(1, len(cloud.points)))
+        eligible = bool(up_cosine >= minimum_up_cosine and fraction >= 0.015
+                        and 0.7 <= float(np.median(heights)) <= 2.2)
+        candidates.append({
+            "index": candidate_index, "normal": candidate_normal.tolist(),
+            "offset": candidate_offset, "pose_up_cosine": up_cosine,
+            "inlier_count": len(inliers), "inlier_fraction_of_original": fraction,
+            "median_camera_height_m": float(np.median(heights)), "eligible": eligible,
+        })
+        if eligible:
+            selected = (candidate_normal, candidate_offset, inliers)
+            break
+        remaining = remaining.select_by_index(inliers, invert=True)
+    if selected is None:
+        raise NoesisAlignmentError("no measured floor plane agrees with phone pose up and camera height")
+    normal, offset, inliers = selected
     rotation = _align_vectors(normal, np.asarray([0.0, 1.0, 0.0]))
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = rotation
@@ -399,6 +430,10 @@ def _level_phone_floor(
         "ransac_sample_count": int(len(cloud.points)),
         "ransac_inlier_count": int(len(inliers)),
         "ransac_inlier_fraction": float(len(inliers) / max(1, len(cloud.points))),
+        "plane_selection": "bounded_measured_planes_pose_up_and_height_gated",
+        "pose_up_source": "negative_mean_opencv_camera_y_axis_not_calibrated_imu_gravity",
+        "minimum_pose_up_cosine": minimum_up_cosine,
+        "plane_candidates": candidates,
         "camera_height_m": {
             "min": float(np.min(camera_heights)),
             "median": float(np.median(camera_heights)),

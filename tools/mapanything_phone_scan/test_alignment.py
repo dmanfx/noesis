@@ -10,6 +10,38 @@ import pytest
 from tools.mapanything_phone_scan import alignment
 
 
+def test_floor_selection_rejects_dominant_wall_with_plausible_camera_distance(tmp_path):
+    # A dominant wall 1.6 m from the camera fooled the height-only selection.
+    rng = np.random.default_rng(21)
+    wall = np.column_stack((rng.uniform(-2, 2, 6000), rng.uniform(0, 2.5, 6000),
+                            np.full(6000, 1.6)))
+    floor = np.column_stack((rng.uniform(-2, 2, 2500), np.zeros(2500),
+                             rng.uniform(-2, 2, 2500)))
+    points = np.concatenate((wall, floor))
+    poses = np.repeat(np.eye(4)[None], 4, axis=0)
+    poses[:, :3, :3] = np.diag([1., -1., -1.])
+    poses[:, 1, 3] = 1.5
+    settings = alignment.NoesisAlignmentSettings("test", tmp_path, tmp_path)
+    leveled, _, _, report = alignment._level_phone_floor(points, poses, settings)
+    assert report["plane_candidates"][0]["eligible"] is False
+    assert report["plane_candidates"][0]["pose_up_cosine"] < .1
+    assert len(report["plane_candidates"]) >= 2
+    assert np.allclose(report["normal_in_mapanything_world"], [0, 1, 0], atol=1e-5)
+    assert np.max(np.abs(leveled[len(wall):, 1])) < 1e-5
+
+
+def test_floor_selection_rejects_wall_only_scene(tmp_path):
+    rng = np.random.default_rng(22)
+    points = np.column_stack((rng.uniform(-2, 2, 600), rng.uniform(0, 2.5, 600),
+                              np.full(600, 1.6)))
+    poses = np.repeat(np.eye(4)[None], 2, axis=0)
+    poses[:, :3, :3] = np.diag([1., -1., -1.])
+    poses[:, 1, 3] = 1.5
+    settings = alignment.NoesisAlignmentSettings("test", tmp_path, tmp_path)
+    with pytest.raises(alignment.NoesisAlignmentError, match="no measured floor plane"):
+        alignment._level_phone_floor(points, poses, settings)
+
+
 def test_explicit_static_rgb_exclusion_removes_features_before_matching(tmp_path):
     image = np.random.default_rng(7).integers(0, 256, (192, 256, 3), dtype=np.uint8)
     keyframe = tmp_path / "keyframe.png"

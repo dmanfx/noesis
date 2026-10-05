@@ -36,11 +36,27 @@ def _robust_percentile_clip(values: np.ndarray, low_q: float = 2.5, high_q: floa
     return values[(values >= lo) & (values <= hi)]
 
 
-def _enforce_monotonic(values: np.ndarray) -> np.ndarray:
-    out = np.asarray(values, dtype=np.float64).copy()
-    for idx in range(1, out.size):
-        if out[idx] < out[idx - 1]:
-            out[idx] = out[idx - 1]
+def _enforce_monotonic(values: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
+    """Weighted isotonic least squares, not a one-sided cumulative maximum.
+
+    A noisy high near-depth bin must not lift every farther reference depth to
+    that value. Pool adjacent violating bins using their observed support. A
+    genuinely unobservable plateau stays flat and remains runtime-ineligible.
+    """
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.ones_like(values) if weights is None else np.asarray(weights, dtype=np.float64).reshape(-1)
+    if weights.shape != values.shape or not np.all(np.isfinite(values)) or not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+        raise DepthRegistrationBuildError("isotonic values/positive weights must be finite and aligned")
+    blocks: list[list[float | int]] = []
+    for index, (value, weight) in enumerate(zip(values, weights)):
+        blocks.append([index, index + 1, float(value * weight), float(weight)])
+        while len(blocks) >= 2 and blocks[-2][2] / blocks[-2][3] > blocks[-1][2] / blocks[-1][3]:
+            right = blocks.pop()
+            left = blocks.pop()
+            blocks.append([left[0], right[1], left[2] + right[2], left[3] + right[3]])
+    out = np.empty_like(values)
+    for start, end, weighted_sum, total_weight in blocks:
+        out[int(start):int(end)] = weighted_sum / total_weight
     return out
 
 
@@ -77,6 +93,7 @@ def fit_monotonic_piecewise_mapping(
     quantiles = np.linspace(0.0, 1.0, knot_count)
     raw_knots: list[float] = []
     target_knots: list[float] = []
+    knot_support: list[int] = []
     retained_total = 0
     for idx in range(knot_count - 1):
         q_lo = float(quantiles[idx])
@@ -102,18 +119,22 @@ def fit_monotonic_piecewise_mapping(
         retained_total += int(bin_raw.size)
         raw_knots.append(float(np.median(bin_raw)))
         target_knots.append(float(np.median(bin_target)))
+        knot_support.append(int(bin_raw.size))
     if len(raw_knots) < 2:
         raise DepthRegistrationBuildError("Unable to construct a monotonic mapping from the provided samples")
 
     raw_knots[0] = lo
     raw_knots[-1] = hi
-    reg_knots = _enforce_monotonic(np.asarray(target_knots, dtype=np.float64))
+    reg_knots = _enforce_monotonic(
+        np.asarray(target_knots, dtype=np.float64), np.asarray(knot_support, dtype=np.float64)
+    )
     if reg_knots.size != len(raw_knots):
         raise DepthRegistrationBuildError("Internal knot vector mismatch")
 
     corrected = np.interp(raw, raw_knots, reg_knots)
     residual = corrected - target
     fit_metrics = {
+        "monotonic_fit_method": "weighted_pool_adjacent_violators",
         "median_abs_error_m": float(np.median(np.abs(residual))),
         "mean_abs_error_m": float(np.mean(np.abs(residual))),
         "p90_abs_error_m": float(np.percentile(np.abs(residual), 90.0)),
@@ -142,7 +163,7 @@ def build_registration_entry(
     provenance: Mapping[str, Any],
     raw_depth_m: Sequence[float],
     registered_depth_m: Sequence[float],
-    generation_tool_version: str = "depth_registration_builder_v1",
+    generation_tool_version: str = "depth_registration_builder_v2_isotonic",
     created_ts_us: Optional[int] = None,
     num_knots: int = DEFAULT_NUM_KNOTS,
     min_samples: int = DEFAULT_MIN_SAMPLES,

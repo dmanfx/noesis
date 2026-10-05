@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import colorsys
+import copy
 import hashlib
 import json
 import logging
@@ -71,6 +72,14 @@ from noesis_core.depth_contract import usable_registered_depth_m
 from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
 from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
 from noesis_core.contracts.base import Matrix3, Vector3
+from noesis_core.contracts.support_surface import SupportSurfaceReference, SupportSurfaceSet
+from noesis_core.world.support_surfaces import (
+    calibrated_ray_intersections,
+    constrained_plane_covariance,
+    contains_xz,
+    elevation_at,
+    select_unique_intersection,
+)
 from noesis_core.contracts.world_measurement import (
     ResolvedGroundMeasurement,
     WorldMeasurementCohort,
@@ -342,6 +351,7 @@ _MANUAL_DEPTH_BACKENDS = frozenset({"mapanything", "da3metric-large"})
 _DA3METRIC_LARGE_FOCAL_DENOMINATOR = 300.0
 _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS = (
     "world_estimator_evaluated",
+    "world_estimation_error",
     "world_floor_candidate",
     "world_floor_range_m",
     "world_floor_range_limit_m",
@@ -3883,6 +3893,7 @@ class _WorldOutputWatermark:
     media_pts_ns: Optional[int]
     filter_ts: float
     trail_segment_id: int
+    support_surface: Optional[SupportSurfaceReference] = None
     committed_world_source: str = ""
     committed_provenance_type: Optional[str] = None
     projective_bridge_root_media_pts_ns: Optional[int] = None
@@ -12563,19 +12574,39 @@ class _AnalyticsTelemetryProcessor:
         if tracker_id_int is not None and tracker_id_int < 0:
             tracker_id_int = None
         world_x = None
+        world_y = None
         world_z = None
         if track.get("world_valid") is True:
             world = track.get("world")
             if isinstance(world, (list, tuple)) and len(world) >= 3:
                 try:
                     wx = float(world[0])
+                    wy = float(world[1])
                     wz = float(world[2])
-                    if math.isfinite(wx) and math.isfinite(wz):
+                    if all(math.isfinite(v) for v in (wx, wy, wz)):
                         world_x = float(wx)
+                        world_y = float(wy)
                         world_z = float(wz)
                 except Exception:
                     world_x = None
+                    world_y = None
                     world_z = None
+        world_covariance = None
+        covariance_payload = track.get("world_covariance")
+        if isinstance(covariance_payload, Mapping):
+            covariance_payload = covariance_payload.get("values")
+        if isinstance(covariance_payload, (list, tuple)) and len(covariance_payload) == 9:
+            try:
+                values = tuple(float(v) for v in covariance_payload)
+                if all(math.isfinite(v) for v in values):
+                    world_covariance = values
+            except (TypeError, ValueError, OverflowError):
+                pass
+        support_payload = track.get("world_support_surface")
+        support_surface = (
+            dict(support_payload)
+            if isinstance(support_payload, Mapping) else None
+        )
         depth_m = None
         depth_source = None
         depth_candidate = usable_registered_depth_m(track)
@@ -12685,7 +12716,10 @@ class _AnalyticsTelemetryProcessor:
             track_key=track_key_value,
             tracker_lifecycle_generation=lifecycle_generation_int,
             world_x=world_x,
+            world_y=world_y,
             world_z=world_z,
+            world_covariance=world_covariance,
+            support_surface=support_surface,
             depth_m=depth_m,
             depth_source=depth_source,
             anchor_source=str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
@@ -13258,6 +13292,7 @@ class _AnalyticsTelemetryProcessor:
         world_frame_id: str,
         world_frame_revision: Optional[str],
         world_transform_sha256: Optional[str],
+        support_surface: SupportSurfaceReference | None = None,
         stationary_hold_posture: Optional[str] = None,
         upright_presence_evidence: Optional[Mapping[str, Any]] = None,
         current_presence_evidence: Optional[Mapping[str, Any]] = None,
@@ -13288,16 +13323,20 @@ class _AnalyticsTelemetryProcessor:
             process = np.asarray(process_observation, dtype=np.float64).reshape(-1)
             emitted = np.asarray(emitted_point, dtype=np.float64).reshape(-1)
             floor_y = float(emitted[1])
-            prior_world = [float(prior_x), floor_y, float(prior_z)]
-            metric_world = [float(metric_x), floor_y, float(metric_z)]
+            def elevation(x: float, z: float) -> float:
+                if support_surface is None:
+                    return floor_y
+                return self._support_reference_elevation(support_surface, x, z)
+            prior_world = [float(prior_x), elevation(float(prior_x), float(prior_z)), float(prior_z)]
+            metric_world = [float(metric_x), elevation(float(metric_x), float(metric_z)), float(metric_z)]
             process_world = [
                 float(process[0]),
-                floor_y,
+                elevation(float(process[0]), float(process[2])),
                 float(process[2]),
             ]
             emitted_world = [
                 float(emitted[0]),
-                floor_y,
+                elevation(float(emitted[0]), float(emitted[2])),
                 float(emitted[2]),
             ]
             prior_segment = int(prior_segment)
@@ -13698,6 +13737,7 @@ class _AnalyticsTelemetryProcessor:
         committed_world_source: Any = None,
         committed_provenance_type: Any = None,
         bbox_geometry: Any = None,
+        support_surface: Optional[SupportSurfaceReference] = None,
     ) -> None:
         """Store one bounded canonical queue-admission watermark."""
 
@@ -13865,6 +13905,7 @@ class _AnalyticsTelemetryProcessor:
             media_pts_ns=parsed_media_pts,
             filter_ts=parsed_filter_ts,
             trail_segment_id=parsed_segment,
+            support_surface=support_surface,
             committed_world_source=normalized_world_source,
             committed_provenance_type=(
                 normalized_provenance_type or None
@@ -13913,6 +13954,7 @@ class _AnalyticsTelemetryProcessor:
             media_pts_ns=state.last_output_media_pts_ns,
             filter_ts=state.last_output_filter_ts,
             trail_segment_id=state.last_output_trail_segment_id,
+            support_surface=state.active_support_surface,
         )
 
     def _clear_uncommitted_world_output_state(
@@ -14126,11 +14168,22 @@ class _AnalyticsTelemetryProcessor:
                 try:
                     if prior is None or prior.media_pts_ns is None:
                         raise ValueError("missing committed output watermark")
+                    current_surface = (
+                        SupportSurfaceReference.model_validate(track["world_support_surface"])
+                        if track.get("world_support_surface") is not None else None
+                    )
+                    if current_surface != prior.support_surface:
+                        raise ValueError("continuation cannot change committed support")
                     floor_y = float(world[1])
+                    def prior_y(x, z):
+                        return (
+                            self._support_reference_elevation(prior.support_surface, x, z)
+                            if prior.support_surface is not None else floor_y
+                        )
                     metric_position = (
                         (
                             float(prior.metric_world_x),
-                            floor_y,
+                            prior_y(prior.metric_world_x, prior.metric_world_z),
                             float(prior.metric_world_z),
                         )
                         if prior.metric_world_x is not None
@@ -14140,11 +14193,12 @@ class _AnalyticsTelemetryProcessor:
                     expected_origin = _CanonicalTrackOutput(
                         position=(
                             float(prior.world_x),
-                            floor_y,
+                            prior_y(prior.world_x, prior.world_z),
                             float(prior.world_z),
                         ),
                         media_pts_ns=int(prior.media_pts_ns),
                         trail_segment_id=int(prior.trail_segment_id),
+                        support_surface=prior.support_surface,
                         committed_world_source=str(
                             prior.committed_world_source
                         ),
@@ -14167,7 +14221,7 @@ class _AnalyticsTelemetryProcessor:
                         kinematic_position=(
                             (
                                 float(prior.kinematic_world_x),
-                                floor_y,
+                                prior_y(prior.kinematic_world_x, prior.kinematic_world_z),
                                 float(prior.kinematic_world_z),
                             )
                             if prior.kinematic_world_x is not None
@@ -14287,6 +14341,10 @@ class _AnalyticsTelemetryProcessor:
                     else None
                 ),
                 bbox_geometry=track.get("bbox"),
+                support_surface=(
+                    SupportSurfaceReference.model_validate(track["world_support_surface"])
+                    if track.get("world_support_surface") is not None else None
+                ),
             )
 
             if not state_matches_authority or state is None:
@@ -16021,7 +16079,53 @@ class _AnalyticsTelemetryProcessor:
         flip_u: bool,
         flip_v: bool,
     ) -> Optional[np.ndarray]:
-        return self._project_pixel_to_world_observation(
+        surfaces = getattr(calib, "support_surfaces", None)
+        if isinstance(surfaces, SupportSurfaceSet) and surfaces.authority == "measured_calibration":
+            if (
+                surfaces.camera_id != str(getattr(calib, "camera_id", ""))
+                or surfaces.world_frame_revision != str(getattr(calib, "world_frame_revision", ""))
+                or surfaces.calibration_revision != str(getattr(calib, "camera_calibration_sha256", ""))
+                or surfaces.world_transform_sha256 != str(getattr(calib, "frame_transform_sha256", ""))
+            ):
+                return None
+        if (
+            isinstance(surfaces, SupportSurfaceSet)
+            and surfaces.authority == "measured_calibration"
+            and str(getattr(calib, "image_localization_basis", ""))
+            == "revision_target_floor"
+        ):
+            try:
+                width, height = calib.image_size
+                ray_u, ray_v = self._apply_image_flip(
+                    float(u), float(v), int(width), int(height),
+                    bool(flip_u), bool(flip_v),
+                )
+                rotation, origin = parse_extrinsics(calib.extrinsics_col_major)
+                ray_origin, direction = ray_from_pixel(
+                    ray_u, ray_v, calib.intrinsics, rotation, origin,
+                )
+                unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+                if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+                    return None
+                ray_origin = np.asarray(ray_origin, dtype=np.float64) * unit_scale
+                hits = calibrated_ray_intersections(
+                    surfaces,
+                    camera_id=str(calib.camera_id),
+                    world_frame_revision=str(calib.world_frame_revision),
+                    calibration_revision=str(calib.camera_calibration_sha256),
+                    world_transform_sha256=str(calib.frame_transform_sha256),
+                    origin_world_m=tuple(float(v) for v in ray_origin),
+                    direction_world=tuple(float(v) for v in direction),
+                    max_range_m=max(1.0, float(getattr(self, "_world_resolver_max_range_m", 100.0))),
+                )
+                if len(hits) > 1:
+                    return None
+                selected = select_unique_intersection(hits)
+                if selected is not None:
+                    return np.asarray(selected.point_world_m, dtype=np.float64)
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                return None
+        baseline = self._project_pixel_to_world_observation(
             calib,
             u,
             v,
@@ -16029,6 +16133,46 @@ class _AnalyticsTelemetryProcessor:
             flip_u=flip_u,
             flip_v=flip_v,
         )
+        if baseline is None:
+            return None
+        if isinstance(surfaces, SupportSurfaceSet) and surfaces.authority == "measured_calibration":
+            if any(contains_xz(surface, float(baseline[0]), float(baseline[2]))
+                   for surface in surfaces.surfaces):
+                return None
+        return baseline
+
+    @staticmethod
+    def _support_at_world_xz(
+        calib: Any, x: float, z: float,
+    ) -> tuple[float | None, SupportSurfaceReference | None, bool]:
+        """Return one admitted observed elevation, or explicit ambiguity."""
+
+        surfaces = getattr(calib, "support_surfaces", None)
+        if not isinstance(surfaces, SupportSurfaceSet) or surfaces.authority != "measured_calibration":
+            return None, None, False
+        if (
+            surfaces.camera_id != str(getattr(calib, "camera_id", ""))
+            or surfaces.world_frame_revision != str(getattr(calib, "world_frame_revision", ""))
+            or surfaces.calibration_revision != str(getattr(calib, "camera_calibration_sha256", ""))
+            or surfaces.world_transform_sha256 != str(getattr(calib, "frame_transform_sha256", ""))
+        ):
+            return None, None, True
+        matches = [surface for surface in surfaces.surfaces if contains_xz(surface, x, z)]
+        if len(matches) > 1:
+            return None, None, True
+        if not matches:
+            return None, None, False
+        height = elevation_at(matches[0], x, z)
+        if height is None:
+            return None, None, True
+        return height, SupportSurfaceReference.from_surface(matches[0]), False
+
+    @staticmethod
+    def _support_reference_elevation(
+        reference: SupportSurfaceReference, x: float, z: float,
+    ) -> float:
+        nx, ny, nz = reference.normal_world
+        return -(nx * float(x) + nz * float(z) + reference.offset_m) / ny
 
     def _torso_depth_corroborates_floor_contact(
         self,
@@ -16433,6 +16577,7 @@ class _AnalyticsTelemetryProcessor:
         perturbations: Sequence[Tuple[float, Optional[np.ndarray]]],
         *,
         floor_y_variance: float = 0.0025,
+        additional_covariance: Optional[np.ndarray] = None,
     ) -> Optional[Matrix3]:
         """Propagate bounded input uncertainty through a world projection.
 
@@ -16473,6 +16618,11 @@ class _AnalyticsTelemetryProcessor:
         # The calibrated floor is not exact.  Keep a conservative bounded
         # vertical variance even though the resolver uses X/Z for display.
         covariance[1, 1] += max(1e-5, min(1.0, float(floor_y_variance)))
+        if additional_covariance is not None:
+            extra = np.asarray(additional_covariance, dtype=np.float64)
+            if extra.shape != (3, 3) or not np.all(np.isfinite(extra)):
+                return None
+            covariance += extra
         if used == 0:
             return None
         covariance = 0.5 * (covariance + covariance.T)
@@ -16495,6 +16645,7 @@ class _AnalyticsTelemetryProcessor:
         anchor_uv: Sequence[float],
         floor_candidate: np.ndarray,
         incidence_sin: float,
+        support_surface: Optional[SupportSurfaceReference] = None,
         posture: str,
         occlusion_fraction: float,
         flip_u: bool,
@@ -16515,21 +16666,62 @@ class _AnalyticsTelemetryProcessor:
         width, height = self._normalize_image_size(getattr(calib, "image_size", None)) or (0, 0)
         if width <= 0 or height <= 0:
             return None
+        plane_covariance = None
+        if support_surface is not None:
+            collection = getattr(calib, "support_surfaces", None)
+            if not isinstance(collection, SupportSurfaceSet):
+                return None
+            observed = next(
+                (surface for surface in collection.surfaces
+                 if SupportSurfaceReference.from_surface(surface) == support_surface),
+                None,
+            )
+            if observed is None:
+                return None
+            try:
+                _, origin = parse_extrinsics(calib.extrinsics_col_major)
+                unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+                if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+                    return None
+                camera_world = np.asarray(origin, dtype=np.float64) * unit_scale
+                ray = np.asarray(floor_candidate, dtype=np.float64) - camera_world
+                ray_length = float(np.linalg.norm(ray))
+                if not math.isfinite(ray_length) or ray_length <= 1e-6:
+                    return None
+                ray /= ray_length
+                normal = np.asarray(observed.normal_world, dtype=np.float64)
+                dot = float(np.dot(normal, ray))
+                if not math.isfinite(dot) or abs(dot) <= 1e-3:
+                    return None
+                plane_jacobian = -ray / dot
+                plane_covariance = (
+                    float(observed.residual_sigma_m) ** 2
+                    * np.outer(plane_jacobian, plane_jacobian)
+                )
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                return None
         def _project(du: float, dv: float) -> Optional[np.ndarray]:
             pu = min(float(width - 1), max(0.0, float(u) + float(du)))
             pv = min(float(height - 1), max(0.0, float(v) + float(dv)))
-            return self._project_pixel_to_floor_world(
+            perturbed = self._project_pixel_to_floor_world(
                 calib,
                 pu,
                 pv,
                 flip_u=flip_u,
                 flip_v=flip_v,
             )
+            if perturbed is None:
+                return None
+            _, reference, ambiguous = self._support_at_world_xz(
+                calib, float(perturbed[0]), float(perturbed[2]),
+            )
+            return None if ambiguous or reference != support_surface else perturbed
 
         return self._covariance_matrix_from_projection(
             floor_candidate,
             ((sigma_px, _project(sigma_px, 0.0)), (sigma_px, _project(0.0, sigma_px))),
             floor_y_variance=0.01 + 0.04 * (1.0 - incidence),
+            additional_covariance=plane_covariance,
         )
 
     def _depth_registration_sigma_m(self, calib: Any) -> float:
@@ -16563,6 +16755,7 @@ class _AnalyticsTelemetryProcessor:
         registered_depth_m: float,
         depth_result: Optional[ObjectDepthResult],
         depth_candidate: np.ndarray,
+        support_surface: Optional[SupportSurfaceReference] = None,
         posture: str,
         occlusion_fraction: float,
         flip_u: bool,
@@ -16618,7 +16811,12 @@ class _AnalyticsTelemetryProcessor:
             if point is None:
                 return None
             grounded = np.asarray(point, dtype=np.float64).copy()
-            grounded[1] = float(calib.floor_y)
+            support_height, reference, ambiguous = self._support_at_world_xz(
+                calib, float(grounded[0]), float(grounded[2]),
+            )
+            if ambiguous or reference != support_surface:
+                return None
+            grounded[1] = float(support_height) if support_height is not None else float(calib.floor_y)
             return grounded
 
         return self._covariance_matrix_from_projection(
@@ -16732,6 +16930,19 @@ class _AnalyticsTelemetryProcessor:
         )
         if covariance is None:
             return None
+        # Torso reference height was measured in this calibration's vertical
+        # frame. Its ray solve already establishes X/Z; only the footprint's
+        # support elevation changes. Never add the floor rise to that measured
+        # torso plane a second time.
+        support_y, support_reference, support_ambiguous = self._support_at_world_xz(
+            calib, float(candidate[0]), float(candidate[2]),
+        )
+        if support_ambiguous:
+            return None
+        if support_reference is not None:
+            candidate = np.asarray(candidate, dtype=np.float64).copy()
+            candidate[1] = float(support_y)
+            covariance = constrained_plane_covariance(support_reference, covariance)
         return (
             np.asarray(candidate, dtype=np.float64),
             covariance,
@@ -16873,6 +17084,57 @@ class _AnalyticsTelemetryProcessor:
         return float(height_scene), float(uncertainty_scene)
 
     def _upright_pose_ground_projection(
+        self,
+        calib: Any,
+        *,
+        kpts_abs: np.ndarray,
+        bbox: Sequence[float],
+        state: Optional[_WorldAnchorState],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[Tuple[np.ndarray, Matrix3, float, float, int, bool]]:
+        """Solve against each admitted flat support, retaining only a unique fit.
+
+        Solving at Y=0 then changing only output Y changes the anatomical ray
+        geometry. Recompute the body-plane solve for each finite support. An
+        ambiguous level remains unavailable; previous track positions do not
+        select the floor or manufacture fresh evidence.
+        """
+        surfaces = getattr(calib, "support_surfaces", None)
+        kwargs = dict(kpts_abs=kpts_abs, bbox=bbox, state=state,
+                      flip_u=flip_u, flip_v=flip_v)
+        baseline = self._upright_pose_ground_projection_on_floor(calib, **kwargs)
+        if not isinstance(surfaces, SupportSurfaceSet) or surfaces.authority != "measured_calibration":
+            return baseline
+        candidates = []
+        if baseline is not None:
+            point = baseline[0]
+            _, reference, ambiguous = self._support_at_world_xz(calib, float(point[0]), float(point[2]))
+            if not ambiguous and reference is None:
+                candidates.append(baseline)
+        for surface in surfaces.surfaces:
+            if abs(surface.normal_world[0]) > 1e-6 or abs(surface.normal_world[2]) > 1e-6:
+                # The existing anatomical solver models horizontal height
+                # bands; do not pretend it estimates a tilted floor.
+                continue
+            height = -surface.offset_m / surface.normal_world[1]
+            try:
+                floor_calib = replace(calib, floor_y=height)
+            except TypeError:
+                # SDK-independent fixture/provider views can be mutable
+                # namespaces. Copy before replacing their local floor.
+                floor_calib = copy.copy(calib)
+                floor_calib.floor_y = height
+            solved = self._upright_pose_ground_projection_on_floor(floor_calib, **kwargs)
+            if solved is None:
+                continue
+            point = solved[0]
+            _, reference, ambiguous = self._support_at_world_xz(calib, float(point[0]), float(point[2]))
+            if not ambiguous and reference == SupportSurfaceReference.from_surface(surface):
+                candidates.append(solved)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _upright_pose_ground_projection_on_floor(
         self,
         calib: Any,
         *,
@@ -17240,11 +17502,19 @@ class _AnalyticsTelemetryProcessor:
             else None
         )
         if floor_candidate is not None and floor_ray_admitted and pose_uv is not None and floor_anchor is not None:
-            floor_covariance = self._floor_candidate_covariance(
+            floor_height, floor_surface, floor_ambiguous = self._support_at_world_xz(
+                calib, float(floor_candidate[0]), float(floor_candidate[2]),
+            )
+            floor_surface_invalid = floor_ambiguous or (
+                floor_surface is not None
+                and (floor_height is None or abs(float(floor_candidate[1]) - floor_height) > 0.05)
+            )
+            floor_covariance = None if floor_surface_invalid else self._floor_candidate_covariance(
                 calib,
                 anchor_uv=pose_uv,
                 floor_candidate=floor_candidate,
                 incidence_sin=float(track.get("world_floor_incidence_sin", 0.0) or 0.0),
+                support_surface=floor_surface,
                 posture=str(posture),
                 occlusion_fraction=float(occlusion_fraction),
                 flip_u=flip_u,
@@ -17280,6 +17550,7 @@ class _AnalyticsTelemetryProcessor:
                         "source_reliability": 1.0,
                         "ray_incidence_sin": float(track.get("world_floor_incidence_sin", 0.0) or 0.0),
                         "pixel_uncertainty_px": 2.0,
+                        "support_surface": floor_surface,
                         "correlation_group": f"floor_ray:{int(sensor_id)}:{int(track.get('tracker_id', -1))}",
                         "pcf": self._world_prior_evidence(camera_id, floor_candidate),
                     }
@@ -17294,7 +17565,15 @@ class _AnalyticsTelemetryProcessor:
         ):
             depth_position = np.asarray(depth_obs, dtype=np.float64).copy()
             try:
-                depth_position[1] = float(calib.floor_y)
+                depth_height, depth_surface, depth_ambiguous = self._support_at_world_xz(
+                    calib, float(depth_position[0]), float(depth_position[2]),
+                )
+                if depth_ambiguous:
+                    return
+                depth_position[1] = (
+                    float(depth_height)
+                    if depth_height is not None else float(calib.floor_y)
+                )
             except (TypeError, ValueError, IndexError, OverflowError):
                 return
             depth_covariance = self._depth_candidate_covariance(
@@ -17303,6 +17582,7 @@ class _AnalyticsTelemetryProcessor:
                 registered_depth_m=float(depth_observation.registered_depth_m),
                 depth_result=depth_result,
                 depth_candidate=depth_position,
+                support_surface=depth_surface,
                 posture=str(posture),
                 occlusion_fraction=float(occlusion_fraction),
                 flip_u=flip_u,
@@ -17365,6 +17645,7 @@ class _AnalyticsTelemetryProcessor:
                     "posture_compatibility": 0.80 if posture in ("sitting", "lying") else 1.0,
                     "source_reliability": 1.0,
                     "depth_support_fraction": depth_support_fraction,
+                    "support_surface": depth_surface,
                     # This is registration uncertainty, not the measured
                     # disagreement between the registered-depth and floor-ray
                     # hypotheses. Keep the two quantities distinct.
@@ -17602,6 +17883,11 @@ class _AnalyticsTelemetryProcessor:
                         if isinstance(candidate.get("pcf"), WorldPriorEvidence)
                         else None
                     ),
+                    **(
+                        {"support_surface": candidate["support_surface"]}
+                        if isinstance(candidate.get("support_surface"), SupportSurfaceReference)
+                        else {}
+                    ),
                     valid=bool(candidate.get("valid", True)),
                     rejection_reason=(
                         str(candidate["rejection_reason"])
@@ -17738,6 +18024,7 @@ class _AnalyticsTelemetryProcessor:
             "world_resolver_source_continuity_match",
             "world_resolver",
             "world_covariance",
+            "world_support_surface",
         ):
             track.pop(field_name, None)
         # A resolver covariance describes the raw current measurement.  It is
@@ -17802,6 +18089,10 @@ class _AnalyticsTelemetryProcessor:
                 "depth_registration_sigma_m": candidate.depth_registration_sigma_m,
                 "floor_depth_disagreement_m": candidate.floor_depth_disagreement_m,
                 "pixel_uncertainty_px": candidate.pixel_uncertainty_px,
+                "support_surface": (
+                    candidate.support_surface.model_dump()
+                    if candidate.support_surface is not None else None
+                ),
                 "selected": bool(diagnostic.selected) if diagnostic is not None else False,
                 "status": "selected" if diagnostic is not None and diagnostic.selected else (
                     "alternate" if diagnostic is not None and diagnostic.retained_as_alternate else "candidate"
@@ -17867,6 +18158,10 @@ class _AnalyticsTelemetryProcessor:
                     if result.selected_kind is not None
                     else None
                 ),
+                "support_surface": (
+                    result.support_surface.model_dump()
+                    if result.support_surface is not None else None
+                ),
                 "contributor_ids": [str(item) for item in result.contributor_ids[:4]],
                 "alternate_id": result.alternate_candidate_id,
                 "fused": bool(result.fused),
@@ -17887,6 +18182,10 @@ class _AnalyticsTelemetryProcessor:
                 diagnostic_payload["resolved"] = {
                     "position": self._world_vector_payload(result.position),
                     "covariance": self._world_covariance_payload(result.covariance),
+                    "support_surface": (
+                        result.support_surface.model_dump()
+                        if result.support_surface is not None else None
+                    ),
                 }
             if result.disagreement_m is not None:
                 diagnostic_payload["disagreement"] = {
@@ -18653,7 +18952,19 @@ class _AnalyticsTelemetryProcessor:
                 unit_scale = 1.0
             projection_extrinsics = calib.extrinsics_col_major
             candidate = np.asarray(floor_candidate, dtype=np.float64)
+            support_height, support_ref, support_ambiguous = self._support_at_world_xz(
+                calib, float(candidate[0]), float(candidate[2]),
+            )
+            if support_ambiguous:
+                raise ValueError("floor contact has ambiguous support")
+            on_observed_support = bool(
+                support_ref is not None
+                and support_height is not None
+                and abs(float(candidate[1]) - support_height) <= 0.05
+            )
             if (
+                not on_observed_support
+                and
                 anchor_uv is not None
                 and len(anchor_uv) >= 2
                 and getattr(
@@ -18685,7 +18996,11 @@ class _AnalyticsTelemetryProcessor:
             horizontal_range_m = float(math.hypot(float(delta[0]), float(delta[2])))
             ray_range_m = float(np.linalg.norm(delta))
             incidence_sin = (
-                abs(float(delta[1])) / ray_range_m
+                abs(
+                    float(np.dot(np.asarray(support_ref.normal_world, dtype=np.float64), delta))
+                    if on_observed_support and support_ref is not None
+                    else float(delta[1])
+                ) / ray_range_m
                 if math.isfinite(ray_range_m) and ray_range_m > 1e-9
                 else 0.0
             )
@@ -18697,14 +19012,21 @@ class _AnalyticsTelemetryProcessor:
                     bbox_left, bbox_top, bbox_width, bbox_height = (
                         float(value) for value in bbox[:4]
                     )
-                    bbox_bottom_hit = self._project_pixel_to_localization_observation(
-                        calib,
-                        bbox_left + 0.5 * bbox_width,
-                        bbox_top + bbox_height,
-                        depth_m=None,
-                        flip_u=bool(flip_u),
-                        flip_v=bool(flip_v),
-                    )
+                    if on_observed_support:
+                        bbox_bottom_hit = self._project_pixel_to_floor_world(
+                            calib, bbox_left + 0.5 * bbox_width,
+                            bbox_top + bbox_height, flip_u=bool(flip_u),
+                            flip_v=bool(flip_v),
+                        )
+                    else:
+                        bbox_bottom_hit = self._project_pixel_to_localization_observation(
+                            calib,
+                            bbox_left + 0.5 * bbox_width,
+                            bbox_top + bbox_height,
+                            depth_m=None,
+                            flip_u=bool(flip_u),
+                            flip_v=bool(flip_v),
+                        )
                     if bbox_bottom_hit is not None:
                         bbox_bottom_delta = (
                             np.asarray(bbox_bottom_hit, dtype=np.float64)
@@ -18824,6 +19146,8 @@ class _AnalyticsTelemetryProcessor:
         track.pop("world_frame", None)
         track.pop("world_frame_revision", None)
         track.pop("world_transform_sha256", None)
+        track.pop("world_support_surface", None)
+        track.pop("world_covariance", None)
 
     def _set_track_image_base_from_world(
         self,
@@ -18837,7 +19161,10 @@ class _AnalyticsTelemetryProcessor:
         try:
             projection_point = np.asarray(world_point, dtype=np.float64)
             projection_extrinsics = calib.extrinsics_col_major
-            if getattr(calib, "target_from_calibration_col_major", None) is not None:
+            if (
+                track.get("world_support_surface") is None
+                and getattr(calib, "target_from_calibration_col_major", None) is not None
+            ):
                 source_floor_point = (
                     self._localization_floor_from_target_ground_point(
                         calib,
@@ -19983,6 +20310,7 @@ class _AnalyticsTelemetryProcessor:
                 Tuple[float, float, Optional[int], float, int]
             ] = None
             output_reference_committed_at_entry = False
+            published_support_at_entry: Optional[SupportSurfaceReference] = None
             output_commit_provenance_at_entry: Optional[
                 Tuple[str, Optional[str]]
             ] = None
@@ -20032,6 +20360,9 @@ class _AnalyticsTelemetryProcessor:
                 if published_output_reference is not None:
                     output_reference_at_entry = published_output_reference
                     output_reference_committed_at_entry = True
+                    published_watermark = self._world_output_watermarks.get(output_watermark_key)
+                    if published_watermark is not None:
+                        published_support_at_entry = published_watermark.support_surface
                     output_commit_provenance_at_entry = (
                         self._world_output_commit_provenance(
                             output_watermark_key
@@ -20465,7 +20796,7 @@ class _AnalyticsTelemetryProcessor:
                 ) = upright_pose_projection
                 track["world_upright_body_candidate"] = [
                     float(upright_candidate[0]),
-                    float(calib.floor_y),
+                    float(upright_candidate[1]),
                     float(upright_candidate[2]),
                 ]
                 track["world_upright_body_height_m"] = float(upright_height_m)
@@ -21261,6 +21592,9 @@ class _AnalyticsTelemetryProcessor:
                                     dtype=np.float64,
                                 ),
                                 "covariance": upright_covariance,
+                                "support_surface": self._support_at_world_xz(
+                                    calib, float(upright_candidate[0]), float(upright_candidate[2]),
+                                )[1],
                                 "anchor": "upright_body_plane",
                                 "contact_basis": "pose:upright_body_planes",
                                 "support_state": "unknown",
@@ -21383,7 +21717,7 @@ class _AnalyticsTelemetryProcessor:
                         ):
                             track["world_seated_pose_candidate"] = [
                                 float(seated_pose_candidate[0]),
-                                float(calib.floor_y),
+                                float(seated_pose_candidate[1]),
                                 float(seated_pose_candidate[2]),
                             ]
                             track["world_seated_torso_height_m"] = float(
@@ -21398,6 +21732,9 @@ class _AnalyticsTelemetryProcessor:
                                         dtype=np.float64,
                                     ),
                                     "covariance": seated_pose_covariance,
+                                    "support_surface": self._support_at_world_xz(
+                                        calib, float(seated_pose_candidate[0]), float(seated_pose_candidate[2]),
+                                    )[1],
                                     "anchor": "seated_torso_plane",
                                     "contact_basis": "pose:seated_torso_plane",
                                     "support_state": "seat",
@@ -21560,6 +21897,7 @@ class _AnalyticsTelemetryProcessor:
                                 and trusted_metric_lifecycle
                                 and posture == "standing"
                                 and state is not None
+                                and state.active_support_surface == published_support_at_entry
                                 and str(state.motion_mode) not in ("sit", "lie")
                                 and track.get("tracker_lifecycle_generation")
                                 is not None
@@ -21579,10 +21917,17 @@ class _AnalyticsTelemetryProcessor:
                                     gravity_candidate,
                                     dtype=np.float64,
                                 ).copy()
+                                if published_support_at_entry is not None:
+                                    inferred_process_raw_candidate[1] = self._support_reference_elevation(
+                                        published_support_at_entry,
+                                        float(inferred_process_raw_candidate[0]),
+                                        float(inferred_process_raw_candidate[2]),
+                                    )
                                 aligned_process = align_inferred_ground_observation(
                                     state,
                                     raw_measurement=inferred_process_raw_candidate,
                                     floor_y=float(calib.floor_y),
+                                    support_surface=published_support_at_entry,
                                     now_ts=float(now_ts),
                                     observed_at_us=int(
                                         track.get("observed_at_us", 0)
@@ -21731,7 +22076,7 @@ class _AnalyticsTelemetryProcessor:
                                                 float(
                                                     inferred_process_raw_candidate[0]
                                                 ),
-                                                float(calib.floor_y),
+                                                float(inferred_process_raw_candidate[1]),
                                                 float(
                                                     inferred_process_raw_candidate[2]
                                                 ),
@@ -21740,7 +22085,7 @@ class _AnalyticsTelemetryProcessor:
                                                 float(
                                                     inferred_process_robust_raw_candidate[0]
                                                 ),
-                                                float(calib.floor_y),
+                                                float(inferred_process_robust_raw_candidate[1]),
                                                 float(
                                                     inferred_process_robust_raw_candidate[2]
                                                 ),
@@ -21771,7 +22116,7 @@ class _AnalyticsTelemetryProcessor:
                                                 float(
                                                     continuity_anchor.raw_origin[0]
                                                 ),
-                                                float(calib.floor_y),
+                                                float(continuity_anchor.raw_origin[1]),
                                                 float(
                                                     continuity_anchor.raw_origin[2]
                                                 ),
@@ -21785,7 +22130,7 @@ class _AnalyticsTelemetryProcessor:
                                                 float(
                                                     continuity_anchor.trusted_world_origin[0]
                                                 ),
-                                                float(calib.floor_y),
+                                                float(continuity_anchor.trusted_world_origin[1]),
                                                 float(
                                                     continuity_anchor.trusted_world_origin[2]
                                                 ),
@@ -21794,7 +22139,7 @@ class _AnalyticsTelemetryProcessor:
                                                 float(
                                                     inferred_process_candidate[0]
                                                 ),
-                                                float(calib.floor_y),
+                                                float(inferred_process_candidate[1]),
                                                 float(
                                                     inferred_process_candidate[2]
                                                 ),
@@ -21810,6 +22155,8 @@ class _AnalyticsTelemetryProcessor:
                                             ),
                                         }
                                         projection_fields: Dict[str, Any] = {}
+                                        if published_support_at_entry is not None:
+                                            projection_fields["world_support_surface"] = published_support_at_entry.model_dump()
                                         self._set_track_image_base_from_world(
                                             projection_fields,
                                             calib=calib,
@@ -22355,11 +22702,19 @@ class _AnalyticsTelemetryProcessor:
                                 state.vel_world_z = 0.0
                                 state.locked_world = None
                                 track["world_non_upright_filter_rebased"] = True
+                    resolved_surface = getattr(resolved, "support_surface", None)
+                    resolved_floor_y = (
+                        self._support_reference_elevation(
+                            resolved_surface, float(resolved_hit[0]), float(resolved_hit[2]),
+                        )
+                        if isinstance(resolved_surface, SupportSurfaceReference)
+                        else float(calib.floor_y)
+                    )
                     hit = self._update_track_world_state(
                         track,
                         state,
                         measurement=resolved_hit,
-                        floor_y=float(calib.floor_y),
+                        floor_y=float(resolved_floor_y),
                         now_ts=float(now_ts),
                         alpha=(
                             float(self._world_smooth_alpha_good)
@@ -22396,6 +22751,29 @@ class _AnalyticsTelemetryProcessor:
                         ),
                         display_output=display_recovery_reference_at_entry,
                     )
+                    if state is None or bool(state.measurement_accepted):
+                        if state is not None:
+                            surface_changed = (
+                                state.active_support_surface != resolved_surface
+                                and state.last_good_world is not None
+                            )
+                            if surface_changed:
+                                state.trail_segment_id = int(state.trail_segment_id) + 1
+                                state.trail_break_required = True
+                                state.trail_append_allowed = False
+                                # A level transition is a new metric anchor,
+                                # never an interpolation through empty height.
+                                state.world_x = float(resolved_hit[0])
+                                state.world_z = float(resolved_hit[2])
+                                state.vel_world_x = 0.0
+                                state.vel_world_z = 0.0
+                                state.locked_world = None
+                                hit = np.asarray(resolved_hit, dtype=np.float64).copy()
+                            state.active_support_surface = resolved_surface
+                        if isinstance(resolved_surface, SupportSurfaceReference):
+                            hit[1] = self._support_reference_elevation(
+                                resolved_surface, float(hit[0]), float(hit[2]),
+                            )
                     if (
                         selected_non_upright_projection
                         and state is not None
@@ -22724,6 +23102,17 @@ class _AnalyticsTelemetryProcessor:
                 camera_id,
                 track,
             )
+            projective_surface_consistent = True
+            if projective_prediction is not None and state is not None:
+                candidate_point = np.asarray(projective_prediction[0], dtype=np.float64)
+                _, candidate_surface, candidate_ambiguous = self._support_at_world_xz(
+                    calib, float(candidate_point[0]), float(candidate_point[2]),
+                )
+                projective_surface_consistent = bool(
+                    not candidate_ambiguous
+                    and candidate_surface == state.active_support_surface
+                    and candidate_surface == published_support_at_entry
+                )
             upright_presence_hold_evidence_at_selection = (
                 self._upright_presence_output_hold_evidence(
                     track,
@@ -22782,6 +23171,7 @@ class _AnalyticsTelemetryProcessor:
                 state is not None
                 and projective_prediction is not None
                 and projective_allowed
+                and projective_surface_consistent
                 and output_reference_committed_at_entry
                 and not post_occlusion_upright_hold_pending
                 and (
@@ -22813,9 +23203,32 @@ class _AnalyticsTelemetryProcessor:
                     hit = np.asarray(integrated, dtype=np.float64)
                     prediction_provenance = dict(prediction_provenance)
                     prediction_provenance["state_integrated"] = True
+                    active_surface = state.active_support_surface
+                    if isinstance(active_surface, SupportSurfaceReference):
+                        hit[1] = self._support_reference_elevation(
+                            active_surface, float(hit[0]), float(hit[2]),
+                        )
+                        transition = dict(filter_transition)
+                        for vector_key in (
+                            "origin_world", "position_base", "raw_position_target",
+                            "filter_observation", "visible_origin_world",
+                        ):
+                            raw_vector = transition.get(vector_key)
+                            if isinstance(raw_vector, (list, tuple)) and len(raw_vector) >= 3:
+                                x, z = float(raw_vector[0]), float(raw_vector[2])
+                                transition[vector_key] = [
+                                    x, self._support_reference_elevation(active_surface, x, z), z,
+                                ]
+                        filter_transition = transition
                     prediction_provenance["process_observation"] = [
                         float(projective_point[0]),
-                        float(calib.floor_y),
+                        (
+                            self._support_reference_elevation(
+                                active_surface, float(projective_point[0]), float(projective_point[2]),
+                            )
+                            if isinstance(active_surface, SupportSurfaceReference)
+                            else float(calib.floor_y)
+                        ),
                         float(projective_point[2]),
                     ]
                     prediction_provenance["filter_transition"] = dict(
@@ -22823,7 +23236,7 @@ class _AnalyticsTelemetryProcessor:
                     )
                     track["world_filter_prediction"] = [
                         float(hit[0]),
-                        float(calib.floor_y),
+                        float(hit[1]),
                         float(hit[2]),
                     ]
                     track["world_prediction_provenance"] = prediction_provenance
@@ -23344,15 +23757,38 @@ class _AnalyticsTelemetryProcessor:
                 # or BEV/trail publication. A prediction that leaves the
                 # calibrated camera envelope is typed invalid; it is never
                 # clipped, seeded as last-good, or appended to a trail.
-                if not self._admit_world_observation_range(
+                output_reference = (
+                    state.active_support_surface if state is not None
+                    else (
+                        getattr(canonical_resolved, "support_surface", None)
+                        if canonical_resolved is not None
+                        and canonical_resolved.status == "measured"
+                        else None
+                    )
+                )
+                _, observed_reference, support_ambiguous = self._support_at_world_xz(
+                    calib, float(hit[0]), float(hit[2]),
+                )
+                support_output_admitted = bool(
+                    not support_ambiguous and observed_reference == output_reference
+                )
+                if support_output_admitted and isinstance(output_reference, SupportSurfaceReference):
+                    hit[1] = self._support_reference_elevation(
+                        output_reference, float(hit[0]), float(hit[2]),
+                    )
+                if not support_output_admitted or not self._admit_world_observation_range(
                     camera_id,
                     calib=calib,
                     world_candidate=np.asarray(hit, dtype=np.float64),
                     track=track,
                 ):
-                    rejection_reason = str(
-                        track.get("world_observation_range_rejection_reason")
-                        or "world_observation_range_exceeded"
+                    rejection_reason = (
+                        "support_surface_transition_unmeasured"
+                        if not support_output_admitted
+                        else str(
+                            track.get("world_observation_range_rejection_reason")
+                            or "world_observation_range_exceeded"
+                        )
                     )
                     if state is not None:
                         mark_world_measurement_unavailable(
@@ -23515,6 +23951,10 @@ class _AnalyticsTelemetryProcessor:
                             not output_reference_committed_at_entry
                         ),
                     )
+                    if isinstance(state.active_support_surface, SupportSurfaceReference):
+                        hit[1] = self._support_reference_elevation(
+                            state.active_support_surface, float(hit[0]), float(hit[2]),
+                        )
                     if force_exact_output_hold:
                         # Gain-zero publication semantics are distinct from a
                         # successful zero-distance process step. Preserve the
@@ -23536,7 +23976,7 @@ class _AnalyticsTelemetryProcessor:
                         # make the strict observation disagree with tracking.
                         track["world_filter_prediction"] = [
                             float(hit[0]),
-                            float(calib.floor_y),
+                            float(hit[1]),
                             float(hit[2]),
                         ]
                         current_upright_presence_hold_evidence = (
@@ -23555,7 +23995,15 @@ class _AnalyticsTelemetryProcessor:
                                 reason=str(quality_reason),
                                 prior_output=output_reference_at_entry,
                                 metric_output=metric_output_reference_at_entry,
-                                process_observation=output_candidate,
+                                # On named geometry, gain zero rejected the
+                                # proposed step. Prove the emitted in-extent
+                                # hold, not the proposal beyond its boundary.
+                                # Preserve the existing unnamed-floor proof.
+                                process_observation=(
+                                    np.asarray(hit, dtype=np.float64)
+                                    if isinstance(state.active_support_surface, SupportSurfaceReference)
+                                    else output_candidate
+                                ),
                                 emitted_point=np.asarray(hit, dtype=np.float64),
                                 output_continuous=False,
                                 emitted_trail_segment_id=int(
@@ -23566,6 +24014,7 @@ class _AnalyticsTelemetryProcessor:
                                 ),
                                 world_frame_revision=world_frame_revision,
                                 world_transform_sha256=world_transform_sha256,
+                                support_surface=state.active_support_surface,
                                 stationary_hold_posture=(
                                     str(state.posture)
                                     if exact_output_hold_stationary_evidence
@@ -23633,6 +24082,7 @@ class _AnalyticsTelemetryProcessor:
                                 ),
                                 world_frame_revision=world_frame_revision,
                                 world_transform_sha256=world_transform_sha256,
+                                support_surface=state.active_support_surface,
                             )
                         )
                         if bounded_provenance is not None:
@@ -23675,6 +24125,29 @@ class _AnalyticsTelemetryProcessor:
                         )
                         and (state is None or bool(state.measurement_accepted))
                     )
+                output_surface = (
+                    state.active_support_surface if state is not None
+                    else (
+                        getattr(canonical_resolved, "support_surface", None)
+                        if accepted_current else None
+                    )
+                )
+                if isinstance(output_surface, SupportSurfaceReference):
+                    hit[1] = self._support_reference_elevation(
+                        output_surface, float(hit[0]), float(hit[2]),
+                    )
+                    track["world_support_surface"] = output_surface.model_dump()
+                    if world_source in (
+                        "anchor_hold", "cv_prediction", "image_motion_prediction",
+                    ):
+                        raw_prediction = track.get("world_filter_prediction")
+                        if isinstance(raw_prediction, (list, tuple)) and len(raw_prediction) >= 3:
+                            px, pz = float(raw_prediction[0]), float(raw_prediction[2])
+                            track["world_filter_prediction"] = [
+                                px, self._support_reference_elevation(output_surface, px, pz), pz,
+                            ]
+                else:
+                    track.pop("world_support_surface", None)
                 if accepted_current:
                     self._publish_filtered_world_covariance(
                         track,
@@ -23778,14 +24251,16 @@ class _AnalyticsTelemetryProcessor:
                             world_point=np.asarray(hit, dtype=np.float64),
                         )
                 if (
-                    metric_output_reference_at_entry is None
+                    (metric_output_reference_at_entry is None
+                     or output_surface != published_support_at_entry)
                     and bool(accepted_current)
                 ):
-                    # A first defensible metric point can mature between the
+                    # A first metric point or measured support transition can mature between the
                     # normal scalar publication ticks. Publish this exact
                     # proof-bearing callback as one ordered tracking/world/BEV
                     # cohort instead of retaining an invisible process-local
-                    # seed that the next callback cannot claim as authority.
+                    # seed. Never re-label an older published floor as the new
+                    # one when constructing the next continuation's proof.
                     track["_world_force_first_metric_publication"] = True
             else:
                 track["world_estimator_evaluated"] = True
@@ -23801,12 +24276,22 @@ class _AnalyticsTelemetryProcessor:
                     for key, value in state.as_public_fields().items():
                         if value is not None:
                             track[key] = value
-        except Exception:
+        except Exception as exc:
             # A calibration/refinement failure must not preserve arbitrary
             # pre-existing world_valid state or let a partial point cross the
             # publication boundary.
             logger.debug("World augmentation failed", exc_info=True)
             self._invalidate_world_track(track, "world_estimation_failed")
+            failure_frame = exc.__traceback__
+            while failure_frame is not None and failure_frame.tb_next is not None:
+                failure_frame = failure_frame.tb_next
+            failure_site = (
+                f"{failure_frame.tb_frame.f_code.co_name}:{failure_frame.tb_lineno}"
+                if failure_frame is not None else "unknown"
+            )
+            track["world_estimation_error"] = (
+                f"{failure_site} {type(exc).__name__}: {str(exc)[:160]}"
+            )
         finally:
             # Calibration-raster predictor state is an implementation detail,
             # not part of the public tracking contract.  Never let the

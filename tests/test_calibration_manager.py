@@ -26,6 +26,7 @@ from noesis.calibration.manager import (
     load_camera_labels,
 )
 from noesis_core.contracts.base import ArtifactFingerprint
+from noesis_core.contracts.support_surface import SupportSurface, SupportSurfaceSet
 from noesis_core.contracts.scene_prior import (
     ScenePriorMetricFrame,
     ScenePriorFloorPlane,
@@ -132,6 +133,50 @@ def test_live_and_offline_factory_uses_one_calibration_authority(
         [snapshot.intrinsics[0, 0], snapshot.intrinsics[1, 1]],
         [400.0, 400.0],
     )
+
+
+def test_optional_measured_support_artifact_binds_to_exact_active_calibration(
+    temp_calibration_dir: Path,
+) -> None:
+    labels = {0: "test-camera"}
+    kwargs = dict(
+        cameras_yaml_path=temp_calibration_dir / "cameras.yaml",
+        camera_calibration_json_path=temp_calibration_dir / "camera_calibration.json",
+        ply_alignment_json_path=temp_calibration_dir / "ply_alignment.json",
+        camera_labels=labels,
+    )
+    baseline = create_calibration_manager(
+        **kwargs, pipeline_config={"streammux": {"width": 640, "height": 360}},
+    )
+    world = baseline.world_snapshot(0, "test-camera")
+    assert world is not None and world.support_surfaces is None
+    surface_set = SupportSurfaceSet(
+        camera_id="test-camera",
+        world_frame_revision=world.world_frame_revision,
+        calibration_revision=world.camera_calibration_sha256,
+        world_transform_sha256=world.frame_transform_sha256,
+        evidence_sha256="a" * 64,
+        authority="measured_calibration",
+        surfaces=(SupportSurface(
+            surface_id="surveyed-floor", revision="survey-1",
+            normal_world=(0.0, 1.0, 0.0), offset_m=-0.25,
+            extent_xz=((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)),
+            residual_sigma_m=0.02, source_observation_count=8,
+            source_kind="independent_static_metric_depth",
+            source_artifact_sha256="a" * 64,
+        ),),
+    )
+    artifact = temp_calibration_dir / "support-surfaces.json"
+    artifact.write_text(surface_set.model_dump_json(), encoding="utf-8")
+    config = {"streammux": {"width": 640, "height": 360},
+              "support_surfaces": {"path": str(artifact)}}
+    manager = create_calibration_manager(**kwargs, pipeline_config=config)
+    attached = manager.world_snapshot(0, "test-camera")
+    assert attached is not None and attached.support_surfaces == surface_set
+    stale = surface_set.model_copy(update={"world_transform_sha256": "b" * 64})
+    artifact.write_text(stale.model_dump_json(), encoding="utf-8")
+    with pytest.raises(CalibrationValidationError, match="active calibration binding"):
+        create_calibration_manager(**kwargs, pipeline_config=config)
 
 
 def test_calibration_authority_rejects_ambiguous_or_missing_inputs(
@@ -601,8 +646,8 @@ def test_partial_align_update_preserves_values(manager: CalibrationManager, temp
     assert abs(align.get("units", {}).get("s_obj_to_m", 0) - 2.0) < 1e-9, "s_obj_to_m should be updated"
 
 
-def test_scene_similarity_persists_and_round_trips(manager: CalibrationManager, temp_calibration_dir: Path):
-    """Verify world-to-scene similarity persists in alignment and bundle payloads."""
+def test_retired_scene_similarity_cannot_mutate_alignment(manager: CalibrationManager, temp_calibration_dir: Path):
+    """Legacy marker/manual presentation writes must not revive retired authority."""
     similarity = {
         "world_to_scene_col_major": [
             2.0, 0.0, 0.0, 0.0,
@@ -615,34 +660,12 @@ def test_scene_similarity_persists_and_round_trips(manager: CalibrationManager, 
         "mean_residual": 0.25,
     }
 
-    result = manager.set_align({"scene_similarity": similarity})
-    assert result.get("ok"), f"set_align failed: {result}"
-
-    manager.reload_alignment()
-    bundle = manager.calibration_bundle()
-    stored = bundle.get("align", {}).get("scene_similarity")
-    assert isinstance(stored, dict), "Expected scene_similarity in calibration bundle"
-    assert stored.get("source") == "unit_test"
-    assert stored.get("camera_count") == 3
-    assert abs(float(stored.get("mean_residual", 0.0)) - 0.25) < 1e-9
-    assert stored.get("world_to_scene_col_major") == similarity["world_to_scene_col_major"]
-    expected_digest = _world_to_scene_sha256(
-        similarity["world_to_scene_col_major"], stored["s_obj_to_m"]
-    )
-    assert stored.get("world_to_scene_sha256") == expected_digest
-
-    raw_align = json.loads((temp_calibration_dir / "ply_alignment.json").read_text())
-    assert raw_align.get("scene_similarity", {}).get("world_to_scene_col_major") == similarity["world_to_scene_col_major"]
-    assert (
-        raw_align.get("scene_similarity", {}).get("world_to_scene_sha256")
-        == expected_digest
-    )
-
-    mismatched = dict(similarity)
-    mismatched["world_to_scene_sha256"] = "0" * 64
-    rejected = manager.set_align({"scene_similarity": mismatched})
-    assert rejected["ok"] is False
-    assert "world_to_scene_sha256 does not match" in rejected["error"]
+    alignment_path = temp_calibration_dir / "ply_alignment.json"
+    before = alignment_path.read_bytes()
+    assert manager.set_align({"scene_similarity": similarity}) == {
+        "ok": False, "error": "camera_marker_presentation_retired",
+    }
+    assert alignment_path.read_bytes() == before
 
 
 def _family_active_frame_binding(repo_root: Path) -> ScenePriorFrameBinding:
@@ -941,9 +964,9 @@ def test_calibration_bundle_transports_target_owned_presentation_for_v2_binding(
     assert bundle["world_frame_presentations"][target_revision]["source_transform_sha256s"] == [edge_digest]
     assert bundle["world_frame_presentations"][target_revision]["world_frame"]["revision"] == target_revision
 
-    # An explicit mapping is valid only for the authored scene revision it
-    # names.  Changing that scene-only dependency while retaining the metric
-    # frame must reject the stale mapping before it reaches Menon.
+    # The explicit target-owned mapping does not depend on retired marker
+    # metadata. Authored-model revision admission is exercised by the
+    # structural-registration checks, not by this legacy field.
     transported._align["scene_similarity"] = {
         "world_to_scene_col_major": list(identity),
     }
@@ -957,11 +980,12 @@ def test_calibration_bundle_transports_target_owned_presentation_for_v2_binding(
     transported._align["scene_similarity"] = {
         "world_to_scene_col_major": changed_scene,
     }
-    with pytest.raises(CalibrationValidationError, match="stale for the current authored scene"):
-        transported.world_frame_presentations()
+    assert transported.world_frame_presentations()[target_revision]["scene_revision_id"] == scene_revision_sha256(
+        target, "menon_scene", identity,
+    )
 
 
-def test_camera_anchor_scene_similarity_preserves_binding_and_rejects_bad_fit(
+def test_camera_anchor_scene_similarity_is_retired_even_with_a_good_fit(
     manager: CalibrationManager,
 ) -> None:
     from noesis.calibration.scene_registration import camera_anchor_state_sha256
@@ -992,23 +1016,19 @@ def test_camera_anchor_scene_similarity_preserves_binding_and_rejects_bad_fit(
         "correspondences": correspondences,
     }
     result = manager.set_align({"scene_similarity": similarity})
-    assert result == {"ok": True}
-    stored = manager.calibration_bundle()["align"]["scene_similarity"]
-    assert stored["anchor_state_sha256"] == camera_anchor_state_sha256(correspondences)
-    assert stored["camera_calibration_sha256"] == "b" * 64
-    assert all(row.get("anchor_id") for row in stored["correspondences"])
+    assert result == {"ok": False, "error": "camera_marker_presentation_retired"}
 
     bad_binding = dict(similarity)
     bad_binding["anchor_state_sha256"] = "0" * 64
     rejected_binding = manager.set_align({"scene_similarity": bad_binding})
     assert rejected_binding["ok"] is False
-    assert "does not match anchor_state_sha256" in rejected_binding["error"]
+    assert rejected_binding["error"] == "camera_marker_presentation_retired"
 
     bad_fit = dict(similarity)
     bad_fit["max_residual_m"] = 0.051
     rejected = manager.set_align({"scene_similarity": bad_fit})
     assert rejected["ok"] is False
-    assert "exceeds its residual limit" in rejected["error"]
+    assert rejected["error"] == "camera_marker_presentation_retired"
 
 
 # ---------------------------------------------------------------------------

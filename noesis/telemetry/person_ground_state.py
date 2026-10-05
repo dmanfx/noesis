@@ -20,6 +20,8 @@ from typing import Any, Deque, Dict, Hashable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
+from noesis_core.contracts.support_surface import SupportSurfaceReference
+
 
 # COCO-17 indices used by the pose SGIE path.
 POSE_KPT_INDEX: Dict[str, int] = {
@@ -324,6 +326,7 @@ class InferredGroundContinuityAnchor:
     world_frame_revision: Optional[str]
     world_transform_sha256: Optional[str]
     trail_segment_id: int
+    support_surface: Optional[SupportSurfaceReference] = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +371,10 @@ class PersonGroundState:
     world_frame_id: Optional[str] = None
     world_frame_revision: Optional[str] = None
     world_transform_sha256: Optional[str] = None
+    # Only a physically accepted metric measurement may replace this plane.
+    # Rejected current candidates and bounded continuations retain the prior
+    # support identity, while bind_world_frame resets it with all metric state.
+    active_support_surface: Optional[SupportSurfaceReference] = None
 
     # Phase 1 / 3
     motion_mode: MotionMode = "unknown"
@@ -876,6 +883,7 @@ def align_inferred_ground_observation(
         Tuple[float, float, Optional[int], float, int]
     ],
     config: Optional[HumanGroundConfig] = None,
+    support_surface: Optional[SupportSurfaceReference] = None,
 ) -> Optional[
     Tuple[
         np.ndarray,
@@ -925,6 +933,11 @@ def align_inferred_ground_observation(
     if current_observed_at_us <= 0 or generation <= 0 or height_ref <= 0.0:
         clear_inferred_ground_continuity_anchor(state)
         return None
+    def support_y(x: float, z: float) -> float:
+        if support_surface is None:
+            return floor
+        nx, ny, nz = support_surface.normal_world
+        return -(nx * x + nz * z + support_surface.offset_m) / ny
     if bool(state.inferred_ground_continuity_blocked):
         return None
     try:
@@ -1001,6 +1014,7 @@ def align_inferred_ground_observation(
         and anchor.world_frame_id == normalized_frame_id
         and anchor.world_frame_revision == normalized_revision
         and anchor.world_transform_sha256 == normalized_transform
+        and anchor.support_surface == support_surface
         and int(anchor.trail_segment_id) == trusted_segment
         and current_ts >= float(anchor.raw_origin_ts)
         and current_observed_at_us >= int(anchor.raw_origin_observed_at_us)
@@ -1013,8 +1027,8 @@ def align_inferred_ground_observation(
     if not anchor_matches:
         state.inferred_ground_raw_history.clear()
         anchor = InferredGroundContinuityAnchor(
-            raw_origin=(raw_x, floor, raw_z),
-            trusted_world_origin=(trusted_x, floor, trusted_z),
+            raw_origin=(raw_x, support_y(raw_x, raw_z), raw_z),
+            trusted_world_origin=(trusted_x, support_y(trusted_x, trusted_z), trusted_z),
             raw_origin_ts=current_ts,
             raw_origin_observed_at_us=current_observed_at_us,
             raw_origin_media_pts_ns=current_pts,
@@ -1026,6 +1040,7 @@ def align_inferred_ground_observation(
             world_frame_revision=normalized_revision,
             world_transform_sha256=normalized_transform,
             trail_segment_id=trusted_segment,
+            support_surface=support_surface,
         )
         state.inferred_ground_continuity_anchor = anchor
 
@@ -1078,7 +1093,7 @@ def align_inferred_ground_observation(
             current_observed_at_us,
             current_pts,
             raw_x,
-            floor,
+            support_y(raw_x, raw_z),
             raw_z,
         )
     )
@@ -1113,7 +1128,7 @@ def align_inferred_ground_observation(
         robust_sample = samples[selected_index]
     robust_raw = (
         float(robust_sample[3]),
-        floor,
+        float(robust_sample[4]),
         float(robust_sample[5]),
     )
     consensus_span_s = max(
@@ -1122,13 +1137,13 @@ def align_inferred_ground_observation(
     )
     delta = (
         float(robust_raw[0]) - float(anchor.raw_origin[0]),
-        0.0,
+        float(robust_raw[1]) - float(anchor.raw_origin[1]),
         float(robust_raw[2]) - float(anchor.raw_origin[2]),
     )
     aligned = np.asarray(
         [
             float(anchor.trusted_world_origin[0]) + float(delta[0]),
-            floor,
+            float(anchor.trusted_world_origin[1]) + float(delta[1]),
             float(anchor.trusted_world_origin[2]) + float(delta[2]),
         ],
         dtype=np.float64,

@@ -1,0 +1,24 @@
+{
+  "camera_id": "living-room",
+  "surface_id": "foyer-upper-floor",
+  "floor_model": "upper_parallel_to_calibrated_lower",
+  "measurement_source": "User physically measured the floor-to-floor rise at both ends of the step; both read 7.5 inches. User specifies practically flat parallel floors.",
+  "rise_observations": [
+    {"location": "first end of step", "reported_inches": 7.5, "floor_to_floor_rise_m": 0.1905},
+    {"location": "other end of step", "reported_inches": 7.5, "floor_to_floor_rise_m": 0.1905}
+  ],
+  "calibration_path": "data/mapanything_phone_scans/20260922-120808-2713a4ce/paired_static_reference/paired_static_reference_5474e6ce2a6ae6a7/calibration.json",
+  "source_image_path": "data/mapanything_phone_scans/20260922-120808-2713a4ce/paired_static_reference/paired_static_reference_5474e6ce2a6ae6a7/keyframe.png",
+  "pcf_manifest_path": "data/scene_priors/revisions/sceneprior_living-room_20260802T202254Z_9380ed8099bb/manifest.json",
+  "pcf_grid_path": "data/scene_priors/revisions/sceneprior_living-room_20260802T202254Z_9380ed8099bb/grid.npz",
+  "pixel_space": "rectified_source_image",
+  "image_size": [1920, 1080],
+  "extent_method": "Visible foyer perimeter: upper threshold edge, side boundaries and far door-floor boundary. Project onto measured parallel upper plane, then intersect with admitted PCF coverage hull. Furniture does not select the floor elevation.",
+  "upper_floor_extent_pixels": [[565, 686], [840, 643], [751, 527], [578, 546]],
+  "lower_reference_patch_pixels": [[574, 724], [837, 680], [841, 749], [567, 801]],
+  "limitations": [
+    "The earlier 0.153 m image-derived riser estimate is not used as the measured rise.",
+    "Image annotations and PCF/calibration binding can limit absolute horizontal accuracy.",
+    "No phone optical-center path or Noesis person position is used as a fit target."
+  ]
+}

@@ -60,3 +60,26 @@ def test_render_requires_one_video_for_every_canonical_camera(tmp_path: Path) ->
     videos.pop("family-room")
     with pytest.raises(module.ReplayConfigError, match="missing cameras: family-room"):
         module.render_replay_config(baseline, videos)
+
+
+def test_render_resolves_support_surface_path_from_ds9_config_scope(tmp_path: Path) -> None:
+    module = _module()
+    ds9_root = tmp_path / "checkout" / "DS9"
+    baseline_path = ds9_root / "config" / "infer.yaml"
+    baseline_path.parent.mkdir(parents=True)
+    baseline_path.write_text("", encoding="utf-8")
+    baseline = {
+        "sources": [{}, {}, {}],
+        "streammux": {},
+        "support_surfaces": {"path": "config/support_surfaces.json"},
+    }
+
+    rendered = module.render_replay_config(
+        baseline,
+        _videos(tmp_path),
+        baseline_path=baseline_path,
+    )
+
+    assert rendered["support_surfaces"]["path"] == str(
+        (ds9_root / "config" / "support_surfaces.json").resolve()
+    )

@@ -3038,6 +3038,78 @@ def test_camera_local_coverage_boundary_tolerance_does_not_clamp_position() -> N
     assert point["y"] == pytest.approx(2.0)
 
 
+def test_canonical_point_metadata_is_available_without_alignment_debug() -> None:
+    ws = _FakeWs()
+    renderer = _coverage_renderer(ws, trails=False)
+    renderer._alignment_debug_enabled = False
+    covariance = (
+        0.04, 0.01, 0.02,
+        0.01, 0.25, 0.03,
+        0.02, 0.03, 0.09,
+    )
+    support_surface = {
+        "surface_id": "foyer-riser",
+        "revision": "surfaces-r4",
+        "normal_world": [0.0, 1.0, 0.0],
+        "offset_m": -0.42,
+        "extent_xz": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    }
+
+    renderer.render_and_publish(
+        "cam0",
+        _coverage_calibration(),
+        footpoints=[
+            Footpoint(
+                stable_id=7,
+                tracker_id=101,
+                track_key="0:101:1",
+                tracker_lifecycle_generation=1,
+                frame_id=1,
+                world_x=2.0,
+                world_y=1.25,
+                world_z=2.0,
+                world_covariance=covariance,
+                support_surface=support_surface,
+                canonical_world_required=True,
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    point = ws.messages[-1]["footpoints"][0]
+    assert "alignmentDebug" not in point
+    assert point["worldElevationM"] == pytest.approx(1.25)
+    assert point["supportSurface"] == support_surface
+    np.testing.assert_allclose(
+        point["covarianceXZ"],
+        [[0.04, 0.02], [0.02, 0.09]],
+    )
+
+    renderer.render_and_publish(
+        "cam0",
+        _coverage_calibration(),
+        footpoints=[
+            Footpoint(
+                stable_id=7,
+                tracker_id=101,
+                track_key="0:101:1",
+                tracker_lifecycle_generation=1,
+                frame_id=2,
+                world_x=2.1,
+                world_y=1.25,
+                world_z=2.0,
+                anchor_source="anchor_hold",
+                world_covariance=None,
+                canonical_world_required=True,
+            )
+        ],
+        timestamp_us=1_100_000,
+    )
+    held_point = ws.messages[-1]["footpoints"][0]
+    assert held_point["worldAdmission"] == "held"
+    assert held_point["covarianceXZ"] is None
+
+
 def test_camera_local_coverage_config_fails_closed_when_polygon_is_invalid() -> None:
     ws = _FakeWs()
     invalid = _coverage_envelopes()

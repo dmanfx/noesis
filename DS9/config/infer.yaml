@@ -6,6 +6,11 @@ version: 1
 depth_registration:
   path: DS9/config/depth_registration.json
 
+# Explicit measured calibration, separate from the review-only scene prior.
+# The artifact is bound to the exact camera/PCF revision; no room policy is used.
+support_surfaces:
+  path: DS9/config/support_surfaces.json
+
 # Immutable scan-derived evidence, bound to cameras in explicit shadow mode.
 # Runtime world positions remain producer-owned; the prior adds diagnostics and
 # static/composite floorplan layers without replacing live observations.

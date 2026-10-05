@@ -94,6 +94,7 @@ class CalibrationSnapshot:
     world_alignment_sha256: str | None = None
     scene_prior_id: str | None = None
     target_revision_id: str | None = None
+    support_surfaces: SupportSurfaceSet | None = None
 
     @property
     def calibration_frame(self) -> RevisionedFrame | None:
@@ -154,6 +155,7 @@ class CalibrationSnapshot:
             scene_prior_id=self.scene_prior_id,
             target_revision_id=self.target_revision_id,
             image_localization_basis="revision_target_floor",
+            support_surfaces=self.support_surfaces,
         )
 
 
@@ -199,6 +201,7 @@ class WorldCalibrationSnapshot:
     scene_prior_id: str | None = None
     target_revision_id: str | None = None
     image_localization_basis: str = "revision_target_floor"
+    support_surfaces: SupportSurfaceSet | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +785,7 @@ class CalibrationManager:
                     if frame_binding is not None
                     else None
                 ),
+                support_surfaces=self._support_surfaces.get(camera_id),
             )
             self._snapshot_cache[cache_key] = snapshot
             self._snapshot_intrinsics[cache_key] = intr

@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot, Footpoint, FloorplanSpace
 from noesis_core.coordinate_frames import CameraGroundFrame
@@ -418,3 +419,118 @@ def test_canonical_bev_admission_requires_frame_id_revision_and_transform_match(
     assert ws.messages[-1]["droppedFootpoints"][0]["reason"] == (
         "canonical_world_transform_mismatch"
     )
+
+
+def test_resolver_diagnostics_project_raised_xyz_and_full_covariance() -> None:
+    source = _source()
+    covariance = np.asarray(
+        [
+            [0.04, 0.01, 0.02],
+            [0.01, 0.25, 0.03],
+            [0.02, 0.03, 0.09],
+        ],
+        dtype=np.float64,
+    )
+    covariance_payload = {"values": covariance.reshape(-1).tolist()}
+    support_surface = {
+        "surface_id": "foyer-riser",
+        "revision": "surfaces-r4",
+        "normal_world": [0.0, 1.0, 0.0],
+        "offset_m": -0.42,
+        "extent_xz": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    }
+    source["resolved"]["position"] = {"x": 1.0, "y": 1.35, "z": 3.0}
+    source["resolved"]["covariance"] = covariance_payload
+    source["resolved"]["support_surface"] = support_surface
+    source["candidates"][0]["position"] = {"x": 1.4, "y": 0.8, "z": 2.7}
+    source["candidates"][0]["covariance"] = covariance_payload
+    source["candidates"][0]["support_surface"] = support_surface
+
+    calib = CalibrationSnapshot(
+        camera_id="family-room",
+        intrinsics=np.eye(3),
+        extrinsics_col_major=np.eye(4).reshape(-1).tolist(),
+        floor_y=0.0,
+        image_size=(1280, 720),
+        world_frame_id="backend_world_m",
+        world_frame_revision="world-r7",
+        camera_calibration_sha256="calibration-r9",
+    )
+    theta = np.deg2rad(30.0)
+    beta = np.deg2rad(20.0)
+    right = np.asarray([np.cos(theta), np.sin(theta), 0.0])
+    forward = np.asarray(
+        [-np.sin(theta) * np.sin(beta), np.cos(theta) * np.sin(beta), np.cos(beta)]
+    )
+    camera_world = np.asarray([0.2, 0.3, -0.1], dtype=np.float64)
+    camera_ground_frame = CameraGroundFrame(
+        camera_world_m=camera_world,
+        camera_right_world=right,
+        camera_forward_world=forward,
+    )
+    alignment = np.asarray(
+        [[1.0, 0.25, 0.3], [-0.15, 0.85, -0.2]],
+        dtype=np.float64,
+    )
+    fp = Footpoint(
+        frame_id=42,
+        tracker_id=17,
+        world_x=1.0,
+        world_y=1.35,
+        world_z=3.0,
+        debug={"world_resolver": source},
+    )
+    payload = BevRenderer._normalize_resolver_diagnostics(
+        fp=fp,
+        source=source,
+        expected_camera_id="family-room",
+        expected_source_id=2,
+        expected_observed_at_us=123_456,
+        expected_world_frame="backend_world_m",
+        expected_world_revision="world-r7",
+        frame_mode="camera_local",
+        calib=calib,
+        R_wc=np.eye(3),
+        C_world=camera_world,
+        camera_ground_frame=camera_ground_frame,
+        floorplan_alignment=alignment,
+        floorplan_space=None,
+    )
+
+    assert payload is not None
+    resolved = payload["resolved"]
+    world_delta = np.asarray([1.0, 1.35, 3.0]) - camera_world
+    view_jacobian = np.asarray([right, forward])
+    aligned_jacobian = alignment[:, :2] @ view_jacobian
+    expected_display = aligned_jacobian @ world_delta + alignment[:, 2]
+    expected_covariance = aligned_jacobian @ covariance @ aligned_jacobian.T
+    assert resolved["worldElevationM"] == pytest.approx(1.35)
+    assert resolved["display"]["x"] == pytest.approx(expected_display[0])
+    assert resolved["display"]["z"] == pytest.approx(expected_display[1])
+    np.testing.assert_allclose(resolved["covarianceXZ"], expected_covariance)
+    assert resolved["supportSurface"] == support_surface
+
+    candidate = payload["candidates"][0]
+    assert candidate["worldElevationM"] == pytest.approx(0.8)
+    assert candidate["supportSurface"] == support_surface
+    candidate_delta = np.asarray([1.4, 0.8, 2.7]) - camera_world
+    candidate_display = aligned_jacobian @ candidate_delta + alignment[:, 2]
+    assert candidate["display"]["x"] == pytest.approx(candidate_display[0])
+    assert candidate["display"]["z"] == pytest.approx(candidate_display[1])
+
+
+def test_support_surface_reference_requires_valid_bounded_extent() -> None:
+    valid = {
+        "surface_id": "foyer-riser",
+        "revision": "surfaces-r4",
+        "normal_world": [0.0, 1.0, 0.0],
+        "offset_m": -0.42,
+        "extent_xz": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    }
+    assert BevRenderer._support_surface_reference(valid) == valid
+    assert BevRenderer._support_surface_reference(
+        {key: value for key, value in valid.items() if key != "extent_xz"}
+    ) is None
+    assert BevRenderer._support_surface_reference(
+        {**valid, "extent_xz": [[0.0, 0.0], [1.0, 0.0], [0.25, 0.25], [0.0, 1.0]]}
+    ) is None

@@ -1,0 +1,45 @@
+{
+  "contract": "noesis.support_surfaces",
+  "contract_version": 1,
+  "camera_id": "living-room",
+  "world_frame": "backend_world_m",
+  "world_frame_revision": "sceneprior_living-room_20260802T202254Z_9380ed8099bb",
+  "calibration_revision": "9b34e3ea8a3808475584a55383afcff96373a9e0845d33dc026a6659c975be93",
+  "world_transform_sha256": "006952a2f835e2cf9f85082eed831f2de466cc0734e5e56cb5d32efbfdfda643",
+  "evidence_sha256": "692b982cf2973d3dca6bca9f69ff99f8461c81dd3dc8103237d7c0611bb50d60",
+  "authority": "measured_calibration",
+  "surfaces": [
+    {
+      "surface_id": "foyer-upper-floor",
+      "revision": "692b982cf2973d3dca6bca9f69ff99f8461c81dd3dc8103237d7c0611bb50d60",
+      "normal_world": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "offset_m": -0.1905,
+      "extent_xz": [
+        [
+          6.355887911888553,
+          8.720242938196536
+        ],
+        [
+          5.714492312291988,
+          4.4409155409119565
+        ],
+        [
+          7.5651657717555185,
+          4.332387358586472
+        ],
+        [
+          8.465699999124784,
+          8.495734174333105
+        ]
+      ],
+      "residual_sigma_m": 0.03882558459014386,
+      "source_observation_count": 4326,
+      "source_kind": "measured_rise_parallel_plane_visible_pcf_extent",
+      "source_artifact_sha256": "692b982cf2973d3dca6bca9f69ff99f8461c81dd3dc8103237d7c0611bb50d60"
+    }
+  ]
+}

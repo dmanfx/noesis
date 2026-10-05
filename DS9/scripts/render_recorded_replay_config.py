@@ -100,7 +100,7 @@ def _preserve_baseline_path_scope(payload: dict[str, Any], baseline_path: Path) 
             return str((ds9_root / candidate).resolve())
         return str((baseline_path.parent / candidate).resolve())
 
-    for section_name in ("depth_registration", "scene_priors", "scene_fusions"):
+    for section_name in ("depth_registration", "scene_priors", "scene_fusions", "support_surfaces"):
         section = payload.get(section_name)
         if isinstance(section, dict) and str(section.get("path") or "").strip():
             section["path"] = preserve(section["path"])

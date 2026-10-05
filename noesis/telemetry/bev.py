@@ -17,6 +17,7 @@ from noesis_core.coordinate_frames import (
     CameraGroundFrame,
     camera_ground_frame_from_camera_to_world,
 )
+from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis.telemetry.motion_smoothing import MotionGatedAlphaBetaSmoother, MotionSmoothingConfig
 from noesis.telemetry.person_ground_state import HumanGroundConfig, commit_path_point
 
@@ -265,7 +266,10 @@ class Footpoint:
     track_key: Optional[str] = None
     tracker_lifecycle_generation: Optional[int] = None
     world_x: Optional[float] = None
+    world_y: Optional[float] = None
     world_z: Optional[float] = None
+    world_covariance: Optional[Tuple[float, ...]] = None
+    support_surface: Optional[Dict[str, Any]] = None
     depth_m: Optional[float] = None
     depth_source: Optional[str] = None
     anchor_source: Optional[str] = None
@@ -1889,38 +1893,108 @@ class BevRenderer:
         return float(x), float(z)
 
     @classmethod
-    def _resolver_covariance_xz(cls, value: Any) -> Optional[List[List[float]]]:
-        """Extract the XZ block from the resolver's flat row-major 3x3."""
+    def _resolver_world_xyz(
+        cls,
+        value: Any,
+        *,
+        fallback_y: Optional[float] = None,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Extract a full resolver position, keeping legacy Y fallback explicit."""
 
         if not isinstance(value, Mapping):
             return None
-        raw = value.get("covariance")
-        if not isinstance(raw, Mapping):
+        position = value.get("position")
+        if not isinstance(position, Mapping):
             return None
-        raw = raw.get("values")
+        x = cls._json_number(position.get("x"))
+        y = cls._json_number(position.get("y"))
+        z = cls._json_number(position.get("z"))
+        if y is None:
+            y = cls._json_number(fallback_y)
+        if x is None or y is None or z is None:
+            return None
+        return float(x), float(y), float(z)
+
+    @classmethod
+    def _world_covariance_xyz(cls, value: Any) -> Optional[List[List[float]]]:
+        """Validate a finite symmetric 3x3 world covariance without eigensolving."""
+
+        raw = value
+        if isinstance(raw, Mapping):
+            raw = raw.get("values")
         if not isinstance(raw, (list, tuple)) or len(raw) != 9:
             return None
         values = [cls._json_number(item) for item in raw]
         if any(item is None for item in values):
             return None
-        # Keep this admission check scalar and allocation-free.  The resolver
-        # already validated the full 3x3; BEV only needs the X/Z block and
-        # should not put an eigendecomposition on the per-track render path.
-        xx, xz, zx, zz = (
-            float(values[0]),
-            float(values[2]),
-            float(values[6]),
-            float(values[8]),
+        matrix = [
+            [float(values[row * 3 + column]) for column in range(3)]
+            for row in range(3)
+        ]
+        if any(
+            abs(matrix[row][column] - matrix[column][row]) > 1e-4
+            for row in range(3)
+            for column in range(row + 1, 3)
+        ):
+            return None
+        if any(matrix[index][index] < -1e-5 for index in range(3)):
+            return None
+        principal_minors = [
+            matrix[left][left] * matrix[right][right]
+            - matrix[left][right] * matrix[right][left]
+            for left, right in ((0, 1), (0, 2), (1, 2))
+        ]
+        if not all(math.isfinite(value) for value in principal_minors) or any(
+            value < -1e-5 for value in principal_minors
+        ):
+            return None
+        determinant = (
+            matrix[0][0] * matrix[1][1] * matrix[2][2]
+            + 2.0 * matrix[0][1] * matrix[0][2] * matrix[1][2]
+            - matrix[0][0] * matrix[1][2] * matrix[1][2]
+            - matrix[1][1] * matrix[0][2] * matrix[0][2]
+            - matrix[2][2] * matrix[0][1] * matrix[0][1]
         )
-        if abs(xz - zx) > 1e-4:
+        if not math.isfinite(determinant) or determinant < -1e-5:
             return None
-        if xx < -1e-5 or zz < -1e-5 or xx * zz - xz * zx < -1e-5:
+        return matrix
+
+    @classmethod
+    def _support_surface_reference(cls, value: Any) -> Optional[Dict[str, Any]]:
+        """Validate and serialize the complete bounded support-surface reference."""
+
+        if not isinstance(value, Mapping):
             return None
-        return [[xx, xz], [zx, zz]]
+        try:
+            reference = SupportSurfaceReference.model_validate(value)
+        except (TypeError, ValueError):
+            return None
+        return reference.model_dump(mode="json")
+
+    @classmethod
+    def _footpoint_world_y(
+        cls,
+        fp: Footpoint,
+        *,
+        fallback_y: Optional[float],
+    ) -> Optional[float]:
+        """Prefer typed current Y, then the canonical track vector for old callers."""
+
+        world_y = cls._json_number(fp.world_y)
+        if world_y is not None:
+            return float(world_y)
+        debug = fp.debug if isinstance(fp.debug, Mapping) else None
+        world = debug.get("world") if debug is not None else None
+        if isinstance(world, (list, tuple)) and len(world) >= 3:
+            world_y = cls._json_number(world[1])
+            if world_y is not None:
+                return float(world_y)
+        world_y = cls._json_number(fallback_y)
+        return float(world_y) if world_y is not None else None
 
     @staticmethod
     def _resolver_covariance_to_display(
-        covariance_xz: List[List[float]],
+        covariance_xyz: List[List[float]],
         *,
         frame_mode: str,
         R_wc: np.ndarray,
@@ -1928,35 +2002,35 @@ class BevRenderer:
         camera_ground_frame: Optional[CameraGroundFrame],
         floorplan_alignment: Optional[np.ndarray],
     ) -> Optional[List[List[float]]]:
-        """Express world X/Z covariance in the BEV display frame.
+        """Express a full world covariance in the declared BEV display frame.
 
-        The resolver covariance is authored in ``backend_world_m``.  A
-        camera-local BEV is a linear horizontal projection followed by the
-        optional affine floorplan alignment, so its ellipse must be pushed
-        through that same Jacobian.  World-mode BEV can retain the block
-        unchanged.  This is intentionally bounded scalar/matrix work for the
-        already-admitted diagnostic record; it never feeds tracking.
+        The resolver covariance is authored in ``backend_world_m``. A
+        camera-local BEV projects all three world axes through its view basis,
+        then applies the optional floorplan alignment. This bounded transform
+        is presentation-only and never feeds tracking.
         """
 
-        if str(frame_mode) == "world":
-            return covariance_xz
         try:
-            ground_frame = camera_ground_frame
-            if ground_frame is None:
-                ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
-            right = np.asarray(ground_frame.camera_right_world, dtype=np.float64)
-            forward = np.asarray(ground_frame.camera_forward_world, dtype=np.float64)
-            horizontal_jacobian = np.asarray(
-                [[right[0], right[2]], [forward[0], forward[2]]],
-                dtype=np.float64,
-            )
-            jacobian = horizontal_jacobian
-            if floorplan_alignment is not None:
-                alignment = np.asarray(floorplan_alignment, dtype=np.float64)
-                if alignment.shape != (2, 3):
-                    return None
-                jacobian = alignment[:, :2] @ horizontal_jacobian
-            covariance = np.asarray(covariance_xz, dtype=np.float64)
+            covariance = np.asarray(covariance_xyz, dtype=np.float64)
+            if covariance.shape != (3, 3) or not np.all(np.isfinite(covariance)):
+                return None
+            if str(frame_mode) == "world":
+                jacobian = np.asarray(
+                    [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                    dtype=np.float64,
+                )
+            else:
+                ground_frame = camera_ground_frame
+                if ground_frame is None:
+                    ground_frame = _camera_ground_frame_from_pose(R_wc, C_world)
+                right = np.asarray(ground_frame.camera_right_world, dtype=np.float64)
+                forward = np.asarray(ground_frame.camera_forward_world, dtype=np.float64)
+                jacobian = np.asarray([right, forward], dtype=np.float64)
+                if floorplan_alignment is not None:
+                    alignment = np.asarray(floorplan_alignment, dtype=np.float64)
+                    if alignment.shape != (2, 3):
+                        return None
+                    jacobian = alignment[:, :2] @ jacobian
             transformed = jacobian @ covariance @ jacobian.T
             if transformed.shape != (2, 2) or not np.all(np.isfinite(transformed)):
                 return None
@@ -2165,12 +2239,21 @@ class BevRenderer:
         ):
             return None
 
-        def _display_point(world_x: float, world_z: float) -> Optional[Tuple[float, float]]:
+        fallback_world_y = cls._footpoint_world_y(
+            fp,
+            fallback_y=calib.floor_y,
+        )
+
+        def _display_point(
+            world_x: float,
+            world_y: float,
+            world_z: float,
+        ) -> Optional[Tuple[float, float]]:
             if str(frame_mode) == "world":
                 return float(world_x), float(world_z)
             local_x, local_z = cls._world_to_camera_local_ground(
                 float(world_x),
-                float(calib.floor_y),
+                float(world_y),
                 float(world_z),
                 R_wc,
                 C_world,
@@ -2186,23 +2269,31 @@ class BevRenderer:
         ) -> Optional[Dict[str, Any]]:
             if not isinstance(item, Mapping):
                 return None
-            world = cls._resolver_world_xz(item)
-            if world is None:
+            world_xyz = cls._resolver_world_xyz(
+                item,
+                fallback_y=fallback_world_y,
+            )
+            if world_xyz is None:
                 return None
-            display = _display_point(*world)
-            if display is None or not all(math.isfinite(float(value)) for value in (*world, *display)):
+            world_x, world_y, world_z = world_xyz
+            display = _display_point(*world_xyz)
+            if display is None or not all(
+                math.isfinite(float(value))
+                for value in (*world_xyz, *display)
+            ):
                 return None
             candidate: Dict[str, Any] = {
                 "id": cls._resolver_text(item.get("id")),
                 "kind": cls._resolver_text(item.get("kind")),
-                "world": {"x": float(world[0]), "z": float(world[1])},
+                "world": {"x": float(world_x), "z": float(world_z)},
+                "worldElevationM": float(world_y),
                 "display": {"x": float(display[0]), "z": float(display[1])},
                 "selected": bool(item.get("selected", selected)),
             }
             status = cls._resolver_text(item.get("status"))
             if status is not None:
                 candidate["status"] = status
-            covariance = cls._resolver_covariance_xz(item)
+            covariance = cls._world_covariance_xyz(item.get("covariance"))
             if require_covariance and covariance is None:
                 return None
             if covariance is not None:
@@ -2217,6 +2308,11 @@ class BevRenderer:
                 if display_covariance is None:
                     return None
                 candidate["covarianceXZ"] = display_covariance
+            support_surface = cls._support_surface_reference(
+                item.get("support_surface")
+            )
+            if support_surface is not None:
+                candidate["supportSurface"] = support_surface
             for output_key, input_key in (
                 ("depthRegistrationSigmaM", "depth_registration_sigma_m"),
                 ("floorDepthDisagreementM", "floor_depth_disagreement_m"),
@@ -3602,6 +3698,10 @@ class BevRenderer:
         for fp in footpoints:
             anchor_source = str(fp.anchor_source or "").strip().lower()
             is_canonical_track = bool(fp.canonical_world_required)
+            world_y = self._footpoint_world_y(fp, fallback_y=calib.floor_y)
+            world_y_for_projection = (
+                float(world_y) if world_y is not None else float(calib.floor_y)
+            )
             image_u = self._json_number(fp.u)
             image_v = self._json_number(fp.v)
             has_image_anchor = image_u is not None and image_v is not None
@@ -3809,7 +3909,7 @@ class BevRenderer:
                 ):
                     candidate_x, candidate_z = self._world_to_camera_local_ground(
                         float(wx),
-                        float(calib.floor_y),
+                        world_y_for_projection,
                         float(wz),
                         R_wc,
                         C_world,
@@ -3825,6 +3925,7 @@ class BevRenderer:
                     world_candidate = {
                         "x": float(candidate_x),
                         "z": float(candidate_z),
+                        "worldElevationM": world_y,
                         "anchorSource": str(fp.anchor_source or ""),
                         "insideBounds": bool(world_inside),
                         "depthFused": bool(self._world_source_is_depth_fused(fp.anchor_source)),
@@ -4238,6 +4339,20 @@ class BevRenderer:
                 tracker_id = None
             if tracker_id is not None and tracker_id < 0:
                 tracker_id = None
+            covariance_xyz = self._world_covariance_xyz(fp.world_covariance)
+            covariance_xz = (
+                self._resolver_covariance_to_display(
+                    covariance_xyz,
+                    frame_mode=frame_mode,
+                    R_wc=R_wc,
+                    C_world=C_world,
+                    camera_ground_frame=camera_ground_frame,
+                    floorplan_alignment=floorplan_alignment,
+                )
+                if covariance_xyz is not None
+                else None
+            )
+            support_surface = self._support_surface_reference(fp.support_surface)
             try:
                 tracker_lifecycle_generation = (
                     int(fp.tracker_lifecycle_generation)
@@ -4316,6 +4431,9 @@ class BevRenderer:
                         if fp.world_transform_sha256
                         else None
                     ),
+                    "world_elevation_m": world_y,
+                    "covariance_xz": covariance_xz,
+                    "support_surface": support_surface,
                 }
             )
 
@@ -4407,7 +4525,11 @@ class BevRenderer:
                     'worldFrame': item.get("world_frame"),
                     'worldFrameRevision': item.get("world_frame_revision"),
                     'worldTransformSha256': item.get("world_transform_sha256"),
+                    'worldElevationM': item.get("world_elevation_m"),
+                    'covarianceXZ': item.get("covariance_xz"),
                 }
+                if isinstance(item.get("support_surface"), Mapping):
+                    point_payload["supportSurface"] = item["support_surface"]
                 point_payload.update(
                     self._floorplan_point_fields(
                         float(lx),

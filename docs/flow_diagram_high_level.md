@@ -12,7 +12,13 @@ flowchart LR
     F --> H
     G --> H
     H --> I[oai2-fe dashboard]
+    H --> J[Menon canonical 3D + PCF review]
 ```
 
 The application has no Docker or legacy-runtime hop. Noesis ports are
 loopback-only; Menon owns browser authentication and delivery.
+
+Canonical XYZ/support/continuity supplies both views. BEV drops height only
+after its explicit basis transform. Menon's authored model and RGB PCF overlay
+use the same target-revision-owned room presentation; neither alters Noesis
+positions or substitutes static geometry for current person measurements.

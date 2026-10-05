@@ -1,5 +1,5 @@
 # Depth metadata
-_Status: canonical native DS9.1 contract, updated 2026-08-15._
+_Status: canonical native DS9.1 contract, updated 2026-10-04._
 
 DS9.1 has two distinct depth paths. They share calibration and world-estimation
 semantics, but they do not share a public payload or runtime cadence.
@@ -37,6 +37,15 @@ semantics, but they do not share a public payload or runtime cadence.
 positive usable depth exists. Registration/transform rejection makes it false.
 When `depth_registration_status` is `ok`, raw `depth_anchor_m` alone is not
 enough; `depth_registered_m` or `depth_used_m` must be usable.
+
+The DAv2 anchor and registered scalar are camera-forward optical Z, not unit-ray
+range. Register to the admitted PCF scale/camera/world binding; intrinsically
+correct model scale is not a prerequisite. Weighted isotonic pooling repairs
+the fitter without making a flat or unsupported interval usable. PCF-relative
+static scale reviews are offline evidence, not occupied-person qualification:
+only actual exact-frame person-support MapAnything depth at the same anchor can
+supply an occupied target. Background hidden behind a person cannot do so.
+See [localization and registration](universal_world_localization.md#depth-registration-boundary).
 
 ## Failure and health evidence
 

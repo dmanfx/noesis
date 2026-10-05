@@ -1,6 +1,6 @@
 # Noesis testing guide
 
-Status: direct native-host validation policy, 2026-08-25.
+Status: direct native-host validation policy, 2026-10-04.
 
 ## Principle
 
@@ -38,6 +38,32 @@ should be reused.
 
 Do not use a liveness response as evidence for perception quality or
 performance. Do not use unrelated frontend tests to validate a model change.
+
+## Retained producer/BEV/Menon reviews
+
+Use saved exact cohorts before launching inference again:
+
+- `scripts/review_world_bev_replay.py` joins tracking and captured BEV on their
+  complete cohort and renders them beside corresponding source-video frames.
+  Video seek is approximate: inspect requested versus decoded times rather
+  than treating an OpenCV millisecond seek as proof of an exact decoded frame.
+- `scripts/compare_world_bev_replays.py` compares matched before/after cohorts
+  and reports coverage, displacement, holds/predictions and unmatched rows.
+  Output difference and transform parity are not physical accuracy.
+- `scripts/replay_retained_world_contract.py` exercises current canonical
+  fusion on admitted retained observations without inference or fitting.
+- `scripts/capture_world_bev_replay.py` is an explicit bounded runtime operation,
+  not a harmless report. It stops the existing Noesis owner, isolates replay
+  persistence and restores it in `finally`. Use it only when replay authority
+  is granted, preserve the selected model explicitly, and never run alongside
+  the configured service.
+
+Include paired walk, July walking and multi-person cohorts when localization
+changes affect all three. Compare the same source frame, BEV and Menon sample,
+preserving measured versus held/predicted state and support identity. Reuse
+already suitable evidence for documentation/commit-only work. Independent
+physical measurements are targeted qualification, not a prerequisite for a
+PCF-relative implementation or a reason to fit tracks to a phone optical path.
 
 ## Direct physical world/BEV check
 

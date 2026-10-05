@@ -1,12 +1,12 @@
 # Universal person world localization
 
-Status: current canonical DS9.1 baseline, 2026-08-25.
+Status: current canonical DS9.1 baseline, 2026-10-04.
 
 ## Purpose
 
 Noesis localizes each tracked person once as a revision-bound
 `ground_footprint` in `backend_world_m`.  Every downstream spatial view—strict
-world observations, BEV, dashboard trails, OSD reprojection, and later Menon
+world observations, BEV, dashboard trails, OSD reprojection, and Menon
 3D rendering—consumes that same filtered point and may only apply an explicit
 view transform.
 
@@ -61,6 +61,8 @@ Each hypothesis carries:
 - posture, support state, occlusion, motion and support evidence;
 - ray-incidence or depth-support evidence when applicable;
 - optional revision-matched PCF evidence and a bounded rejection reason.
+- an optional typed `support_surface`, preserving surface ID/revision, plane
+  normal/offset and finite convex XZ extent in the same metric world frame.
 
 Prediction and hold are process continuations, not measurements.  They cannot
 be placed in the hypothesis list or presented as fresh geometric evidence.
@@ -77,7 +79,7 @@ The DS9 analytics hook constructs each candidate independently:
   with the active revision's calibrated floor plane.  Near-horizon and
   out-of-range geometry is rejected before resolver entry.
 - `registered_depth`: the exact current object-depth anchor UV projected with
-  that camera's validated DAv2-to-room range mapping, then represented as a
+  that camera's validated DAv2-to-room optical-Z mapping, then represented as a
   ground footprint at the active floor elevation.  Pose UV is never substituted
   for the depth sample's own anchor. The object-geometry and GPU depth-tensor
   frame/PTS must both match; a current bbox sampled against a lagged tensor is
@@ -115,6 +117,47 @@ authoritative floor contacts. When an exact upright body-plane candidate is
 available, the resolver does not also add the learned-height gravity hypothesis
 from the same current body; correlated body estimates cannot masquerade as
 independent fusion evidence.
+
+## Measured finite floor surfaces
+
+`support_surfaces.path` loads exact camera/calibration/world/transform-bound
+`measured_calibration` sets. `review_only` sets cannot place people. The current
+baseline selects one Living Room upper patch derived from the owner's measured
+0.1905 m rise at both ends, the existing lower-plane normal, calibrated visible
+perimeter and PCF coverage. The rise is room-specific evidence; generic
+localization contains neither that constant nor a floor chosen by room name.
+See [the measurement builder](../scripts/build_parallel_floor_surfaces.py).
+
+Floor rays must have one unique bounded intersection. Upright body-plane solves
+are recalculated on each eligible level before selecting one; solving at the
+lower level and changing Y afterward would corrupt X/Z. A measured seated torso
+height is already absolute and must not receive the rise again. Fusion never
+averages different or unknown support identities into a named surface. Plane
+projection retains finite extent and propagates covariance conservatively.
+
+Accepted measured support changes reset motion and break trails. A continuation
+keeps the committed surface and cannot establish or cross into another level.
+Outside the measured patch, the original calibrated lower-plane path remains.
+Local PCF residual scatter is not an absolute camera/annotation uncertainty
+bound. The earlier image-derived 0.153 m rise remains a recorded unresolved
+edge-correspondence discrepancy, not a competing runtime floor.
+
+## Depth registration boundary
+
+DAv2's sampled scalar is camera-forward optical Z, not distance along a unit
+ray. Some historical field names contain `range`; projection must retain the
+declared optical-Z meaning. Registration needs trustworthy alignment to the
+admitted PCF scale and frame, not intrinsically perfect DAv2 metric scale.
+
+The fitter uses support-weighted isotonic pooling rather than cumulative maxima.
+Flat/dead intervals, unsupported domains and stale or mismatched frames still
+reject. The offline `noesis.calibration.pcf_depth_alignment` review fits scale
+on person-excluded stationary PCF correspondences with disjoint frame/tile
+holdouts. Applying that scale to an occupied sample requires actual same-frame
+MapAnything person support at the identical DAv2 anchor. Empty-room depth behind
+a person is not a person measurement. The current replacement remains
+review-only pending adequate occupied evidence; a successful static fit is not
+runtime admission or independent physical proof.
 
 ## Uncertainty and resolution
 
@@ -156,10 +199,11 @@ covariance is enlarged by the resolver-to-emitted displacement.  Prediction
 and hold do not inherit a stale current-measurement covariance; downstream
 compatibility behavior uses conservative continuation uncertainty.
 
-The canonical global-world service admits only fresh measured observations
-with a complete revision and transform identity. `cv_prediction`,
-`image_motion_prediction`, and `anchor_hold` remain tracking/BEV continuity;
-they cannot become new global fusion evidence. Simultaneous camera
+The canonical global-world service admits measured observations only with a
+complete revision and transform identity. `cv_prediction`,
+`image_motion_prediction`, and `anchor_hold` can preserve guarded, exact
+producer continuity in the snapshot; they cannot become new global fusion
+evidence or renew last-good measurement time. Simultaneous camera
 observations can fuse only in the same proven target-frame revision. Mixed or
 incomplete target identities remain typed conflict evidence. Cross-camera
 fusion uses full-matrix covariance intersection, preserving anisotropy and
@@ -222,10 +266,28 @@ The accepted track publishes:
 - `world_quantity="ground_footprint"`;
 - `world_covariance` for an accepted current measurement;
 - `world_posture` and `world_support_state`;
+- `world_support_surface` when a measured bounded surface was selected;
 - the existing PersonGroundState admission, motion, hold, prediction, and
   trail fields;
 - compact `world_resolver_*` decision scalars (confidence, selected ID, fusion,
   and disagreement) on normal tracking/statistics publications.
+
+The canonical snapshot additionally publishes entity `position_state`
+(`measured`, `predicted`, `held`) and `continuity_segment_id`. Source evidence
+preserves its own `position_source`, `position_quality`, `position_state` and
+support reference. Presence/lifecycle does not imply a fresh measurement. An
+accepted support/frame/source-lifecycle discontinuity breaks the entity segment;
+switching contributors must not hide a reset previously seen on another source.
+Menon preserves these distinctions and uses exact held samples rather than
+inferring freshness from confidence or animation.
+
+BEV footpoints normally expose `worldElevationM`, transformed `covarianceXZ`
+and optional full `supportSurface`; rich candidate diagnostics remain gated.
+The renderer projects full canonical XYZ and full covariance through the same
+display basis, then drops height for the top-down view. Menon applies one
+validated target-world-to-scene mapping, with velocity transformed linearly and
+covariance as A Sigma A^T. Its delayed interpolation is presentation only;
+support/continuity changes reset playback, never interpolate through a step.
 
 Canonical `world`, not the diagnostic candidates, moves the BEV dot or trail.
 The BEV renderer accepts resolver details only when camera, source, tracker,
@@ -238,6 +300,9 @@ When a callback transitions a lifecycle from no queue-published metric output
 to a valid accepted current metric point, that exact tracking/world/BEV cohort
 is forced through the publication cadence immediately. Predictions, holds, and
 saved proof samples do not trigger this rule.
+
+An accepted support transition likewise forces its exact cohort immediately;
+an older point must not be reclassified onto a new level between publications.
 
 The full exact-cohort candidate tree is never copied into the canonical
 tracking publication. The normal dashboard has a `Localization details`

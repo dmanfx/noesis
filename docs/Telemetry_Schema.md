@@ -204,6 +204,7 @@ strictly advancing ordering/freshness fields for downstream consumers.
       "world_quantity": "ground_footprint"|null,
       "world_covariance": [<9 row-major float values>]|null,
       "world_support_state": "floor"|"seat"|"couch"|"unknown"|null,
+      "world_support_surface": { /* exact surface ID/revision, plane and finite XZ extent */ }|null,
       "world_posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"pose_depth_only"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_depth_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
       "world_resolver_confidence": <float 0..1|null>,
@@ -428,7 +429,7 @@ strictly advancing ordering/freshness fields for downstream consumers.
   bbox/non-floor row may preserve the pending ankle-family run but cannot be
   published or become its coordinate; a second intervening row or expired gap
   clears the run.
-- `depth_used_m` is the current registered DAv2 anchor range admitted as a
+- `depth_used_m` is the current registered DAv2 anchor optical Z admitted as a
   resolver candidate; `world_source` and compact `world_resolver_*` fields
   describe the normal decision, while request-gated BEV diagnostics expose
   exact contributors. `depth_anchor_m` remains the raw anchor carried by
@@ -444,6 +445,22 @@ strictly advancing ordering/freshness fields for downstream consumers.
   `depth_registered_m`. If `depth_used_m` is present it must match the
   registered value. Missing, raw-passthrough, or rejected registration and raw
   anchor depth do not qualify.
+
+## Canonical support and continuity
+
+Canonical `world_snapshot` entities additionally expose explicit `position_state`
+(`measured`, `predicted`, `held`), `continuity_segment_id` and optional
+`support_surface`. Their source evidence carries its own position source,
+quality, state and support geometry. Lifecycle presence is not fresh localization.
+Strict field/frame/revision/provenance validation applies at the consumer.
+An accepted support transition forces its exact cohort, resets interpolation
+and breaks trails; a hold/prediction cannot establish a new floor.
+
+BEV footpoints normally include `worldElevationM`, display-frame `covarianceXZ`
+and optional `supportSurface`. Full XYZ and full covariance are transformed
+before dropping the vertical display axis. These normal fields do not require
+the rich `Localization details` diagnostic toggle. See
+[`api_contracts_ws.md`](api_contracts_ws.md) for the field-level contract.
 
 ## Depth Payload (type: `depth_result`)
 

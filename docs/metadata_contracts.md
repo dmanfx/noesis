@@ -1,5 +1,5 @@
 # DS9.1 metadata contracts
-_Status: canonical native-host metadata contract, updated 2026-08-23._
+_Status: canonical native-host metadata contract, updated 2026-10-04._
 
 This document summarizes the key metadata structures used by the DS9.1 pipeline, both on-frame (user meta) and in downstream telemetry.
 
@@ -62,11 +62,21 @@ DS9.1 code that consumes intrinsics should prefer the runtime `calibration-bundl
 
 ## 1.1 Depth Registration Artifact
 
-**Primary producer:** offline builder `scripts/build_depth_registration.py`.
+**Primary producer:** offline builder `DS9/scripts/build_depth_registration.py`.
 
 **Primary consumer:** baseline DS9.1 startup + fused world estimator (`DS9/noesis/ds9_runtime_core.py`, `DS9/noesis/pipelines/hooks.py`).
 
 This artifact is separate from `NOESIS.OBJECT_DEPTH`, `DepthResult`, floorplan caches, and MapAnything snapshot storage. It is a DS9.1-owned config artifact that maps raw DAv2 anchor range into MapAnything-aligned room range on a per-camera basis.
+
+The historical `*_range_m` space names are retained for artifact identity, but
+the current tensor and projection contract uses **camera-forward optical Z**,
+not Euclidean ray length or world Z. A reference expressed as ray length must
+first be converted with that sample's calibrated pixel ray. The monotonic
+builder uses support-weighted pool-adjacent-violators fitting; a noisy near bin
+must not raise every farther bin through cumulative maximum. This does not
+create missing depth information: flat intervals and out-of-domain samples
+remain ineligible, and a revised fit still needs independent occupied-anchor
+evidence. No existing registration bundle is rewritten by this fitter change.
 
 Canonical bundle shape:
 
@@ -461,6 +471,30 @@ binding still prevents canonical measurement admission.
   resolver covariance after enlargement for any accepted
   resolver-to-filter displacement. It is absent for process-only prediction or
   hold rather than carrying stale measurement uncertainty.
+- Baseline localization can consume an explicitly configured
+  `support_surfaces.path` containing one `noesis.support_surfaces` set or a
+  `{"sets": [...]}` collection. Each bounded convex plane has an observed
+  extent, upward unit normal/offset, local residual sigma and evidence digest.
+  Camera ID, calibration digest, world revision and transform digest must
+  exactly match active calibration. `review_only` geometry has no placement
+  authority; only independently measured calibration geometry can be supplied
+  with `authority="measured_calibration"`. PCF/Scene Prior data is never
+  implicitly converted to this authority.
+- `world_support_surface`, when present, is the selected compact reference
+  `{surface_id, revision, normal_world, offset_m, extent_xz}`; elevation is
+  `world[1]`. The bounded observed polygon remains required through fusion and
+  continuation; a plane equation is not authority outside that polygon.
+  World observations, entities and source evidence expose this as
+  `support_surface`. Different or unknown support identities cannot corroborate
+  a named plane or be fused across a step. A current ray must have one
+  unambiguous bounded intersection; temporal continuation cannot establish a
+  new surface. Accepted support changes break the trail rather than smoothing
+  through an intermediate elevation. Holds retain support identity, not fresh
+  measurement covariance. Plane residual sigma measures local scatter only,
+  not camera/registration error. The current baseline config explicitly loads
+  the measured Living Room upper patch from `DS9/config/support_surfaces.json`.
+  Generic deployments without a selected artifact retain the calibrated
+  single-floor path; outside the admitted finite patch that path is unchanged.
 - Normal public tracking metadata carries only compact `world_resolver_*`
   decision scalars. The exact candidate tree described in
   [`universal_world_localization.md`](universal_world_localization.md) is

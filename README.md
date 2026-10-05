@@ -11,13 +11,17 @@ telemetry, and feeds the Menon/oai2-fe dashboard.
 - Native Python 3.12 environment; Docker is not part of the canonical runtime
   or build path.
 - Three live `nvurisrcbin` sources: Living Room, Kitchen, and Family Room.
-- YOLO26-m detector, NvDCF tracker, Swin ReID, YOLO26 pose, always-on
+- YOLO26 detector (configured service selects the L realization), NvDCF
+  tracker, Swin ReID, YOLO26 pose, always-on
   DepthAnythingV2 object-depth, and gated MapAnything full-frame depth.
 - One GPU H.264 mosaic delivered through SHM/WebRTC. RTSP output is disabled.
 - REST is loopback-only on 8080 and WebSocket/WebRTC signaling is loopback-only
   on 6008; Menon owns browser-facing authentication and delivery.
 - Baseline tracking is canonical. MV3DT is an explicit opt-in limited to the
   accepted Kitchen/Family Room peer edge; AMC remains deferred.
+- One surface-aware canonical ground footprint supplies BEV and Menon, with
+  explicit measured/predicted/held state and continuity. Room-specific measured
+  geometry is calibration data, never a room-specific tracking algorithm.
 
 DeepStream 8, DeepStream 9.0, and the former DS9.1 container deployment are
 historical. They are not supported runtime alternatives, and their executable
@@ -39,6 +43,7 @@ flowchart LR
     MEDIA --> MENON
     REST --> MENON
     MENON --> UI[oai2-fe dashboard]
+    MENON --> SCENE[Menon canonical 3D presentation]
 ```
 
 The detailed graph and authority boundaries are in
@@ -105,6 +110,10 @@ See [`docs/testing_guide.md`](docs/testing_guide.md) for practical commands.
 - [`docs/README.md`](docs/README.md): current documentation index.
 - [`docs/runtime_baseline.md`](docs/runtime_baseline.md): exact runtime and
   performance baseline.
+- [`docs/universal_world_localization.md`](docs/universal_world_localization.md):
+  measured support, depth registration, continuity, and BEV authority.
+- [`docs/structural_scene_registration.md`](docs/structural_scene_registration.md):
+  measured structural registration into Menon and current qualification limits.
 - [`docs/api_contracts_ws.md`](docs/api_contracts_ws.md),
   [`docs/api_contracts_rest.md`](docs/api_contracts_rest.md), and
   [`docs/metadata_contracts.md`](docs/metadata_contracts.md): public/internal

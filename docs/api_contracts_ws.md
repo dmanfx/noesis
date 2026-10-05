@@ -1,5 +1,5 @@
 # DS9.1 WebSocket API contracts
-_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-25._
+_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-10-04._
 
 The WebSocket server (`noesis.server.websocket.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
@@ -480,6 +480,9 @@ Emitted by `BevRenderer`:
       "worldFrame": "backend_world_m"|null,
       "worldFrameRevision": "<revision>"|null,
       "worldTransformSha256": "<sha256>"|null,
+      "worldElevationM": <float>|null,
+      "covarianceXZ": [[<float>, <float>], [<float>, <float>]]|null,
+      "supportSurface": {"surface_id": "<id>", "revision": "<revision>", "normal_world": [<float>, <float>, <float>], "offset_m": <float>, "extent_xz": [[<float>, <float>], "..."]},
       "resolverDiagnostics": {
         "contract": "noesis.world_resolver_diagnostics",
         "version": 1,
@@ -544,6 +547,14 @@ Emitted by `BevRenderer`:
 ```
 
 - `footpoints[].method` is an image-anchor/render provenance string emitted by the backend (`image_base`, `image_foot`, `bbox`, etc.), not the canonical track world estimator source.
+- `worldElevationM` is the canonical backend Y. `supportSurface` is optional
+  and identifies an explicitly measured selected support plane; absence does
+  not invent a floor ID. `covarianceXZ` is the accepted current world covariance
+  projected into the declared BEV display axes, or null for no current
+  covariance (including holds/predictions). These normal fields do not require
+  localization details. The full XYZ point and 3×3 covariance are transformed
+  before discarding display height; diagnostic candidates follow the same
+  transform and may also carry `worldElevationM` and `supportSurface`.
 - `sourceId`, `sourceEpoch`, `frameId`, `observedAtUs`, and
   `trackingPublicationSequence` identify the exact tracking
   publication cohort that produced the BEV frame. Every current footpoint
@@ -889,6 +900,7 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "world_quantity": "ground_footprint"|null,
       "world_covariance": [<9 row-major float values>]|null,
       "world_support_state": "floor"|"seat"|"couch"|"unknown"|null,
+      "world_support_surface": {"surface_id": "<id>", "revision": "<revision>", "normal_world": [<float>, <float>, <float>], "offset_m": <float>, "extent_xz": [[<float>, <float>], "..."]}|null,
       "world_posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"cv_prediction"|"image_motion_prediction"|"anchor_hold"|null,
       "world_resolver_confidence": <float 0..1|null>,
@@ -1399,6 +1411,10 @@ Human pathing fields (producer-owned):
 
 Depth exposure:
 
+- Depth values on the current baseline tensor/projection path are optical
+  camera-Z meters, not Euclidean camera-to-anchor distance. Historical artifact
+  names containing `range_m` are unchanged; their names do not authorize a
+  ray-length interpretation. World X/Y/Z still require calibrated backprojection.
 - `depth_used_m` is the current registered DAv2 anchor range that qualified as
   a resolver hypothesis. It may be present even when another hypothesis is
   selected. `world_source` and the compact `world_resolver_*` fields explain
@@ -1989,11 +2005,22 @@ Current DS9.1 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_r
 
 ## 8. Calibration Data Conventions
 
-Same as prior DS9.1 revisions:
+Current physical and presentation authorities are separate:
 
 - **Extrinsics (`E`)**: stored in `config/camera_calibration.json`, world→camera, 4×4 column-major, meters.
 - **PoseV1 (`pose`)**: stored scene pose summaries (`position`, `yaw_pitch_roll_deg`, `rotation_order=YXZ`, `frame=menon_scene`) are authoritative scene-camera poses, not raw OpenCV image-camera extrinsics. Converting PoseV1 to `E` applies a fixed local 180 degree roll so the resulting camera basis matches DS9.1 depth/image math (`+X right`, `+Y down`, `+Z forward`).
 - **Intrinsics (`K`)**: from `config/cameras.yaml` (`intrinsics_models` + `cameras` map). Scaled to streammux resolution by the calibration provider in `DS9/noesis/ds9_runtime_core.py`.
-- **Alignment (`align`)**: `config/ply_alignment.json` with `matrix` (room-model alignment), `floor_y`, and `units.s_obj_to_m`.
-- **Calibration bundle (`calibration-bundle`)**: carries the canonical backend-world-meters pose/extrinsics plus the room-alignment metadata Menon needs for its own scene conversion. When `align.scene_similarity` is present, it includes `s_obj_to_m` and authoritative `world_to_scene_sha256`, computed over canonical JSON `{world_to_scene_col_major, s_obj_to_m}`. Consumers use that digest directly rather than reproducing Python float serialization.
-- `pixel_to_world_response` returns world-frame meters; Menon applies its room alignment and scene-unit conversion client-side.
+- **Historical alignment bytes**: `config/ply_alignment.json` remains an exact
+  fingerprinted dependency of admitted frame bindings. Retained marker
+  `scene_similarity` metadata is ignored, not published or used as placement
+  authority. `set_align` cannot revive it.
+- **Calibration bundle (`calibration-bundle`)**: carries physical camera
+  calibration, exact `frame_bindings` and `world_frame_presentations`. Menon
+  selects the validated mapping owned by the entity's target frame/revision,
+  including accepted source-transform provenance; a fused person does not
+  select an arbitrary camera transform. The current structural artifact also
+  binds the actual authored model and measured support geometry. Missing or
+  stale mappings fail closed rather than using a legacy marker/global matrix.
+- `pixel_to_world_response` returns world-frame meters. Menon applies the same
+  explicit target-world-to-scene transform used by canonical people, once.
+  See [`structural_scene_registration.md`](structural_scene_registration.md).

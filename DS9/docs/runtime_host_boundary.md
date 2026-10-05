@@ -72,6 +72,14 @@ config/cameras.yaml
 Normal operation is through systemd. Direct `run` is for an explicitly isolated
 development session after the managed service is stopped; never run both.
 
+The command block above describes base-config defaults, not a permanently
+selected detector. As checked on 2026-10-04, the configured service uses
+`--model-size l` with baseline `infer.yaml`. Preserve that selection during
+maintenance/replay rather than silently substituting the default M model.
+Baseline measured support and active depth-registration artifacts remain part
+of that configured producer; a served Menon build must not choose an older
+Noesis implementation to match a historical release label.
+
 An explicit `--tracking-mode v3dt` on both supervisor `check` and `run` selects
 `DS9/config/infer_v3dt.yaml`, `DS9/config/cameras_v3dt.yaml`, and YOLO26-m.
 This enables per-camera native 3D tracking with health variant `ds9:v3dt`;

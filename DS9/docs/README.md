@@ -1,6 +1,6 @@
 # DS9.1 documentation index
 
-Status: native-host baseline, updated 2026-08-26.
+Status: native-host baseline, updated 2026-10-04.
 
 ## Current operational docs
 
@@ -34,10 +34,18 @@ Status: native-host baseline, updated 2026-08-26.
 
 ## Capability state
 
-The baseline lane is YOLO26-m + NvDCF with Swin ReID, YOLO26 pose, always-on
+The baseline lane is YOLO26 + NvDCF with Swin ReID, YOLO26 pose, always-on
 DAv2 tracking depth, gated MapAnything depth, WebRTC media, and JSON BEV. MV3DT
 is available as an explicit opt-in for the accepted Kitchen/Family Room edge;
 AMC remains deferred.
+
+The configured service selects YOLO26-L; the base config and historical
+performance reference use M. Baseline localization consumes measured finite
+support surfaces and publishes full XYZ and explicit continuity. Current
+Menon/whole-home PCF mapping is structural and revision-owned, never derived
+from hand-placed camera devices. See the
+[localization contract](../../docs/universal_world_localization.md) and
+[structural registration](../../docs/structural_scene_registration.md).
 
 ## History
 

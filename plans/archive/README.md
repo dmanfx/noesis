@@ -8,6 +8,10 @@ implementation instructions.
 - `ds8/`: curated tracked DS8 work-order and V3DT history.
 - `completed/`: completed cross-version feature programs, including the
   original occupancy and WebRTC rollout plans.
+  It also retains the [September 28 world/BEV first delivery](completed/person_ground_accuracy_results_20260928.md)
+  and [September 29 PCF-relative reassessment](completed/person_ground_pcf_reassessment_results_20260929.md).
+  Their capture-era runtime/scope statements are historical; current authority
+  is documented in the localization and structural-registration guides.
 - `migrations/`: detailed migration worklogs whose remaining actions were
   distilled into current plans. `migrations/ds9_native/` contains the completed
   DS9.0/container-to-native-DS9.1 preparation and upgrade records formerly

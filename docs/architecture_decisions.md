@@ -3,6 +3,38 @@
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
 
+## Coherent single-room photo surfaces — 2026-10-04
+
+Offline RGB mesh reconstruction consumes the distinct-view-supported consensus
+surface, not a concatenation of independently triangulated depth sheets. Source
+photographs are selected in coherent adjacent triangle regions under exact
+image/pose/revision bindings and corner/centroid depth visibility. Missing texture
+is explicitly neutral; unknown surface closure is not synthesized. Optional
+photometric gains require measured same-surface overlaps and reserved-sample
+acceptance within independently anchored overlap components; rejected and weak
+components retain original pixels. A supplied anchor is immutable; failed other
+components may try at most two additional references preselected only from
+training overlap ratios and assigned-face support. All fit, reserved-sample and
+clipping limits remain unchanged, with every attempt recorded. Same-image
+reserved checks do not establish independent colour accuracy. Exact official preprocessing replay permits
+deterministic photo maps without replacing model-predicted geometry intrinsics.
+Neither presentation change alters reconstruction geometry or source photographs.
+See the [single-room photo workflow](../tools/mapanything_phone_scan/README.md#single-room-coherent-photo-surface-offline).
+These exports remain review-only and do not admit world, calibration, or tracking
+authority. Reconstruction carrier selection uses evidence; a larger joint view
+count is not presumed more consistent.
+
+The automatic phone floor estimator searches a finite set of measured planes
+and rejects planes inconsistent with pose-derived camera up or plausible camera
+height. A dominant wall is not a floor merely because camera-to-wall distance
+passes a height check. This is a model-pose heuristic, not admitted IMU gravity;
+independent target alignment and all existing geometry gates still apply.
+
+Sparse depth conditioning checks its unchanged minimum after official cropping,
+not only in the raw DA3 grid. A bounded deterministic top-up can use only the
+identically processed reliable DA3 evidence while preserving existing samples,
+RGB and camera inputs. Insufficient reliable support remains a failed candidate.
+
 ## Owner-selected structural intermediate — 2026-10-03
 
 An explicit owner-reviewed intermediate scene mapping may retain failed
@@ -13,6 +45,53 @@ This presentation-only selection cannot change localization or BEV. The native
 calibration factory supplies configured camera identities before checking rays.
 High-detail RGB review surfaces remain separate selectable presentation assets,
 with the original mesh and exact metric room edges preserved.
+
+## ADR-044 — Measured support planes preserve baseline world and BEV geometry
+
+Status: implemented and committed, updated 2026-10-04. The selected native
+non-SV3DT baseline includes the owner's measured parallel-floor calibration.
+The September replay work did not change SV3DT; it is now an explicit opt-in,
+not the selected live lane. Replacement depth registration remains review-only.
+
+The non-SV3DT resolver can consume bounded, independently measured support
+planes through an explicit camera/calibration/world-revision binding. A plane
+is not inferred from a room name, phone carrying height, person track, or a PCF
+presentation grid. Ambiguous ray hits remain ambiguous; different support
+identities never fuse into an intermediate elevation. PersonGroundState keeps
+the accepted support for bounded continuation and breaks a trail on an accepted
+support transition. The world service preserves that identity, full XYZ and
+provenance. BEV transforms full XYZ and covariance into its display basis before
+dropping height, and publishes selected support/elevation/uncertainty normally.
+
+DAv2 does not need independently correct absolute model scale: registration
+must bind its current person-support samples to the admitted PCF room scale
+and camera/world revision. Static PCF correspondences may establish the model
+scale, but background behind a person cannot supply that person's depth.
+Distinguish PCF-relative alignment from independently proven physical accuracy.
+Intrinsic metric DAv2 and a new manual room-depth survey are not prerequisites.
+
+Depth registration now uses weighted isotonic pooling instead of cumulative
+maximum, which could propagate a noisy near-bin elevation through all farther
+knots. Existing flat intervals and unsupported ranges stay rejected. New fits
+still require current occupied-anchor evidence and disjoint capture holdouts;
+running DAv2 frequently does not repair an unobservable registration curve.
+
+The owner measured the Living Room floor-to-floor rise as 7.5 inches (0.1905 m)
+at both ends and specified practically flat, parallel floors. That measurement
+lives in room-specific calibration data, not generic tracking logic. The upper
+patch keeps the lower normal, projects the visible perimeter through the bound
+camera, and is limited by the PCF coverage hull. The map itself is not shifted
+or tilted. Local PCF scatter is not an absolute calibration error bound.
+
+The earlier image-derived 0.153 m result disagrees by 37 mm. Reprojecting the
+measured rise exposes a roughly 4.5–5 pixel edge discrepancy. Visible nosing /
+riser-edge correspondence and camera provenance remain investigation items;
+neither an invented slope nor a map adjustment resolves that uncertainty.
+See the [implementation work orders](../plans/person_ground_accuracy_implementation.md)
+and [PCF-relative replay results](../plans/archive/completed/person_ground_pcf_reassessment_results_20260929.md)
+for direct evidence and limits. Menon was excluded from that producer work
+order and subsequently integrated under ADR-045 through ADR-048. SV3DT
+implementation and gait-aware foot placement remain separate deferred work.
 
 ## Find the relevant decision
 
@@ -473,6 +552,12 @@ weakening camera/revision identity checks.
 
 **Accepted:** 2026-08-16 for review; the current three-room registration remains
 rejected for canonical use
+
+**Presentation superseded:** 2026-10-04. The historical camera-anchor assembly
+contract below is retained for diagnostic endpoints, not the served checkbox.
+Current Menon uses the strict RGB tracking descriptor and one exact structural
+mapping per target room revision (ADR-048). See
+[current REST presentation](api_contracts_rest.md#independent-rgb-pcf-tracking-view).
 
 Noesis owns the metric PCF assembly and publishes its immutable point artifact,
 provenance, registration status, uncertainty, and complete binding to the
@@ -2236,6 +2321,41 @@ This is read-only reference selection, not inference, a new room admission,
 live catalog mutation, or promotion. The new walk still needs its own passed
 static-camera registration and retained timing evidence; choosing PCF does not
 certify body position or improve a path merely by changing its label.
+
+## ADR-045 — Menon preserves canonical support and measured scene elevation
+
+Status: accepted, 2026-10-01; initial marker-based horizontal presentation
+superseded by all-room structural mapping on 2026-10-04 (ADR-048).
+
+Canonical snapshots publish explicit measured/predicted/held position state and
+an entity-local continuity segment. Lifecycle presence is not measurement
+freshness. Source evidence carries its own position source, quality, and state.
+Support references retain revisioned plane geometry and finite extent at both
+entity and source boundaries. These additions do not change localization or
+relax world admission.
+
+Menon applies one admitted target-world-to-scene similarity, including linear
+velocity and covariance propagation. An explicit scene-only registration can
+bind the actual authored OBJ digest, current calibration/PCF frame edge, measured
+support evidence. The initial October 1 implementation retained camera XZ
+anchors; that dependency is now retired. Its vertical
+alignment follows admitted PCF lower floors and actual authored floor geometry;
+old authored camera-marker Y is diagnostic, not floor authority. Current yaw,
+XZ and uniform scale come from reviewed PCF/authored structural correspondences,
+not camera devices, occupied tracks or a phone optical-center path. The current
+owner-selected intermediate retains failed holdouts rather than claiming a pass.
+
+The measured foyer rise is consumed from the room-specific support measurement
+artifact. A derived authored model changes only the bound upper-floor slab,
+retaining its parent model and material provenance. No room offset, generic
+height, slope, calibration replacement, or BEV localization correction is
+introduced. Both scene registration and authored model paths must be explicitly
+selected together, and mismatched revisions/digests fail closed.
+
+Menon keeps elevation through markers, Presence, footprints, uncertainty,
+selection, labels and trails. Accepted support/continuity changes reset delayed
+playout and break trails. Holds and diagnostic evidence use exact samples;
+cosmetic visual dimensions cannot feed back into Noesis positions.
 
 ## ADR-046 — Admit structural scene registration only after observed geometry passes
 

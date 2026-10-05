@@ -5,7 +5,7 @@ flowchart TB
     SRC[nvurisrcbin ×3] --> DEW[Per-camera dewarp + NVMM caps]
     DEW --> MUX[nvstreammux batch=3, 1920×1080, pool=8]
     MUX --> PRE[nvdspreprocess YOLO26]
-    PRE --> PGIE[YOLO26-m PGIE]
+    PRE --> PGIE[Selected YOLO26 PGIE]
     PGIE --> TEE{Main tee}
 
     TEE --> ROI[nvdsroiexclude]
@@ -26,6 +26,7 @@ flowchart TB
     MA --> DEPTH[Exact depth capture/store/floorplan]
 
     OBS --> COMMIT[Tracking/world commit]
+    SUPPORT[Revision-bound measured support planes] --> OBS
     COMMIT --> WS[Tracking → world → BEV publication]
     DEPTH --> REST[REST/WS depth descriptors]
 ```
@@ -37,3 +38,7 @@ Optional DAv2/evidence/persistence work bounds its own freshness and cannot
 back-pressure the media spine. Canonical tracking/world/BEV messages remain an
 exact ordered cohort and are not latest-only. See
 [`performance_invariants.md`](performance_invariants.md).
+
+The configured service currently selects the L detector, while the base config
+and historical performance reference use M. Measurement, hold and prediction
+truth remain explicit through world/BEV/Menon, including support transitions.

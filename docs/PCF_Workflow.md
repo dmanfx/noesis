@@ -1,7 +1,7 @@
 # Prior-Conditioned Fusion (PCF) workflow
 
 Status: canonical room-reconstruction and Scene Prior handoff runbook,
-2026-09-07 (phase boundaries; deployed inventory retains its dated evidence).
+2026-10-04 (phase boundaries; deployed inventory retains its dated evidence).
 
 Use this document when someone asks to **run PCF**, **reconstruct another room
 with PCF**, or **publish a PCF room to Noesis**. Execute only the phases
@@ -52,6 +52,30 @@ interchangeably:
 The PCF candidate is the reconstruction method's output. The Scene Prior is the
 runtime artifact Noesis verifies and loads. Building a good PCF candidate does
 not by itself change the running application.
+
+## Current presentation and reconstruction additions
+
+Menon's authored-home alignment is now a separate structural presentation bound
+to exact PCF metric rooms, current calibration and the actual authored model.
+It does not refit live camera calibration or track coordinates. Hand-placed
+camera markers are retired as mapping authority; see
+[structural registration](structural_scene_registration.md) and its remaining
+opening-holdout limits. The measured foyer rise lives in explicit room support
+calibration rather than a generic floor constant.
+
+RGB low/high tracking-review meshes and the coherent single-room photo exporter
+are derived presentation assets. They preserve source geometry and exact
+phone-only carrier/static-alignment provenance; holes, neutral texture support
+and failed photometric checks remain explicit. More pixels or views do not
+qualify a reconstruction. The
+[phone workflow](../tools/mapanything_phone_scan/README.md#single-room-coherent-photo-surface-offline)
+documents current source-photo, visibility and exposure boundaries.
+
+Sparse DA3 conditioning now enforces its existing minimum after official
+resize/crop using only reliable identically processed depth; a dominant wall
+cannot pass automatic floor selection from distance alone. Pose-derived up is
+not calibrated IMU gravity. These offline repairs neither activate new room
+geometry nor change canonical tracking authority.
 
 ## Authority that must remain intact
 

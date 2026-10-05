@@ -1,6 +1,6 @@
 # Codebase description
 
-Status: native DeepStream 9.1 architecture, 2026-08-26.
+Status: native DeepStream 9.1 architecture, 2026-10-04.
 
 ## Runtime ownership
 
@@ -43,12 +43,14 @@ flowchart TB
     subgraph MENON[Menon browser boundary]
         GATEWAY[Authenticated gateway]
         UI[oai2-fe dashboard]
+        SCENE[Menon canonical 3D + PCF review]
     end
 
     WS --> GATEWAY
     REST --> GATEWAY
     MEDIA --> GATEWAY
     GATEWAY --> UI
+    GATEWAY --> SCENE
 ```
 
 ## Source ownership
@@ -89,6 +91,19 @@ sequenceDiagram
 Publication lifecycle is deliberate: the runtime closes and drains the shared
 publication gate before stopping WebSocket egress so no admitted callback races
 the transport shutdown.
+
+## Spatial authority and presentation
+
+World localization and authored-scene presentation are separate authorities.
+The measured finite support module, resolver and PersonGroundState supply one
+canonical footprint with explicit freshness/continuity. BEV projects it;
+Menon renders it through a target-revision-owned structural similarity, carrying
+full XYZ, velocity and covariance. Its whole-home PCF review uses the same room
+mappings, while selectable high/low RGB meshes remain presentation-only.
+Hand-placed camera devices and review geometry never localize people. See
+[`universal_world_localization.md`](universal_world_localization.md) and
+[`structural_scene_registration.md`](structural_scene_registration.md).
+
 
 ## Legacy boundary
 

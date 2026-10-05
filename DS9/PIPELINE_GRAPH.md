@@ -1,7 +1,11 @@
 # Canonical DeepStream 9.1 pipeline graph
 
-Status: native baseline, 2026-08-23. Source of truth:
+Status: native baseline topology, updated 2026-10-04. Source of truth:
 `DS9/config/infer.yaml` plus `DS9/noesis/pipelines/`.
+
+The base config uses YOLO26-m; the configured live supervisor currently passes
+`--model-size l` and selects the L realization without changing this topology.
+Confirm the actual service command before maintenance or matched replay.
 
 ## Video graph
 
@@ -59,6 +63,11 @@ flowchart LR
 Tracking/world authority is committed before BEV release. PCF provides the
 floorplan/reconstruction presentation, while the paired live tracking cohort
 provides dots and trails. PCF does not synthesize people.
+
+World hooks consume finite measured support geometry and keep canonical XYZ,
+covariance, explicit position state and continuity. Accepted floor changes
+force their exact paired publication. Menon consumes the snapshot through one
+target-revision structural mapping; BEV and review meshes are not estimators.
 
 ## Source and batching contract
 

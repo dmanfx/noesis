@@ -157,3 +157,22 @@ file bytes remain because admitted frame bindings fingerprint them; their
 device objects and calibrated camera rays remain diagnostic presentation only.
 Menon consumes exact revision-owned room mappings without requiring a global
 marker matrix; a missing or mismatched mapping fails closed.
+
+## Served RGB overlay and tracking review
+
+Menon's `Whole home PCF overlay` checkbox now loads the strict authenticated
+RGB tracking-review descriptor, not the older camera-anchor assembly consumer.
+For each descriptor-owned room subtree, it composes
+`scene_from_assembly = scene_from_world * inverse(assembly_from_world)` using
+the same model-bound world presentation as canonical people. Original GLB node
+transforms remain applied once. Calibration changes revoke/restage stale
+geometry; missing room mappings do not fall back to a global marker or offset.
+The independently framed temporary PCF tracking viewer retains original and
+high-detail meshes, canonical people and its own preferences/playback/trails.
+
+These are presentation connections, not reconstruction or localization fixes.
+Current three-room overlay/model parity and retained occupied consumer parity
+are demonstrated, while Family/Kitchen holdouts still fail and the selected
+combined fit remains unqualified. Source-frame seek in older replay videos is
+approximate and should be checked against recorded decoded timing before
+claiming a corresponding exact video frame.

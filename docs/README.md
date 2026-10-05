@@ -1,6 +1,6 @@
 # Noesis documentation
 
-Status: current for the native DeepStream 9.1 application, 2026-08-26.
+Status: current for the native DeepStream 9.1 application, 2026-10-04.
 
 This directory separates current specifications from historical implementation
 records. If an archived document conflicts with a current document, the current
@@ -37,7 +37,8 @@ document and live source/config win.
   publication boundary.
 - [`universal_world_localization.md`](universal_world_localization.md):
   camera-agnostic floor/depth hypothesis resolution, covariance, conservative
-  PCF evidence, PersonGroundState boundary, and dashboard diagnostics.
+  PCF evidence, measured finite support surfaces, explicit continuity,
+  PersonGroundState boundary, and dashboard diagnostics.
 - [`depth_metadata.md`](depth_metadata.md) and
   [`DEPTH_STACK_FLOW_V2.md`](DEPTH_STACK_FLOW_V2.md): object and full-frame
   depth semantics.
@@ -59,7 +60,8 @@ document and live source/config win.
 - [`scene_prior_v1.md`](scene_prior_v1.md): immutable runtime artifact and
   catalog contract built from approved PCF evidence.
 - [`Virtual_Twin_Reconstruction.md`](Virtual_Twin_Reconstruction.md):
-  independent static-camera room-revision workflow.
+  independent static-camera evidence, coherent served scenes, and the boundary
+  between PCF reconstruction and canonical people.
 - [`charuco_intrinsics_calibration.md`](charuco_intrinsics_calibration.md):
   camera intrinsics workflow.
 - [`roi_editor.md`](roi_editor.md) and
@@ -89,6 +91,13 @@ canonical-world, BEV/capture, maintenance, and operator references.
 
 ## Active work records
 
+- [`../plans/person_ground_accuracy_implementation.md`](../plans/person_ground_accuracy_implementation.md):
+  completed feasible producer/BEV work and the remaining occupied-depth
+  qualification boundary; gait-aware body footprints stay deferred.
+- [`../plans/structural_registration_results.md`](../plans/structural_registration_results.md):
+  current owner-selected all-room fit, source/model evidence, retained consumer
+  parity, and failed independent opening holdouts. Visual agreement is not
+  independent physical qualification.
 - [`../plans/ds91_native_host_only_migration.md`](../plans/ds91_native_host_only_migration.md):
   accepted native state and remaining destructive legacy/Docker cleanup.
 - [`../plans/household_identity/README.md`](../plans/household_identity/README.md):
@@ -118,6 +127,10 @@ but are not instructions for the current app.
 
 ## Documentation change log
 
+- **2026-10-04:** Refreshed canonical world/BEV support and continuity, optical-Z
+  registration, selected native baseline, Menon structural mapping and RGB
+  review connections. Retired camera-marker instructions; archived dated
+  producer replay reports while preserving their results and private evidence.
 - **2026-08-26:** Consolidated runtime history under one root archive, moved
   completed DS9 native-port work orders into the plans archive, retired active
   DS8 visuals and nested archive policy files, and aligned current MV3DT status

@@ -1,5 +1,5 @@
 # Depth stack flow
-_Status: canonical native DS9.1 depth topology, updated 2026-08-15._
+_Status: canonical native DS9.1 depth topology, updated 2026-10-04._
 
 DS9.1 has two GPU-first full-frame depth branches: always-on DAv2 supplies
 tracking observations, while gated MapAnything supplies dense snapshots, RPCs,
@@ -109,6 +109,11 @@ geometry.
 - Calibration: `calibration-bundle` (intrinsics/extrinsics/align) is served on connect and cached on the storage manager for world projections and floorplans.
 - Registration: baseline startup loads the read-only DAv2→MapAnything
   registration artifact and validates every active camera before activation.
+- Registration uses camera optical Z and exact PCF/camera/world provenance.
+  Static PCF pixels can align room scale, never measure an occluding person.
+  Weighted isotonic fits preserve unsupported/flat-domain rejection. The current
+  replacement remains review-only until occupied evidence qualifies it; see
+  [`universal_world_localization.md`](universal_world_localization.md#depth-registration-boundary).
 - Floorplan grid convention: columns increase in camera-local `X`; row 0 is farthest forward `Z`; rows advance toward the camera. The `image_flip` field is diagnostic-only and should not be reapplied by renderers.
 
 ## Related Docs

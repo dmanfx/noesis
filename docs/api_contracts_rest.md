@@ -1,5 +1,5 @@
 # DS9.1 REST API contracts
-_Status: canonical native-host contract, updated 2026-08-15._
+_Status: canonical native-host contract, updated 2026-10-04._
 
 This document describes the REST endpoints used by the DS9.1 runtime. Implementations must preserve these contracts unless all consumers are updated in lockstep.
 
@@ -116,6 +116,13 @@ supervisor supplies a fixed health-authority digest through
 `state_release_id` names the installed state baseline. The response deliberately
 does not rehash the checkout or state on every health read.
 
+`software_revision` is the declared startup health identity, not proof that a
+development checkout's current HEAD or every loaded Python file matches it.
+For the explicit Menon native-presentation path, exact configured producer-file
+hashes and built frontend assets bind the actual implementation separately.
+Inspect those and the process/config before making source or model claims;
+committing documentation does not itself restart or replace the producer.
+
 ## Scene releases
 
 The `/api/v1/scenes` surface owns immutable coherent reconstruction releases:
@@ -158,6 +165,12 @@ native DS9.1 baseline and disabled V3DT adapter use this same shared router and
 store implementation.
 
 ### Whole-home PCF review assembly
+
+The following v3/v4 assembly routes retain a historical camera-anchored review
+contract. They are not the current Menon checkbox's placement authority. The
+served `Whole home PCF overlay` now uses the RGB tracking-review descriptor
+below and exact per-room structural presentations; it does not fall back to a
+global marker fit or manual nudge.
 
 The Room Walk service may expose one explicitly selected, review-only multi-room
 PCF sidecar for the current authored scene:
@@ -239,6 +252,16 @@ geometry used to build the mesh before replaying its recorded room transforms.
 It neither approves rejected room joins nor changes world localization, scene
 release selection, or calibration. Menon exposes the two GET routes only to
 owners; canonical snapshots remain the sole people authority.
+
+The same verified RGB descriptor also supplies the current authored-home
+overlay. Menon maps each exact owner-named room subtree through
+`scene_from_world * inverse(assembly_from_world)`, using that target frame's
+current `world_frame_presentation` bound to the staged authored model. GLB node
+transforms are preserved once; stale calibration hides the layer and triggers
+a restage. Low/high switching in the standalone viewer retains the same room
+edges and canonical people. Neither view makes the rejected joined geometry
+canonical. The current all-room structural presentation is owner-selected and
+unqualified; Family/Kitchen opening holdouts remain visible evidence.
 
 ## 1. Depth API
 

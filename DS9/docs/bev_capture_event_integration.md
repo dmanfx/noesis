@@ -1,7 +1,7 @@
 # BEV and capture-event integration
 
-Status: active native DS9.1 contract, including PCF tracking pairing,
-2026-08-15.
+Status: active native DS9.1 contract, including PCF tracking pairing and
+measured support/continuity, 2026-10-04.
 
 ## Shared ownership
 
@@ -91,6 +91,13 @@ a client delivery acknowledgement.
 - Inline BEV/PCF: `camera_local_ground_m`.
 - Projection happens only at the BEV boundary using accepted calibration and
   active floorplan authority.
+- Full canonical XYZ and full covariance cross the same display basis before
+  the top-down height axis is dropped. Normal footpoints retain
+  `worldElevationM`, display `covarianceXZ` and optional full `supportSurface`.
+- `worldAdmission` distinguishes accepted measurements, predictions and holds.
+  Lifecycle presence does not imply measurement freshness. Holds cannot append
+  trails; authoritative segment/support changes break them, and an accepted
+  measured support transition forces its exact paired cohort immediately.
 - Registered DAv2 depth is usable only when status, registration, finite
   positive depth, and tolerance checks all pass.
 

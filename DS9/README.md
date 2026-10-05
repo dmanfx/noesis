@@ -38,12 +38,15 @@ port ownership without opening the cameras.
 
 ## Canonical lane
 
-- YOLO26-m FP16 detector.
+- YOLO26 FP16 detector; M is the base config, while the currently configured
+  native service selects L with `--model-size l`.
 - Native ROI exclusion and NvDCF baseline tracking.
 - Swin Tiny ReID and YOLO26 pose.
 - Always-on DAv2 metric object/tracking depth.
 - Request-gated MapAnything FP32 full-frame depth.
 - Canonical observation/world/identity publication.
+- Surface-aware ground footprints with full XYZ, covariance and explicit
+  measured/predicted/held continuity; measured geometry stays revision-bound.
 - Tiled OSD followed by one H.264 encode and private SHM/WebRTC delivery.
 - JSON BEV in `camera_local_ground_m`; no BEV JPEG stream.
 - RTSP output disabled.

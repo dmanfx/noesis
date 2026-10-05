@@ -1,5 +1,46 @@
 # Noesis upgrade history
 
+## 2026-10-04 — Producer work consolidated and current docs refreshed
+
+- Committed measured support contracts/geometry and explicit canonical position
+  state/continuity (`a06987a`), isotonic fitting and PCF-relative depth review
+  (`e77c049`), and native surface-aware producer/BEV integration (`821b115`).
+  The room-specific measurement and finite patch are source calibration data;
+  no generic rise or room offset was introduced. Active depth selection is
+  unchanged; replacement occupied registration remains unqualified.
+- Committed RoomWalk floor/prior/provenance repairs (`b570724`) and the
+  bound-photo coherent-surface review exporter (`4eaff64`). Sixty-eight focused
+  phone checks pass; outputs remain review-only and preserve source geometry.
+- Committed bounded capture, exact-cohort review, before/after comparison and
+  retained canonical-fusion utilities (`16567e7`). Input/allocation/work limits
+  fail explicitly rather than dropping cohorts; approximate video seek and
+  independent physical-accuracy limits remain visible in the reports.
+- Refreshed current Noesis/DS9/core/PCF/BEV/depth/scene docs and archived the
+  dated September producer replay reports. Their capture-era SV3DT selection,
+  Menon exclusion and uncommitted status describe those deliveries, not the
+  current non-SV3DT service or completed Menon integration.
+- Functional checks of affected producer/contracts/BEV pass; three older marker
+  tests now assert retirement. Two existing timing budgets fail on the occupied
+  host, including a bounded in-memory run with the pre-consolidation fusion and
+  world-service sources. No thresholds or runtime capabilities were reduced;
+  this does not establish a new isolated performance baseline.
+- Preserved private captures, generated builds, local configuration and
+  concurrent work. No push, runtime replacement or documentation-only restart.
+
+## 2026-10-04 — Whole-home PCF overlay uses active room presentations
+
+- Wired the served Menon checkbox to the verified RGB tracking descriptor and
+  each room's exact structural world-frame presentation. The transform is
+  `scene_from_world * inverse(assembly_from_world)`; GLB node transforms are
+  preserved once, and calibration changes revoke/restage stale geometry.
+- Served browser checks loaded all three rooms and preserved saved preferences.
+  Current mesh/world coordinate parity was within floating-point error; the
+  sampled current snapshots were empty. Reused occupied consumer evidence does
+  not prove new physical accuracy. Family/Kitchen opening holdouts still fail,
+  and the selected all-room presentation remains structurally unqualified.
+- The independent temporary PCF viewer retains both low/high RGB mesh choices.
+  Camera-marker alignment and manual global-offset authority are not restored.
+
 ## 2026-10-04 — Updated-model all-room structural presentation
 
 - Selected the reviewed updated-model Living, Family and Kitchen fits. The
@@ -16,6 +57,30 @@
   the retired global marker matrix, and complete runtime bundles clear stale
   presentation state. Private evidence and concurrent localization work are
   excluded from these scoped source commits.
+
+## 2026-10-04 — Fresh phone-only reconstruction and photo-surface diagnosis
+
+- Diagnosed RGB blotching in the retained all-view preview as competing depth
+  sheets amplified by changing exposure, rather than corrupt RGB/frame binding.
+  Reconstructed an exact fresh shared DA3/conditioned-MapAnything phone cohort;
+  preserved the independent masked static alignment and heldout boundary.
+- Added a bounded single-room photo exporter with exact source checks,
+  depth-visible adjacent photo labels, explicit neutral fallback, unlit materials,
+  and measured-overlap photometric validation. Export preserves every supported
+  input triangle and original photographs. This is an offline review tool.
+- Fixed automatic floor selection incorrectly accepting a dominant wall whose
+  camera distance happened to pass the height check. Measured plane candidates
+  now also require pose-up agreement; all existing independent alignment gates
+  remain intact. Corrected DA3-carrier pose-graph provenance separately.
+- Fixed the raw-versus-processed sparse-prior minimum: official cropping could
+  leave fewer than 500 samples despite the raw-grid top-up. Missing samples now
+  come only from identically processed, already reliable DA3 depths; existing
+  samples, RGB, camera inputs and the final 500-sample gate are preserved.
+- Larger joint/window reconstructions and strict surface exports are evaluated,
+  not presumed better. Fresh alignment passing does not establish a solid mesh
+  or improved physical accuracy: independent depth results remain mixed, and
+  rendered holes/seams remain explicit failed-candidate evidence. No live
+  calibration, reconstruction selector, world or tracking authority is admitted.
 
 ## 2026-10-04 — Kitchen offline structural evidence extraction
 
@@ -105,6 +170,94 @@
 
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
+
+## 2026-10-01 — Current baseline tracking integrated into served Menon
+
+- Canonical snapshots now distinguish measured, predicted and held positions,
+  with authoritative entity-local continuity segments and revision-bound
+  support geometry on entities and source evidence. Lifecycle presence no
+  longer impersonates a fresh localization measurement. No validity gates or
+  backend position estimates were weakened or replaced.
+- Menon consumes the current target-frame presentations, transforms full XYZ,
+  velocity and covariance once, and resets delayed non-extrapolating playback
+  and trails across incompatible support/continuity/frame transitions. The
+  newer Presence, posture, uncertainty, footprints and owner evidence remain.
+- A measured scene-only registration removes demonstrated vertical floor
+  mismatch in the authored model. A parent-derived Foyer slab represents the
+  measured 0.1905 m rise. Registration and model hashes are bound together;
+  existing XZ/yaw camera registration remains inherited, not independently
+  requalified physical room accuracy.
+- Current fusion replay of the retained paired, July and multi-person producer
+  observations retains identical entity sets and positions. Menon admits
+  12,986 entity observations; 5,582 exact producer/BEV heads have coordinate
+  parity within floating-point tolerance. A current occupied capture admits
+  another 138 measured entity observations, with 100 exact BEV joins. Scene
+  elevation is 0 or 17.627972669462153 authored units, representing the two
+  measured floor levels. These are contract/coordinate checks, not independent
+  physical ground truth.
+- The existing Menon gateway now serves the integrated development build via
+  an explicit native-presentation binding to the actual current Noesis files.
+  The existing Noesis service remains baseline/non-SV3DT from the development
+  checkout with unchanged model/configuration, calibration, measured surfaces
+  and active depth registration. No older paired release was selected. The
+  authenticated main application mounts its promoted scene and live canonical
+  people; retained presentation and live visual evidence remain owner-private.
+- Menon changes are committed separately; Noesis changes remain uncommitted.
+  SV3DT, backend gait changes, jitter polish and broader depth qualification
+  remain outside this integration.
+
+## 2026-09-29 UTC — Measured foyer plane and PCF-relative depth reassessment
+
+- The non-SV3DT baseline now loads the owner's measured 0.1905 m parallel
+  upper-floor patch, with visible-image extent, PCF coverage and exact revision
+  binding. The height is calibration data, not a generic tracking constant.
+  No map offset or invented slope was applied. The earlier image estimate's
+  37.2 mm discrepancy remains an edge/camera-binding investigation limit.
+- Corrected upright body-plane solving, measured-level publication timing,
+  support identity in publication watermarks and full XYZ in inferred-motion
+  origins/deltas/proofs. Fixed a registered-depth covariance shadowing error.
+  Canonical admission checks and surface-transition gates remain intact.
+- Added review-only MapAnything-to-PCF registration. Held-out static optical-Z
+  disagreement falls to about 0.10 m median; a separate static DAv2 affine fit
+  has 0.181 m median held-out disagreement and 0.344 m on four occupied pixels.
+  These demonstrate reconstruction consistency, not physical accuracy. Sparse
+  far-range and capture-disjoint occupied support prevent active replacement;
+  a broad manual room survey is no longer treated as prerequisite.
+- Corrected native paired, July and multi-person replays exited cleanly;
+  281 focused tests passed and 47 source/BEV stills were inspected selectively.
+  Paired valid-world heads are 3,207/3,207. Multi-person exact joined cohorts
+  retain all 1,382 valid heads (one trailing tracking cohort was not captured
+  with its BEV). July emits 993/1,046, retaining 53 existing-policy display-guard
+  exclusions. Emitted-coordinate parity is exact, not proof of accuracy.
+- Original selected live SV3DT runtime restored; no SV3DT or Menon
+  implementation, gait changes, commit or push. See the
+  [dated evidence and remaining work](../plans/archive/completed/person_ground_pcf_reassessment_results_20260929.md).
+
+## 2026-09-28 — Baseline support-surface and BEV geometry contracts
+
+- Added revision-bound finite measured support surfaces to the non-SV3DT
+  localization path. Rays, resolver, canonical continuation and fusion preserve
+  the selected plane and extent; incompatible floors do not average together.
+  Plane-constrained covariance retains residual uncertainty. No new surface is
+  enabled without independent measured calibration evidence.
+- BEV now transforms full XYZ and covariance before dropping display height,
+  and carries support identity/elevation/covariance in normal footpoints.
+  Holds and predictions do not impersonate fresh covariance measurements.
+- Fixed one-sided cumulative-maximum depth fitting with weighted isotonic
+  pooling; flat-domain and independent metric-evidence gates remain intact.
+  Existing active depth artifacts were not overwritten.
+- Direct baseline producer/BEV replays cover the paired walk, July walking
+  recordings and multi-person room recordings. Paired and multi-person exact
+  cohorts have 3,090/3,090 and 1,505/1,505 valid-world BEV heads respectively;
+  July has 832/868, with 36 Living Room display-guard exclusions. Coordinate
+  transform parity is exact for emitted heads; this is not physical accuracy.
+- Image-edge metrology supports a local approximately 0.153 m riser, but the
+  retained depth/phone data does not qualify a full upper-floor plane or new
+  occupied metric-depth mapping. Historical camera framing and occlusions
+  remain meaningful limits. See the [work orders](../plans/person_ground_accuracy_implementation.md)
+  and [direct results](../plans/archive/completed/person_ground_accuracy_results_20260928.md).
+- Existing selected native runtime restored. Menon, SV3DT implementation and
+  gait-aware placement remain out of scope. No commit or push performed.
 
 ## 2026-09-27 — SV3DT occlusion box and pose-confidence correction
 

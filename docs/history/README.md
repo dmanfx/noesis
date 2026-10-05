@@ -13,6 +13,8 @@ chronology, rationale, provenance, or forensics.
   including the DS9 native-port bridge reports.
 - [`experiments/`](experiments/README.md): completed or rejected model,
   pipeline, and feature investigations that are not the current baseline.
+  Includes the [May/June virtual-twin builder record](experiments/virtual_twin_reconstruction_20260503.md),
+  replaced by current PCF/scene authority guidance.
 - `upgrade_projects/`: completed implementation records retained for provenance,
   including the initial MapAnything integration.
 - `debug/`: dated troubleshooting diaries retained for forensics, not current

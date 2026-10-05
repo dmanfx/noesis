@@ -1,6 +1,7 @@
 # Native DeepStream 9.1 runtime baseline
 
-Status: accepted application baseline, updated 2026-08-25.
+Status: selected native baseline, checked 2026-10-04. Dated performance
+measurements below retain their original model/config context.
 
 ## Platform
 
@@ -24,14 +25,23 @@ does not use Docker, a deployment selector, or a container filesystem.
 - Config: `DS9/config/infer.yaml`.
 - Cameras: Living Room, Kitchen, Family Room via `nvurisrcbin`.
 - Batch: 3 at 1920×1080, live input, 40 ms mux timeout.
-- Detector: YOLO26-m FP16, GIE 1.
+- Detector: YOLO26 FP16, GIE 1. The current configured service passes
+  `--model-size l`; the checked-in base config and older performance reference
+  use M. Read the service command and selected realization, not a document
+  label, before replaying or maintaining engines.
 - Tracker: NvDCF baseline.
 - ReID: Swin Tiny, 256-dimensional embedding, GIE 3.
 - Pose: YOLO26-n pose, GIE 4.
-- Tracking depth: DepthAnythingV2 metric, always on, GIE 5.
+- Tracking depth: DepthAnythingV2, always on, GIE 5. Its optical-Z samples need
+  validated registration to room scale; a model label is not independent
+  physical accuracy.
 - Person world localization: universal typed floor/depth hypothesis resolver
   with full covariance, conservative PCF evidence, then the shared
   `PersonGroundState`; no room-specific localization policy.
+- Measured support: `support_surfaces.path` selects the finite Living Room
+  upper-floor patch in `DS9/config/support_surfaces.json`, derived from the
+  owner's 0.1905 m parallel-floor rise and bound imagery/PCF extent. Generic
+  logic contains no fixed rise. Other regions retain their calibrated plane.
 - Manual/full-frame depth: MapAnything FP32, request-gated, GIE 2.
 - Analytics: native ROI exclusion followed by `nvdsanalytics`.
 - Output: one 3840×720 H.264 mosaic through SHM/WebRTC.
@@ -45,6 +55,21 @@ does not use Docker, a deployment selector, or a container filesystem.
 
 MV3DT, V3DT activation, and AMC are not part of this baseline. Assets/configs
 for future experiments do not constitute an enabled capability.
+
+## Canonical presentation
+
+`world_snapshot` carries full XYZ, covariance, measured support, explicit
+`position_state` and `continuity_segment_id`. BEV and Menon consume this
+producer authority, not display-derived measurements. Menon uses one exact
+target-revision-owned room similarity for points, velocity and covariance;
+camera-marker alignment is retired. The whole-home PCF overlay uses those same
+room mappings while the temporary RGB viewer retains selectable low/high meshes.
+See [`structural_scene_registration.md`](structural_scene_registration.md).
+
+The current owner-selected all-room intermediate remains structurally
+unqualified: Family/Kitchen opening holdouts still fail. It does not change
+camera K/E, admitted PCF metric frames or BEV localization. Replacement depth
+registration is review-only until adequate current occupied evidence passes.
 
 ## Model realization
 

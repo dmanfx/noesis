@@ -19,6 +19,28 @@ Public tracks include:
 - nonnegative stream-relative `media_pts_ns`, never represented as Unix time;
 - stable identity and visitor generation where applicable.
 
+## Position, support and continuity
+
+The baseline producer resolves one `ground_footprint` in `backend_world_m`.
+Current typed hypotheses may reference finite measured support planes bound to
+the exact camera, calibration, frame revision and transform. Unknown/different
+supports do not fuse into an intermediate elevation. Predictions and holds
+retain the committed support and cannot establish a new floor.
+
+Canonical entities publish `support_surface`, full XYZ/covariance,
+`position_state` (`measured`, `predicted`, `held`) and
+`continuity_segment_id`; source evidence preserves its own position truth.
+Lifecycle presence is independent of measurement freshness. An accepted support
+or authoritative continuity change breaks trails and resets Menon's delayed
+interpolation. Held coordinates stay exact. None of these display consumers
+becomes a second position estimator.
+
+BEV transforms canonical XYZ and covariance into its declared basis before
+dropping height. Menon applies the target frame's single validated structural
+presentation, including linear velocity and A Sigma A^T covariance. Diagnostic
+PCF meshes/camera markers cannot replace missing canonical evidence. See
+[`universal_world_localization.md`](../../docs/universal_world_localization.md).
+
 ## Transactional publication
 
 For each publishable frame:

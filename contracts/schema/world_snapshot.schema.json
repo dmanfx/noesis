@@ -65,6 +65,15 @@
       "title": "Matrix3",
       "type": "object"
     },
+    "PositionState": {
+      "enum": [
+        "measured",
+        "predicted",
+        "held"
+      ],
+      "title": "PositionState",
+      "type": "string"
+    },
     "ProducerRef": {
       "additionalProperties": false,
       "properties": {
@@ -171,6 +180,73 @@
       "title": "SubjectRef",
       "type": "object"
     },
+    "SupportSurfaceReference": {
+      "additionalProperties": false,
+      "description": "Compact selected-plane identity for a canonical world measurement.",
+      "properties": {
+        "extent_xz": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "maxItems": 64,
+          "minItems": 3,
+          "title": "Extent Xz",
+          "type": "array"
+        },
+        "normal_world": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Normal World",
+          "type": "array"
+        },
+        "offset_m": {
+          "title": "Offset M",
+          "type": "number"
+        },
+        "revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Revision",
+          "type": "string"
+        },
+        "surface_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Surface Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "surface_id",
+        "revision",
+        "normal_world",
+        "offset_m",
+        "extent_xz"
+      ],
+      "title": "SupportSurfaceReference",
+      "type": "object"
+    },
     "Vector3": {
       "additionalProperties": false,
       "properties": {
@@ -230,6 +306,19 @@
           "default": null,
           "title": "Conflict Reason"
         },
+        "continuity_segment_id": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Continuity Segment Id"
+        },
         "covariance": {
           "anyOf": [
             {
@@ -271,6 +360,17 @@
           "default": "ground_footprint",
           "title": "Position Quantity",
           "type": "string"
+        },
+        "position_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "posture": {
           "default": "unknown",
@@ -323,6 +423,17 @@
           ],
           "title": "Support State",
           "type": "string"
+        },
+        "support_surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupportSurfaceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "velocity_mps": {
           "anyOf": [
@@ -424,6 +535,48 @@
         "position": {
           "$ref": "#/$defs/Vector3"
         },
+        "position_quality": {
+          "anyOf": [
+            {
+              "enum": [
+                "good",
+                "estimated",
+                "held"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Quality"
+        },
+        "position_source": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Source"
+        },
+        "position_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "rejection_reason": {
           "anyOf": [
             {
@@ -436,6 +589,17 @@
           ],
           "default": null,
           "title": "Rejection Reason"
+        },
+        "support_surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupportSurfaceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "world_frame": {
           "const": "backend_world_m",

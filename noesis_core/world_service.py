@@ -21,6 +21,7 @@ from noesis_core.contracts.observation import (
 )
 from noesis_core.contracts.world import EntityLifecycle, WorldEntity, WorldEvent, WorldSnapshot
 from noesis_core.contracts.world_measurement import WorldMeasurementCandidateDiagnostic
+from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis_core.depth_contract import usable_registered_depth_m
 from noesis_core.journal import (
     AsyncContractJournal,
@@ -28,6 +29,7 @@ from noesis_core.journal import (
     ContractJournal,
 )
 from noesis_core.world import GlobalWorldFusion
+from noesis_core.world.support_surfaces import contains_xz
 
 
 _WORLD_DIAGNOSTIC_TRACK_FIELDS = frozenset(
@@ -156,6 +158,7 @@ class _CanonicalOutputOrigin:
     media_pts_ns: int
     trail_segment_id: int
     committed_world_source: str
+    support_surface: SupportSurfaceReference | None = None
     committed_provenance_type: str | None = None
     metric_position: tuple[float, float, float] | None = None
     metric_media_pts_ns: int | None = None
@@ -177,6 +180,7 @@ class _CanonicalTrackOutput:
     media_pts_ns: int
     trail_segment_id: int
     committed_world_source: str
+    support_surface: SupportSurfaceReference | None = None
     committed_provenance_type: str | None = None
     metric_position: tuple[float, float, float] | None = None
     metric_media_pts_ns: int | None = None
@@ -622,6 +626,7 @@ class CanonicalWorldService:
                                 committed_world_source=(
                                     previous_output.committed_world_source
                                 ),
+                                support_surface=previous_output.support_surface,
                                 committed_provenance_type=(
                                     previous_output.committed_provenance_type
                                 ),
@@ -670,6 +675,7 @@ class CanonicalWorldService:
                             media_pts_ns=media_pts_ns,
                             trail_segment_id=trail_segment_id,
                             committed_world_source=world_source,
+                            support_surface=observation.payload.world.support_surface,
                             committed_provenance_type=(
                                 committed_provenance_type or None
                             ),
@@ -1645,6 +1651,7 @@ class CanonicalWorldService:
                 media_pts_ns=int(expected_origin.media_pts_ns),
                 trail_segment_id=int(expected_origin.trail_segment_id),
                 committed_world_source=expected_origin.committed_world_source,
+                support_surface=expected_origin.support_surface,
                 committed_provenance_type=(
                     expected_origin.committed_provenance_type
                 ),
@@ -1713,6 +1720,51 @@ class CanonicalWorldService:
             )
             is not None
         )
+
+    @staticmethod
+    def _support_plane_elevation(
+        surface: SupportSurfaceReference, x: float, z: float,
+    ) -> float:
+        nx, ny, nz = surface.normal_world
+        return -(nx * x + nz * z + surface.offset_m) / ny
+
+    @staticmethod
+    def _point_matches_support_plane(
+        surface: SupportSurfaceReference, point: tuple[float, float, float],
+    ) -> bool:
+        nx, ny, nz = surface.normal_world
+        residual = nx * point[0] + ny * point[1] + nz * point[2] + surface.offset_m
+        return (
+            math.isfinite(residual)
+            and abs(residual) <= 1e-8
+            and contains_xz(surface, point[0], point[2])
+        )
+
+    @classmethod
+    def _continuation_support_surface(
+        cls,
+        track: Mapping[str, Any],
+        expected_origin: _CanonicalTrackOutput | None,
+    ) -> tuple[bool, SupportSurfaceReference | None]:
+        """A continuation can only retain the last accepted plane identity."""
+
+        if expected_origin is None:
+            return False, None
+        payload = track.get("world_support_surface")
+        if payload is None:
+            surface = None
+        else:
+            try:
+                surface = SupportSurfaceReference.model_validate(payload)
+            except (TypeError, ValueError):
+                return False, None
+        if surface != expected_origin.support_surface:
+            return False, None
+        if surface is not None and not cls._point_matches_support_plane(
+            surface, expected_origin.position,
+        ):
+            return False, None
+        return True, surface
 
     @classmethod
     def _matched_inferred_ground_restart_origin(
@@ -1938,6 +1990,11 @@ class CanonicalWorldService:
 
         if expected_origin is None:
             return False
+        support_valid, support_surface = cls._continuation_support_surface(
+            track, expected_origin,
+        )
+        if not support_valid:
+            return False
         process_observation = provenance.get("process_observation")
         transition = provenance.get("filter_transition")
         if (
@@ -2074,22 +2131,27 @@ class CanonicalWorldService:
             or origin_trail_segment_id != track_trail_segment_id
         ):
             return False
-        if not cls._matches_committed_output_origin(
+        matched_origin = cls._matched_committed_output_origin(
             expected_origin,
             origin_point=origin_point,
             origin_media_pts_ns=origin_media_pts_ns,
             origin_trail_segment_id=origin_trail_segment_id,
             current_media_pts_ns=current_media_pts_ns,
-        ):
+            maximum_age_s=cls.IMAGE_MOTION_COMMITTED_ORIGIN_HISTORY_HORIZON_S,
+        )
+        if matched_origin is None or matched_origin.support_surface != support_surface:
             return False
-        # Every vector describes the same calibrated ground plane.
-        if not all(
-            math.isclose(
-                point[1],
-                world_point[1],
-                rel_tol=0.0,
-                abs_tol=1e-9,
-            )
+        if support_surface is not None:
+            if not all(
+                cls._point_matches_support_plane(support_surface, point)
+                for point in (
+                    world_point, process_point, filter_point, origin_point,
+                    base_point, expected_origin.position,
+                )
+            ):
+                return False
+        elif not all(
+            math.isclose(point[1], world_point[1], rel_tol=0.0, abs_tol=1e-9)
             for point in (process_point, origin_point, base_point)
         ):
             return False
@@ -2138,7 +2200,14 @@ class CanonicalWorldService:
             expected_filter_point = (
                 base_point[0]
                 + expected_scale * (process_point[0] - base_point[0]),
-                base_point[1],
+                (
+                    cls._support_plane_elevation(
+                        support_surface,
+                        base_point[0] + expected_scale * (process_point[0] - base_point[0]),
+                        base_point[2] + expected_scale * (process_point[2] - base_point[2]),
+                    )
+                    if support_surface is not None else base_point[1]
+                ),
                 base_point[2]
                 + expected_scale * (process_point[2] - base_point[2]),
             )
@@ -2210,7 +2279,14 @@ class CanonicalWorldService:
         expected_posterior = (
             base_point[0]
             + position_gain * (filter_point[0] - base_point[0]),
-            base_point[1],
+            (
+                cls._support_plane_elevation(
+                    support_surface,
+                    base_point[0] + position_gain * (filter_point[0] - base_point[0]),
+                    base_point[2] + position_gain * (filter_point[2] - base_point[2]),
+                )
+                if support_surface is not None else base_point[1]
+            ),
             base_point[2]
             + position_gain * (filter_point[2] - base_point[2]),
         )
@@ -2323,6 +2399,9 @@ class CanonicalWorldService:
                 cls.IMAGE_MOTION_MAX_SPEED_MPS * age_s
                 + cls.IMAGE_MOTION_PROJECTIVE_SLACK_M
             )
+            _, support_surface = cls._continuation_support_surface(
+                track, expected_origin,
+            )
             return bool(
                 all(
                     math.isfinite(value)
@@ -2349,6 +2428,12 @@ class CanonicalWorldService:
                     abs_tol=1e-9,
                 )
                 and 0.0 <= world_delta_m <= world_delta_limit_m + 1e-9
+                and (
+                    support_surface is None
+                    or cls._point_matches_support_plane(
+                        support_surface, projective_origin_point,
+                    )
+                )
             )
 
         if provenance_type != "inferred_ground_process_observation":
@@ -2954,6 +3039,11 @@ class CanonicalWorldService:
 
         if expected_origin is None:
             return False
+        support_valid, support_surface = cls._continuation_support_surface(
+            track, expected_origin,
+        )
+        if not support_valid:
+            return False
         source = str(track.get("world_source") or "").strip().lower()
         if source not in {"cv_prediction", "anchor_hold"}:
             return False
@@ -3257,11 +3347,13 @@ class CanonicalWorldService:
                             evidence_candidate_point,
                         )
                     )
-                    and math.isclose(
-                        candidate_point[1],
-                        world_point[1],
-                        rel_tol=0.0,
-                        abs_tol=1e-6,
+                    and (
+                        cls._point_matches_support_plane(support_surface, candidate_point)
+                        if support_surface is not None
+                        else math.isclose(
+                            candidate_point[1], world_point[1],
+                            rel_tol=0.0, abs_tol=1e-6,
+                        )
                     )
                     and output_distance_m
                     <= cls.UPRIGHT_PRESENCE_MAX_OUTPUT_DISTANCE_M
@@ -3368,7 +3460,7 @@ class CanonicalWorldService:
             current_media_pts_ns=current_media_pts_ns,
             maximum_age_s=origin_horizon_s,
         )
-        if matched_origin is None:
+        if matched_origin is None or matched_origin.support_surface != support_surface:
             return False
         if provenance_type == "bounded_output_hold" and not (
             origin_trail_segment_id
@@ -3456,14 +3548,21 @@ class CanonicalWorldService:
             for left, right in zip(base_point, origin_point)
         ):
             return False
-        if not all(
+        if support_surface is not None:
+            if not all(
+                cls._point_matches_support_plane(support_surface, point)
+                for point in (
+                    world_point, posterior_point, process_point, origin_point,
+                    metric_origin_point, base_point, expected_origin.position,
+                    expected_metric_position,
+                )
+            ):
+                return False
+        elif not all(
             math.isclose(point[1], world_point[1], rel_tol=0.0, abs_tol=1e-9)
             for point in (
-                posterior_point,
-                process_point,
-                origin_point,
-                metric_origin_point,
-                base_point,
+                posterior_point, process_point, origin_point,
+                metric_origin_point, base_point,
             )
         ):
             return False
@@ -3503,7 +3602,14 @@ class CanonicalWorldService:
                 return False
         expected_posterior = (
             base_point[0] + position_gain * (process_point[0] - base_point[0]),
-            base_point[1],
+            (
+                cls._support_plane_elevation(
+                    support_surface,
+                    base_point[0] + position_gain * (process_point[0] - base_point[0]),
+                    base_point[2] + position_gain * (process_point[2] - base_point[2]),
+                )
+                if support_surface is not None else base_point[1]
+            ),
             base_point[2] + position_gain * (process_point[2] - base_point[2]),
         )
         if not all(
@@ -3677,6 +3783,14 @@ class CanonicalWorldService:
             if support_raw in {"floor", "seat", "couch", "unknown"}
             else "unknown"
         )
+        support_surface = None
+        if track.get("world_support_surface") is not None:
+            try:
+                support_surface = SupportSurfaceReference.model_validate(track["world_support_surface"])
+            except (TypeError, ValueError):
+                return None
+            if not self._point_matches_support_plane(support_surface, position):
+                return None
         return WorldPositionObservation(
             position=Vector3(x=position[0], y=position[1], z=position[2]),
             covariance=Matrix3(values=covariance),
@@ -3688,6 +3802,7 @@ class CanonicalWorldService:
             calibration_revision=calibration_revision,
             quantity="ground_footprint",
             support_state=support_state,  # type: ignore[arg-type]
+            support_surface=support_surface,
             posture=posture,  # type: ignore[arg-type]
             source=str(track.get("world_source") or "unspecified"),
             quality=quality,  # type: ignore[arg-type]

@@ -18,12 +18,19 @@ from .base import (
 )
 from .identity import SubjectRef
 from .observation import ZoneSource
+from .support_surface import SupportSurfaceReference
 
 
 class EntityLifecycle(StrEnum):
     PRESENT = "present"
     HELD = "held"
     LOST = "lost"
+
+
+class PositionState(StrEnum):
+    MEASURED = "measured"
+    PREDICTED = "predicted"
+    HELD = "held"
 
 
 class WorldSourceEvidence(ContractModel):
@@ -39,6 +46,10 @@ class WorldSourceEvidence(ContractModel):
     world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
     world_transform_sha256: Sha256 | None = None
     calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    support_surface: SupportSurfaceReference | None = None
+    position_source: str | None = Field(default=None, min_length=1, max_length=120)
+    position_quality: Literal["good", "estimated", "held"] | None = None
+    position_state: PositionState | None = None
     accepted: bool
     rejection_reason: str | None = Field(default=None, max_length=200)
 
@@ -89,12 +100,15 @@ class WorldEntity(ContractModel):
     lifecycle: EntityLifecycle
     position: Vector3 | None = None
     covariance: Matrix3 | None = None
+    position_state: PositionState | None = None
+    continuity_segment_id: int | None = Field(default=None, ge=0)
     world_frame: Literal["backend_world_m"] = "backend_world_m"
     world_frame_revision: str | None = Field(default=None, min_length=1, max_length=200)
     world_transform_sha256: Sha256 | None = None
     calibration_revision: str | None = Field(default=None, min_length=1, max_length=200)
     position_quantity: Literal["ground_footprint"] = "ground_footprint"
     support_state: Literal["floor", "seat", "couch", "unknown"] = "unknown"
+    support_surface: SupportSurfaceReference | None = None
     posture: Literal["standing", "sitting", "lying", "unknown"] = "unknown"
     velocity_mps: Vector3 | None = None
     room_id: str | None = Field(default=None, min_length=1, max_length=160)

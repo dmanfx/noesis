@@ -1,17 +1,127 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
 from noesis_core.contracts.base import ArtifactFingerprint, Matrix3, ProducerRef, Vector3
 from noesis_core.contracts.identity import IdentityKind, SubjectRef, TrackletRef
 from noesis_core.contracts.observation import ObservationEnvelope, PersonObservation, WorldPositionObservation
-from noesis_core.contracts.world import EntityLifecycle
+from noesis_core.contracts.world import EntityLifecycle, PositionState
+from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis_core.world import GlobalWorldFusion, ObservationOrderError, WorldFusionConfig
 
 
 SHA = "a" * 64
+
+
+def test_global_fusion_retains_surface_instead_of_averaging_levels():
+    fusion = GlobalWorldFusion(producer=_world_producer())
+    for camera, source, level in (("a", 0, 0.), ("b", 1, .18)):
+        observation = _observation(camera, source, 1, 1_000_000, 1.,
+                                   world_frame_revision="measured-room", world_transform_sha256=SHA)
+        surface = SupportSurfaceReference(surface_id=camera, revision="survey-1",
+                                          normal_world=(0., 1., 0.), offset_m=-level,
+                                          extent_xz=((-20., -20.), (20., -20.), (20., 20.), (-20., 20.)))
+        world = observation.payload.world.model_copy(update={
+            "position": Vector3(x=1., y=level, z=2.), "support_surface": surface})
+        observation = observation.model_copy(update={"payload": observation.payload.model_copy(update={"world": world})})
+        fusion.ingest(observation, _subject())
+    entity = fusion.snapshot(published_at_us=1_010_000).entities[0]
+    assert entity.position.y in (0., .18)
+    assert entity.support_surface is not None
+    assert entity.support_surface.offset_m == -entity.position.y
+    assert sum(source.accepted for source in entity.sources) == 1
+    assert any(source.rejection_reason == "support_surface_conflict" for source in entity.sources)
+    assert all(source.support_surface is not None for source in entity.sources)
+
+
+def test_global_fusion_rejects_ci_outside_support_extent_and_reports_sources():
+    fusion = GlobalWorldFusion(producer=_world_producer())
+    surface = SupportSurfaceReference(
+        surface_id="triangle", revision="survey-1",
+        normal_world=(0., 1., 0.), offset_m=0.,
+        extent_xz=((0., 0.), (1., 0.), (0., 1.)),
+    )
+    for camera, source, x, z, covariance, confidence in (
+        ("a", 0, .9, .05, (.01, 0., 0., 0., .01, 0., 0., 0., 1.), .98),
+        ("b", 1, .05, .9, (1., 0., 0., 0., .01, 0., 0., 0., .01), .90),
+    ):
+        observation = _observation(
+            camera, source, 1, 1_000_000, x, confidence=confidence,
+            covariance=covariance, world_frame_revision="measured-room",
+            world_transform_sha256=SHA,
+        )
+        world = observation.payload.world.model_copy(update={
+            "position": Vector3(x=x, y=0., z=z), "support_surface": surface,
+        })
+        observation = observation.model_copy(update={
+            "payload": observation.payload.model_copy(update={"world": world}),
+        })
+        fusion.ingest(observation, _subject())
+    entity = fusion.snapshot(published_at_us=1_010_000).entities[0]
+    assert entity.position == Vector3(x=.9, y=0., z=.05)
+    assert entity.support_surface == surface
+    assert entity.conflict
+    assert [source.camera_id for source in entity.sources if source.accepted] == ["a"]
+    assert next(source.rejection_reason for source in entity.sources if source.camera_id == "b") == (
+        "ci_position_outside_support_extent"
+    )
+
+
+def test_global_fusion_named_slope_propagates_horizontal_covariance_into_y():
+    fusion = GlobalWorldFusion(producer=_world_producer())
+    norm = math.sqrt(2.)
+    surface = SupportSurfaceReference(
+        surface_id="slope", revision="survey-1",
+        normal_world=(-1. / norm, 1. / norm, 0.), offset_m=0.,
+        extent_xz=((0., 0.), (2., 0.), (2., 2.), (0., 2.)),
+    )
+    observation = _observation(
+        "a", 0, 1, 1_000_000, .9,
+        covariance=(1., 0., 0., 0., .01, 0., 0., 0., .2),
+        world_frame_revision="measured-room", world_transform_sha256=SHA,
+    )
+    world = observation.payload.world.model_copy(update={
+        "position": Vector3(x=.9, y=.9, z=.05), "support_surface": surface,
+    })
+    fusion.ingest(observation.model_copy(update={
+        "payload": observation.payload.model_copy(update={"world": world}),
+    }), _subject())
+    entity = fusion.snapshot(published_at_us=1_010_000).entities[0]
+    assert entity.position.y == pytest.approx(entity.position.x)
+    assert entity.covariance.values[4] >= entity.covariance.values[0]
+    assert entity.covariance.values[1] == pytest.approx(1.)
+
+
+def test_out_of_extent_named_source_cannot_refresh_fused_entity_time():
+    fusion = GlobalWorldFusion(producer=_world_producer())
+    surface = SupportSurfaceReference(
+        surface_id="triangle", revision="survey-1",
+        normal_world=(0., 1., 0.), offset_m=0.,
+        extent_xz=((0., 0.), (1., 0.), (0., 1.)),
+    )
+    for camera, source, observed_at_us, x, z in (
+        ("a", 0, 1_000_000, .2, .2),
+        ("b", 1, 1_100_000, 2., 2.),
+    ):
+        observation = _observation(
+            camera, source, 1, observed_at_us, x,
+            world_frame_revision="measured-room", world_transform_sha256=SHA,
+        )
+        world = observation.payload.world.model_copy(update={
+            "position": Vector3(x=x, y=0., z=z), "support_surface": surface,
+        })
+        fusion.ingest(observation.model_copy(update={
+            "payload": observation.payload.model_copy(update={"world": world}),
+        }), _subject())
+    entity = fusion.snapshot(published_at_us=1_110_000).entities[0]
+    assert entity.observed_at_us == 1_000_000
+    assert entity.position == Vector3(x=.2, y=0., z=.2)
+    assert next(source.rejection_reason for source in entity.sources if source.camera_id == "b") == (
+        "position_outside_support_extent"
+    )
 
 
 def _producer(run_id: str = "source-run") -> ProducerRef:
@@ -1087,3 +1197,92 @@ def test_entity_is_held_then_expires() -> None:
     assert held.entities[0].lifecycle == EntityLifecycle.HELD
     expired = fusion.snapshot(published_at_us=1_600)
     assert expired.entities == ()
+
+
+def test_position_state_uses_accepted_observation_and_age_not_lifecycle() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(_observation("kitchen", 0, 1, 1_000_000, 1.0), _subject())
+    measured = fusion.snapshot(published_at_us=1_010_000).entities[0]
+    assert measured.position_state == PositionState.MEASURED
+    assert measured.sources[0].position_state == PositionState.MEASURED
+    assert measured.sources[0].position_source == "pose_depth_fused"
+    assert measured.sources[0].position_quality == "good"
+
+    fusion.ingest(_observation("kitchen", 0, 2, 1_100_000, 1.1,
+                               quality="held", source="cv_prediction"), _subject())
+    predicted = fusion.snapshot(published_at_us=1_110_000).entities[0]
+    assert predicted.lifecycle == EntityLifecycle.PRESENT
+    assert predicted.position_state == PositionState.PREDICTED
+    assert predicted.sources[0].position_state == PositionState.PREDICTED
+
+    fusion.ingest(_observation("kitchen", 0, 3, 1_200_000, 1.1,
+                               quality="held", source="anchor_hold"), _subject())
+    held = fusion.snapshot(published_at_us=1_210_000).entities[0]
+    assert held.lifecycle == EntityLifecycle.PRESENT
+    assert held.position_state == PositionState.HELD
+    assert held.sources[0].position_state == PositionState.HELD
+    stale = fusion.snapshot(published_at_us=2_000_001).entities[0]
+    assert stale.position_state == PositionState.HELD
+
+
+def test_continuity_segment_follows_accepted_source_and_support_resets() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    surface = SupportSurfaceReference(
+        surface_id="foyer", revision="survey-1", normal_world=(0., 1., 0.),
+        offset_m=0., extent_xz=((-5., -5.), (5., -5.), (5., 5.), (-5., 5.)),
+    )
+
+    def admit(sequence: int, *, segment: int, generation: int = 1,
+              revision: str = "world-1", support: SupportSurfaceReference = surface,
+              quality: str = "good", source: str = "floor_ray") -> int:
+        observation = _observation(
+            "kitchen", 0, sequence, 1_000_000 + sequence * 100_000, 1.0,
+            tracker_id=7, world_frame_revision=revision,
+            world_transform_sha256=SHA, quality=quality, source=source,
+        )
+        world = observation.payload.world.model_copy(update={"support_surface": support})
+        observation = observation.model_copy(update={
+            "payload": observation.payload.model_copy(update={"world": world}),
+        })
+        fusion.ingest(observation, _subject(), trail_segment_id=segment,
+                      tracker_lifecycle_generation=generation)
+        return fusion.snapshot(published_at_us=1_010_000 + sequence * 100_000).entities[0].continuity_segment_id
+
+    assert admit(1, segment=1) == 1
+    assert admit(2, segment=1, quality="held", source="cv_prediction") == 1
+    assert admit(3, segment=2, quality="held", source="cv_prediction") == 2
+    assert admit(4, segment=2) == 2
+    assert admit(5, segment=2, generation=2) == 3
+    assert admit(6, segment=2, generation=2,
+                 support=surface.model_copy(update={"revision": "survey-2"})) == 4
+    assert admit(7, segment=2, generation=2, revision="world-2",
+                 support=surface.model_copy(update={"revision": "survey-2"})) == 5
+
+
+def test_removing_one_entity_preserves_another_continuity_segment() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    other = _subject().model_copy(update={"subject_id": "resident:def", "resident_uuid": "def", "stable_id": 2})
+    fusion.ingest(_observation("kitchen", 0, 1, 1_000_000, 1.0, tracker_id=7), _subject(),
+                  trail_segment_id=1, tracker_lifecycle_generation=1)
+    fusion.ingest(_observation("hall", 1, 1, 1_000_000, 2.0, tracker_id=8), other,
+                  trail_segment_id=1, tracker_lifecycle_generation=1)
+    assert len(fusion.snapshot(published_at_us=1_010_000).entities) == 2
+    assert fusion.clear_source("kitchen", 0, "source-run") == 1
+    remaining = fusion.snapshot(published_at_us=1_020_000).entities
+    assert len(remaining) == 1
+    assert remaining[0].entity_id == "resident:def"
+    assert remaining[0].continuity_segment_id == 1
+
+
+def test_returning_source_reset_survives_alternate_accepted_head() -> None:
+    fusion = GlobalWorldFusion(_world_producer())
+    fusion.ingest(_observation("kitchen", 0, 1, 1_000_000, 1.0, tracker_id=7), _subject(),
+                  trail_segment_id=1, tracker_lifecycle_generation=1)
+    assert fusion.snapshot(published_at_us=1_010_000).entities[0].continuity_segment_id == 1
+    fusion.ingest(_observation("hall", 1, 1, 1_100_000, 1.0, tracker_id=8), _subject(),
+                  trail_segment_id=1, tracker_lifecycle_generation=1)
+    assert fusion.clear_source("kitchen", 0, "source-run") == 1
+    assert fusion.snapshot(published_at_us=1_110_000).entities[0].continuity_segment_id == 1
+    fusion.ingest(_observation("kitchen", 0, 2, 1_200_000, 1.0, tracker_id=7), _subject(),
+                  trail_segment_id=2, tracker_lifecycle_generation=1)
+    assert fusion.snapshot(published_at_us=1_210_000).entities[0].continuity_segment_id == 2

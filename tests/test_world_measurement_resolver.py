@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from noesis_core.contracts.base import Matrix3, Vector3
+from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis_core.contracts.world_measurement import (
     WorldMeasurementCohort,
     WorldMeasurementHypothesis,
@@ -72,6 +73,100 @@ def _hypothesis(
         ray_incidence_sin=0.9 if kind == "floor_ray" else None,
         depth_support_fraction=0.9 if kind == "registered_depth" else None,
     )
+
+
+@pytest.mark.parametrize("alternate_surface", ["upper", None])
+def test_resolver_never_fuses_different_or_unknown_support_surface(alternate_surface):
+    cohort = _cohort()
+    lower = SupportSurfaceReference(surface_id="lower", revision="survey-1",
+                                    normal_world=(0., 1., 0.), offset_m=0.,
+                                    extent_xz=((-20., -20.), (20., -20.), (20., 20.), (-20., 20.)))
+    upper = (SupportSurfaceReference(surface_id=alternate_surface, revision="survey-1",
+                                     normal_world=(0., 1., 0.), offset_m=-.18,
+                                     extent_xz=((-20., -20.), (20., -20.), (20., 20.), (-20., 20.)))
+             if alternate_surface else None)
+    floor = _hypothesis(cohort, "floor", "floor_ray", (1., 0., 2.)).model_copy(
+        update={"support_surface": lower})
+    depth = _hypothesis(cohort, "depth", "registered_depth", (1., .18, 2.)).model_copy(
+        update={"support_surface": upper})
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(floor, depth)))
+    assert not result.fused
+    assert result.position in (floor.position, depth.position)
+    assert len(result.contributor_ids) == 1
+    assert result.alternate_candidate_id is not None
+    assert any(row.rejection_reason == "support_surface_not_equivalent_to_selected"
+               for row in result.diagnostics)
+
+
+def test_resolver_retains_selected_slope_after_covariance_intersection():
+    cohort = _cohort()
+    norm = math.sqrt(1.01)
+    surface = SupportSurfaceReference(surface_id="ramp", revision="survey-1",
+                                     normal_world=(-.1 / norm, 1. / norm, 0.), offset_m=0.,
+                                     extent_xz=((-20., -20.), (20., -20.), (20., 20.), (-20., 20.)))
+    a = _hypothesis(cohort, "a", "floor_ray", (1., .1, 2.),
+                    covariance=_covariance(.05, .001, .2)).model_copy(update={"support_surface": surface})
+    b = _hypothesis(cohort, "b", "registered_depth", (1.1, .11, 2.1),
+                    covariance=_covariance(.2, .1, .05)).model_copy(update={"support_surface": surface})
+    result = UniversalWorldMeasurementResolver().resolve(WorldMeasurementSet(cohort=cohort, hypotheses=(a, b)))
+    assert result.fused
+    assert result.support_surface == surface
+    assert result.position.y == pytest.approx(.1 * result.position.x)
+    assert min(np.linalg.eigvalsh(np.array(result.covariance.values).reshape(3, 3))) >= 0
+
+
+def test_resolver_rejects_ci_result_outside_observed_convex_extent():
+    cohort = _cohort()
+    surface = SupportSurfaceReference(
+        surface_id="triangle", revision="survey-1",
+        normal_world=(0., 1., 0.), offset_m=0.,
+        extent_xz=((0., 0.), (1., 0.), (0., 1.)),
+    )
+    a = _hypothesis(
+        cohort, "a", "floor_ray", (.9, 0., .05),
+        covariance=_covariance(.01, .01, 1.), confidence=.98,
+    ).model_copy(update={"support_surface": surface})
+    b = _hypothesis(
+        cohort, "b", "registered_depth", (.05, 0., .9),
+        covariance=_covariance(1., .01, .01), confidence=.90,
+    ).model_copy(update={"support_surface": surface})
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(a, b))
+    )
+    assert result.position == a.position
+    assert result.support_surface == surface
+    assert not result.fused
+    assert result.contributor_ids == ("a",)
+    assert result.alternate_candidate_id == "b"
+    rejected = next(row for row in result.diagnostics if row.candidate_id == "b")
+    assert rejected.rejection_reason == "ci_position_outside_support_extent"
+    assert not rejected.compatible_with_selected
+
+
+def test_diagnostics_never_call_multiple_surface_mismatches_compatible():
+    cohort = _cohort()
+    polygon = ((0., 0.), (2., 0.), (2., 2.), (0., 2.))
+    surfaces = tuple(
+        SupportSurfaceReference(
+            surface_id=name, revision="survey-1",
+            normal_world=(0., 1., 0.), offset_m=0., extent_xz=polygon,
+        )
+        for name in ("selected", "other-a", "other-b")
+    )
+    candidates = tuple(
+        _hypothesis(cohort, name, "floor_ray", (1., 0., 1.), confidence=confidence)
+        .model_copy(update={"support_surface": surface})
+        for name, confidence, surface in zip(("selected", "other-a", "other-b"),
+                                              (.99, .90, .80), surfaces)
+    )
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=candidates)
+    )
+    assert result.contributor_ids == ("selected",)
+    for row in result.diagnostics[1:]:
+        assert row.rejection_reason == "support_surface_not_equivalent_to_selected"
+        assert not row.compatible_with_selected
 
 
 def test_covariance_contract_requires_finite_symmetric_psd_values() -> None:

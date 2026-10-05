@@ -16,6 +16,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from .base import ContractModel, Matrix3, Sha256, TimestampUs, Vector3
+from .support_surface import SupportSurfaceReference
 
 
 MeasurementKind = Literal[
@@ -202,6 +203,7 @@ class WorldMeasurementHypothesis(ContractModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     posture: PostureKind = "unknown"
     support_state: SupportState = "unknown"
+    support_surface: SupportSurfaceReference | None = None
     occlusion: float = Field(default=0.0, ge=0.0, le=1.0)
     motion_consistency: float = Field(default=1.0, ge=0.0, le=1.0)
     support_score: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -305,6 +307,7 @@ class ResolvedGroundMeasurement(ContractModel):
     quantity: Literal["ground_footprint"] = "ground_footprint"
     posture: PostureKind = "unknown"
     support_state: SupportState = "unknown"
+    support_surface: SupportSurfaceReference | None = None
     contributor_ids: tuple[str, ...] = Field(default=(), max_length=4)
     alternate_candidate_id: str | None = Field(default=None, max_length=120)
     fused: bool = False

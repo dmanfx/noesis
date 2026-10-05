@@ -530,6 +530,8 @@ export type PersonObservation = {
   readonly occluded?: boolean;
 };
 
+export type PositionState = "measured" | "predicted" | "held";
+
 export type ProducerRef = {
   readonly runtime: "ds8" | "ds9" | "replay" | "test";
   readonly instance_id: string;
@@ -944,12 +946,15 @@ export type WorldEntity = {
   readonly lifecycle: EntityLifecycle;
   readonly position?: Vector3 | null;
   readonly covariance?: Matrix3 | null;
+  readonly position_state?: PositionState | null;
+  readonly continuity_segment_id?: number | null;
   readonly world_frame?: "backend_world_m";
   readonly world_frame_revision?: string | null;
   readonly world_transform_sha256?: string | null;
   readonly calibration_revision?: string | null;
   readonly position_quantity?: "ground_footprint";
   readonly support_state?: "floor" | "seat" | "couch" | "unknown";
+  readonly support_surface?: SupportSurfaceReference | null;
   readonly posture?: "standing" | "sitting" | "lying" | "unknown";
   readonly velocity_mps?: Vector3 | null;
   readonly room_id?: string | null;
@@ -1045,6 +1050,7 @@ export type WorldPositionObservation = {
   readonly calibration_revision?: string | null;
   readonly quantity?: "ground_footprint";
   readonly support_state?: "floor" | "seat" | "couch" | "unknown";
+  readonly support_surface?: SupportSurfaceReference | null;
   readonly posture?: "standing" | "sitting" | "lying" | "unknown";
   readonly source: string;
   readonly quality: "good" | "estimated" | "held";
@@ -1079,6 +1085,10 @@ export type WorldSourceEvidence = {
   readonly world_frame_revision?: string | null;
   readonly world_transform_sha256?: string | null;
   readonly calibration_revision?: string | null;
+  readonly support_surface?: SupportSurfaceReference | null;
+  readonly position_source?: string | null;
+  readonly position_quality?: "good" | "estimated" | "held" | null;
+  readonly position_state?: PositionState | null;
   readonly accepted: boolean;
   readonly rejection_reason?: string | null;
 };

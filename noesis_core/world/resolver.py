@@ -22,6 +22,7 @@ from noesis_core.contracts.world_measurement import (
     WorldMeasurementSet,
     WorldPriorEvidence,
 )
+from noesis_core.world.support_surfaces import contains_xz, constrained_plane_covariance
 
 
 _AXES = 3
@@ -140,12 +141,34 @@ class UniversalWorldMeasurementResolver:
         ranked = tuple(sorted(scored, key=self._ranking_key))
         selected = ranked[0]
         contributors: list[_ScoredHypothesis] = [selected]
+        position = selected.hypothesis.position
+        covariance = selected.hypothesis.covariance
+        surface = selected.hypothesis.support_surface
+        fused = False
         alternate: _ScoredHypothesis | None = None
         disagreement_m: float | None = None
         disagreement_mahalanobis_sq: float | None = None
         excluded_reasons: dict[str, str] = {}
 
         for candidate in ranked[1:]:
+            # Nearby coordinates do not make different physical floors the
+            # same measurement. Unknown geometry also cannot corroborate a
+            # known surface. Preserve the alternate rather than averaging a
+            # step into a fictitious elevation.
+            if candidate.hypothesis.support_surface != selected.hypothesis.support_surface:
+                excluded_reasons[candidate.hypothesis.candidate_id] = (
+                    "support_surface_not_equivalent_to_selected"
+                )
+                if alternate is None:
+                    alternate = candidate
+                    disagreement_m = self._distance(
+                        selected.hypothesis.position, candidate.hypothesis.position
+                    )
+                    disagreement_mahalanobis_sq = self._mahalanobis_sq(
+                        selected.hypothesis.position, candidate.hypothesis.position,
+                        selected.hypothesis.covariance, candidate.hypothesis.covariance,
+                    )
+                continue
             # A ground-footprint resolver cannot treat body/seat geometry as
             # equivalent to an observed floor contact.  In particular, a
             # very precise torso range must not pull covariance intersection
@@ -201,7 +224,32 @@ class UniversalWorldMeasurementResolver:
                     for contributor in contributors
                 )
                 if not literal_duplicate:
+                    candidate_position, candidate_covariance = self._covariance_intersection(
+                        position, covariance,
+                        candidate.hypothesis.position, candidate.hypothesis.covariance,
+                    )
+                    if surface is not None and not contains_xz(
+                        surface, candidate_position.x, candidate_position.z
+                    ):
+                        # Matrix CI is not a scalar convex combination. Its
+                        # X/Z result can leave an observed convex extent even
+                        # when both inputs are inside; reject that merge.
+                        excluded_reasons[candidate.hypothesis.candidate_id] = (
+                            "ci_position_outside_support_extent"
+                        )
+                        if alternate is None:
+                            alternate = candidate
+                            disagreement_m = self._distance(
+                                selected.hypothesis.position, candidate.hypothesis.position
+                            )
+                            disagreement_mahalanobis_sq = self._mahalanobis_sq(
+                                selected.hypothesis.position, candidate.hypothesis.position,
+                                selected.hypothesis.covariance, candidate.hypothesis.covariance,
+                            )
+                        continue
+                    position, covariance = candidate_position, candidate_covariance
                     contributors.append(candidate)
+                    fused = True
                 else:
                     excluded_reasons[candidate.hypothesis.candidate_id] = (
                         "literal_duplicate_of_contributor"
@@ -225,27 +273,27 @@ class UniversalWorldMeasurementResolver:
                 disagreement_mahalanobis_sq = mahalanobis_sq
                 disagreement_m = candidate_distance_m
 
-        # Combine only genuinely compatible candidates.  The
-        # covariance-intersection update makes no independence assumption and
-        # therefore cannot manufacture overconfident precision.
-        position = selected.hypothesis.position
-        covariance = selected.hypothesis.covariance
-        fused = False
-        for contributor in contributors[1:]:
-            position, covariance = self._covariance_intersection(
-                position,
-                covariance,
-                contributor.hypothesis.position,
-                contributor.hypothesis.covariance,
-            )
-            fused = True
-
+        # The accepted contributors above were combined by covariance
+        # intersection without assuming their camera errors are independent.
         if alternate is not None:
             covariance = self._inflate_for_disagreement(
                 covariance,
                 position,
                 alternate.hypothesis.position,
             )
+
+        if surface is not None:
+            nx, ny, nz = surface.normal_world
+            elevation = -(nx * position.x + nz * position.z + surface.offset_m) / ny
+            constrained = Vector3(x=position.x, y=elevation, z=position.z)
+            # Correlated 3-D covariance intersection can leave a sloped
+            # support plane. Ground footprints stay on the selected plane;
+            # retain the displacement as uncertainty, not hidden confidence.
+            delta = self._vector_sub(position, constrained)
+            covariance = constrained_plane_covariance(
+                surface, covariance, vertical_displacement_m=delta[1]
+            )
+            position = constrained
 
         selected_score = selected.score
         quality = self._quality(selected_score)
@@ -295,6 +343,7 @@ class UniversalWorldMeasurementResolver:
             selected_kind=selected.hypothesis.kind,
             posture=selected.hypothesis.posture,
             support_state=selected.hypothesis.support_state,
+            support_surface=selected.hypothesis.support_surface,
             contributor_ids=tuple(item.hypothesis.candidate_id for item in contributors),
             alternate_candidate_id=alternate.hypothesis.candidate_id if alternate else None,
             fused=fused,
@@ -495,8 +544,12 @@ class UniversalWorldMeasurementResolver:
                     agreement_mahalanobis_sq=pairwise_nis,
                     compatible_with_selected=(
                         candidate.candidate_id in contributor_ids
+                        or (excluded_reasons.get(candidate.candidate_id) == "literal_duplicate_of_contributor")
                         or (
-                            candidate.candidate_id != alternate_id
+                            candidate.candidate_id not in excluded_reasons
+                            and candidate.support_surface == selected.hypothesis.support_surface
+                            and candidate.support_state == selected.hypothesis.support_state
+                            and candidate.candidate_id != alternate_id
                             and pairwise_nis is not None
                             and pairwise_nis <= self.config.agreement_mahalanobis_sq
                             and self._distance(

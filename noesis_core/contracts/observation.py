@@ -22,6 +22,7 @@ from .base import (
 )
 from .identity import TrackletRef
 from .world_measurement import WorldMeasurementCandidateDiagnostic
+from .support_surface import SupportSurfaceReference
 
 
 ZoneSource = Literal["nvdsanalytics_roi", "camera_default"]
@@ -44,6 +45,7 @@ class WorldPositionObservation(ContractModel):
     # contract, especially for seated or occluded people.
     quantity: Literal["ground_footprint"] = "ground_footprint"
     support_state: Literal["floor", "seat", "couch", "unknown"] = "unknown"
+    support_surface: SupportSurfaceReference | None = None
     posture: Literal["standing", "sitting", "lying", "unknown"] = "unknown"
     source: str = Field(min_length=1, max_length=120)
     quality: Literal["good", "estimated", "held"]

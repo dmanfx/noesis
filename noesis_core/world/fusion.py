@@ -8,12 +8,15 @@ from typing import Iterable
 from noesis_core.contracts.base import Matrix3, ProducerRef, Vector3
 from noesis_core.contracts.identity import SubjectRef
 from noesis_core.contracts.observation import ObservationEnvelope
+from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis_core.contracts.world import (
     EntityLifecycle,
+    PositionState,
     WorldEntity,
     WorldSnapshot,
     WorldSourceEvidence,
 )
+from noesis_core.world.support_surfaces import contains_xz, constrained_plane_covariance
 
 
 class ObservationOrderError(ValueError):
@@ -71,6 +74,19 @@ class _FusedState:
 
 
 @dataclass(frozen=True)
+class _ContinuityState:
+    segment_id: int
+    frame_identity: tuple[str, str | None]
+    support_state: str
+    support_surface: SupportSurfaceReference | None
+    # One token per accepted source. A changed lifecycle or trail segment for
+    # the same camera/source is a visible trail break, even across held heads.
+    source_tokens: tuple[
+        tuple[str, int, str, int, int | None, int | None, int | None], ...
+    ]
+
+
+@dataclass(frozen=True)
 class _PositionStep:
     dt_s: float
     distance_m: float
@@ -99,6 +115,7 @@ class GlobalWorldFusion:
         self._by_entity: OrderedDict[str, dict[str, _ResolvedObservation]] = OrderedDict()
         self._entity_by_tracklet: dict[tuple[str, int, str, int], str] = {}
         self._last_fused: dict[str, _FusedState] = {}
+        self._continuity_by_entity: dict[str, _ContinuityState] = {}
         self._snapshot_sequence = 0
 
     def fork(self) -> GlobalWorldFusion:
@@ -120,6 +137,7 @@ class GlobalWorldFusion:
         )
         candidate._entity_by_tracklet = dict(self._entity_by_tracklet)
         candidate._last_fused = dict(self._last_fused)
+        candidate._continuity_by_entity = dict(self._continuity_by_entity)
         candidate._snapshot_sequence = int(self._snapshot_sequence)
         return candidate
 
@@ -227,7 +245,10 @@ class GlobalWorldFusion:
         while len(self._by_entity) > self.config.max_entities:
             entity_id, _ = self._by_entity.popitem(last=False)
             self._last_fused.pop(entity_id, None)
+            self._continuity_by_entity.pop(entity_id, None)
             self._drop_entity_tracklets(entity_id)
+        if len(self._continuity_by_entity) > self.config.max_entities:
+            self._prune_absent_continuity()
 
     def clear_source(self, camera_id: str, source_id: int, run_id: str) -> int:
         """Remove current evidence for one empty tracker source frame.
@@ -271,7 +292,13 @@ class GlobalWorldFusion:
             if not observations:
                 self._by_entity.pop(entity_id, None)
                 self._last_fused.pop(entity_id, None)
+        self._prune_absent_continuity()
         return removed
+
+    def _prune_absent_continuity(self) -> None:
+        for entity_id in tuple(self._continuity_by_entity):
+            if entity_id not in self._by_entity:
+                self._continuity_by_entity.pop(entity_id, None)
 
     def snapshot(self, *, published_at_us: int) -> WorldSnapshot:
         if published_at_us <= 0:
@@ -290,7 +317,9 @@ class GlobalWorldFusion:
         for entity_id in expired:
             self._by_entity.pop(entity_id, None)
             self._last_fused.pop(entity_id, None)
+            self._continuity_by_entity.pop(entity_id, None)
             self._drop_entity_tracklets(entity_id)
+        self._prune_absent_continuity()
 
         observed_end = max(observation_times, default=published_at_us)
         observed_start = min(observation_times, default=published_at_us)
@@ -369,7 +398,18 @@ class GlobalWorldFusion:
             ),
             reverse=True,
         )
-        latest_at = usable[0].envelope.observed_at_us
+        bounded_usable = [
+            item for item in usable
+            if (world := item.envelope.payload.world) is not None
+            and (world.support_surface is None or contains_xz(
+                world.support_surface, world.position.x, world.position.z
+            ))
+        ]
+        if not bounded_usable:
+            return None
+        # An out-of-extent named observation cannot refresh entity time or
+        # shorten the cohort window for an older valid measurement.
+        latest_at = bounded_usable[0].envelope.observed_at_us
         age_us = max(0, now_us - latest_at)
         if age_us > self.config.lost_ttl_us:
             return None
@@ -377,13 +417,21 @@ class GlobalWorldFusion:
         contemporaneous = [
             item
             for item in usable
-            if latest_at - item.envelope.observed_at_us <= self.config.simultaneous_window_us
+            if abs(latest_at - item.envelope.observed_at_us) <= self.config.simultaneous_window_us
+        ]
+        bounded_ids = {id(item) for item in bounded_usable}
+        bounded_contemporaneous = [
+            item for item in contemporaneous if id(item) in bounded_ids
+        ]
+        out_of_extent = [
+            (item, "position_outside_support_extent")
+            for item in contemporaneous if id(item) not in bounded_ids
         ]
         authoritative = [
             item
-            for item in contemporaneous
+            for item in bounded_contemporaneous
             if item.envelope.payload.world is not None
-            and item.envelope.payload.world.quality != "held"
+            and self._position_state(item) == PositionState.MEASURED
         ]
         ignored_held: list[tuple[_ResolvedObservation, str]] = []
         if authoritative:
@@ -393,7 +441,7 @@ class GlobalWorldFusion:
             fusion_candidates = authoritative
             ignored_held = [
                 (item, "non_authoritative_held_continuation")
-                for item in contemporaneous
+                for item in bounded_contemporaneous
                 if item not in authoritative
             ]
         else:
@@ -402,13 +450,13 @@ class GlobalWorldFusion:
             # errors can be correlated and the resulting point would exist in
             # neither tracking cohort.
             selected_held = min(
-                contemporaneous,
+                bounded_contemporaneous,
                 key=self._held_continuation_sort_key,
             )
             fusion_candidates = [selected_held]
             ignored_held = [
                 (item, "non_authoritative_held_continuation")
-                for item in contemporaneous
+                for item in bounded_contemporaneous
                 if item is not selected_held
             ]
 
@@ -419,7 +467,7 @@ class GlobalWorldFusion:
         anchor_has_target_identity = self._has_canonical_identity(anchor_world)
 
         accepted: list[_ResolvedObservation] = []
-        rejected: list[tuple[_ResolvedObservation, str]] = []
+        rejected: list[tuple[_ResolvedObservation, str]] = out_of_extent
         for item in fusion_candidates:
             world = item.envelope.payload.world
             assert world is not None
@@ -438,6 +486,9 @@ class GlobalWorldFusion:
                 # silently averaged into any canonical camera cohort.
                 rejected.append((item, "registration_identity_missing"))
                 continue
+            if world.support_surface != anchor_world.support_surface:
+                rejected.append((item, "support_surface_conflict"))
+                continue
             distance = self._distance(anchor_world.position, world.position)
             if distance > self.config.conflict_distance_m:
                 rejected.append((item, f"position_conflict:{distance:.3f}m"))
@@ -446,7 +497,12 @@ class GlobalWorldFusion:
         if not accepted:
             accepted = [anchor]
 
-        position, covariance = self._weighted_position(accepted)
+        if anchor_world.support_surface is not None:
+            # On named finite geometry the best-supported measurement is the
+            # fallback if matrix CI leaves the observed support extent.
+            accepted = [anchor] + [item for item in accepted if item is not anchor]
+        position, covariance, accepted, extent_rejected = self._weighted_position(accepted)
+        rejected.extend(extent_rejected)
         source_evidence: list[WorldSourceEvidence] = []
         rejected_ids = {id(item): reason for item, reason in rejected}
         ignored_held_ids = {id(item): reason for item, reason in ignored_held}
@@ -468,6 +524,10 @@ class GlobalWorldFusion:
                     world_frame_revision=world.world_frame_revision,
                     world_transform_sha256=world.world_transform_sha256,
                     calibration_revision=world.calibration_revision,
+                    support_surface=world.support_surface,
+                    position_source=world.source,
+                    position_quality=world.quality,
+                    position_state=self._position_state(item),
                     accepted=reason is None,
                     rejection_reason=reason,
                 )
@@ -605,6 +665,22 @@ class GlobalWorldFusion:
             if len(accepted_target_identities) == 1
             else None
         )
+        continuity = self._next_continuity_state(
+            entity_id,
+            accepted,
+            frame_identity=common_target_identity or ("backend_world_m", None),
+            support_state=anchor_world.support_state,
+            support_surface=anchor_world.support_surface,
+        )
+        position_state = (
+            PositionState.HELD
+            if age_us > self.config.present_ttl_us
+            else (
+                PositionState.MEASURED
+                if authoritative
+                else self._position_state(anchor)
+            )
+        )
         accepted_calibrations = {
             item.envelope.payload.world.calibration_revision
             for item in accepted
@@ -621,6 +697,8 @@ class GlobalWorldFusion:
             lifecycle=lifecycle,
             position=position,
             covariance=covariance,
+            position_state=position_state,
+            continuity_segment_id=continuity.segment_id,
             world_frame="backend_world_m",
             world_frame_revision=(
                 common_target_identity[1]
@@ -639,6 +717,7 @@ class GlobalWorldFusion:
             ),
             position_quantity="ground_footprint",
             support_state=anchor_world.support_state,
+            support_surface=anchor_world.support_surface,
             posture=anchor_world.posture,
             velocity_mps=velocity,
             room_id=room_id,
@@ -648,6 +727,7 @@ class GlobalWorldFusion:
             conflict=bool(rejected) or room_conflict,
             conflict_reason="; ".join(conflict_reasons) or None,
         )
+        self._continuity_by_entity[entity_id] = continuity
         if authoritative and position_observed_at is not None:
             previous = self._last_fused.get(entity_id)
             if (
@@ -747,6 +827,7 @@ class GlobalWorldFusion:
         return previous.entity.model_copy(
             update={
                 "lifecycle": lifecycle,
+                "position_state": PositionState.HELD,
                 "velocity_mps": None,
                 "observed_at_us": previous.observed_at_us,
                 "stale_after_us": previous.observed_at_us + self.config.lost_ttl_us,
@@ -759,6 +840,79 @@ class GlobalWorldFusion:
                 "conflict": True,
                 "conflict_reason": conflict_reason,
             }
+        )
+
+    @staticmethod
+    def _position_state(item: _ResolvedObservation) -> PositionState:
+        world = item.envelope.payload.world
+        assert world is not None
+        # The strict service already verified process provenance before
+        # ingestion. Source and quality, rather than entity age or confidence,
+        # distinguish a current metric point from its continuation.
+        if world.source in {"cv_prediction", "image_motion_prediction"}:
+            return PositionState.PREDICTED
+        if world.source == "anchor_hold" or world.quality == "held":
+            return PositionState.HELD
+        return PositionState.MEASURED
+
+    def _next_continuity_state(
+        self,
+        entity_id: str,
+        accepted: list[_ResolvedObservation],
+        *,
+        frame_identity: tuple[str, str | None],
+        support_state: str,
+        support_surface: SupportSurfaceReference | None,
+    ) -> _ContinuityState:
+        current_tokens = tuple(sorted((
+            (
+                item.envelope.payload.tracklet.camera_id,
+                int(item.envelope.payload.tracklet.source_id),
+                item.envelope.producer.run_id,
+                int(item.envelope.payload.tracklet.tracker_id),
+                item.tracker_lifecycle_generation,
+                item.source_epoch,
+                item.trail_segment_id,
+            )
+            for item in accepted
+        ), key=lambda token: (token[0], token[1], token[2], token[3])))
+        current_tokens = current_tokens[:self.MAX_TRAIL_SOURCE_TOKENS]
+        previous = self._continuity_by_entity.get(entity_id)
+        if previous is None:
+            segment_id = 1
+        else:
+            prior_by_source = {token[:2]: token for token in previous.source_tokens}
+            source_reset = any(
+                (prior := prior_by_source.get(token[:2])) is not None
+                and (
+                    prior[2:4] != token[2:4]
+                    or (prior[4] is not None and token[4] is not None and prior[4] != token[4])
+                    or (prior[5] is not None and token[5] is not None and prior[5] != token[5])
+                    or (prior[6] is not None and token[6] is not None and prior[6] != token[6])
+                )
+                for token in current_tokens
+            )
+            reset = (
+                previous.frame_identity != frame_identity
+                or previous.support_state != support_state
+                or previous.support_surface != support_surface
+                or source_reset
+            )
+            segment_id = previous.segment_id + int(reset)
+        # Remember a bounded token for a temporarily absent accepted source.
+        # Otherwise A -> B -> A would hide a reset that happened while B was
+        # the selected head of the same canonical entity.
+        current_source_keys = {token[:2] for token in current_tokens}
+        tokens = current_tokens + tuple(
+            token for token in (previous.source_tokens if previous is not None else ())
+            if token[:2] not in current_source_keys
+        )
+        return _ContinuityState(
+            segment_id=segment_id,
+            frame_identity=frame_identity,
+            support_state=support_state,
+            support_surface=support_surface,
+            source_tokens=tokens[:self.MAX_TRAIL_SOURCE_TOKENS],
         )
 
     def _anchor_sort_key(self, item: _ResolvedObservation) -> tuple[int, float, float, int, str]:
@@ -787,27 +941,48 @@ class GlobalWorldFusion:
             item.envelope.payload.tracklet.camera_id,
         )
 
-    def _weighted_position(self, observations: list[_ResolvedObservation]) -> tuple[Vector3, Matrix3]:
+    def _weighted_position(
+        self, observations: list[_ResolvedObservation]
+    ) -> tuple[Vector3, Matrix3, list[_ResolvedObservation], list[tuple[_ResolvedObservation, str]]]:
         first = observations[0]
         first_world = first.envelope.payload.world
         assert first_world is not None
         position = first_world.position
         covariance = Matrix3(values=self._regularized_covariance(first_world.covariance))
+        used = [first]
+        rejected: list[tuple[_ResolvedObservation, str]] = []
         # Camera correlations are not proven by this service.  Covariance
         # intersection retains the complete anisotropic matrix while avoiding
         # the unjustified overconfidence of summing independent precisions.
         for item in observations[1:]:
             world = item.envelope.payload.world
             assert world is not None
-            position, covariance = self._covariance_intersection(
+            candidate_position, candidate_covariance = self._covariance_intersection(
                 position,
                 covariance,
                 world.position,
                 world.covariance,
             )
+            if first_world.support_surface is not None and not contains_xz(
+                first_world.support_surface, candidate_position.x, candidate_position.z
+            ):
+                rejected.append((item, "ci_position_outside_support_extent"))
+                continue
+            position, covariance = candidate_position, candidate_covariance
+            used.append(item)
+        if first_world.support_surface is not None:
+            surface = first_world.support_surface
+            nx, ny, nz = surface.normal_world
+            y = -(nx * position.x + nz * position.z + surface.offset_m) / ny
+            covariance = constrained_plane_covariance(
+                surface, covariance, vertical_displacement_m=y - position.y
+            )
+            position = Vector3(x=position.x, y=y, z=position.z)
         return (
             position,
             covariance,
+            used,
+            rejected,
         )
 
     def _regularized_covariance(self, matrix: Matrix3) -> tuple[float, ...]:

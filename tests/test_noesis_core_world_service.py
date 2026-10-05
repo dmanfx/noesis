@@ -21,7 +21,7 @@ from noesis.telemetry.publishers import (
 from noesis_core.contracts.base import ArtifactFingerprint, ProducerRef
 from noesis_core.health import CapabilityMonitor, CapabilityPolicy
 from noesis_core.journal import AsyncContractJournal, ContractJournal
-from noesis_core.contracts.world import EntityLifecycle
+from noesis_core.contracts.world import EntityLifecycle, PositionState
 from noesis_core.world import GlobalWorldFusion, WorldFusionConfig
 from noesis_core.world_service import CanonicalWorldService, WorldArtifacts
 from noesis.server.websocket import WebSocketServer
@@ -382,6 +382,9 @@ def test_resident_observations_across_cameras_fuse_into_one_entity() -> None:
     assert entity.entity_id == "resident:resident-1"
     assert entity.position is not None
     assert entity.position.x == pytest.approx(1.1)
+    assert entity.position_state == PositionState.MEASURED
+    assert entity.continuity_segment_id == 1
+    assert all(source.position_state == PositionState.MEASURED for source in entity.sources)
     assert {source.camera_id for source in entity.sources} == {"kitchen", "hall"}
 
 
@@ -849,6 +852,14 @@ def test_bounded_process_continuity_updates_canonical_held_position(
         publication.snapshot.entities[0].position.z,
     ) == pytest.approx((expected_x, 0.0, 2.0))
     assert publication.snapshot.entities[0].lifecycle == EntityLifecycle.PRESENT
+    expected_state = (
+        PositionState.HELD
+        if continuity_source == "anchor_hold"
+        else PositionState.PREDICTED
+    )
+    assert publication.snapshot.entities[0].position_state == expected_state
+    assert publication.snapshot.entities[0].sources[0].position_source == continuity_source
+    assert publication.snapshot.entities[0].sources[0].position_quality == "held"
 
 
 @pytest.mark.parametrize(

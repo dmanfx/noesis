@@ -1013,7 +1013,12 @@ than trying to inject an unordered DA3 point cloud.
 
 The prior builder derives a sparse metric-depth input from DA3 only. It keeps
 pixels that pass temporal reprojection and depth-boundary checks, then samples
-10% of those reliable pixels with a fixed seed. For the validated walk, the
+10% of those reliable pixels with a fixed seed. The per-view 500-sample minimum
+is also checked after the official nearest-depth resize/crop. If cropping loses
+samples, the runner deterministically selects missing pixels from identically
+preprocessed reliable DA3 depths, preserving existing samples, RGB and camera
+inputs. Insufficient processed reliable support still fails closed. Raw and
+processed top-ups are recorded separately. For the validated walk, the
 prior retained 6.45% of all pixels. This avoids presenting dense correlated
 DA3 errors to MapAnything as ground truth.
 
@@ -1226,6 +1231,51 @@ source point assembly, copies the already reviewed transform without changing
 its yaw, translation, or scale, and binds Menon to the new mesh digest. Both the
 mesh and point variants remain presentation-only; neither changes calibration,
 room registration, canonical world state, or tracking authority.
+
+### Single-room coherent photo surface (offline)
+
+For a fresh single-room reconstruction, build one supported surface from the
+distinct-view consensus surfels rather than concatenating per-view depth sheets.
+`build_single_room_review_surface.py` requires a passed rigid alignment bound to
+that exact consensus raw directory and output manifest. Its default ceiling mode
+is full height; unsupported closure and single-view points remain withheld.
+
+`texture_single_room_review_surface.py` projects the matching prepared photos
+onto that surface. It verifies image hashes, source order, supplied pose carrier,
+mesh/alignment digests, and same-frame image/ray mapping. When every saved DA3
+and conditioned model RGB replays byte-exactly through the official preprocessing,
+it uses the deterministic resize/crop composition; otherwise it retains measured
+image matching with explicit failed-proof diagnostics. Predicted model intrinsics
+remain the geometry authority, not the supplied conditioning intrinsics. All triangle
+corners and the centroid must be depth-visible in the selected photograph.
+Bounded adjacency-aware source selection reduces tiny texture islands without
+changing geometry, averaging RGB, clipping UVs, or inpainting. Supported geometry
+without an eligible photograph remains explicitly neutral, not silently removed.
+
+```bash
+python3 tools/mapanything_phone_scan/texture_single_room_review_surface.py \
+  --mesh-dir "$PCF_SINGLE_ROOM_SURFACE_DIR" \
+  --scan-dir "$PHONE_SCAN_DIR" \
+  --consensus-dir "$PCF_CONSENSUS_DIR" \
+  --alignment-dir "$PCF_CONSENSUS_ALIGNMENT_DIR" \
+  --output-dir "$PCF_PHOTO_SURFACE_DIR" \
+  --normalize-measured-exposure
+```
+
+The optional exposure normalization derives bounded linear-RGB gains from flat,
+nonclipped, depth-visible photo overlaps. It reserves samples and rejects gains
+that fail residual/improvement or new-clipping limits. Each measured overlap
+component has its own recorded photo anchor and independent acceptance; rejected,
+weak and singleton components keep original pixels. A supplied anchor never
+changes. Other components retain their preferred anchor when it passes; on
+failure, at most two alternatives are preselected from training-only overlap
+ratios and face support. Every attempted fit keeps the same gain, reserved-sample
+and clipping limits and is recorded. Reserved samples from these same images
+are rejection checks, not independent colour-accuracy evidence. Components are
+not globally colour-calibrated. Originals are preserved. The GLB uses unlit photo materials and records
+face-to-photo assignment, neutral coverage, patch coherence, and photometric
+acceptance separately. This is an offline presentation export, not publication,
+surveyed accuracy, calibration, or live world authority.
 
 ## Detection and tracking integration contract
 

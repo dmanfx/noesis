@@ -32,7 +32,7 @@ does not use Docker, a deployment selector, or a container filesystem.
   is a runtime test, not acceptance of model accuracy or numerical parity.
 - Tracker: NvDCF baseline.
 - ReID: Swin Tiny, 256-dimensional embedding, GIE 3.
-- Pose: YOLO26-n pose, GIE 4.
+- Pose: YOLO26-s pose, GIE 4, batch 3, FP16, 640×640 input.
 - Tracking depth: DepthAnythingV2, always on, GIE 5. Its optical-Z samples need
   validated registration to room scale; a model label is not independent
   physical accuracy.

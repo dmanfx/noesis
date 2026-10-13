@@ -44,6 +44,22 @@
   six-image FP32 parity (4/6 pass); application integration does not establish
   detection accuracy or resolve that numerical comparison. No commit or push.
 
+## 2026-10-08 — Small pose runtime and medium engine
+
+- Selected YOLO26-s pose in the canonical baseline configuration. Preserved
+  batch 3, FP16, 640×640 input, GIE 4, thresholds and re-inference cadence.
+- Rebuilt small and medium pose engines with TensorRT 10.16.0.72 from existing
+  batch-3 ONNX exports. The older root-model small engine failed current-stack
+  deserialization. New engines reside under the selected native artifact root's
+  `models/engines`, with source/engine hashes and validation provenance sidecars.
+- Nano, small and medium engines share `images [3,3,640,640]` and
+  `output0 [3,300,57]` with FP32 boundary tensors. Both new engines passed
+  deserialization and bounded synthetic-input inference. The restarted runtime
+  loaded small; tracking/world health and deployment readiness passed in an
+  occupied live smoke. Medium is available but was not selected or evaluated
+  for live pose accuracy. Existing engine-maintenance declarations remain
+  nano-specific; this change does not extend their model-selection interface.
+
 ## 2026-10-05 — Native tracker presence and Menon visual continuity
 
 - Current INACTIVE NvDCF person metadata now carries bounded exact-cohort

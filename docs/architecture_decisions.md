@@ -2499,3 +2499,27 @@ synthetic-only prior smoke. Successful loading and live application progress
 establish integration behavior, not improved detection quality or completed
 numerical parity. Matched footage and independent quality evaluation remain
 separate from this authorized test activation.
+
+## ADR-051 — Preserved baseline for detector resolution trials
+
+Date: 2026-10-10. Status: implemented selection; owner-directed experiment.
+
+Select YOLO26 detector resolution through explicit `models.pgie.input_size`
+([640, 640] by default; [960, 960] for the experiment), with separate artifact
+and generated-config names. Unsupported dimensions and stale preprocessing
+fail startup. Preserve the normal YAML, 640 engines and service overrides.
+Use a separate test YAML and nano pose INI for a matched stock M640/M960
+comparison; full-pipeline L/Watch trials await owner review of M.
+
+Detector network dimensions do not change spatial authority. Installed DS9.1
+maps detector boxes to the original mux frame, while pose and ReID independently
+preprocess their bbox crops. Keep tracker, camera calibration, depth, world
+contracts, BEV and media dimensions unchanged. Do not add duplicate downstream
+scaling or extend lost-person lifetime to compensate for missing detections.
+
+Resolution trials precede a crop-recovery implementation or NvDCF tuning.
+Measure matched occupied inputs and distinguish source, encode and decoded
+delivery cadence from isolated engine timings and detection-quality evidence.
+Build Watch at 960 only from its actual trained checkpoint or a verified new
+export; its fixed 640 graph is not sufficient for an input-declaration-only resize.
+See [the experiment and operating instructions](yolo26_960_experiment.md).

@@ -910,6 +910,8 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
         cfg.pop("layer", None)
         cfg.pop("embedding_dim", None)
         cfg.pop("model_size", None)
+        # Detector export/preprocess selection is consumed by the runtime.
+        cfg.pop("input_size", None)
         cfg.pop("score_threshold", None)
         cfg.pop("kpt_threshold", None)
         cfg.pop("letterbox", None)

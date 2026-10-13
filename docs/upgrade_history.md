@@ -1,4 +1,27 @@
 # Noesis upgrade history
+## 2026-10-10 — Preserved YOLO26 960 detector trial
+
+- Added separate 640/960 comparison configurations with the earlier nano
+  pose, explicit detector resolution selection, matching GPU preprocessing
+  and startup checks. Preserved the normal Watch640/small-pose configuration,
+  original engines, NvDCF settings and prior service overrides.
+- Exported stock YOLO26-M/L at 960×960, batch 3, and built native TensorRT
+  10.16.0.72 FP16 engines. Both passed deserialization and bounded synthetic
+  inference. Watch960 remains pending its exact trained checkpoint or new
+  verified 960 ONNX; the available fixed640 graph was not relabeled.
+- Matched three-camera occupied replays held approximately 30 FPS average;
+  M960 raised median GPU use from 54% to 87%, with p95 at 100%, larger cadence
+  spikes and brief source-rate dips. Exact tracking/world/BEV joins passed
+  within capture boundaries; no source recovery or canonical overflow occurred.
+- Selected only M960+nano for live owner review. L/Watch full-pipeline trials
+  remain deferred until that review. Thirty-five focused tests passed, live
+  producer/Menon readiness was healthy, and a headless WebRTC smoke decoded
+  862 frames in 30 seconds. Refreshed only the authorized runtime-core hash in
+  Menon's existing native presentation binding; other source/build identities
+  were preserved. Integration and throughput checks do not establish accuracy.
+- See [the experiment and restoration instructions](yolo26_960_experiment.md).
+  No crop recovery, NvDCF tuning, commit or push.
+
 ## 2026-10-09 — Partial-body depth reaches canonical BEV
 
 - Baseline localization independently samples observed ankle, narrow torso and

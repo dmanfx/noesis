@@ -589,8 +589,17 @@ def _validate_dewarper_intrinsics_sync(
     return ok
 
 
-def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, Any]:
+def _yolo_detect_input_resolution(pgie_cfg: Dict[str, Any]) -> int:
+    shape = pgie_cfg.get("input_size", [640, 640])
+    if shape not in ([640, 640], [960, 960]) or any(type(v) is not int for v in shape):
+        raise SystemExit("[FATAL] YOLO detector models.pgie.input_size must be [640, 640] or [960, 960]")
+    return shape[0]
+
+
+def _resolve_yolo_detect_assets(profile: str, size: Optional[str], *, resolution: int = 640) -> Dict[str, Any]:
     profile_norm = str(profile or "").strip().lower()
+    if resolution not in (640, 960) or (profile_norm == "yolo11" and resolution != 640):
+        raise SystemExit(f"[FATAL] Unsupported {profile_norm} detection resolution: {resolution}")
     if profile_norm == "yolo11":
         label = "YOLO11"
         size_norm = ""
@@ -618,17 +627,24 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         onnx_path = (_onnx_dir() / f"yolo26{size_norm}.onnx").resolve()
         engine_path = (_engine_dir() / f"yolo26{size_norm}_b3_fp16.engine").resolve()
 
+    if resolution != 640:
+        stem = "watch-26m-v1-e44" if profile_norm == "yolo26-watch" else f"yolo26{size_norm}"
+        onnx_path = (_onnx_dir() / f"{stem}_{resolution}_b3.onnx").resolve()
+        engine_path = (_engine_dir() / f"{stem}_{resolution}_b3_fp16.engine").resolve()
+
     size_suffix = f"_{size_norm}" if size_norm else ""
+    resolution_suffix = f"_{resolution}" if resolution != 640 else ""
     return {
-        "label": label,
+        "label": f"{label} {resolution}x{resolution}" if resolution != 640 else label,
+        "resolution": resolution,
         "template": (_pipeline_dir() / "config_infer_primary_yolo11.ini").resolve(),
         "preprocess_template": (_pipeline_dir() / "config_preproc.ini").resolve(),
-        "preprocess_output": (_build_dir() / f"config_preproc_{profile_norm}{size_suffix}.ini").resolve(),
+        "preprocess_output": (_build_dir() / f"config_preproc_{profile_norm}{size_suffix}{resolution_suffix}.ini").resolve(),
         "tensor_name": tensor_name,
         "onnx": onnx_path,
         "engine": engine_path,
         "labels": ((_pipeline_dir() / "labels_yolo26_watch.txt") if profile_norm == "yolo26-watch" else (_model_dir() / "coco_labels.txt")).resolve(),
-        "output": (_build_dir() / f"config_infer_primary_{profile_norm}{size_suffix}.ini").resolve(),
+        "output": (_build_dir() / f"config_infer_primary_{profile_norm}{size_suffix}{resolution_suffix}.ini").resolve(),
     }
 
 
@@ -659,10 +675,11 @@ def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging
         raise SystemExit(f"[FATAL] YOLO detection preprocess template missing: {template_path}")
 
     text = template_path.read_text(encoding="utf-8")
+    resolution = assets["resolution"]
     replacements = {
-        "network-input-shape": "3;3;640;640",
-        "processing-width": "640",
-        "processing-height": "640",
+        "network-input-shape": f"3;3;{resolution};{resolution}",
+        "processing-width": str(resolution),
+        "processing-height": str(resolution),
         "tensor-name": str(assets["tensor_name"]),
     }
     for key, value in replacements.items():
@@ -682,8 +699,8 @@ def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging
     return out_path
 
 
-def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger: logging.Logger) -> Dict[str, Any]:
-    assets = _resolve_yolo_detect_assets(profile, size)
+def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger: logging.Logger, *, resolution: int = 640) -> Dict[str, Any]:
+    assets = _resolve_yolo_detect_assets(profile, size, resolution=resolution)
     template_path = assets["template"]
     if not template_path.exists():
         raise SystemExit(f"[FATAL] YOLO detection PGIE template missing: {template_path}")
@@ -1003,6 +1020,12 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         preproc_parser = configparser.ConfigParser()
         preproc_parser.read(preprocess_path, encoding="utf-8")
         preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
+        resolution = _yolo_detect_input_resolution(pgie_cfg or {})
+        expected_shape = f"3;3;{resolution};{resolution}"
+        if (preproc_props.get("network-input-shape") != expected_shape
+                or preproc_props.get("processing-width") != str(resolution)
+                or preproc_props.get("processing-height") != str(resolution)):
+            raise SystemExit(f"[FATAL] {label} detector preprocess dimensions must match {expected_shape}")
         tensor_name = str(preproc_props.get("tensor-name", "") or "").strip()
         expected_tensor_name = "input" if profile == "yolo11" else "images"
         if tensor_name != expected_tensor_name:
@@ -1437,13 +1460,15 @@ def _materialize_effective_pipeline_yaml(
         if profile == "yolo26" and not pgie_size:
             raise SystemExit(f"[FATAL] YOLO26 detection profile requires --size ({_YOLO26_DETECT_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower() if profile != "yolo11" else None
-        assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger)
+        resolution = _yolo_detect_input_resolution(base_cfg.get("models", {}).get("pgie", {}))
+        assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger, resolution=resolution)
         overlay = {
             "preprocess": {"config-file": str(assets["preprocess_config"])},
             "models": {
                 "pgie": {
                     "config-file-path": str(assets["pgie_config"]),
                     "engine": str(assets["engine"]),
+                    "input_size": [resolution, resolution],
                 }
             },
         }

@@ -27,6 +27,7 @@ document and live source/config win.
 | Pose metadata and StableID routing | [`pose_stable_id_integration.md`](pose_stable_id_integration.md) |
 | Architecture decisions | [`architecture_decisions.md`](architecture_decisions.md) |
 | Upgrade/change history | [`upgrade_history.md`](upgrade_history.md) |
+| YOLO26 960 detector experiment | [`yolo26_960_experiment.md`](yolo26_960_experiment.md) |
 | Agent skill routing | [`../DS9/docs/deepstream_9_1_agent_skills.md`](../DS9/docs/deepstream_9_1_agent_skills.md) |
 | Agent instructions by implementation area | [`../AGENTS.md`](../AGENTS.md#implementation-guidance) |
 

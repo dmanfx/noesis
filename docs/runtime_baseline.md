@@ -1,6 +1,6 @@
 # Native DeepStream 9.1 runtime baseline
 
-Status: recorded Watch detector baseline, checked 2026-10-09. Dated performance
+Status: selected native lane, checked 2026-10-12 with the owner-requested M960 detector experiment. Dated performance
 measurements below retain their original model/config context.
 
 ## Platform
@@ -22,17 +22,21 @@ does not use Docker, a deployment selector, or a container filesystem.
 
 ## Selected application lane
 
-- Config: `DS9/config/infer.yaml`.
+- Selected experiment config: `DS9/config/infer_yolo26_960_test.yaml`.
+  The retained repository baseline is `DS9/config/infer.yaml`.
 - Cameras: Living Room, Kitchen, Family Room via `nvurisrcbin`.
 - Batch: 3 at 1920×1080, live input, 40 ms mux timeout.
-- Detector experiment: person-only Watch-26m v1 epoch44, FP16, GIE 1,
-  batch 3, 640×640 input. The service selects `--pgie-profile yolo26-watch
-  --model-size m`, loading `watch-26m-v1-e44-b3-fp16.engine`. The stock
-  `yolo26` profile and checked-in base config remain available. This selection
-  is a runtime test, not acceptance of model accuracy or numerical parity.
+- Detector experiment: stock YOLO26-M, FP16, GIE 1, batch 3, 960×960 input.
+  The service selects `--pgie-profile yolo26 --model-size m`, loading
+  `yolo26m_960_b3_fp16.engine`. The earlier person-only Watch-26m epoch44
+  experiment and the retained 640 baseline remain available through explicit
+  selection. This is a runtime test, not acceptance of model accuracy or
+  numerical parity. See the [dated experiment record](yolo26_960_experiment.md).
 - Tracker: NvDCF baseline.
 - ReID: Swin Tiny, 256-dimensional embedding, GIE 3.
-- Pose: YOLO26-s pose, GIE 4, batch 3, FP16, 640×640 input.
+- Selected experiment pose: YOLO26-n pose, GIE 4, batch 3, FP16, 640×640
+  input, through its separate comparison INI. The retained repository baseline
+  selects YOLO26-s pose.
 - Tracking depth: DepthAnythingV2, always on, GIE 5. Its optical-Z samples need
   validated registration to room scale; a model label is not independent
   physical accuracy.

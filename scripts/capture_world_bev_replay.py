@@ -2,7 +2,8 @@
 """Bounded native baseline replay with exact tracking/world/BEV review capture.
 
 Uses the selected native environment, models and replay renderer. Temporarily
-stops only the named active Noesis user service and restores it in finally.
+stops the appliance supervisor and named Noesis service, then restores their
+previous activation in finally.
 Replay identity/world databases are fresh, not copies of household state.
 """
 from __future__ import annotations
@@ -28,14 +29,14 @@ sys.path.insert(0, str(ROOT))
 from scripts.internal_auth_client import connect_required_websocket, load_required_internal_auth
 
 
-def validated_sources(sources):
+def validated_sources(sources, base_config=None):
     """Check actual decoded raster before stopping the selected runtime.
 
     Source intrinsics precede the streammux resize. A higher-resolution file
     cannot silently reuse the lower-resolution camera's dewarper intrinsics.
     Prepare a full-FoV, uniformly scaled derivative explicitly when needed.
     """
-    config = yaml.safe_load((ROOT / "DS9/config/infer.yaml").read_text())
+    config = yaml.safe_load((base_config or ROOT / "DS9/config/infer.yaml").read_text())
     cameras = ("living-room", "kitchen", "family-room")
     normalized, evidence = [], []
     seen = set()
@@ -119,15 +120,24 @@ def main():
     parser.add_argument("--source", action="append", required=True)
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--model-size", choices=("m", "l"), default="m")
+    parser.add_argument("--base-config", type=Path, default=ROOT / "DS9/config/infer.yaml")
+    parser.add_argument("--pgie-profile", choices=("yolo26", "yolo26-watch"), default="yolo26")
     args = parser.parse_args()
+    args.base_config = args.base_config.resolve(strict=True)
     if not 1 <= args.duration <= 600:
         parser.error("duration must be between 1 and 600 seconds")
-    args.source, raster_evidence = validated_sources(args.source)
+    args.source, raster_evidence = validated_sources(args.source, args.base_config)
     out = args.output.resolve()
     out.mkdir(parents=True, mode=0o700, exist_ok=False)
     unit = "noesis-appliance.service"
     target = "menon-appliance.target"  # Supervisor only; no Menon implementation work.
-    target_was_active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", target]).returncode == 0
+    target_state = subprocess.check_output(
+        ["systemctl", "--user", "show", target, "-p", "ActiveState", "--value"], text=True
+    ).strip()
+    target_job = subprocess.check_output(
+        ["systemctl", "--user", "show", target, "-p", "Job", "--value"], text=True
+    ).strip()
+    target_was_active = target_state in {"active", "activating", "reloading"} or target_job not in {"", "0"}
     pid = int(subprocess.check_output(["systemctl", "--user", "show", unit, "-p", "MainPID", "--value"], text=True))
     if pid <= 0:
         raise RuntimeError("No running Noesis service from which to establish native environment")
@@ -150,14 +160,15 @@ def main():
     env["NOESIS_IDENTITY_V2_EVIDENCE_PATH"] = str(out / "identity-evidence.jsonl")
     python = str(Path(env["NOESIS_DS91_NATIVE_ROOT"]) / "venv/bin/python")
     config = out / "infer-replay.yaml"
-    render = [python, "DS9/scripts/render_recorded_replay_config.py", "--output", str(config)]
+    render = [python, "DS9/scripts/render_recorded_replay_config.py", "--output", str(config), "--base-config", str(args.base_config)]
     for source in args.source:
         render += ["--source", source]
     subprocess.run(render, cwd=ROOT, env=env, check=True)
     auth = load_required_internal_auth(env["NOESIS_INTERNAL_AUTH_TOKEN_FILE"], env=env)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     metadata = {"git_revision": revision, "sources": args.source, "model_size": args.model_size,
-                "tracking_mode": "baseline", "service_pid_before": pid,
+                "tracking_mode": "baseline", "base_config": str(args.base_config),
+                "pgie_profile": args.pgie_profile, "service_pid_before": pid,
                 "service_command_before": command_before, "duration_limit_s": args.duration,
                 "new_identity_store": True, "new_world_store": True}
     metadata["source_rasters"] = raster_evidence
@@ -195,13 +206,15 @@ def main():
         # The target's Upholds would otherwise restart Noesis into the replay
         # ports. Preserve its state and stop it before the service, as the
         # existing reconstruction/replay lease does.
-        if target_was_active:
-            subprocess.run(["systemctl", "--user", "stop", target], check=True, timeout=60)
+        # A target can still be inactive while its queued start job waits for
+        # readiness dependencies. Stop unconditionally to cancel that job too.
+        subprocess.run(["systemctl", "--user", "stop", target], check=True, timeout=60)
         subprocess.run(["systemctl", "--user", "stop", unit], check=True, timeout=90)
         with (out / "runtime.log").open("x") as log:
             process = subprocess.Popen(
                 [python, "DS9/scripts/run_canonical_runtime_host.py", "run",
-                 "--pipeline-config", str(config), "--model-size", args.model_size],
+                 "--pipeline-config", str(config), "--model-size", args.model_size,
+                 "--pgie-profile", args.pgie_profile],
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
             )
             report = asyncio.run(capture(process, out / "cohorts.ndjson", auth, args.duration))
@@ -222,7 +235,10 @@ def main():
         if stopped:
             subprocess.run(["systemctl", "--user", "reset-failed", unit], check=True)
             try:
-                subprocess.run(["systemctl", "--user", "start", target if target_was_active else unit], check=True, timeout=90)
+                subprocess.run(["systemctl", "--user", "start", unit], check=True, timeout=90)
+                if target_was_active:
+                    # Gateway readiness has its own longer startup budget.
+                    subprocess.run(["systemctl", "--user", "start", "--no-block", target], check=True, timeout=15)
                 report["service_restored"] = subprocess.check_output(
                     ["systemctl", "--user", "is-active", unit], text=True).strip()
             finally:

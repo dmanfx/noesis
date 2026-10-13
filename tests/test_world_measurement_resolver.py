@@ -116,6 +116,31 @@ def test_resolver_retains_selected_slope_after_covariance_intersection():
     assert min(np.linalg.eigvalsh(np.array(result.covariance.values).reshape(3, 3))) >= 0
 
 
+def test_registered_partial_body_is_not_fused_with_inferred_gravity():
+    cohort = _cohort()
+    depth = _hypothesis(
+        cohort, "body-depth", "registered_depth", (1.0, 0.0, 3.0),
+        confidence=.8, anchor="person_body_projection",
+        support_state="unknown", posture="standing",
+    )
+    gravity = _hypothesis(
+        cohort, "gravity", "gravity_reconstruction", (1.1, 0.0, 3.0),
+        confidence=.45, anchor="learned_body_height",
+        support_state="unknown", posture="standing",
+    )
+    result = UniversalWorldMeasurementResolver().resolve(
+        WorldMeasurementSet(cohort=cohort, hypotheses=(depth, gravity))
+    )
+    assert result.selected_candidate_id == depth.candidate_id
+    assert result.position == depth.position
+    assert not result.fused
+    assert result.contributor_ids == (depth.candidate_id,)
+    assert result.alternate_candidate_id == gravity.candidate_id
+    diagnostic = next(row for row in result.diagnostics
+                      if row.candidate_id == gravity.candidate_id)
+    assert diagnostic.rejection_reason == "inferred_height_not_equivalent_to_measured_support"
+
+
 def test_resolver_rejects_ci_result_outside_observed_convex_extent():
     cohort = _cohort()
     surface = SupportSurfaceReference(

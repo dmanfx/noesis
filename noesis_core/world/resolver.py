@@ -182,6 +182,28 @@ class UniversalWorldMeasurementResolver:
                     "support_state_not_equivalent_to_selected"
                 )
                 continue
+            if (
+                (candidate.hypothesis.kind == "gravity_reconstruction")
+                != (selected.hypothesis.kind == "gravity_reconstruction")
+            ):
+                # Matching unknown support and nearby coordinates do not
+                # turn inferred body height into measured range. In particular,
+                # a qualified partial-body depth footprint must not acquire a
+                # diagnostic-only gravity contributor and then fail canonical
+                # admission. Retain that alternate without averaging it.
+                excluded_reasons[candidate.hypothesis.candidate_id] = (
+                    "inferred_height_not_equivalent_to_measured_support"
+                )
+                if alternate is None:
+                    alternate = candidate
+                    disagreement_m = self._distance(
+                        selected.hypothesis.position, candidate.hypothesis.position
+                    )
+                    disagreement_mahalanobis_sq = self._mahalanobis_sq(
+                        selected.hypothesis.position, candidate.hypothesis.position,
+                        selected.hypothesis.covariance, candidate.hypothesis.covariance,
+                    )
+                continue
             pairwise = tuple(
                 (
                     contributor,

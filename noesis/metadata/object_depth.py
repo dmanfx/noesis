@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -50,6 +51,46 @@ def _coerce_optional_point3(value: Any) -> Optional[Point3]:
 
 
 @dataclass(frozen=True, slots=True)
+class PoseDepthSample:
+    """One bounded anatomy patch, including rejected attempts, at its own UV."""
+
+    anchor_source: str
+    anchor_uv: Sequence[float]
+    sample_count: int
+    valid_fraction: float
+    mask_area_px: int
+    depth_median: Optional[float] = None
+    depth_p10: Optional[float] = None
+    depth_p90: Optional[float] = None
+    evidence_quality: str = "rejected"
+    evidence_reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.anchor_source not in {"pose_ankle_support", "pose_torso_support", "pose_shoulder_support"}:
+            raise ValueError("unsupported pose depth anatomy")
+        object.__setattr__(self, "anchor_uv", _coerce_point2(self.anchor_uv))
+        if not all(math.isfinite(v) for v in self.anchor_uv):
+            raise ValueError("pose depth UV must be finite")
+        object.__setattr__(self, "sample_count", max(0, int(self.sample_count)))
+        object.__setattr__(self, "mask_area_px", max(0, int(self.mask_area_px)))
+        if not math.isfinite(float(self.valid_fraction)) or not 0 <= float(self.valid_fraction) <= 1:
+            raise ValueError("invalid pose depth support fraction")
+        for key in ("depth_median", "depth_p10", "depth_p90"):
+            value = _coerce_optional_float(getattr(self, key))
+            if value is not None and not math.isfinite(value):
+                raise ValueError("pose depth statistic must be finite")
+            object.__setattr__(self, key, value)
+        if self.evidence_quality not in {"good", "estimated", "rejected"}:
+            raise ValueError("invalid pose depth quality")
+        if self.evidence_reason is not None:
+            object.__setattr__(self, "evidence_reason", str(self.evidence_reason)[:160])
+
+    def to_dict(self) -> JsonDict:
+        return {key: (list(self.anchor_uv) if key == "anchor_uv" else getattr(self, key))
+                for key in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True, slots=True)
 class ObjectDepthResult:
     source_id: int
     frame_id: int
@@ -82,6 +123,8 @@ class ObjectDepthResult:
     evidence_reason: Optional[str] = None
     depth_spread_m: Optional[float] = None
     anchor_depth_spread_m: Optional[float] = None
+    pose_depth_samples: Sequence[PoseDepthSample | Mapping[str, Any]] = ()
+    pose_joint_confidences: Sequence[float] = ()
     measurement_frame_id: Optional[int] = None
     measurement_ts_us: Optional[int] = None
     measurement_age_us: Optional[int] = None
@@ -101,6 +144,18 @@ class ObjectDepthResult:
     ts_us: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if len(self.pose_depth_samples) > 3:
+            raise ValueError("pose depth attempts exceed bounded anatomy budget")
+        object.__setattr__(self, "pose_depth_samples", tuple(
+            sample if isinstance(sample, PoseDepthSample) else PoseDepthSample(**sample)
+            for sample in self.pose_depth_samples
+        ))
+        if len(self.pose_joint_confidences) not in (0, 17):
+            raise ValueError("pose confidence diagnostics require 17 joints")
+        confidences = tuple(float(value) for value in self.pose_joint_confidences)
+        if any(not math.isfinite(value) or not 0 <= value <= 1 for value in confidences):
+            raise ValueError("invalid pose joint confidence")
+        object.__setattr__(self, "pose_joint_confidences", confidences)
         object.__setattr__(self, "source_id", int(self.source_id))
         object.__setattr__(self, "frame_id", int(self.frame_id))
         object.__setattr__(self, "object_id", int(self.object_id))
@@ -238,6 +293,10 @@ class ObjectDepthResult:
         for key, value in optional_fields.items():
             if value is not None:
                 payload[key] = value
+        if self.pose_depth_samples:
+            payload["pose_depth_samples"] = [sample.to_dict() for sample in self.pose_depth_samples]
+        if self.pose_joint_confidences:
+            payload["pose_joint_confidences"] = list(self.pose_joint_confidences)
         return payload
 
     def to_json(self, *, indent: int | None = None) -> str:

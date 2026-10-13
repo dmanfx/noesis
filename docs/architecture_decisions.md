@@ -2,6 +2,31 @@
 
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
+
+## Partial-body localization uses observed anatomy, not hidden feet — 2026-10-09
+
+Blankets and reclining posture commonly remove hips/ankles from usable pose.
+Baseline depth therefore samples independent narrow ankle, torso and fallback
+shoulder patches through the existing bounded native GPU statistic API. Torso
+geometry accepts horizontal anatomy; shoulder geometry uses only two observed
+shoulders. Preserve every attempt's own UV/range/support and enclosing exact
+measurement/tensor provenance. No synthetic joints, assumed seated height,
+room offset, new frame-copy branch or alternative runtime is introduced.
+
+Qualified non-upright body depth has priority over ankles. Qualified shoulder
+depth may localize an unknown-posture body footprint without claiming visible
+floor contact; cold state still requires current detector confidence and three
+fresh consistent observations. Registration, contamination, freshness and
+physical-motion gates remain authoritative. A shoulder observation cannot
+teach a torso-height plane at another pixel. Changes between shoulder and torso
+bases are quarantined rather than blended: hold without independent motion,
+or perform an explicit corroborated reanchor with a trail break. BEV receives
+only the resulting admitted canonical point, never the diagnostic patch ray.
+Numerically compatible inferred-height gravity and measured-support candidates
+are not equivalent fusion contributors; keep gravity as an alternate rather
+than contaminating the valid range result. The typed all-contributor admission
+gate remains unchanged.
+
 ## Native tracker presence preserves admitted world continuity — 2026-10-05
 
 An empty object list is not confirmed disappearance when current NvDCF shadow

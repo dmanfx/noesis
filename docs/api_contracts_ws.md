@@ -1037,7 +1037,9 @@ world snapshot can legitimately contain a not-yet-expired tracked person.
       "depth_sample_count": <int|null>,
       "depth_valid_fraction": <float|null>,
       "depth_anchor_sample_count": <int|null>,
-      "depth_anchor_valid_fraction": <float|null>
+      "depth_anchor_valid_fraction": <float|null>,
+      "depth_pose_samples": [<bounded anatomy attempt, see metadata contract>],
+      "depth_pose_joint_confidences": [<17 COCO confidences, or empty>]
     }
   ]
 }
@@ -1461,10 +1463,17 @@ Depth exposure:
 - `depth_registration_id` identifies the exact per-camera registration artifact entry used by the estimator.
 - `depth_status`, `depth_anchor_source`, `depth_sample_count`, and `depth_valid_fraction` are published on both `tracking.tracks[]` and `stats.payload.cameras[*].tracking.active_tracks[]` so the runtime OSD and dashboard can explain whether baseline depth is contributing on a given frame.
 - `depth_anchor_sample_count` and `depth_anchor_valid_fraction` surface support
-  of the exact lower-body/ankle depth band. Resolver candidate diagnostics and
+  of the selected exact ankle/torso/shoulder depth band. Resolver candidate diagnostics and
   covariance are the canonical explanation for whether it was selected,
   fused, retained as an alternate, or rejected; whole-mask support is not a
   substitute.
+- `depth_pose_samples` preserves at most three independently sampled anatomy
+  attempts, including their own UV, raw optical depth, support, spread and
+  rejection reason; `depth_pose_joint_confidences` exposes observed joint
+  availability. Their typed fields are specified by the
+  [object-depth metadata contract](metadata_contracts.md). They explain sampling
+  and do not override `world_valid`, current measurement admission, or the
+  explicit measured/predicted/held position state.
 - The on-screen `depth=` label is optical/registered range sourced from
   `depth_used_m`; it is not canonical world Z. The parser still removes or
   preserves legacy `z=` fragments during mixed-version transitions.

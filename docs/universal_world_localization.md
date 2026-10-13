@@ -84,6 +84,15 @@ The DS9 analytics hook constructs each candidate independently:
   for the depth sample's own anchor. The object-geometry and GPU depth-tensor
   frame/PTS must both match; a current bbox sampled against a lagged tensor is
   retained as diagnostics rather than mislabeled as current evidence.
+  Independent ankle, orientation-independent torso, and partial-shoulder patches
+  retain their own UV/range/support. Missing feet or hips do not invalidate a
+  qualified shoulder observation. The measured body point is gravity-projected
+  to the selected support surface; it is not an observed covered-foot contact
+  or an inferred hip. If only shoulders are visible and posture remains unknown,
+  qualified exact shoulder depth can establish this distinct body footprint
+  when no verified image floor contact exists. Cold shoulder admission requires
+  the existing three-current-sample consensus and detector semantic gate;
+  no posture, population height, or old standing position is fabricated.
 - `pose_scale`: an exact-current, typed body-to-floor projection for people
   whose physical floor contact is hidden. A standing solve intersects calibrated
   nose, shoulder, and hip rays with their anatomical height planes and solves
@@ -117,6 +126,20 @@ authoritative floor contacts. When an exact upright body-plane candidate is
 available, the resolver does not also add the learned-height gravity hypothesis
 from the same current body; correlated body estimates cannot masquerade as
 independent fusion evidence.
+
+An inferred-height `gravity_reconstruction` also cannot become a contributor
+to measured range or observed support merely because both use `unknown`
+support and agree numerically. It remains an explained alternate. This keeps
+a qualified partial-body range from acquiring a diagnostic-only contributor
+and subsequently failing the all-contributor canonical admission gate.
+
+Shoulder depth cannot seed a torso-height reference. A registered torso sample
+may seed one only at the exact corresponding torso UV. Shoulder and torso
+depth have distinct anatomical continuity bases: switching between them cannot
+silently blend a different body point into the accepted trajectory. Without
+independent coherent image motion, the existing valid coordinate remains held;
+an accepted same-basis reacquisition is explicit and breaks the trail. Cached
+rows never increase that consensus or renew last-good measurement time.
 
 ## Measured finite floor surfaces
 

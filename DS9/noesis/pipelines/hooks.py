@@ -42,7 +42,7 @@ from noesis.calibration.world_fusion_policy import WorldFusionPolicy
 from noesis.calibration.geometry import pixel_to_world
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
-from noesis.metadata.object_depth import ObjectDepthResult
+from noesis.metadata.object_depth import ObjectDepthResult, PoseDepthSample
 from noesis.metadata.pose_features import PoseFeatureResult
 from noesis.mapanything_profiles import (
     get_mapanything_profile,
@@ -7254,9 +7254,8 @@ class _ObjectDepthFusionProcessor:
     ]:
         """Return one compact, pose-bounded torso depth sampler.
 
-        This is range evidence, never a floor-contact construction. Requiring
-        both shoulders and both hips keeps the sample on observed person
-        anatomy and out of the detector rectangle's furniture/background.
+        This is range evidence, never a floor-contact construction. The full
+        torso uses observed shoulders/hips; its orientation may be horizontal.
         The native depth API already accepts a generic compound capsule, so
         this remains one bounded GPU statistic with no image-sized host copy.
         """
@@ -7289,6 +7288,7 @@ class _ObjectDepthFusionProcessor:
                 return None
             if (
                 confidence < threshold
+                or not math.isfinite(confidence)
                 or not math.isfinite(px)
                 or not math.isfinite(py)
             ):
@@ -7332,21 +7332,20 @@ class _ObjectDepthFusionProcessor:
         torso_dx = hip_mid[0] - shoulder_mid[0]
         torso_dy = hip_mid[1] - shoulder_mid[1]
         torso_length = math.hypot(torso_dx, torso_dy)
-        min_side_width = max(5.0, 0.08 * width)
+        min_side_width = max(5.0, 0.08 * min(width, height))
         if (
             shoulder_width < min_side_width
             or hip_width < min_side_width
             or torso_length < max(8.0, 0.08 * height)
-            or abs(torso_dy) < 0.45 * torso_length
         ):
             return None, None
 
         # Trim the end joints so the statistic stays in the torso core. The
         # radius is tied to observed anatomy, not the detector rectangle.
-        ax = shoulder_mid[0] + 0.18 * torso_dx
-        ay = shoulder_mid[1] + 0.18 * torso_dy
-        bx = shoulder_mid[0] + 0.78 * torso_dx
-        by = shoulder_mid[1] + 0.78 * torso_dy
+        ax = shoulder_mid[0] + 0.40 * torso_dx
+        ay = shoulder_mid[1] + 0.40 * torso_dy
+        bx = shoulder_mid[0] + 0.56 * torso_dx
+        by = shoulder_mid[1] + 0.56 * torso_dy
         radius = max(
             2.5,
             min(18.0, 0.16 * min(shoulder_width, hip_width)),
@@ -7361,6 +7360,76 @@ class _ObjectDepthFusionProcessor:
         )
         anchor_uv = [0.5 * (ax + bx), 0.5 * (ay + by)]
         return capsule, [float(anchor_uv[0]), float(anchor_uv[1])]
+
+    def _pose_shoulder_capsule_geometry(
+        self, keypoints: np.ndarray, *, bbox: Tuple[float, float, float, float],
+    ) -> Tuple[Optional[Tuple[float, float, float, float, float, float]], Optional[List[float]]]:
+        """Sample the observed shoulder band without constructing covered hips."""
+        if not isinstance(keypoints, np.ndarray) or keypoints.shape[0] < 17 or keypoints.shape[1] < 3:
+            return None, None
+        left, top, width, height = (float(value) for value in bbox)
+        if not all(math.isfinite(value) for value in bbox) or min(width, height) <= 1:
+            return None, None
+        points = np.asarray(keypoints[[5, 6], :3], dtype=np.float64)
+        threshold = _read_env_float("NOESIS_OBJECT_DEPTH_POSE_KPT_THRESHOLD", 0.35, min_value=0.0)
+        if not np.all(np.isfinite(points)) or np.any(points[:, 2] < threshold):
+            return None, None
+        if any(not (left - .15 * width <= x <= left + 1.15 * width
+                    and top - .15 * height <= y <= top + 1.15 * height)
+               for x, y, _confidence in points):
+            return None, None
+        delta = points[1, :2] - points[0, :2]
+        span = float(np.linalg.norm(delta))
+        if span < max(5.0, .08 * min(width, height)):
+            return None, None
+        # Stay inside the observed band. These dimensionless trims define a
+        # sampling patch, not a body height, room offset, or inferred joint.
+        a = points[0, :2] + .35 * delta
+        b = points[0, :2] + .65 * delta
+        radius = max(2.5, min(18.0, .12 * span))
+        return (float(a[0]), float(a[1]), float(b[0]), float(b[1]), radius, radius), list(.5 * (a + b))
+
+    def _pose_depth_sample(
+        self, source: str, uv: Sequence[float], stats: Mapping[str, Any],
+        *, area: int, visible_ankles: int,
+    ) -> PoseDepthSample:
+        count = max(0, int(stats.get("sample_count", 0) or 0))
+        fraction = self._stats_float(stats, "valid_fraction") or 0.0
+        median = self._stats_float(stats, "depth_median")
+        p10 = self._stats_float(stats, "depth_p10")
+        p90 = self._stats_float(stats, "depth_p90")
+        ankle = source == "pose_ankle_support"
+        reason = _depth_evidence_rejection_reason(
+            sample_count=count, valid_fraction=fraction, depth_m=median,
+            depth_spread_m=_depth_spread_from_bounds(p10, p90),
+            min_sample_count=(max(8, min(20, int(math.ceil(area * .20)))) if ankle
+                              else max(24, min(48, int(math.ceil(area * .20))))),
+            min_valid_fraction=.60 if ankle else .55, strict_spread=ankle,
+        )
+        return PoseDepthSample(
+            anchor_source=source, anchor_uv=uv, sample_count=count,
+            valid_fraction=max(0.0, min(1.0, fraction)), mask_area_px=area,
+            depth_median=median, depth_p10=p10, depth_p90=p90,
+            evidence_quality=("rejected" if reason else "good" if ankle and visible_ankles >= 2 else "estimated"),
+            evidence_reason=reason,
+        )
+
+    @staticmethod
+    def _pose_depth_selection(samples: Sequence[PoseDepthSample]) -> Dict[str, Any]:
+        selected = next((sample for sample in samples if sample.evidence_reason is None), None)
+        last = selected or (samples[-1] if samples else None)
+        return {
+            "status": "ok" if selected else ("ambiguous_depth" if last and last.sample_count else "no_ground_contact"),
+            "spatial_class": "person", "pose_depth_samples": tuple(samples),
+            "anchor_source": selected.anchor_source if selected else None,
+            "anchor_uv": selected.anchor_uv if selected else None,
+            "anchor_depth_m": selected.depth_median if selected else None,
+            "anchor_sample_count": selected.sample_count if selected else None,
+            "anchor_valid_fraction": selected.valid_fraction if selected else None,
+            "anchor_depth_spread_m": _depth_spread_from_bounds(last.depth_p10, last.depth_p90) if last else None,
+            "evidence_quality": selected.evidence_quality if selected else "rejected",
+            "evidence_reason": last.evidence_reason if last else "pose_anatomy_unavailable",
+        }
 
     @staticmethod
     def _pose_capsule_host_mask(
@@ -7565,157 +7634,59 @@ class _ObjectDepthFusionProcessor:
         )
 
     def _sample_pose_capsule_result(
-        self,
-        frame_meta: Any,
-        obj_meta: Any,
-        *,
-        bbox: Tuple[float, float, float, float],
-        depth_crop: np.ndarray,
-        body_mask: np.ndarray,
-        contact_mask: np.ndarray,
-        contact_uv: Optional[Sequence[float]],
-        visible_ankles: int,
-        torso_capsule: Optional[Sequence[float]],
-        torso_uv: Optional[Sequence[float]],
-        crop_origin: Tuple[int, int],
-        depth_center: Optional[float],
+        self, frame_meta: Any, obj_meta: Any, *,
+        bbox: Tuple[float, float, float, float], depth_crop: np.ndarray,
+        body_mask: np.ndarray, contact_mask: np.ndarray,
+        contact_uv: Optional[Sequence[float]], visible_ankles: int,
+        torso_capsule: Optional[Sequence[float]], torso_uv: Optional[Sequence[float]],
+        crop_origin: Tuple[int, int], depth_center: Optional[float],
+        shoulder_capsule: Optional[Sequence[float]] = None,
+        shoulder_uv: Optional[Sequence[float]] = None,
     ) -> ObjectDepthResult:
         body_valid = np.logical_and(np.asarray(body_mask, dtype=bool), np.isfinite(depth_crop))
         body_values_full = np.asarray(depth_crop[body_valid], dtype=np.float32)
-        body_values = _bounded_depth_stat_values(body_values_full)
         body_area = int(np.count_nonzero(body_mask))
-        sample_count = int(body_values_full.size)
-        valid_fraction = float(sample_count) / float(body_area or 1)
+        samples: List[PoseDepthSample] = []
 
-        anchor_source: Optional[str] = None
-        anchor_depth_m: Optional[float] = None
-        anchor_sample_count: Optional[int] = None
-        anchor_valid_fraction: Optional[float] = None
-        anchor_depth_spread_m: Optional[float] = None
-        evidence_quality = "rejected"
-        evidence_reason: Optional[str] = "pose_ankles_unavailable"
-        status = "no_ground_contact" if sample_count > 0 else "no_valid_depth"
+        def sample_patch(source: str, uv: Sequence[float], mask: np.ndarray) -> None:
+            area = int(np.count_nonzero(mask))
+            values_full = np.asarray(depth_crop[np.logical_and(mask, np.isfinite(depth_crop))], dtype=np.float32)
+            values = _bounded_depth_stat_values(values_full, env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES")
+            stats = {
+                "sample_count": int(values_full.size),
+                "valid_fraction": float(values_full.size) / float(area or 1),
+                "depth_median": float(np.median(values)) if values.size else None,
+                "depth_p10": float(np.percentile(values, 10)) if values.size else None,
+                "depth_p90": float(np.percentile(values, 90)) if values.size else None,
+            }
+            samples.append(self._pose_depth_sample(source, uv, stats, area=area, visible_ankles=visible_ankles))
 
-        contact_area = int(np.count_nonzero(contact_mask))
-        if contact_uv is not None and visible_ankles > 0 and contact_area > 0:
-            contact_valid = np.logical_and(
-                np.asarray(contact_mask, dtype=bool),
-                np.isfinite(depth_crop),
+        if contact_uv is not None and visible_ankles > 0 and np.any(contact_mask):
+            sample_patch("pose_ankle_support", contact_uv, contact_mask)
+        for source, capsule, uv in (
+            ("pose_torso_support", torso_capsule, torso_uv),
+            ("pose_shoulder_support", shoulder_capsule, shoulder_uv),
+        ):
+            if capsule is None or uv is None:
+                continue
+            # A full-torso success needs no second body basis. Ankle success
+            # does not suppress independently sampled body range.
+            if source == "pose_shoulder_support" and any(
+                sample.anchor_source == "pose_torso_support" and sample.evidence_reason is None
+                for sample in samples
+            ):
+                continue
+            mask = self._pose_capsule_host_mask(
+                capsule, crop_origin=crop_origin, crop_shape=depth_crop.shape,
             )
-            contact_values_full = np.asarray(depth_crop[contact_valid], dtype=np.float32)
-            contact_values = _bounded_depth_stat_values(
-                contact_values_full,
-                env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
-            )
-            contact_count = int(contact_values_full.size)
-            contact_fraction = float(contact_count) / float(contact_area or 1)
-            contact_median = (
-                float(np.median(contact_values)) if contact_values.size > 0 else None
-            )
-            contact_spread = _depth_spread_from_bounds(
-                float(np.percentile(contact_values, 10.0)) if contact_values.size > 0 else None,
-                float(np.percentile(contact_values, 90.0)) if contact_values.size > 0 else None,
-            )
-            min_contact_count = max(8, min(20, int(math.ceil(contact_area * 0.20))))
-            evidence_reason = _depth_evidence_rejection_reason(
-                sample_count=contact_count,
-                valid_fraction=contact_fraction,
-                depth_m=contact_median,
-                depth_spread_m=contact_spread,
-                min_sample_count=min_contact_count,
-                min_valid_fraction=0.60,
-                strict_spread=True,
-            )
-            anchor_depth_spread_m = contact_spread
-            if evidence_reason is None:
-                anchor_source = "pose_ankle_support"
-                anchor_depth_m = contact_median
-                anchor_sample_count = int(contact_count)
-                anchor_valid_fraction = float(contact_fraction)
-                evidence_quality = "good" if int(visible_ankles) >= 2 else "estimated"
-                status = "ok"
-            else:
-                status = "ambiguous_depth"
-        elif torso_uv is not None and torso_capsule is not None:
-            # Host-only fallback for systems without the native compact
-            # sampler. Rasterize the same torso-only capsule used by the
-            # native path; the whole skeleton mask includes legs and must not
-            # supply range for the torso UV.
-            torso_mask = self._pose_capsule_host_mask(
-                torso_capsule,
-                crop_origin=crop_origin,
-                crop_shape=(int(depth_crop.shape[0]), int(depth_crop.shape[1])),
-            )
-            if torso_mask is None:
-                torso_mask = np.zeros_like(depth_crop, dtype=bool)
-            torso_area = int(np.count_nonzero(torso_mask))
-            torso_valid = np.logical_and(torso_mask, np.isfinite(depth_crop))
-            torso_values_full = np.asarray(depth_crop[torso_valid], dtype=np.float32)
-            torso_values = _bounded_depth_stat_values(
-                torso_values_full,
-                env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
-            )
-            torso_count = int(torso_values_full.size)
-            torso_fraction = float(torso_count) / float(torso_area or 1)
-            torso_median = (
-                float(np.median(torso_values)) if torso_values.size > 0 else None
-            )
-            torso_spread = _depth_spread_from_bounds(
-                float(np.percentile(torso_values, 10.0)) if torso_values.size > 0 else None,
-                float(np.percentile(torso_values, 90.0)) if torso_values.size > 0 else None,
-            )
-            min_torso_count = max(24, min(48, int(math.ceil(torso_area * 0.20))))
-            evidence_reason = _depth_evidence_rejection_reason(
-                sample_count=torso_count,
-                valid_fraction=torso_fraction,
-                depth_m=torso_median,
-                depth_spread_m=torso_spread,
-                min_sample_count=min_torso_count,
-                min_valid_fraction=0.55,
-                strict_spread=False,
-            )
-            anchor_depth_spread_m = torso_spread
-            if evidence_reason is None:
-                anchor_source = "pose_torso_support"
-                anchor_depth_m = torso_median
-                anchor_sample_count = int(torso_count)
-                anchor_valid_fraction = float(torso_fraction)
-                evidence_quality = "estimated"
-                status = "ok"
-            else:
-                status = "ambiguous_depth" if torso_count > 0 else "no_valid_depth"
-
-        anchor_fields: Dict[str, Any] = {
-            "spatial_class": "person",
-            "anchor_uv": (
-                list(contact_uv)
-                if anchor_source == "pose_ankle_support" and contact_uv is not None
-                else (
-                    list(torso_uv)
-                    if anchor_source == "pose_torso_support" and torso_uv is not None
-                    else None
-                )
-            ),
-            "anchor_source": anchor_source,
-            "anchor_depth_m": anchor_depth_m,
-            "anchor_sample_count": anchor_sample_count,
-            "anchor_valid_fraction": anchor_valid_fraction,
-            "anchor_depth_spread_m": anchor_depth_spread_m,
-        }
+            sample_patch(source, uv, mask if mask is not None else np.zeros_like(depth_crop, dtype=bool))
+        fields = self._pose_depth_selection(samples)
         return self._build_result(
-            frame_meta,
-            obj_meta,
-            bbox=bbox,
-            status=status,
-            mask_area_px=body_area,
-            sample_count=sample_count,
-            valid_fraction=valid_fraction,
-            depth_center=depth_center,
-            values=body_values,
-            anchor_fields=anchor_fields,
-            sampling_mode="pose_capsule",
-            evidence_quality=evidence_quality,
-            evidence_reason=evidence_reason,
+            frame_meta, obj_meta, bbox=bbox, status=fields["status"],
+            mask_area_px=body_area, sample_count=int(body_values_full.size),
+            valid_fraction=float(body_values_full.size) / float(body_area or 1),
+            depth_center=depth_center, values=_bounded_depth_stat_values(body_values_full),
+            anchor_fields=fields, sampling_mode="pose_capsule",
         )
 
     def _stats_float(self, stats: Mapping[str, Any], key: str) -> Optional[float]:
@@ -7867,239 +7838,88 @@ class _ObjectDepthFusionProcessor:
         return dict(stats_raw)
 
     def _sample_pose_capsule_result_native(
-        self,
-        frame_meta: Any,
-        obj_meta: Any,
-        *,
-        bbox: Tuple[float, float, float, float],
-        depth_frame: _AlignedDepthFrame,
-        crop_rect: Tuple[int, int, int, int],
-        body_mask: np.ndarray,
-        contact_mask: np.ndarray,
-        contact_uv: Optional[Sequence[float]],
+        self, frame_meta: Any, obj_meta: Any, *,
+        bbox: Tuple[float, float, float, float], depth_frame: _AlignedDepthFrame,
+        crop_rect: Tuple[int, int, int, int], body_mask: np.ndarray,
+        contact_mask: np.ndarray, contact_uv: Optional[Sequence[float]],
         visible_ankles: int,
         contact_capsules: Optional[Sequence[Sequence[float]]] = None,
         torso_capsule: Optional[Sequence[float]] = None,
         torso_uv: Optional[Sequence[float]] = None,
+        shoulder_capsule: Optional[Sequence[float]] = None,
+        shoulder_uv: Optional[Sequence[float]] = None,
     ) -> Optional[ObjectDepthResult]:
-        depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
-        if depth_device_frame is None:
+        device = getattr(depth_frame, "depth_device_frame", None)
+        if device is None or not np.any(body_mask):
             return None
-        body_area = int(np.count_nonzero(body_mask))
-        contact_area = int(np.count_nonzero(contact_mask))
-        if body_area <= 0:
+        plans: List[Tuple[str, Sequence[Sequence[float]], Sequence[float]]] = []
+        if contact_uv is not None and visible_ankles > 0 and np.any(contact_mask) and contact_capsules:
+            plans.append(("pose_ankle_support", list(contact_capsules)[:2], contact_uv))
+        if torso_capsule is not None and torso_uv is not None:
+            plans.append(("pose_torso_support", [torso_capsule], torso_uv))
+        if shoulder_capsule is not None and shoulder_uv is not None:
+            plans.append(("pose_shoulder_support", [shoulder_capsule], shoulder_uv))
+        sampler = getattr(device, "sample_pose_capsule_stats", None)
+        if plans and not callable(sampler):
             return None
-
-        # Position authority needs only compact anatomy support. Prefer ankle
-        # contact; when lower-body contact is not observed, one strict torso
-        # capsule may provide current person range without claiming a floor
-        # contact. The native method returns one compact statistic from the
-        # GPU-resident tensor and never uploads an image-sized host mask.
-        ankle_sampling = bool(
-            contact_uv is not None
-            and visible_ankles > 0
-            and contact_area > 0
-            and contact_capsules
-        )
-        torso_sampling = bool(
-            not ankle_sampling and torso_capsule is not None and torso_uv is not None
-        )
-        selected_capsules: Sequence[Sequence[float]] = (
-            list(contact_capsules or ())[:2]
-            if ankle_sampling
-            else ([list(torso_capsule)] if torso_sampling and torso_capsule is not None else [])
-        )
-        body_stats: Mapping[str, Any] = {}
-        if selected_capsules:
-            sample_capsule_stats = getattr(
-                depth_device_frame,
-                "sample_pose_capsule_stats",
-                None,
-            )
-            if not callable(sample_capsule_stats):
-                return None
+        samples: List[PoseDepthSample] = []
+        stats_by_source: Dict[str, Mapping[str, Any]] = {}
+        for source, capsules, uv in plans:
+            if source == "pose_shoulder_support" and any(
+                sample.anchor_source == "pose_torso_support" and sample.evidence_reason is None
+                for sample in samples
+            ):
+                continue
+            start_ns = time.perf_counter_ns()
             try:
-                start_ns = time.perf_counter_ns()
-                stats_raw = sample_capsule_stats(
-                    [list(capsule) for capsule in selected_capsules],
-                    _read_env_int(
-                        "NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
-                        4096,
-                        min_value=128,
-                    ),
-                )
-                _record_core_stage_timing(
-                    (
-                        "object_depth.native_pose_contact_capsule_stats"
-                        if ankle_sampling
-                        else "object_depth.native_pose_torso_capsule_stats"
-                    ),
-                    start_ns,
-                    item_count=int(contact_area if ankle_sampling else body_area),
+                stats = sampler(
+                    [list(capsule) for capsule in capsules],
+                    _read_env_int("NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES", 4096, min_value=128),
                 )
             except Exception:
-                logger.debug(
-                    "Native pose-contact object-depth ROI stats failed",
-                    exc_info=True,
-                )
-                return None
-            if not isinstance(stats_raw, Mapping):
-                return None
-            body_stats = dict(stats_raw)
-            body_area = int(
-                body_stats.get("sampled_capsule_area_px", contact_area) or contact_area
+                # A failed patch is unavailable evidence, not permission to
+                # copy the frame or replace the native algorithm.
+                logger.debug("Native anatomy depth statistic failed: %s", source, exc_info=True)
+                stats = {}
+            if not isinstance(stats, Mapping):
+                stats = {}
+            area = max(0, int(stats.get("sampled_capsule_area_px", 0) or 0))
+            _record_core_stage_timing(
+                "object_depth.native_pose_contact_capsule_stats" if source == "pose_ankle_support"
+                else "object_depth.native_pose_torso_capsule_stats",
+                start_ns, item_count=area,
             )
-            _increment_core_counter("object_depth_gpu_roi_copies_total")
-
-        try:
-            sample_count = int(body_stats.get("sample_count", 0) or 0)
-        except Exception:
-            sample_count = 0
-        valid_fraction = self._stats_float(body_stats, "valid_fraction") or 0.0
-        depth_median = self._stats_float(body_stats, "depth_median")
-        depth_p10 = self._stats_float(body_stats, "depth_p10")
-        depth_p90 = self._stats_float(body_stats, "depth_p90")
-        depth_spread = _depth_spread_from_bounds(depth_p10, depth_p90)
-
-        anchor_source: Optional[str] = None
-        anchor_depth_m: Optional[float] = None
-        anchor_sample_count: Optional[int] = None
-        anchor_valid_fraction: Optional[float] = None
-        anchor_depth_spread_m: Optional[float] = None
-        evidence_quality = "rejected"
-        evidence_reason: Optional[str] = "pose_ankles_unavailable"
-        status = "no_ground_contact"
-
-        if ankle_sampling:
-            contact_stats = body_stats
-            if contact_stats is not None:
-                try:
-                    contact_count = int(contact_stats.get("sample_count", 0) or 0)
-                except Exception:
-                    contact_count = 0
-                contact_fraction = self._stats_float(contact_stats, "valid_fraction") or 0.0
-                contact_median = self._stats_float(contact_stats, "depth_median")
-                contact_spread = _depth_spread_from_bounds(
-                    self._stats_float(contact_stats, "depth_p10"),
-                    self._stats_float(contact_stats, "depth_p90"),
-                )
-                min_contact_count = max(8, min(20, int(math.ceil(contact_area * 0.20))))
-                evidence_reason = _depth_evidence_rejection_reason(
-                    sample_count=contact_count,
-                    valid_fraction=contact_fraction,
-                    depth_m=contact_median,
-                    depth_spread_m=contact_spread,
-                    min_sample_count=min_contact_count,
-                    min_valid_fraction=0.60,
-                    strict_spread=True,
-                )
-                anchor_depth_spread_m = contact_spread
-                if evidence_reason is None:
-                    anchor_source = "pose_ankle_support"
-                    anchor_depth_m = contact_median
-                    anchor_sample_count = int(contact_count)
-                    anchor_valid_fraction = float(contact_fraction)
-                    evidence_quality = "good" if int(visible_ankles) >= 2 else "estimated"
-                    status = "ok"
-                else:
-                    status = "ambiguous_depth"
-        elif torso_sampling:
-            try:
-                torso_count = int(body_stats.get("sample_count", 0) or 0)
-            except Exception:
-                torso_count = 0
-            torso_fraction = self._stats_float(body_stats, "valid_fraction") or 0.0
-            torso_median = self._stats_float(body_stats, "depth_median")
-            torso_spread = _depth_spread_from_bounds(
-                self._stats_float(body_stats, "depth_p10"),
-                self._stats_float(body_stats, "depth_p90"),
-            )
-            torso_area = int(
-                body_stats.get("sampled_capsule_area_px", body_area) or body_area
-            )
-            min_torso_count = max(24, min(48, int(math.ceil(torso_area * 0.20))))
-            evidence_reason = _depth_evidence_rejection_reason(
-                sample_count=torso_count,
-                valid_fraction=torso_fraction,
-                depth_m=torso_median,
-                depth_spread_m=torso_spread,
-                min_sample_count=min_torso_count,
-                min_valid_fraction=0.55,
-                strict_spread=False,
-            )
-            anchor_depth_spread_m = torso_spread
-            if evidence_reason is None:
-                anchor_source = "pose_torso_support"
-                anchor_depth_m = torso_median
-                anchor_sample_count = int(torso_count)
-                anchor_valid_fraction = float(torso_fraction)
-                evidence_quality = "estimated"
-                status = "ok"
-            else:
-                status = "ambiguous_depth" if torso_count > 0 else "no_valid_depth"
-
-        try:
-            object_id = int(getattr(obj_meta, "object_id", -1))
-        except Exception:
-            object_id = -1
-        try:
-            class_id = int(getattr(obj_meta, "class_id", -1))
-        except Exception:
-            class_id = -1
-        try:
-            score = float(getattr(obj_meta, "confidence", 0.0))
-        except Exception:
-            score = 0.0
+            if stats:
+                _increment_core_counter("object_depth_gpu_roi_copies_total")
+            stats_by_source[source] = stats
+            samples.append(self._pose_depth_sample(source, uv, stats, area=area, visible_ankles=visible_ankles))
+        fields = self._pose_depth_selection(samples)
+        selected_source = fields.get("anchor_source") or (samples[-1].anchor_source if samples else "")
+        stats = stats_by_source.get(str(selected_source), {})
         frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
         ts_us = _frame_pts_key_us(frame_meta)
-        payload: Dict[str, Any] = {
-            "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
-            "frame_id": frame_id,
-            "object_id": object_id,
-            "class_id": class_id,
-            "bbox": bbox,
-            "score": score,
-            "sampling_mode": "pose_capsule_native",
-            "status": status,
-            "unit": self.depth_unit,
-            "is_metric": self.depth_is_metric,
-            "sample_count": max(0, int(sample_count)),
-            "valid_fraction": max(0.0, min(1.0, float(valid_fraction))),
-            "depth_center": self._stats_float(body_stats, "depth_center"),
-            "depth_median": depth_median,
-            "depth_mean": self._stats_float(body_stats, "depth_mean"),
-            "depth_p10": depth_p10,
-            "depth_p90": depth_p90,
-            "depth_min": self._stats_float(body_stats, "depth_min"),
-            "depth_max": self._stats_float(body_stats, "depth_max"),
-            "depth_spread_m": depth_spread,
-            "mask_area_px": body_area,
-            "model": self.depth_model_name,
-            "ts_us": ts_us,
-            "spatial_class": "person",
-            "anchor_uv": (
-                list(contact_uv)
-                if anchor_source == "pose_ankle_support" and contact_uv is not None
-                else (
-                    list(torso_uv)
-                    if anchor_source == "pose_torso_support" and torso_uv is not None
-                    else None
-                )
-            ),
-            "anchor_source": anchor_source,
-            "anchor_depth_m": anchor_depth_m,
-            "anchor_sample_count": anchor_sample_count,
-            "anchor_valid_fraction": anchor_valid_fraction,
-            "anchor_depth_spread_m": anchor_depth_spread_m,
-            "evidence_quality": evidence_quality,
-            "evidence_reason": evidence_reason,
-            "measurement_frame_id": frame_id,
-            "measurement_ts_us": ts_us,
-            "measurement_age_us": 0,
-            "measurement_cached": False,
-        }
         _increment_core_counter("detection_wake.object_depth_pose_capsule_stats")
-        return ObjectDepthResult(**payload)
+        return ObjectDepthResult(
+            source_id=int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            frame_id=frame_id, object_id=int(getattr(obj_meta, "object_id", -1)),
+            class_id=int(getattr(obj_meta, "class_id", -1)), bbox=bbox,
+            score=float(getattr(obj_meta, "confidence", 0.0)),
+            sampling_mode="pose_capsule_native", unit=self.depth_unit, is_metric=self.depth_is_metric,
+            sample_count=max(0, int(stats.get("sample_count", 0) or 0)),
+            valid_fraction=max(0.0, min(1.0, self._stats_float(stats, "valid_fraction") or 0.0)),
+            depth_center=self._stats_float(stats, "depth_center"),
+            depth_median=self._stats_float(stats, "depth_median"),
+            depth_mean=self._stats_float(stats, "depth_mean"),
+            depth_p10=self._stats_float(stats, "depth_p10"),
+            depth_p90=self._stats_float(stats, "depth_p90"),
+            depth_min=self._stats_float(stats, "depth_min"),
+            depth_max=self._stats_float(stats, "depth_max"),
+            depth_spread_m=_depth_spread_from_bounds(self._stats_float(stats, "depth_p10"), self._stats_float(stats, "depth_p90")),
+            mask_area_px=max(0, int(stats.get("sampled_capsule_area_px", 0) or 0)),
+            model=self.depth_model_name, ts_us=ts_us,
+            measurement_frame_id=frame_id, measurement_ts_us=ts_us,
+            measurement_age_us=0, measurement_cached=False, **fields,
+        )
 
     def _sample_person_mask_stats_native(
         self,
@@ -8491,6 +8311,9 @@ class _ObjectDepthFusionProcessor:
             Tuple[float, float, float, float, float, float]
         ] = None
         pose_torso_uv: Optional[List[float]] = None
+        pose_shoulder_capsule = None
+        pose_shoulder_uv = None
+        pose_keypoints = None
         if not mask_payload:
             pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox)
             if pose_keypoints is not None:
@@ -8508,6 +8331,9 @@ class _ObjectDepthFusionProcessor:
                 pose_torso_capsule, pose_torso_uv = self._pose_torso_capsule_geometry(
                     pose_keypoints,
                     bbox=bbox,
+                )
+                pose_shoulder_capsule, pose_shoulder_uv = self._pose_shoulder_capsule_geometry(
+                    pose_keypoints, bbox=bbox,
                 )
                 if int(np.count_nonzero(pose_body_mask)) <= 0:
                     pose_body_mask = None
@@ -8530,9 +8356,14 @@ class _ObjectDepthFusionProcessor:
                 contact_capsules=pose_contact_capsules,
                 torso_capsule=pose_torso_capsule,
                 torso_uv=pose_torso_uv,
+                shoulder_capsule=pose_shoulder_capsule,
+                shoulder_uv=pose_shoulder_uv,
             )
             if native_pose_result is not None:
-                return native_pose_result
+                return replace(native_pose_result, pose_joint_confidences=tuple(
+                    float(value) if math.isfinite(float(value)) and 0 <= value <= 1 else 0.0
+                    for value in pose_keypoints[:17, 2]
+                ))
         elif not mask_payload:
             crop_x0, crop_y0, crop_x1, crop_y1 = self._bbox_fallback_rect(
                 x0,
@@ -8583,7 +8414,7 @@ class _ObjectDepthFusionProcessor:
         center_value = center_sample if np.isfinite(center_sample) else None
 
         if not mask_payload and pose_body_mask is not None and pose_contact_mask is not None:
-            return self._sample_pose_capsule_result(
+            result = self._sample_pose_capsule_result(
                 frame_meta,
                 obj_meta,
                 bbox=bbox,
@@ -8596,7 +8427,13 @@ class _ObjectDepthFusionProcessor:
                 torso_uv=pose_torso_uv,
                 crop_origin=(crop_x0, crop_y0),
                 depth_center=center_value,
+                shoulder_capsule=pose_shoulder_capsule,
+                shoulder_uv=pose_shoulder_uv,
             )
+            return replace(result, pose_joint_confidences=tuple(
+                float(value) if math.isfinite(float(value)) and 0 <= value <= 1 else 0.0
+                for value in pose_keypoints[:17, 2]
+            ))
 
         mask, _mask_status = self._decode_instance_mask_payload(mask_payload, depth_crop.shape)
         if mask is None:
@@ -15110,6 +14947,26 @@ class _AnalyticsTelemetryProcessor:
             upright_height_ratio,
         )
 
+    @staticmethod
+    def _person_depth_for_posture(
+        depth_result: Optional[ObjectDepthResult], posture: str,
+    ) -> Optional[ObjectDepthResult]:
+        """Select a separately qualified patch without changing its time/UV."""
+        if depth_result is None or posture not in ("sitting", "lying"):
+            return depth_result
+        body = next((sample for sample in depth_result.pose_depth_samples
+                     if sample.anchor_source in ("pose_torso_support", "pose_shoulder_support")
+                     and sample.evidence_reason is None and sample.evidence_quality != "rejected"), None)
+        if body is None:
+            return depth_result
+        return replace(
+            depth_result, status="ok", anchor_source=body.anchor_source,
+            anchor_uv=body.anchor_uv, anchor_depth_m=body.depth_median,
+            anchor_sample_count=body.sample_count, anchor_valid_fraction=body.valid_fraction,
+            anchor_depth_spread_m=_depth_spread_from_bounds(body.depth_p10, body.depth_p90),
+            evidence_quality=body.evidence_quality, evidence_reason=None,
+        )
+
     def _resolve_person_depth_anchor(self, depth_result: Optional[ObjectDepthResult]) -> Optional[_PoseAnchorCandidate]:
         if depth_result is None or str(depth_result.status) != "ok":
             return None
@@ -15125,6 +14982,7 @@ class _AnalyticsTelemetryProcessor:
             "torso_core",
             "pose_ankle_support",
             "pose_torso_support",
+            "pose_shoulder_support",
         ):
             return None
         anchor_depth_m = depth_result.anchor_depth_m
@@ -15150,6 +15008,7 @@ class _AnalyticsTelemetryProcessor:
         torso_projection = anchor_band in (
             "torso_core",
             "pose_torso_support",
+            "pose_shoulder_support",
         )
         return _PoseAnchorCandidate(
             u=float(anchor_uv[0]),
@@ -16498,7 +16357,7 @@ class _AnalyticsTelemetryProcessor:
             min_support_fraction = 0.45
             support_scale_denom = 128.0
             anchor_source_weight = 0.50
-        elif anchor_source == "pose_torso_support":
+        elif anchor_source in ("pose_torso_support", "pose_shoulder_support"):
             min_support_count = 24
             min_support_fraction = 0.55
             support_scale_denom = 128.0
@@ -17037,6 +16896,7 @@ class _AnalyticsTelemetryProcessor:
         depth_result: Optional[ObjectDepthResult],
         flip_u: bool,
         flip_v: bool,
+        sample_uv: Optional[Sequence[float]] = None,
     ) -> Optional[Tuple[float, float]]:
         """Measure the pose torso-anchor plane from exact registered range."""
 
@@ -17055,6 +16915,9 @@ class _AnalyticsTelemetryProcessor:
             registered_depth_m = float(depth_observation.registered_depth_m)
             observed_spread_m = float(depth_result.anchor_depth_spread_m or 0.0)
             floor_y = self._localization_projection_floor_y(calib)
+            sampled_uv = sample_uv if sample_uv is not None else depth_result.anchor_uv
+            if sampled_uv is None or not np.allclose([u, v], sampled_uv, rtol=0.0, atol=1e-6):
+                return None
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
         if (
@@ -17635,7 +17498,7 @@ class _AnalyticsTelemetryProcessor:
                 str(posture) in ("sitting", "lying")
                 and depth_registration_supported
                 and depth_anchor_source
-                in ("torso_core", "pose_torso_support")
+                in ("torso_core", "pose_torso_support", "pose_shoulder_support")
                 and str(person_anchor.source)
                 == "person_body_projection"
             ):
@@ -18520,6 +18383,8 @@ class _AnalyticsTelemetryProcessor:
     @staticmethod
     def _resolver_candidate_is_ground_footprint_supported(
         candidate: Any,
+        *,
+        contact_basis: Optional[str] = None,
     ) -> bool:
         """Return whether a typed hypothesis localizes a floor footprint.
 
@@ -18544,6 +18409,18 @@ class _AnalyticsTelemetryProcessor:
         ):
             return True
         posture = str(getattr(candidate, "posture", "") or "")
+        if (
+            support_state == "unknown"
+            and posture in ("unknown", "standing")
+            and kind == "registered_depth"
+            and anchor == "person_body_projection"
+            and str(contact_basis or getattr(candidate, "contact_basis", ""))
+            == "depth:pose_shoulder_support"
+        ):
+            # Exact registered range on observed partial anatomy is already
+            # a metric body point. Gravity projection needs no guessed body
+            # height or posture. This distinct basis makes no foot/seat claim.
+            return True
         if support_state == "seat" and posture == "sitting":
             return bool(
                 (kind == "pose_scale" and anchor == "seated_torso_plane")
@@ -18568,6 +18445,7 @@ class _AnalyticsTelemetryProcessor:
         image_motion_supported: bool = False,
         depth_corroborated: bool = False,
         verified_first_output_contact: bool = False,
+        contact_basis_by_candidate: Optional[Mapping[str, str]] = None,
     ) -> bool:
         """Return whether weak current evidence may enter temporal consensus.
 
@@ -18593,11 +18471,17 @@ class _AnalyticsTelemetryProcessor:
             return False
         kind = str(selected.kind)
         anchor = str(selected.anchor or "").strip().lower()
+        selected_contact_basis = (contact_basis_by_candidate or {}).get(
+            str(selected.candidate_id)
+        )
+        selected_ground_supported = self._resolver_candidate_is_ground_footprint_supported(
+            selected, contact_basis=selected_contact_basis,
+        )
         seated_projection = bool(
-            self._resolver_candidate_is_ground_footprint_supported(selected)
+            selected_ground_supported
             and str(selected.support_state) == "seat"
         )
-        if not self._resolver_candidate_is_ground_footprint_supported(selected):
+        if not selected_ground_supported:
             return False
         if (
             kind not in ("floor_ray", "registered_depth", "pose_scale")
@@ -20696,6 +20580,7 @@ class _AnalyticsTelemetryProcessor:
             if state is not None:
                 if posture != "sitting":
                     self._clear_seated_torso_height_reference(state)
+            depth_result = self._person_depth_for_posture(depth_result, str(posture))
             person_anchor = self._resolve_person_depth_anchor(depth_result)
             if (
                 person_anchor is not None
@@ -20703,18 +20588,22 @@ class _AnalyticsTelemetryProcessor:
                 in {
                     "depth:torso_core",
                     "depth:pose_torso_support",
+                    "depth:pose_shoulder_support",
                 }
             ):
-                # A pose-bounded torso capsule is useful only as a bridge for
-                # a known person whose lower body is genuinely unavailable.
+                # A qualified exact body patch measures its own anatomy; it
+                # does not require an unrelated hip-based motion reference.
                 # Admitting it on every upright/unknown row lets ordinary pose
                 # dropout compete with accurate floor contact and can pull the
                 # filter along a body-range ray. Keep the range branch exact-
                 # cohort, confidence-gated, lifecycle-backed, and limited to
                 # seated or explicitly lower-body-occluded observations.
+                partial_body_without_floor_contact = bool(
+                    str(person_anchor.contact_basis) == "depth:pose_shoulder_support"
+                    and not self._anchor_is_verified_ground_contact(pose_anchor)
+                )
                 exact_current_non_upright_torso = bool(
-                    posture in ("sitting", "lying")
-                    and pose_torso_reference_anchor is not None
+                    (posture in ("sitting", "lying") or partial_body_without_floor_contact)
                     and self._depth_measurement_is_current(
                         depth_result,
                         track=track,
@@ -20730,6 +20619,7 @@ class _AnalyticsTelemetryProcessor:
                 )
                 torso_context_supported = bool(
                     posture in ("sitting", "lying")
+                    or partial_body_without_floor_contact
                     or (
                         occlusion_assessment is not None
                         and occlusion_assessment.active
@@ -21542,6 +21432,10 @@ class _AnalyticsTelemetryProcessor:
                         depth_result=depth_result,
                         flip_u=flip_u,
                         flip_v=flip_v,
+                        sample_uv=(self._scale_uv_to_image_size(
+                            float(person_anchor.u), float(person_anchor.v),
+                            track_image_size, calib_image_size,
+                        ) if person_anchor is not None else None),
                     )
                 )
                 if measured_seated_height is not None:
@@ -22273,7 +22167,10 @@ class _AnalyticsTelemetryProcessor:
                     == len(resolved_support_ids)
                     and all(
                         self._resolver_candidate_is_ground_footprint_supported(
-                            candidate
+                            candidate,
+                            contact_basis=resolver_contact_basis_by_candidate.get(
+                                str(candidate.candidate_id)
+                            ),
                         )
                         for candidate in resolved_support_candidates
                     )
@@ -22298,7 +22195,10 @@ class _AnalyticsTelemetryProcessor:
                     or (
                         str(candidate.support_state) in {"seat", "couch"}
                         and self._resolver_candidate_is_ground_footprint_supported(
-                            candidate
+                            candidate,
+                            contact_basis=resolver_contact_basis_by_candidate.get(
+                                str(candidate.candidate_id)
+                            ),
                         )
                     )
                     for candidate in resolved_support_candidates
@@ -22442,6 +22342,7 @@ class _AnalyticsTelemetryProcessor:
                         verified_first_output_contact=bool(
                             verified_first_output_contact
                         ),
+                        contact_basis_by_candidate=resolver_contact_basis_by_candidate,
                     )
                 )
                 cold_floor_semantic_blocked = bool(
@@ -22530,7 +22431,10 @@ class _AnalyticsTelemetryProcessor:
                     selected_non_upright_projection = bool(
                         selected_resolver_candidate is not None
                         and self._resolver_candidate_is_ground_footprint_supported(
-                            selected_resolver_candidate
+                            selected_resolver_candidate,
+                            contact_basis=resolver_contact_basis_by_candidate.get(
+                                str(selected_resolver_candidate.candidate_id)
+                            ),
                         )
                         and str(
                             selected_resolver_candidate.support_state
@@ -22635,6 +22539,11 @@ class _AnalyticsTelemetryProcessor:
                     selected_contact_basis = str(
                         track.get("world_resolver_contact_basis") or ""
                     ).strip()
+                    if (not trusted_metric_lifecycle
+                            and selected_contact_basis == "depth:pose_shoulder_support"):
+                        # Partial anatomy requires the existing exact-basis
+                        # weak bootstrap, not one furniture-prone patch.
+                        filter_quality = "weak"
                     cold_bbox_temporal_consensus = bool(
                         not trusted_metric_lifecycle
                         and selected_kind == "floor_ray"
@@ -25091,6 +25000,16 @@ class _AnalyticsTelemetryProcessor:
         track: Dict[str, Any],
         depth_result: Optional[ObjectDepthResult],
     ) -> None:
+        depth_result = self._person_depth_for_posture(
+            depth_result, str(track.get("world_posture_effective") or "unknown"),
+        )
+        track["depth_pose_samples"] = (
+            [sample.to_dict() for sample in depth_result.pose_depth_samples]
+            if depth_result is not None else []
+        )
+        track["depth_pose_joint_confidences"] = (
+            list(depth_result.pose_joint_confidences) if depth_result is not None else []
+        )
         diagnostic_fields = (
             "depth_evidence_quality",
             "depth_evidence_reason",

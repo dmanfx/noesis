@@ -876,6 +876,16 @@ def test_registered_pose_torso_depth_measures_seated_projection_plane() -> None:
     assert measured is not None
     assert measured[0] == pytest.approx(0.71, abs=1e-6)
     assert measured[1] > 0.0
+    # A qualified sample at another anatomy pixel cannot teach this torso's
+    # height. Otherwise shoulder fallback would create a circular pose plane.
+    assert processor._seated_torso_height_from_registered_depth(
+        calibration,
+        torso_uv=(float(torso_uv[0]) + 3.0, float(torso_uv[1])),
+        depth_observation=depth_observation,
+        depth_result=depth_result,
+        flip_u=False,
+        flip_v=False,
+    ) is None
     assert processor._record_seated_torso_height_reference(
         state,
         height_scene=measured[0],

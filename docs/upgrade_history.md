@@ -1,4 +1,31 @@
 # Noesis upgrade history
+## 2026-10-09 — Partial-body depth reaches canonical BEV
+
+- Baseline localization independently samples observed ankle, narrow torso and
+  fallback shoulder anatomy. Horizontal torsos and missing hips/feet no longer
+  fail sampling categorically. Each bounded attempt retains its own UV,
+  optical depth, support and rejection reason; sitting/lying prioritizes
+  qualified body evidence. Unknown posture is not relabeled merely to admit
+  qualified partial-body range.
+- Preserved detector semantic, registration, freshness, spread, lifecycle and
+  physical gates. Cold shoulder range requires three fresh consistent samples;
+  cached/lagged depth does not count. Shoulder/torso basis switches use honest
+  continuation or explicit corroborated reanchor/trail break, never an assumed
+  body displacement. A sampled depth cannot teach torso height at another UV.
+- Inferred-height gravity remains a diagnostic alternate rather than joining a
+  measured-support/range contributor set and invalidating the entire result.
+- All 262 affected tests passed, plus syntax, diff and documentation checks.
+  Occupied authenticated producer/BEV capture showed fresh seated body-depth
+  measurements reaching corresponding canonical BEV dots and explicitly
+  predicted continuations. All three BEV cameras were active after normal
+  read-only PCF requests. See the
+  [direct evidence and limitations](../artifacts/partial-body-depth-20261009/review.md).
+- Concurrent Watch-26m selection, existing calibration and measured surfaces
+  were preserved. Browser visual recheck was unavailable because a separate
+  concurrent host-supervisor edit invalidated the Menon gateway's checkout
+  binding. Software-path and coordinate delivery checks are not independent
+  couch-position accuracy qualification. No commit or push.
+
 ## 2026-10-05 — Native tracker presence and Menon visual continuity
 
 - Current INACTIVE NvDCF person metadata now carries bounded exact-cohort

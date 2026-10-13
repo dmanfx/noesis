@@ -443,7 +443,7 @@ def test_pose_capsule_uses_observed_ankles_for_native_depth_support(monkeypatch)
     payload, device, _processor = _run_pose_depth_sample(monkeypatch)
 
     assert device.calls == []
-    assert len(device.capsule_calls) == 1
+    assert len(device.capsule_calls) == 2
     capsules, _max_samples = device.capsule_calls[0]
     assert len(capsules) == 2
     assert all(len(capsule) == 6 for capsule in capsules)
@@ -568,7 +568,7 @@ def test_pose_torso_requires_complete_confident_anatomy(monkeypatch) -> None:
     assert device.capsule_calls == []
     assert payload["status"] == "no_ground_contact"
     assert payload["evidence_quality"] == "rejected"
-    assert payload["evidence_reason"] == "pose_ankles_unavailable"
+    assert payload["evidence_reason"] == "pose_anatomy_unavailable"
     assert "anchor_source" not in payload
 
 
@@ -579,7 +579,7 @@ def test_pose_torso_rejects_mixed_foreground_depth(monkeypatch) -> None:
         ankles_available=False,
     )
 
-    assert len(device.capsule_calls) == 1
+    assert len(device.capsule_calls) == 2
     assert payload["status"] == "ambiguous_depth"
     assert payload["evidence_quality"] == "rejected"
     assert payload["evidence_reason"] == "depth_spread_exceeded"
@@ -3424,3 +3424,62 @@ def test_person_mask_anchor_rejects_bimodal_lower_body_depth() -> None:
     assert anchor.anchor_depth_m is None
     assert anchor.anchor_rejection_reason == "lower_body_depth_spread_exceeded"
     assert anchor.anchor_depth_spread_m == 3.0
+
+
+def test_partial_shoulder_cold_producer_reaches_bev_without_claiming_posture():
+    calibration = _anchor_calibration()
+    calibration.world_frame_id = "backend_world_m"
+    calibration.world_frame_revision = "world-r1"
+    calibration.frame_transform_sha256 = "a" * 64
+    processor = hooks._AnalyticsTelemetryProcessor(
+        pipeline=SimpleNamespace(config={"canonical_world": {
+            "measurement_resolver": {"enabled": True, "max_range_m": 22.0,
+                                     "max_disagreement_m": 1.25, "max_candidates": 4},
+        }}), tracking_pub=SimpleNamespace(), camera_labels={0: "cam0"},
+        sensor_id_map={}, publication_gate=RuntimePublicationGate(),
+        bev_calibration=SimpleNamespace(snapshot=lambda *_args: calibration),
+    )
+    processor.set_world_resolver_diagnostics_enabled(True)
+    body_point = np.array([.45, 1.0, 4.6])
+    body_uv = project_world_to_image(body_point, calibration.intrinsics,
+                                    calibration.extrinsics_col_major, calibration.image_size)
+    assert body_uv is not None
+    extrinsics = np.array(calibration.extrinsics_col_major).reshape((4, 4), order="F")
+    optical_z = float((extrinsics @ np.r_[body_point, 1.0])[2])
+    keypoints = np.zeros((17, 3))
+    for index, x in ((5, .27), (6, .63)):
+        uv = project_world_to_image([x, 1.0, 4.6], calibration.intrinsics,
+                                    calibration.extrinsics_col_major, calibration.image_size)
+        keypoints[index] = [*uv, .95]
+    bbox = [float(body_uv[0]) - 45, float(body_uv[1]) - 30, 90.0, 75.0]
+    rows = []
+    for frame, timestamp in enumerate((1.0, 1.2, 1.4), start=1):
+        depth = ObjectDepthResult(
+            source_id=0, frame_id=frame, object_id=86, class_id=0,
+            bbox=bbox, score=.95, sampling_mode="pose_capsule_native", status="ok",
+            unit="m", is_metric=True, sample_count=80, valid_fraction=.95,
+            anchor_uv=body_uv, anchor_source="pose_shoulder_support", anchor_depth_m=optical_z,
+            anchor_sample_count=80, anchor_valid_fraction=.95, anchor_depth_spread_m=.04,
+            evidence_quality="estimated", measurement_frame_id=frame,
+            measurement_ts_us=int(timestamp * 1e6), measurement_cached=False,
+        )
+        track = {"tracker_id": 86, "stable_id": 1014, "class_id": 0,
+                 "frame_id": frame, "source_id": 0,
+                 "observed_at_us": int(timestamp * 1e6), "tracker_lifecycle_generation": 1,
+                 "bbox": bbox, "image_size": list(calibration.image_size), "confidence": .95}
+        processor._augment_track_with_world(
+            0, "cam0", track, pose_kpts_abs=keypoints, depth_result=depth, world_now_ts=timestamp,
+        )
+        rows.append(track)
+    assert rows[0]["world_valid"] is False
+    assert rows[1]["world_valid"] is False
+    assert rows[2]["world_valid"] is True, [
+        (row.get("world_rejection_reason"), row.get("world_quality_reason"), row.get("world_resolver"))
+        for row in rows
+    ]
+    assert rows[2]["world_measurement_accepted"] is True
+    assert rows[2]["world_posture_effective"] == "unknown"
+    np.testing.assert_allclose(rows[2]["world"], [.45, 0.0, 4.6], atol=1e-6)
+    footpoint = processor._footpoint_from_track(rows[2], calibration.image_size)
+    assert footpoint is not None
+    assert [footpoint.world_x, footpoint.world_y, footpoint.world_z] == pytest.approx(rows[2]["world"])

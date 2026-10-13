@@ -531,6 +531,7 @@ class PersonGroundState:
     measurement_rejection_reason: Optional[str] = None
     measurement_innovation_m: float = 0.0
     measurement_allowed_m: float = 0.0
+    accepted_metric_contact_basis: Optional[str] = None
     reacquire_candidate_x: Optional[float] = None
     reacquire_candidate_z: Optional[float] = None
     reacquire_candidate_ts: float = -1.0
@@ -810,6 +811,8 @@ def _reacquire_basis_family(contact_basis: Optional[str]) -> str:
     """Collapse exact support subtypes into their trajectory family."""
 
     basis = str(contact_basis or "").strip()
+    if basis == "depth:pose_shoulder_support":
+        return "partial_shoulder_projection"
     if basis in {
         "pose:seated_torso_plane",
         "depth:torso_core",
@@ -1342,6 +1345,7 @@ def mark_world_measurement_unavailable(
         in {
             "pose:upright_body_planes",
             "non_upright_body_projection",
+            "partial_shoulder_projection",
         }
         and int(state.reacquire_count) > 0
         and now_ts is not None
@@ -4350,6 +4354,7 @@ def _quarantine_or_reacquire_measurement(
         state.locked_world = None
         state.exit_motion_frames = 0
         state.reacquired = True
+        state.accepted_metric_contact_basis = str(contact_basis or "") or None
         state.trail_break_required = True
         state.trail_segment_id = int(state.trail_segment_id) + 1
         state.post_occlusion_reacquire_support_required = False
@@ -4460,6 +4465,7 @@ def update_human_cv_filter(
         state.vel_world_x = 0.0
         state.vel_world_z = 0.0
         state.filtered_ts = now_ts
+        state.accepted_metric_contact_basis = str(contact_basis or "") or None
         state.last_good_world = None
         state.last_good_ts = 0.0
         state.locked_world = None
@@ -4624,6 +4630,7 @@ def update_human_cv_filter(
             state.post_occlusion_reacquire_support_required = False
         _clear_reacquire_candidate(state)
         _clear_rejection_anchor(state)
+        state.accepted_metric_contact_basis = str(contact_basis or "") or None
         return np.array([mx, floor_y, mz], dtype=np.float64)
 
     dt = now_ts - float(state.filtered_ts)
@@ -4648,6 +4655,25 @@ def update_human_cv_filter(
     allowed = float(config.max_jump_m) + float(config.max_speed_mps) * gate_dt
     state.measurement_innovation_m = float(innov_dist)
     state.measurement_allowed_m = float(allowed)
+    previous_basis = str(state.accepted_metric_contact_basis or "")
+    current_basis = str(contact_basis or "")
+    body_bases = {"depth:pose_shoulder_support", "depth:pose_torso_support",
+                  "depth:torso_core", "pose:seated_torso_plane"}
+    if (not force_accept and previous_basis != current_basis
+            and previous_basis in body_bases and current_basis in body_bases
+            and "depth:pose_shoulder_support" in (previous_basis, current_basis)):
+        # A shoulder footprint and a torso footprint are different observed
+        # anatomy, not interchangeable body centres. No generic displacement
+        # may turn a basis change into measured person motion. The existing
+        # exact-basis/motion consensus either reanchors with a trail break or
+        # leaves an honest continuation at the accepted coordinate.
+        return _quarantine_or_reacquire_measurement(
+            state, measurement_x=mx, measurement_z=mz, pred_x=pred_x, pred_z=pred_z,
+            now_ts=now_ts, floor_y=floor_y, reason="body_depth_anatomical_basis_changed",
+            config=config, contact_basis=contact_basis,
+            image_motion_supported=image_motion_supported,
+            verified_reacquire_support=False,
+        )
     if (
         not force_accept
         and allowed > 0.0
@@ -4678,6 +4704,7 @@ def update_human_cv_filter(
             "pose:seated_torso_plane",
             "depth:torso_core",
             "depth:pose_torso_support",
+            "depth:pose_shoulder_support",
         }
     )
 
@@ -4778,6 +4805,7 @@ def update_human_cv_filter(
         if state.locked_world is not None:
             state.world_x = float(state.locked_world[0])
             state.world_z = float(state.locked_world[1])
+        state.accepted_metric_contact_basis = str(contact_basis or "") or None
         _clear_reacquire_candidate(state)
         _clear_rejection_anchor(state)
         if verified_reacquire_support or _reacquire_basis_family(contact_basis) == "pose_floor":
@@ -4911,6 +4939,7 @@ def update_human_cv_filter(
     state.vel_world_x = float(next_vx)
     state.vel_world_z = float(next_vz)
     state.filtered_ts = now_ts
+    state.accepted_metric_contact_basis = str(contact_basis or "") or None
     if verified_reacquire_support or _reacquire_basis_family(contact_basis) == "pose_floor":
         state.post_occlusion_reacquire_support_required = False
     _clear_rejection_anchor(state)

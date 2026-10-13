@@ -3,6 +3,7 @@ import { setCalibration } from '../lib/calibration';
 import { CameraKey, detectCameraKey } from '../lib/camera';
 import { wsLog } from '../lib/wsLogger';
 import { LatencyMetrics } from '../types/latency';
+import { dispatchUnifiedBevMessage } from '../lib/unifiedBevConsumer.js';
 
 type Track = {
   stable_id: number;
@@ -68,6 +69,8 @@ export interface StatsPayload {
 }
 
 export type FrameHandlers = {
+  onUnifiedBevMessage?: (message: unknown, receivedAtMs: number) => void;
+  onDisconnect?: () => void;
   onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
@@ -258,6 +261,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
 
       ws.onclose = (event) => {
         if (socketRef.current !== ws) return;
+        handlersRef.current.onDisconnect?.();
         setStatus('closed');
         stopHeartbeat();
         clearAllDepthRequests();
@@ -272,6 +276,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
 
       ws.onerror = (error) => {
         if (socketRef.current !== ws) return;
+        handlersRef.current.onDisconnect?.();
         setStatus('error');
         wsLog.error('[WS] Error:', error);
       };
@@ -286,6 +291,9 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           }
           const data = JSON.parse(ev.data);
           const currentHandlers = handlersRef.current;
+          // Preserve every canonical envelope and its receive order before
+          // calibration normalization or optional asynchronous display work.
+          dispatchUnifiedBevMessage(data, currentHandlers.onUnifiedBevMessage, performance.now());
 
           // Handle ping messages by responding with pong
           if (data.type === 'ping') {
@@ -422,6 +430,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         reconnectTimeoutRef.current = null;
       }
       clearAllDepthRequests();
+      handlersRef.current.onDisconnect?.();
       socketRef.current?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

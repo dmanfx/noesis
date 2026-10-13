@@ -15,6 +15,8 @@ import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
+import { UnifiedBevView } from './components/UnifiedBevView';
+import { createUnifiedBevConsumer, createUnifiedBevDisplayState } from './lib/unifiedBevConsumer.js';
 import { MosaicCropCanvas } from './components/MosaicCropCanvas';
 import type { BevTrailConfig } from './lib/bevTrails';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
@@ -123,6 +125,9 @@ const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<strin
 
 function Dashboard() {
   const { publish } = useTelemetry();
+  const [unifiedBev, setUnifiedBev] = useState(createUnifiedBevDisplayState);
+  const [unifiedBevConsumer] = useState(() => createUnifiedBevConsumer({ onChange: setUnifiedBev }));
+  useEffect(() => () => unifiedBevConsumer.stop(), [unifiedBevConsumer]);
 
   // Item 4: BEV state now keyed by discovered cameras (seeded with the original three).
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
@@ -1342,6 +1347,8 @@ function Dashboard() {
     sendWebRTCOffer,
     sendWebRTCIceCandidate,
   } = useWebSocketClient(WS_URL, {
+    onUnifiedBevMessage: unifiedBevConsumer.receive,
+    onDisconnect: unifiedBevConsumer.disconnect,
     onBevMeta: handleBevMeta,
     onStats,
     onTrailToggle: (en) => {
@@ -1816,6 +1823,8 @@ function Dashboard() {
               ))}
             </div>
           )}
+          <UnifiedBevView display={unifiedBev} connection={status} trailEnabled={trailEnabled}
+            trailConfig={bevTrailConfig} debug={bevDebugEnabled} />
         </section>
 
         <section className="side">

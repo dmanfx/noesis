@@ -65,8 +65,11 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  overflow: visible;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
 }
+.streams:not(.streams--expanded) > * { flex-shrink: 0; }
 .mosaic-close {
   display: none;
 }
@@ -156,13 +159,32 @@
   display: none;
 }
 @media (max-width: 980px) {
-  .main { grid-template-columns: 1fr; }
-  .streams { height: auto; }
+  .shell:not(.shell--streams-expanded) .main {
+    grid-template-columns: 1fr;
+    grid-auto-rows: max-content;
+    align-content: start;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  .streams { height: auto; overflow: visible; }
+  .main > .side { height: auto; }
   .stream-tiler,
   .bev-row {
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   }
 }
+
+.unified-bev-card { margin-top: 8px; padding: 12px; min-width: 0; }
+.unified-bev-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.unified-bev-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.unified-bev-status, .unified-bev-caption { color: var(--muted); font-size: 12px; }
+.unified-bev-canvas-wrap { position: relative; height: clamp(300px, 40vh, 420px); background: #0b1118; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.unified-bev-canvas-wrap canvas { display: block; width: 100%; height: 100%; }
+.unified-bev-placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+.unified-bev-caption { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.unified-bev-diagnostic { margin-top: 8px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.unified-bev-accessible-people { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.shell--streams-expanded .unified-bev-card { display: none; }
 .stream-tiler {
   align-items: stretch;
 }

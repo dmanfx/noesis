@@ -2,6 +2,24 @@
 
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
+## Native tracker presence preserves admitted world continuity — 2026-10-05
+
+An empty object list is not confirmed disappearance when current NvDCF shadow
+metadata positively identifies an already owned INACTIVE person lifecycle.
+Copy bounded scalar lifecycle/termination metadata once through the existing
+native analytics bridge; carry its exact source/epoch/frame/PTS receipt through
+the ordered publication worker. No raw-frame branch, invented person row,
+historical tracker coordinate or PCF localization is introduced.
+
+The world service retains the exact accepted source envelope, not the current
+per-camera slot, which might contain a newer rejected candidate. Retention is
+transactional, subject/lifecycle/epoch/calibration/registration bound and never
+renews observation time or the default two-second lost TTL. Termination wins
+immediately. Unknown shadow IDs cannot acquire ownership. Menon displays a
+valid canonical entity until canonical removal/receipt-anchored expiry, without
+an earlier independent renderer fade. Diagnostic rings, heading helpers and
+detailed labels are behind the shared developer-visuals preference.
+
 
 ## Coherent single-room photo surfaces — 2026-10-04
 

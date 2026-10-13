@@ -1,4 +1,31 @@
 # Noesis upgrade history
+## 2026-10-05 — Native tracker presence and Menon visual continuity
+
+- Current INACTIVE NvDCF person metadata now carries bounded exact-cohort
+  lifecycle evidence through the existing native analytics bridge and ordered
+  tracking/world/BEV worker. Unknown/TENTATIVE IDs cannot bootstrap presence;
+  explicit termination invalidates ownership immediately. Existing detector,
+  tracker quality, inference cadence, depth and calibration are unchanged.
+- World continuity retains one exact accepted envelope under subject,
+  lifecycle, source epoch, calibration and registration ownership. Its original
+  observation/media clocks and the default two-second expiry remain intact.
+  A conflict-rejected slot cannot become authority when its peer disappears.
+- Menon diagnostics/helpers are default-off behind the shared developer
+  preference. Valid canonical persons remain visible until authoritative
+  removal/expiry instead of the renderer's earlier independent fade. PCF and
+  authored-model presentation remain unchanged; the explicit producer binding
+  retains the complete existing chain plus the new continuity sources.
+- Matched 120-second three-camera YOLO26-large replay: short remove/reappear
+  gaps 8 → 1, total removals 20 → 10, tombstones 77 → 18, and zero source tracking
+  sequence gaps. The remaining gap followed expiry of a 2.083-second-old point.
+  All 2,929 canonical entity samples rendered in Menon's actual consumer;
+  1,541 BEV head joins had no missing canonical entity. This is continuity and
+  coordinate-parity evidence, not independent physical accuracy or FPS proof.
+- 374 affected behavior checks and 13 native provenance checks pass. Existing
+  host timing-budget failures reproduce with unchanged HEAD sources; no limits
+  or capabilities were reduced. Live sources and served Menon are restored;
+  YOLO26-large is pinned in a persistent user-service override. No commit/push
+  or unrelated reconstruction/runtime replacement was performed.
 
 ## 2026-10-04 — Producer work consolidated and current docs refreshed
 

@@ -12,6 +12,9 @@ TargetManagement:
   probationAge: 2
   maxShadowTrackingAge: 90
   earlyTerminationAge: 6
+  # Scalar metadata only; no trajectory files or new media branch.
+  outputShadowTracks: 1
+  outputTerminatedTracks: 1
 
 TrajectoryManagement:
   useUniqueID: 0

@@ -818,13 +818,29 @@ direct-write or `memory://` publication fallback.
 
 Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` is internal and never exposed.
 
-Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry and disappearance emits an exact tombstone. A same-camera numeric tracker ID may reuse its lifecycle generation only when it returns within 750 ms and strict bbox position/scale compatibility proves a short metadata gap. A moved, size-incompatible, expired, evicted, unknown, or post-reconnect return receives a new positive generation. Downstream clients can therefore distinguish rate-limited camera-frame gaps from absence and numeric tracker-ID reuse. On every exact processed frame, the canonical world service removes absent filter state from active authority. Scalar-only quarantine may restore it only across that same compatible 750 ms lifecycle grace; otherwise position, velocity, lock, rejection, and hold state start cold. The exact tombstone still breaks BEV/OSD trail history even when the compatible generation is reused. Tracker shadow age remains the owner of brief detector occlusion.
+Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` and an advancing top-level `frame_id`. Count transitions to zero publish immediately; sustained emptiness uses the bounded `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` gate (default 2 Hz). A tracker-key-set change also publishes immediately even when the count is unchanged. The publisher owns a contiguous per-source `tracking_publication_sequence`; every processed frame updates the tracker lifecycle registry and confirmed disappearance emits an exact tombstone. A same-camera numeric tracker ID may reuse its lifecycle generation after absence only when it returns within 750 ms and strict bbox position/scale compatibility proves a short metadata gap. A moved, size-incompatible, expired, evicted, unknown, or post-reconnect return receives a new positive generation. Downstream clients can distinguish rate-limited camera-frame gaps, current native tracker shadow presence, actual absence and numeric tracker-ID reuse. With no current native presence proof, absent filter state leaves active authority; scalar-only quarantine may restore it only across the same compatible 750 ms lifecycle grace. The exact tombstone still breaks BEV/OSD trail history even when that compatible generation is reused.
+
+`tracker_lifecycle_evidence` is additive, exact-cohort native presence evidence,
+not a synthetic person row. Its contract is `noesis.tracker.lifecycle-evidence`
+v1; `source_id`, `camera_id`, `source_epoch`, `frame_id`, `observed_at_us` and
+`media_pts_ns` must equal the enclosing tracking cohort. `shadow_lifecycles`
+contains current native INACTIVE person IDs plus their already owned positive
+`tracker_lifecycle_generation`; `terminated_tracker_ids` takes precedence.
+Both lists are bounded at 256. Unknown/TENTATIVE IDs and archived frames cannot
+bootstrap presence. A shadow retains lifecycle ownership and the exact last
+accepted world envelope, with its original observation/media clocks, coordinate
+binding, uncertainty and normal expiry; it cannot renew world age or promote a
+previously rejected position. Explicit termination removes ownership and world
+evidence immediately. The default world lost TTL remains two seconds. Empty
+`tracks` still means no current object rows, while the accompanying canonical
+world snapshot can legitimately contain a not-yet-expired tracked person.
 
 ```json
 {
   "type": "tracking",
   "source_id": <int>,
   "frame_id": <int>,
+  "source_epoch": <int>,
   "captured_at_us": <int epoch microseconds>,
   "track_count": <int>,
   "observed_at_us": <int epoch microseconds>,
@@ -850,6 +866,18 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "disappeared_at_observed_at_us": <int>
     }
   ],
+  "tracker_lifecycle_evidence": {
+    "contract": "noesis.tracker.lifecycle-evidence",
+    "contract_version": 1,
+    "source_id": <int>,
+    "camera_id": "<string>",
+    "source_epoch": <int>,
+    "frame_id": <int>,
+    "observed_at_us": <int>,
+    "media_pts_ns": <int>,
+    "shadow_lifecycles": [{"tracker_id": <int>, "tracker_lifecycle_generation": <positive int>}],
+    "terminated_tracker_ids": [<int>]
+  },
   "camera_id": "<string>",
   "coord_space": "<string>",
   "units": "<string>",

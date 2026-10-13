@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from noesis_core.tracking_continuity import (
     TrackingLifecycleRegistry,
+    parse_tracker_presence_evidence,
     pair_safe_publication_interval_s,
 )
+
+import pytest
 
 
 def test_identity_receipt_reserves_generation_without_publishing_presence() -> None:
@@ -43,6 +46,75 @@ def _track(
     if bbox is not None:
         row["bbox"] = list(bbox)
     return row
+
+
+def test_native_shadow_retains_only_known_lifecycle_and_last_actual_receipt() -> None:
+    registry = TrackingLifecycleRegistry()
+    row = _track(7, (10, 20, 40, 120))
+    first = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=1,
+                                  observed_at_us=1_000_000, media_pts_ns=1_000_000_000, tracks=[row])
+    registry.mark_published(first)
+    for frame, pts in ((2, 1_100_000_000), (3, 2_900_000_000)):
+        shadow = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=frame,
+                                       observed_at_us=pts // 1_000, media_pts_ns=pts,
+                                       tracks=[], shadow_tracker_ids=[7, 99])
+        prepared = registry.prepare_publication(shadow)
+        assert prepared.tombstones == ()
+        assert prepared.tracker_keys_changed is False
+        assert prepared.active_lifecycles == first.active_lifecycles
+        assert prepared.shadow_lifecycles == ((7, 1),)
+        assert prepared.active_lifecycles[0].last_seen_observed_at_us == 1_000_000
+        evidence = prepared.presence_evidence()
+        assert parse_tracker_presence_evidence(evidence, source_id=0, metadata=evidence) == (frozenset({(7, 1)}), frozenset())
+        registry.mark_published(prepared)
+    returned = _track(7, (11, 20, 40, 120))
+    update = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=4,
+                                   observed_at_us=3_000_000, media_pts_ns=3_000_000_000, tracks=[returned])
+    assert returned["tracker_lifecycle_generation"] == 1
+    assert update.tombstones == ()
+
+
+def test_native_termination_overrides_shadow_and_invalidates_reappearance_grace() -> None:
+    registry = TrackingLifecycleRegistry()
+    first = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=1,
+                                  observed_at_us=1_000_000, media_pts_ns=1_000_000_000,
+                                  tracks=[_track(7, (10, 20, 40, 120))])
+    registry.mark_published(first)
+    ended = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=2,
+                                  observed_at_us=1_100_000, media_pts_ns=1_100_000_000, tracks=[],
+                                  shadow_tracker_ids=[7], terminated_tracker_ids=[7])
+    assert ended.active_lifecycles == ()
+    assert len(ended.tombstones) == 1
+    registry.mark_published(ended)
+    row = _track(7, (10, 20, 40, 120))
+    registry.update_frame(source_id=0, camera_id="kitchen", frame_id=3,
+                          observed_at_us=1_200_000, media_pts_ns=1_200_000_000, tracks=[row])
+    assert row["tracker_lifecycle_generation"] == 2
+
+
+def test_contradictory_native_termination_cannot_leave_generation_reusable() -> None:
+    registry = TrackingLifecycleRegistry()
+    registry.update_frame(source_id=0, camera_id="kitchen", frame_id=1,
+                          observed_at_us=1_000_000, media_pts_ns=1_000_000_000, tracks=[_track(7)])
+    with pytest.raises(ValueError, match="also an active object"):
+        registry.update_frame(source_id=0, camera_id="kitchen", frame_id=2,
+                              observed_at_us=1_100_000, media_pts_ns=1_100_000_000,
+                              tracks=[_track(7)], terminated_tracker_ids=[7])
+    row = _track(7)
+    registry.update_frame(source_id=0, camera_id="kitchen", frame_id=3,
+                          observed_at_us=1_200_000, media_pts_ns=1_200_000_000, tracks=[row])
+    assert row["tracker_lifecycle_generation"] == 2
+
+
+@pytest.mark.parametrize("field,value", [("source_id", 1), ("camera_id", "hall"), ("source_epoch", 1),
+                                        ("frame_id", 99), ("observed_at_us", 99), ("media_pts_ns", 99)])
+def test_tracker_presence_receipt_cannot_cross_cohorts(field: str, value: object) -> None:
+    registry = TrackingLifecycleRegistry()
+    update = registry.update_frame(source_id=0, camera_id="kitchen", frame_id=1,
+                                    observed_at_us=1_000_000, media_pts_ns=1_000_000_000, tracks=[])
+    evidence = update.presence_evidence()
+    with pytest.raises(ValueError, match="cohort mismatch"):
+        parse_tracker_presence_evidence({**evidence, field: value}, source_id=0, metadata=evidence)
 
 
 def test_tombstone_binds_last_published_not_last_processed_presence() -> None:

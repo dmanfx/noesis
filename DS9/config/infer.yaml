@@ -149,6 +149,8 @@ models:
 tracker:
   config-file: DS9/config/nvtracker.yaml
   ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
+  # Misc lifecycle IDs must join public object IDs without EOS remapping.
+  tracking-id-reset-mode: 0
 
 analytics:
   enable: true

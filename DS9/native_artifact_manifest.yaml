@@ -6,7 +6,7 @@ base_manifest:
 artifacts:
   - id: native.analytics_meta
     kind: native_extension
-    role: NvDsAnalytics object metadata extraction through public Service Maker iteration
+    role: NvDsAnalytics object and bounded tracker lifecycle metadata through public Service Maker iteration
     output: DS9/native_extensions/noesis_analytics_meta_ext*.so
     sources: [DS9/native/noesis_analytics_meta_ext.cpp]
     builder: DS9/scripts/build_noesis_analytics_meta_ext.sh
@@ -14,8 +14,8 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: d9f3e48e33efc20a6aac29176014796fbda3956ce8347657739a67a75dbbe765
-      output_sha256: f535287518ec36ed17a357d80a8b4237549f183e2bbdab79d2e95f5208de8240
-      built_at_utc: "2026-08-12T14:47:33Z"
+      source_sha256: 60abaf4a102f507c32fb79e705b7f8745779ba38bdf6e957c9c4fa33700e6e20
+      output_sha256: 664cbe732a74ca2f6e8a0ec67a96d1de39a0b4c1a6577d9453ee9c570e757f79
+      built_at_utc: "2026-10-05T04:17:21Z"
       build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_native_extensions.sh
+      command: bash DS9/scripts/build_noesis_analytics_meta_ext.sh

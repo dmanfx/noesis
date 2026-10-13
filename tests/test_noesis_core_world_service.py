@@ -5099,6 +5099,138 @@ def test_empty_source_frame_requires_explicit_camera_identity() -> None:
         service.publish(0, [], metadata={})
 
 
+def _native_presence_metadata(*, frame: int, observed: int, media: int,
+                              generation: int = 1, epoch: int = 0,
+                              terminated: bool = False) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "source_id": 0, "camera_id": "kitchen", "frame_id": frame,
+        "observed_at_us": observed, "source_epoch": epoch, "media_pts_ns": media,
+    }
+    metadata["tracker_lifecycle_evidence"] = {
+        **metadata, "contract": "noesis.tracker.lifecycle-evidence", "contract_version": 1,
+        "shadow_lifecycles": [{"tracker_id": 7, "tracker_lifecycle_generation": generation}],
+        "terminated_tracker_ids": [7] if terminated else [],
+    }
+    return metadata
+
+
+def _native_presence_track(*, frame: int = 1, observed: int = 1_000_000,
+                           media: int = 1_000_000_000, x: float = 1.0) -> dict[str, Any]:
+    track = _track(camera_id="kitchen", tracker_id=7, frame_id=frame, observed_at_us=observed, x=x)
+    track.update(media_pts_ns=media, tracker_lifecycle_generation=1, source_epoch=0)
+    return track
+
+
+def test_native_shadow_preserves_exact_admitted_point_without_renewing_world_age() -> None:
+    now = [1_000_000]
+    service = CanonicalWorldService(producer=_producer(), artifacts=_artifacts(), clock_us=lambda: now[0])
+    first = service.publish(0, [_native_presence_track()], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    origin = next(iter(service._canonical_track_outputs.values()))
+    for frame, observed in ((2, 1_100_000), (3, 2_900_000)):
+        now[0] = observed
+        held = service.publish(0, [], metadata=_native_presence_metadata(frame=frame, observed=observed, media=observed * 1_000))
+        assert held.observations == ()
+        assert len(held.snapshot.entities) == 1
+        entity = held.snapshot.entities[0]
+        assert entity.position == first.snapshot.entities[0].position
+        assert entity.observed_at_us == 1_000_000
+        assert next(iter(service._canonical_track_outputs.values())) == origin
+        assert all(event.event_type != "lost" for event in held.events)
+    now[0] = 3_001_000
+    expired = service.publish(0, [], metadata=_native_presence_metadata(frame=4, observed=now[0], media=now[0] * 1_000))
+    assert expired.snapshot.entities == ()
+    assert [event.event_type for event in expired.events] == ["lost"]
+
+
+@pytest.mark.parametrize("generation,epoch", [(2, 0), (1, 1)])
+def test_native_shadow_cannot_retain_different_lifecycle_or_source_epoch(generation: int, epoch: int) -> None:
+    service = _service()
+    service.publish(0, [_native_presence_track(observed=1_900_000, media=1_900_000_000)], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    result = service.publish(0, [], metadata=_native_presence_metadata(frame=2, observed=2_000_000, media=2_000_000_000, generation=generation, epoch=epoch))
+    assert result.snapshot.entities == ()
+
+
+def test_native_shadow_cannot_cross_camera_calibration_artifact() -> None:
+    artifacts = [_artifacts()]
+    service = CanonicalWorldService(producer=_producer(), artifacts=lambda *_args: artifacts[0], clock_us=lambda: 2_000_000)
+    service.publish(0, [_native_presence_track(observed=1_900_000, media=1_900_000_000)], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    artifacts[0] = replace(artifacts[0], calibration=ArtifactFingerprint(role="camera_calibration", sha256="e" * 64))
+    result = service.publish(0, [], metadata=_native_presence_metadata(frame=2, observed=2_000_000, media=2_000_000_000))
+    assert result.snapshot.entities == ()
+
+
+@pytest.mark.parametrize("other_active", [False, True])
+def test_native_termination_removes_shadow_even_in_nonempty_source(other_active: bool) -> None:
+    service = _service()
+    service.publish(0, [_native_presence_track(observed=1_900_000, media=1_900_000_000)], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    rows = []
+    if other_active:
+        rows.append(_track(camera_id="kitchen", tracker_id=8, frame_id=2, observed_at_us=2_000_000, x=2.0, resident_uuid="resident-2", stable_id=2))
+    result = service.publish(0, rows, metadata=_native_presence_metadata(frame=2, observed=2_000_000, media=2_000_000_000, terminated=True))
+    assert {entity.entity_id for entity in result.snapshot.entities} == ({"resident:resident-2"} if other_active else set())
+    assert not any(key[2] == 7 for key in service._canonical_track_outputs)
+
+
+def test_native_shadow_never_promotes_velocity_rejected_point() -> None:
+    now = [1_000_000]
+    service = CanonicalWorldService(producer=_producer(), artifacts=_artifacts(), clock_us=lambda: now[0])
+    service.publish(0, [_native_presence_track(x=0.0)], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    now[0] = 1_100_000
+    rejected = service.publish(0, [_native_presence_track(frame=2, observed=now[0], media=now[0] * 1_000, x=9.0)], metadata={"camera_id": "kitchen", "source_epoch": 0})
+    assert rejected.snapshot.entities[0].position.x == 0.0
+    now[0] = 1_200_000
+    held = service.publish(0, [], metadata=_native_presence_metadata(frame=3, observed=now[0], media=now[0] * 1_000))
+    assert held.snapshot.entities[0].position.x == 0.0
+    assert held.snapshot.entities[0].observed_at_us == 1_000_000
+    assert next(iter(service._canonical_track_outputs.values())).media_pts_ns == 1_000_000_000
+
+
+def test_native_shadow_cannot_promote_conflict_rejected_slot_when_peer_disappears() -> None:
+    now = [1_000_000]
+    service = CanonicalWorldService(producer=_producer(), artifacts=_artifacts(), clock_us=lambda: now[0])
+
+    def point(source: int, frame: int, observed: int, x: float) -> None:
+        camera = "kitchen" if source == 0 else "hall"
+        variance = 0.04 if source == 0 else 0.01
+        track = _track(camera_id=camera, tracker_id=7 + source, frame_id=frame, observed_at_us=observed, x=x)
+        track.update(tracker_lifecycle_generation=1, source_epoch=0, media_pts_ns=observed * 1_000,
+                     world_covariance=[variance, 0, 0, 0, variance, 0, 0, 0, variance])
+        now[0] = observed
+        service.publish(source, [track], metadata={"camera_id": camera, "source_epoch": 0})
+
+    point(0, 1, 1_000_000, 0.0)
+    point(1, 1, 1_050_000, 0.0)
+    point(0, 2, 1_100_000, 5.0)
+    assert service.current_snapshot().entities[0].position.x == 0.0
+    point(1, 2, 1_150_000, 0.0)
+    now[0] = 1_200_000
+    service.publish(0, [], metadata=_native_presence_metadata(frame=3, observed=now[0], media=now[0] * 1_000))
+    now[0] = 1_250_000
+    alone = service.publish(1, [], metadata={"camera_id": "hall", "source_epoch": 0,
+                                          "frame_id": 3, "observed_at_us": now[0], "media_pts_ns": now[0] * 1_000})
+    entity = alone.snapshot.entities[0]
+    assert entity.position.x == 0.0
+    assert entity.observed_at_us == 1_000_000
+    assert entity.sources[0].observation_id.endswith(":0:7")
+    assert entity.sources[0].accepted is True
+
+
+def test_tracking_publisher_preserves_empty_cohort_native_presence_and_epoch() -> None:
+    now = [1_000_000]
+    service = CanonicalWorldService(producer=_producer(), artifacts=_artifacts(), clock_us=lambda: now[0])
+    websocket = _WebSocketRecorder()
+    publisher = TrackingTelemetryPublisher(websocket, metadata_getter=lambda *_args: {}, world_service=service)
+    publisher.publish(0, [_native_presence_track()], frame_metadata={"camera_id": "kitchen", "source_epoch": 0})
+    now[0] = 1_100_000
+    publisher.publish(0, [], frame_metadata=_native_presence_metadata(frame=2, observed=now[0], media=now[0] * 1_000))
+    message = [item for item in websocket.messages if item["type"] == "tracking"][-1]
+    assert message["source_epoch"] == 0
+    assert message["camera_id"] == "kitchen"
+    assert message["tracks"] == []
+    assert message["tracker_lifecycle_evidence"]["shadow_lifecycles"] == [{"tracker_id": 7, "tracker_lifecycle_generation": 1}]
+    assert message["world_snapshot"]["entities"][0]["position"]["x"] == 1.0
+
+
 def test_empty_source_frame_removes_only_that_camera_and_clears_conflict() -> None:
     service = _service(conflict_distance_m=0.5)
     service.publish(

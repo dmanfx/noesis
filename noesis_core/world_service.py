@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import time
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Mapping
@@ -30,6 +30,7 @@ from noesis_core.journal import (
 )
 from noesis_core.world import GlobalWorldFusion
 from noesis_core.world.support_surfaces import contains_xz
+from noesis_core.tracking_continuity import parse_tracker_presence_evidence
 
 
 _WORLD_DIAGNOSTIC_TRACK_FIELDS = frozenset(
@@ -173,6 +174,18 @@ class _CanonicalOutputOrigin:
 
 
 @dataclass(frozen=True)
+class _TrackerPresenceOrigin:
+    """One exact accepted source envelope; native presence cannot renew it."""
+
+    envelope: ObservationEnvelope
+    subject: SubjectRef
+    trail_segment_id: int | None
+    trail_break_required: bool
+    tracker_lifecycle_generation: int
+    source_epoch: int
+
+
+@dataclass(frozen=True)
 class _CanonicalTrackOutput:
     """Last committed source-local point used by projective continuity."""
 
@@ -197,6 +210,7 @@ class _CanonicalTrackOutput:
     kinematic_bbox_geometry: tuple[float, float, float, float] | None = None
     inferred_ground_episode_root: _InferredGroundEpisodeRoot | None = None
     prior_outputs: tuple[_CanonicalOutputOrigin, ...] = ()
+    presence_origin: _TrackerPresenceOrigin | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -487,7 +501,41 @@ class CanonicalWorldService:
             source_id=source,
             current_media_pts_ns=current_source_media_pts_ns,
         )
+        shadow_keys, terminated_ids = parse_tracker_presence_evidence(
+            metadata.get("tracker_lifecycle_evidence"),
+            source_id=source,
+            metadata=metadata,
+        )
+        camera_id = str(metadata.get("camera_id") or "").strip()
+        calibration_sha256 = self._sha256_text(artifacts.camera_calibration_sha256) or artifacts.calibration.sha256
+        source_epoch = self._nonnegative_int(metadata.get("source_epoch")) or 0
+        retained_keys: set[tuple[int, int, int]] = set()
+        if shadow_keys:
+            for key, output in working_track_outputs.items():
+                origin = output.presence_origin
+                if (
+                    key[0] == source and key[1] == camera_id
+                    and (key[2], key[3]) in shadow_keys
+                    and key[6] == calibration_sha256 and key[7] == source_epoch
+                    and key[2] not in terminated_ids and origin is not None
+                    and working_fusion._retain_admitted_tracker_origin(
+                        origin.envelope, origin.subject,
+                        tracker_lifecycle_generation=origin.tracker_lifecycle_generation,
+                        source_epoch=origin.source_epoch,
+                        trail_segment_id=origin.trail_segment_id,
+                        trail_break_required=origin.trail_break_required,
+                    )
+                ):
+                    retained_keys.add((key[2], key[3], key[7]))
+        retained_lifecycles = frozenset(retained_keys)
+        # Termination invalidates every process origin for that physical key.
+        # Presence receipts never update these origins or observation clocks.
+        if terminated_ids:
+            for key in tuple(working_track_outputs):
+                if key[0] == source and key[1] == camera_id and key[2] in terminated_ids:
+                    working_track_outputs.pop(key, None)
         observations: list[ObservationEnvelope] = []
+        pending_presence_origins: dict[str, _TrackerPresenceOrigin] = {}
         pending_track_outputs: dict[
             str,
             tuple[
@@ -757,6 +805,14 @@ class CanonicalWorldService:
                         ),
                     )
             subject = self._subject(observation, track)
+            if observation.observation_id in pending_track_outputs:
+                pending_presence_origins[observation.observation_id] = _TrackerPresenceOrigin(
+                    envelope=observation, subject=subject,
+                    trail_segment_id=self._nonnegative_int(track.get("trail_segment_id")),
+                    trail_break_required=track.get("trail_break_required") is True,
+                    tracker_lifecycle_generation=continuity_key[3],
+                    source_epoch=continuity_key[7],
+                )
             # Trail episodes are producer-internal continuity authority, not
             # part of the public observation schema. Pass the exact accepted
             # row's break/segment context privately so global fusion does not
@@ -781,8 +837,7 @@ class CanonicalWorldService:
                     else metadata.get("source_epoch")
                 ),
             )
-        if not tracks:
-            camera_id = str(metadata.get("camera_id") or "").strip()
+        if not tracks or terminated_ids:
             if not camera_id:
                 raise ValueError(
                     "empty source publication requires metadata.camera_id"
@@ -791,6 +846,9 @@ class CanonicalWorldService:
                 camera_id,
                 source,
                 self.producer.run_id,
+                retained_lifecycles=retained_lifecycles,
+                terminated_tracker_ids=terminated_ids,
+                terminated_only=bool(tracks),
             )
         self._prune_expired_track_outputs(
             working_track_outputs,
@@ -827,7 +885,16 @@ class CanonicalWorldService:
             (continuity_key, output),
         ) in pending_track_outputs.items():
             if observation_id in cache_admitted_observation_ids:
-                working_track_outputs[continuity_key] = output
+                evidence = source_evidence_by_observation_id[observation_id]
+                prior = working_track_outputs.get(continuity_key)
+                working_track_outputs[continuity_key] = replace(
+                    output,
+                    presence_origin=(
+                        pending_presence_origins[observation_id]
+                        if evidence.accepted is True
+                        else prior.presence_origin if prior is not None else None
+                    ),
+                )
         self._bound_track_outputs(working_track_outputs)
         events, next_event_sequence, next_previous_entities = (
             self._events_for_state(

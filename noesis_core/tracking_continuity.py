@@ -10,6 +10,8 @@ from typing import Any, Mapping, MutableMapping, Sequence
 TRACKING_CONTINUITY_CONTRACT = "noesis.tracking.publication-continuity"
 TRACKING_CONTINUITY_CONTRACT_VERSION = 1
 TRACKER_LIFECYCLE_GENERATION_FIELD = "tracker_lifecycle_generation"
+TRACKER_PRESENCE_CONTRACT = "noesis.tracker.lifecycle-evidence"
+TRACKER_PRESENCE_MAX_IDS = 256
 
 
 def _exact_nonnegative_int(value: object, label: str) -> int:
@@ -141,6 +143,65 @@ class TrackingContinuityUpdate:
     # worker must call ``prepare_publication`` against the then-current
     # last-published lifecycle immediately before emitting this cohort.
     publication_prepared: bool = False
+    camera_id: str = ""
+    media_pts_ns: int | None = None
+    shadow_lifecycles: tuple[tuple[int, int], ...] = ()
+    terminated_tracker_ids: tuple[int, ...] = ()
+
+    def presence_evidence(self) -> dict[str, object]:
+        """Current native presence, separate from last actual observation time."""
+        return {
+            "contract": TRACKER_PRESENCE_CONTRACT,
+            "contract_version": 1,
+            "source_id": self.source_id,
+            "camera_id": self.camera_id,
+            "source_epoch": self.source_epoch,
+            "frame_id": self.frame_id,
+            "observed_at_us": self.observed_at_us,
+            "media_pts_ns": self.media_pts_ns,
+            "shadow_lifecycles": [
+                {"tracker_id": tracker, "tracker_lifecycle_generation": generation}
+                for tracker, generation in self.shadow_lifecycles
+            ],
+            "terminated_tracker_ids": list(self.terminated_tracker_ids),
+        }
+
+
+def parse_tracker_presence_evidence(
+    value: object, *, source_id: int, metadata: Mapping[str, Any],
+) -> tuple[frozenset[tuple[int, int]], frozenset[int]]:
+    """Validate an exact-cohort receipt; it carries no coordinate authority."""
+    if value is None:
+        return frozenset(), frozenset()
+    if not isinstance(value, Mapping) or value.get("contract") != TRACKER_PRESENCE_CONTRACT or type(value.get("contract_version")) is not int or value.get("contract_version") != 1:
+        raise ValueError("invalid tracker presence evidence contract")
+    for field in ("source_id", "source_epoch", "frame_id", "observed_at_us"):
+        parsed = _exact_nonnegative_int(value.get(field), field)
+        expected = source_id if field == "source_id" else metadata.get(field)
+        if parsed != expected or type(expected) is not int or (field == "observed_at_us" and parsed == 0):
+            raise ValueError(f"tracker presence evidence cohort mismatch: {field}")
+    if not value.get("camera_id") or value.get("camera_id") != metadata.get("camera_id"):
+        raise ValueError("tracker presence evidence cohort mismatch: camera_id")
+    media = _media_pts_ns(value.get("media_pts_ns"))
+    if media is None or media != _media_pts_ns(metadata.get("media_pts_ns")):
+        raise ValueError("tracker presence evidence cohort mismatch: media_pts_ns")
+    shadow = value.get("shadow_lifecycles")
+    terminated = value.get("terminated_tracker_ids")
+    if not isinstance(shadow, (list, tuple)) or not isinstance(terminated, (list, tuple)) or len(shadow) > TRACKER_PRESENCE_MAX_IDS or len(terminated) > TRACKER_PRESENCE_MAX_IDS:
+        raise ValueError("tracker presence evidence exceeds ID bounds")
+    shadow_keys: set[tuple[int, int]] = set()
+    for row in shadow:
+        if not isinstance(row, Mapping):
+            raise ValueError("invalid tracker shadow lifecycle")
+        tracker = _exact_nonnegative_int(row.get("tracker_id"), "tracker_id")
+        generation = _exact_nonnegative_int(row.get(TRACKER_LIFECYCLE_GENERATION_FIELD), TRACKER_LIFECYCLE_GENERATION_FIELD)
+        if generation <= 0 or any(key[0] == tracker for key in shadow_keys):
+            raise ValueError("invalid or duplicate tracker shadow generation")
+        shadow_keys.add((tracker, generation))
+    terminated_ids = frozenset(_exact_nonnegative_int(item, "terminated tracker_id") for item in terminated)
+    if len(terminated_ids) != len(terminated):
+        raise ValueError("duplicate terminated tracker ID")
+    return frozenset(key for key in shadow_keys if key[0] not in terminated_ids), terminated_ids
 
 
 class TrackingLifecycleRegistry:
@@ -495,6 +556,8 @@ class TrackingLifecycleRegistry:
         observed_at_us: int,
         media_pts_ns: object = None,
         tracks: Sequence[MutableMapping[str, Any]],
+        shadow_tracker_ids: Sequence[int] = (),
+        terminated_tracker_ids: Sequence[int] = (),
     ) -> TrackingContinuityUpdate:
         source = _exact_nonnegative_int(source_id, "source_id")
         frame = _exact_nonnegative_int(frame_id, "frame_id")
@@ -505,6 +568,10 @@ class TrackingLifecycleRegistry:
         camera = str(camera_id or "").strip()
         if not camera:
             raise ValueError("camera_id is required")
+        if len(shadow_tracker_ids) > TRACKER_PRESENCE_MAX_IDS or len(terminated_tracker_ids) > TRACKER_PRESENCE_MAX_IDS:
+            raise ValueError("tracker presence evidence exceeds ID bounds")
+        shadow_ids = {_exact_nonnegative_int(item, "shadow tracker_id") for item in shadow_tracker_ids}
+        terminated_ids = {_exact_nonnegative_int(item, "terminated tracker_id") for item in terminated_tracker_ids}
 
         with self._lock:
             previous = self._active_by_source.get(source, {})
@@ -526,17 +593,39 @@ class TrackingLifecycleRegistry:
                 indexed[tracker] = track
                 indexed_bbox[tracker] = _track_bbox(track.get("bbox"))
 
+            if terminated_ids.intersection(indexed):
+                # Fail closed, but do not leave a terminated identity reusable
+                # if the caller records the failure before a later frame.
+                for tracker in terminated_ids:
+                    previous.pop(tracker, None)
+                    self._retired_by_source.get(source, {}).pop(tracker, None)
+                self._generation_preview_by_source.pop(source, None)
+                raise ValueError("terminated tracker is also an active object in the same cohort")
+
             previous_ids = set(previous)
-            current_id_set = set(current_ids)
+            known_shadow_ids = {
+                tracker for tracker in shadow_ids.intersection(previous_ids)
+                if tracker not in terminated_ids and tracker not in indexed
+                and previous[tracker].camera_id == camera
+            }
+            current_id_set = set(current_ids) | known_shadow_ids
             self._prune_retired_locked(source, observed, media)
             for tracker in sorted(previous_ids - current_id_set):
-                self._retire_lifecycle_locked(source, previous[tracker])
+                if tracker not in terminated_ids:
+                    self._retire_lifecycle_locked(source, previous[tracker])
+            retired_for_source = self._retired_by_source.get(source, {})
+            for tracker in terminated_ids:
+                retired_for_source.pop(tracker, None)
             next_generation = self._next_generation_by_source.get(source, 1)
             preview = self._generation_preview_by_source.get(source)
             preview_generations: dict[int, int] = {}
             if preview is not None and preview[:3] == (frame, observed, media):
                 preview_generations = dict(preview[3])
-            current: dict[int, _ActiveTrackLifecycle] = {}
+            # Native shadow presence retains identity/lifecycle ownership only.
+            # Keep the last ACTUAL row's bbox/frame/time/media proof unchanged.
+            current: dict[int, _ActiveTrackLifecycle] = {
+                tracker: previous[tracker] for tracker in known_shadow_ids
+            }
             for tracker in current_ids:
                 prior = previous.get(tracker)
                 if prior is None:
@@ -606,6 +695,10 @@ class TrackingLifecycleRegistry:
                 active_lifecycles=tuple(
                     current[tracker] for tracker in sorted(current)
                 ),
+                camera_id=camera,
+                media_pts_ns=media,
+                shadow_lifecycles=tuple((tracker, current[tracker].generation) for tracker in sorted(known_shadow_ids)),
+                terminated_tracker_ids=tuple(sorted(terminated_ids)),
             )
 
     @staticmethod

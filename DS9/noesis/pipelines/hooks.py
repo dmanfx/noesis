@@ -1574,6 +1574,9 @@ def attach_analytics_telemetry_hook(
             "noesis_analytics_meta_ext.extract_analytics is required for DS9 analytics telemetry"
         )
 
+    if not callable(getattr(noesis_analytics_meta_ext, "extract_tracker_lifecycle", None)):
+        raise RuntimeError("noesis_analytics_meta_ext.extract_tracker_lifecycle is required for canonical tracker presence")
+
     analytics_component = pipeline.components.get("analytics")
     if analytics_component is None:
         raise KeyError("analytics component missing; cannot attach telemetry hook")
@@ -10149,6 +10152,8 @@ class _AnalyticsTelemetryProcessor:
         media_pts_ns: Any = None,
         tracks: Sequence[MutableMapping[str, Any]],
         footpoints: Sequence[Footpoint],
+        shadow_tracker_ids: Sequence[int] = (),
+        terminated_tracker_ids: Sequence[int] = (),
     ) -> TrackingContinuityUpdate:
         """Stamp one lifecycle on the rows shared by OSD, BEV, and worker.
 
@@ -10202,6 +10207,8 @@ class _AnalyticsTelemetryProcessor:
                 observed_at_us=observed,
                 media_pts_ns=media_pts_ns,
                 tracks=tracks,
+                shadow_tracker_ids=shadow_tracker_ids,
+                terminated_tracker_ids=terminated_tracker_ids,
             )
             self._source_epoch_by_sensor[source] = int(continuity.source_epoch)
             self._last_source_frame_by_sensor[source] = (frame, observed)
@@ -10463,10 +10470,13 @@ class _AnalyticsTelemetryProcessor:
                     int(work.source_id),
                     work.tracks,
                     frame_metadata={
+                        "camera_id": str(work.camera_id),
                         "frame_id": int(work.frame_id),
                         "source_epoch": int(work.source_epoch),
                         "tracker_lifecycle_tombstones": list(continuity.tombstones),
                         "observed_at_us": int(work.observed_at_us),
+                        **({"tracker_lifecycle_evidence": continuity.presence_evidence()}
+                           if continuity.media_pts_ns is not None else {}),
                         **dict(work.temporal_contract),
                     },
                 ),
@@ -11233,15 +11243,15 @@ class _AnalyticsTelemetryProcessor:
             _REID_NATIVE_MISSING_LOGGED = True
         return None
 
-    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any, *, tracker_lifecycle: Any = None) -> None:
         lease = self.publication_gate.acquire()
         if lease is None:
             _increment_core_counter("runtime_publication_gate_rejected_frames_total")
             return
         with lease:
-            self._handle_servicemaker_frame_admitted(frame_meta)
+            self._handle_servicemaker_frame_admitted(frame_meta, tracker_lifecycle=tracker_lifecycle)
 
-    def _handle_servicemaker_frame_admitted(self, frame_meta: Any) -> None:
+    def _handle_servicemaker_frame_admitted(self, frame_meta: Any, *, tracker_lifecycle: Any = None) -> None:
         """Extract tracking telemetry for one Service Maker frame."""
         frame_start_ns = time.perf_counter_ns()
         try:
@@ -11270,6 +11280,12 @@ class _AnalyticsTelemetryProcessor:
                 sensor_id=int(sensor_id),
                 frame_id=int(frame_id),
                 observed_at_us=int(temporal_contract["observed_at_us"]),
+                media_pts_ns=int(temporal_contract.get("media_pts_ns", 0) or 0),
+            )
+            shadow_tracker_ids, terminated_tracker_ids = _tracker_lifecycle_ids_for_frame(
+                tracker_lifecycle,
+                source_id=int(getattr(frame_meta, "pad_index", source_id)),
+                frame_id=frame_id,
                 media_pts_ns=int(temporal_contract.get("media_pts_ns", 0) or 0),
             )
             world_now_ts = self._world_timestamp_for_frame(
@@ -11748,8 +11764,6 @@ class _AnalyticsTelemetryProcessor:
 
             self._publish_occupancy(sensor_id, occupancy_counts)
             self._cleanup_zone_state(sensor_id, present_stable_ids)
-            if not identity_v2_authoritative:
-                self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             if (
                 not tracks
                 and os.environ.get("NOESIS_REID_TEST_MODE") == "1"
@@ -11770,15 +11784,6 @@ class _AnalyticsTelemetryProcessor:
                 tracks.append(synthetic)
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
-            self._clear_absent_world_state(
-                sensor_id,
-                (
-                    track.get("tracker_id", track.get("track_id"))
-                    for track in tracks
-                    if isinstance(track, Mapping)
-                ),
-                now_ts=float(world_now_ts),
-            )
             continuity = self._prepare_tracking_cohort(
                 sensor_id=int(sensor_id),
                 camera_id=str(camera_id),
@@ -11787,7 +11792,16 @@ class _AnalyticsTelemetryProcessor:
                 media_pts_ns=temporal_contract.get("media_pts_ns"),
                 tracks=tracks,
                 footpoints=footpoints,
+                shadow_tracker_ids=shadow_tracker_ids,
+                terminated_tracker_ids=terminated_tracker_ids,
             )
+            alive_ids = {item.tracker_id for item in continuity.active_lifecycles}
+            self._clear_absent_world_state(sensor_id, alive_ids, now_ts=float(world_now_ts))
+            for tracker_id in terminated_tracker_ids:
+                self._world_state_by_track.pop((int(sensor_id), tracker_id), None)
+                self._world_state_ghost_by_track.pop((int(sensor_id), tracker_id), None)
+            if not identity_v2_authoritative:
+                self._maintain_stable_ids(sensor_id, present_track_ids | alive_ids, now_ts)
             self._set_active_tracks_snapshot(sensor_id, frame_id, tracks)
             if not identity_v2_authoritative:
                 self._maybe_log_stable_id_metrics(sensor_id, now_ts)
@@ -11868,9 +11882,14 @@ class _AnalyticsTelemetryProcessor:
                 item_count=len(tracks),
             )
             _record_core_stage_timing("analytics.handle_servicemaker_frame", frame_start_ns, item_count=len(tracks))
-        except Exception:  # pragma: no cover - defensive guardrail
+        except Exception as exc:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame")
             _record_core_stage_timing("analytics.handle_servicemaker_frame", frame_start_ns)
+            report = getattr(self.tracking_pub, "_report_failure", None)
+            if callable(report):
+                report(exc)
+            else:
+                raise
 
     def handle_frame(self, frame_meta: Any) -> None:
         lease = self.publication_gate.acquire()
@@ -25488,6 +25507,45 @@ class _IdentityV2PostResolutionOsdOperator(
         self._operator.handle_metadata(batch_meta)
 
 
+def _tracker_lifecycle_ids_for_frame(
+    evidence: Any, *, source_id: int, frame_id: int, media_pts_ns: int,
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Accept only native INACTIVE person receipts from this exact frame/PTS."""
+    if evidence is None:
+        return (), ()
+    if not isinstance(evidence, Mapping) or any(
+        type(evidence.get(field)) is not int or evidence.get(field) != expected
+        for field, expected in (("source_id", source_id), ("frame_id", frame_id), ("media_pts_ns", media_pts_ns))
+    ):
+        raise ValueError("native tracker lifecycle cohort mismatch")
+    shadow, terminated = evidence.get("shadow"), evidence.get("terminated")
+    if not isinstance(shadow, (list, tuple)) or not isinstance(terminated, (list, tuple)) or len(shadow) > 256 or len(terminated) > 256:
+        raise ValueError("native tracker lifecycle ID bounds invalid")
+    shadow_ids: set[int] = set()
+    terminated_ids: set[int] = set()
+    for rows, available, destination in (
+        (shadow, evidence.get("shadow_available"), shadow_ids),
+        (terminated, evidence.get("terminated_available"), terminated_ids),
+    ):
+        if rows and available is not True:
+            raise ValueError("native tracker lifecycle rows have no metadata receipt")
+        for row in rows:
+            tracker = row.get("tracker_id") if isinstance(row, Mapping) else None
+            if isinstance(tracker, bool) or not isinstance(tracker, int) or not 0 <= tracker < (1 << 64) - 1 or type(row.get("class_id")) is not int or row.get("class_id") != 0:
+                raise ValueError("native tracker lifecycle person ID invalid")
+            if destination is shadow_ids:
+                # TENTATIVE IDs cannot bootstrap canonical presence. An
+                # archived/stale sample likewise is not current alive proof.
+                if row.get("tracker_state") != 2 or row.get("tracker_frame_id") != frame_id:
+                    continue
+            if tracker in destination:
+                raise ValueError("duplicate native tracker lifecycle ID")
+            destination.add(tracker)
+    _increment_core_counter("tracking.native_shadow_ids_total", len(shadow_ids))
+    _increment_core_counter("tracking.native_terminated_ids_total", len(terminated_ids))
+    return tuple(sorted(shadow_ids - terminated_ids)), tuple(sorted(terminated_ids))
+
+
 class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: _AnalyticsTelemetryProcessor) -> None:
         super().__init__()
@@ -25497,14 +25555,34 @@ class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cov
         if batch_meta is None:
             return
 
+        extract_start_ns = time.perf_counter_ns()
+        try:
+            tracker_lifecycles = noesis_analytics_meta_ext.extract_tracker_lifecycle(batch_meta)
+        except Exception as exc:
+            _increment_core_counter("tracking.native_lifecycle_extract_failed_total")
+            logger.exception("Failed to extract canonical tracker lifecycle metadata")
+            report = getattr(self._processor.tracking_pub, "_report_failure", None)
+            if callable(report):
+                report(exc)
+            return
+        finally:
+            _record_core_stage_timing("analytics.tracker_lifecycle_extract", extract_start_ns)
         frame_items = getattr(batch_meta, "frame_items", None)
         if frame_items is None:
             return
         for frame_meta in frame_items:
             try:
-                self._processor.handle_servicemaker_frame(frame_meta)
-            except Exception:
+                self._processor.handle_servicemaker_frame(
+                    frame_meta,
+                    tracker_lifecycle=tracker_lifecycles.get(int(getattr(frame_meta, "pad_index", -1))),
+                )
+            except Exception as exc:
                 logger.exception("Failed to process analytics telemetry within batch metadata")
+                report = getattr(self._processor.tracking_pub, "_report_failure", None)
+                if callable(report):
+                    report(exc)
+                else:
+                    raise
 
 
 class _TrailOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime

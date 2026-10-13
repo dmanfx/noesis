@@ -407,9 +407,27 @@ of waiting for the normal cadence.
 Zero-person camera frames still produce a tracking publication with
 `track_count=0`, `tracks=[]`, an empty observation set, and advancing frame
 timing. The nonempty-to-empty transition is immediate; sustained emptiness is
-cadenced by `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (2 Hz default). Canonical world
-state removes that producer/source evidence while retaining its sequence
-watermark so absence cannot be confused with replay or telemetry stall.
+cadenced by `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (2 Hz default). Without positive
+native tracker evidence, canonical world state removes that producer/source
+evidence while retaining its sequence watermark so absence cannot be confused
+with replay or telemetry stall.
+
+The native baseline additionally carries `tracker_lifecycle_evidence` under
+`noesis.tracker.lifecycle-evidence` v1. Its source/camera/epoch/frame/observation
+time/media PTS must match the exact tracking cohort. Only current INACTIVE
+person IDs from NvDCF shadow metadata may preserve an already owned lifecycle;
+TENTATIVE, unknown, stale-frame and terminated IDs cannot do so. Shadow and
+termination lists each have a 256-ID cap. Shadow metadata carries no bbox,
+position, embedding or new observation. It does not mint a tracking row, reset
+the last actual observation clock, or renew the world's existing expiry.
+
+World continuity retains one exact previously accepted source envelope under
+the same lifecycle/epoch/calibration/registration and subject ownership. A newer
+rejected or image-only row cannot replace that authority merely because a peer
+camera disappears. Existing world TTLs still expire the retained sample (2 s
+lost TTL in the default fusion config); explicit termination clears it
+immediately, including in a nonempty source cohort. BEV and Menon consume the
+same ordered world publication. No PCF-derived person coordinate is introduced.
 
 Native baseline identity resolution consumes the lifecycle owner's generation
 reservation before assignment. A bounded private confirmed binding may survive

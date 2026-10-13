@@ -22,7 +22,10 @@ _TRACKING_FRAME_FIELDS = (
     "observed_at_us",
     "capture_time_status",
     "media_pts_ns",
+    "source_epoch",
+    "camera_id",
     "tracker_lifecycle_tombstones",
+    "tracker_lifecycle_evidence",
 )
 
 

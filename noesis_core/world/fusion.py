@@ -250,7 +250,58 @@ class GlobalWorldFusion:
         if len(self._continuity_by_entity) > self.config.max_entities:
             self._prune_absent_continuity()
 
-    def clear_source(self, camera_id: str, source_id: int, run_id: str) -> int:
+    def _retain_admitted_tracker_origin(
+        self, envelope: ObservationEnvelope, subject: SubjectRef, *,
+        tracker_lifecycle_generation: int, source_epoch: int,
+        trail_segment_id: int | None, trail_break_required: bool,
+    ) -> bool:
+        """Restore an already admitted source sample without replaying ingest.
+
+        A later rejected/image-only row may occupy this camera's slot. Native
+        presence must retain the admitted sample, not make that row authority
+        when another camera disappears. Ordering watermarks and all original
+        observation clocks are deliberately unchanged.
+        """
+        tracklet = envelope.payload.tracklet
+        world = envelope.payload.world
+        if world is None or envelope.producer.run_id != self.producer.run_id:
+            return False
+        observations = self._by_entity.get(subject.subject_id)
+        current = observations.get(tracklet.camera_id) if observations else None
+        if current is None:
+            return False
+        current_tracklet = current.envelope.payload.tracklet
+        if (
+            (current_tracklet.run_id, current_tracklet.camera_id,
+             current_tracklet.source_id, current_tracklet.tracker_id)
+            != (tracklet.run_id, tracklet.camera_id, tracklet.source_id, tracklet.tracker_id)
+            or current.envelope.producer.run_id != envelope.producer.run_id
+            or current.subject != subject
+            or current.tracker_lifecycle_generation != tracker_lifecycle_generation
+            or current.source_epoch != source_epoch
+            or current.envelope.observed_at_us < envelope.observed_at_us
+        ):
+            return False
+        current_world = current.envelope.payload.world
+        if current_world is not None and (
+            self._registration_identity(current_world) != self._registration_identity(world)
+        ):
+            return False
+        observations[tracklet.camera_id] = _ResolvedObservation(
+            envelope=envelope, subject=subject,
+            trail_segment_id=trail_segment_id,
+            trail_break_required=trail_break_required,
+            tracker_lifecycle_generation=tracker_lifecycle_generation,
+            source_epoch=source_epoch,
+        )
+        return True
+
+    def clear_source(
+        self, camera_id: str, source_id: int, run_id: str, *,
+        retained_lifecycles: frozenset[tuple[int, int, int]] = frozenset(),
+        terminated_tracker_ids: frozenset[int] = frozenset(),
+        terminated_only: bool = False,
+    ) -> int:
         """Remove current evidence for one empty tracker source frame.
 
         Observation ordering state is deliberately retained. A delayed
@@ -280,6 +331,12 @@ class GlobalWorldFusion:
                 or current.envelope.producer.run_id != run_key
             ):
                 continue
+            tracker = int(tracklet.tracker_id)
+            if tracker not in terminated_tracker_ids:
+                if terminated_only or (
+                    tracker, current.tracker_lifecycle_generation, current.source_epoch
+                ) in retained_lifecycles:
+                    continue
             tracklet_key = (
                 camera_key,
                 source_key,

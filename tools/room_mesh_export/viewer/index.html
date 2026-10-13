@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Living Room · renderer mesh trial</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/viewer.css">
+  <script type="importmap">{"imports":{"three":"/vendor/build/three.module.js","three/addons/":"/vendor/examples/jsm/","three/examples/jsm/":"/vendor/examples/jsm/"}}</script>
+</head>
+<body>
+  <header><div class="eyebrow">ROOM RECONSTRUCTION / LIVING ROOM</div>
+    <h1>Living Room · renderer mesh trial</h1>
+    <p id="description">Loading trial information…</p></header>
+  <main>
+    <div class="toolbar">
+      <label><span id="asset-label">Detail</span> <select id="asset" aria-label="Mesh or texture variant"></select></label>
+      <label>View <select id="camera" aria-label="Camera view"></select></label>
+      <label>Surface <select id="mode"><option value="rgb">Photo colour</option><option value="normal">Geometry normals</option><option value="wire">Wireframe</option></select></label>
+      <label class="check"><input id="cutaway" type="checkbox"> Cutaway</label>
+      <button id="overview">Room overview</button><button id="reset">Reset view</button>
+    </div>
+    <div class="viewport"><canvas aria-label="Orbitable Living Room reconstruction"></canvas><div id="loading" role="status">Loading room…</div></div>
+    <p id="error" role="alert"></p>
+    <div class="metrics" aria-live="polite">
+      <div><span class="metric-title">Model download</span><strong id="download-size">—</strong></div>
+      <div><span class="metric-title">Triangles</span><strong id="triangles">—</strong></div>
+      <div><span class="metric-title">Draw calls</span><strong id="draws">—</strong></div>
+      <div><span class="metric-title">Texture + geometry</span><strong id="gpu-memory">—</strong></div>
+      <div><span class="metric-title">Fetch + decode</span><strong id="load-time">—</strong></div>
+    </div>
+    <div class="downloads"><a id="download" download>Download compact GLB</a><a id="compatible" download>Standard GLB for existing loaders</a><a href="/trial.json">Asset manifest</a><button id="benchmark">Measure 3-second orbit</button><span id="benchmark-result"></span></div>
+    <p class="note">Drag to orbit · scroll to zoom · right-drag to pan. Only the selected level is downloaded. The room renders on demand while idle.</p>
+    <p id="source-note" class="note"></p>
+    <details><summary>Compare with the original surface</summary><p id="source-size-note">The detailed source is loaded only when you choose this comparison.</p><button id="source">Load original for comparison</button></details>
+  </main>
+  <script type="module" src="/viewer.js"></script>
+</body></html>

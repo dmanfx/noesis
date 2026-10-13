@@ -18,6 +18,7 @@ document and live source/config win.
 | Native runtime operation | [`../DS9/docs/runtime_host_boundary.md`](../DS9/docs/runtime_host_boundary.md) |
 | Focused validation | [`testing_guide.md`](testing_guide.md) |
 | Run or reproduce Prior-Conditioned Fusion (PCF) | [`PCF_Workflow.md`](PCF_Workflow.md) |
+| Export browser-sized reconstructed room meshes | [`../tools/room_mesh_export/README.md`](../tools/room_mesh_export/README.md) |
 | Join overlapping accepted PCF rooms | [`PCF_Multiroom_Registration.md`](PCF_Multiroom_Registration.md) |
 | PCF coordinate/orientation contract and flip audit | [`PCF_Coordinate_Orientation_Audit.md`](PCF_Coordinate_Orientation_Audit.md) |
 | Structural PCF-to-Menon scene registration | [`structural_scene_registration.md`](structural_scene_registration.md) |
@@ -58,6 +59,9 @@ document and live source/config win.
   phone-walk capture, synchronized Android sensor import, and review workflow.
 - [`room_reconstruction_fitting.md`](room_reconstruction_fitting.md):
   reusable fitting procedure, independent-reference checks, and experiment ledger.
+- [`../tools/room_mesh_export/README.md`](../tools/room_mesh_export/README.md):
+  offline Living Room Three.js mesh trial, explicit detail/download budgets,
+  source-relative export loss and measured browser-consumer results.
 - [`scene_prior_v1.md`](scene_prior_v1.md): immutable runtime artifact and
   catalog contract built from approved PCF evidence.
 - [`Virtual_Twin_Reconstruction.md`](Virtual_Twin_Reconstruction.md):

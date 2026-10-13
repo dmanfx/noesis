@@ -83,6 +83,50 @@
   for live pose accuracy. Existing engine-maintenance declarations remain
   nano-specific; this change does not extend their model-selection interface.
 
+## 2026-10-07 — Same-geometry Living Room texture comparison
+
+- Kept the existing 400,000 oriented triangles fixed and verified each reused
+  UV layout against the bound raw export. Better 4K packing increases actual
+  surface texel utilization from 20.18% to 46.24%; eight-pixel outside-chart
+  colour dilation resolves the narrow-padding trial's visible hairline seams.
+- Reused the 130 existing bound native-frame photos, original provider-depth
+  visibility and accepted photometric gains. The robust direct-photo blend is
+  the separate preview's selected review default: 9.69 MB compact / 17.02 MB
+  compatible, one draw/material/texture. Direct photos cover 88.07% of sampled
+  texels; the remainder retain explicit existing colour, without inpainting.
+- Matched browser views show modest extra detail but residual colour patches
+  and rough geometry, not photorealism. All five variants and the existing Menon
+  compatible loader pass; bounded local orbits remain at the approximately
+  60 fps display cap with approximately 100.80 MB decoded geometry/texture.
+- Inspected the 504×280 DA3 and 518×294 conditioned MapAnything grids and the
+  controls required for a true larger-grid experiment. No additional capture,
+  depth inference, runtime restart, product integration, scene publication,
+  commit or push was performed. See the [texture trial](../tools/room_mesh_export/TEXTURE_TRIAL.md).
+
+## 2026-10-07 — Browser-sized Living Room mesh trial
+
+- Derived selectable 40,000 / 150,000 / 400,000-triangle presentation meshes from
+  the retained October 4 130-view reconstruction's October 5 detailed colour
+  surface. Compact downloads are 0.92 / 3.04 / 8.24 MB instead of the 74.34 MB
+  dense input; compatible GLBs are 1.48 / 5.91 / 15.58 MB. Each has one JPEG
+  atlas, material and draw call. The default loads only the balanced asset.
+- Bounded spatial UV generation preserves simplified corners/winding; dense
+  source colour is transferred in linear light then encoded as sRGB. Tiny
+  ambiguous UV samples remain neutral and are reported, without geometry
+  removal or inpainting. Source-relative simplification p95 is approximately
+  7 mm balanced and 2.8 mm high-detail before final quantization.
+- Nine focused checks and the actual Three.js browser consumer pass. Existing
+  Menon embedded-image loading accepts the compatible balanced variant. All
+  levels reach the local browser's approximately 60 fps cap on Intel UHD 630 in
+  three-second orbit tests, as does the original source; this is not a claim of
+  faster rendering or cross-device performance. Level switching releases the
+  old geometry/texture, and the 412-pixel layout has no horizontal overflow.
+- The source's roughly 23.64% inferred area, colour noise and geometry roughness
+  remain. Independent physical accuracy and self-intersections are unqualified.
+  No RoomWalk utility or Menon product edits, inference rerun, runtime restart,
+  live scene publication, commit or push. Reproduction, files and limitations
+  are described in the [offline renderer trial](../tools/room_mesh_export/README.md).
+
 ## 2026-10-05 — Denser, closed same-video room review mesh
 
 - Rechecked the original 68.33-second 8K phone video and exact frame/timestamp

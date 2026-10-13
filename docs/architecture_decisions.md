@@ -27,6 +27,48 @@ are not equivalent fusion contributors; keep gravity as an alternate rather
 than contaminating the valid range result. The typed all-contributor admission
 gate remains unchanged.
 
+## Room appearance improvements keep existing geometry fixed — 2026-10-07
+
+The follow-on Living Room texture trial reuses the verified high-detail export's
+oriented world-space triangles instead of reconstructing or simplifying again.
+Bound native-frame photos and previously accepted gains may improve colour
+detail without changing camera poses, depth visibility gates or geometry.
+Combine only the finite existing witness pool in linear light; retain labelled
+existing colour when direct photographs fail the original provider-depth gate.
+UV ambiguity remains neutral and excessive ambiguity rejects the layout.
+
+Denser atlas packing and outside-chart colour padding are separate controls:
+reduced packing gutters improve surface texel utilization, while sufficient
+outside-chart dilation avoids visible seams. Preserve rejected-looking trials
+for comparison. The robust photo blend is a local review default, not a live
+scene selection or photorealistic/physical qualification. A genuinely larger
+depth grid requires new matched inference, not upsampling saved depth arrays.
+See the [texture workflow and limitations](../tools/room_mesh_export/TEXTURE_TRIAL.md).
+
+## Browser-sized room surfaces are separate presentation derivatives — 2026-10-07
+
+The Living Room renderer trial consumes the exact retained dense colour surface
+and its manifest, not a newly selected capture or another inference path.
+Quadratic-error simplification is paired with source-bound linear-RGB-to-sRGB
+atlas baking so colour detail is not limited by the reduced vertex count.
+Spatially bounded UV chart generation must preserve every simplified triangle's
+world-space corners and winding. Small ambiguous UV samples remain explicitly
+neutral; excessive ambiguity rejects the layout. No image inpainting, new
+geometry or source-photo modification is introduced.
+
+One material/texture/draw call and selectable triangle/atlas budgets keep the
+browser transfer and decoded memory explicit. Compact meshopt and compatible
+quantized GLBs are separate variants; require the decoder for the compact file.
+Load only the selected level and dispose previous resources. The original dense
+source is an explicit opt-in comparison, not part of initial page loading.
+
+The source alignment is already applied in `backend_world_m_stream_points`.
+Retain that frame, inferred-completion provenance and review-only status.
+Simplification error is relative to the saved source, never physical accuracy.
+No RoomWalk utility, canonical world authority, Menon scene binding or runtime
+selection changes follow from this export. See the
+[trial workflow and measured results](../tools/room_mesh_export/README.md).
+
 ## Native tracker presence preserves admitted world continuity — 2026-10-05
 
 An empty object list is not confirmed disappearance when current NvDCF shadow

@@ -79,6 +79,9 @@ document and live source/config win.
 
 ## Diagrams and operations
 
+- [`future_home_setup.html`](future_home_setup.html): self-contained illustrated
+  CAD-free future-home setup workflow, using dated RoomWalk, registration,
+  PCF mesh, and Noesis source/BEV examples with their review limitations.
 - [`flow_diagram_high_level.md`](flow_diagram_high_level.md) and
   [`flow_diagram_low_level.md`](flow_diagram_low_level.md): current application
   and publication flows.

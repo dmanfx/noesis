@@ -148,6 +148,7 @@ Qualification still requires the independent native-pixel holdout checks.
 | Fuse and diagnose phone-only geometry | [Consensus fusion](#consensus-fusion-workflow), [diagnostic views](#heatmap-style-diagnostic-views) |
 | Fit against independent static-camera evidence | [Alignment findings](#static-camera-alignment-findings), [reusable fitting process](../../docs/room_reconstruction_fitting.md) |
 | Generate a PCF candidate or perform an authorized handoff | [Conditioned workflow](#validated-landscape-da3-conditioned-mapanything-workflow), [PCF phase boundaries](../../docs/PCF_Workflow.md#phase-boundaries-and-stopping-points) |
+| Test larger inference grids without changing retained scans or defaults | [Separate higher-resolution lane](HIGH_RES_RECONSTRUCTION.md) |
 | Direct integration and focused checks | [Tracking contract](#detection-and-tracking-integration-contract), [artifacts](#important-artifacts), [validation commands](#validation-commands) |
 
 Historical validation sections name their tested captures. They do not establish

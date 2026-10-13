@@ -83,6 +83,35 @@
   for live pose accuracy. Existing engine-maintenance declarations remain
   nano-specific; this change does not extend their model-selection interface.
 
+## 2026-10-07 — Isolated higher-resolution Living Room reconstruction
+
+- Added an opt-in DA3/conditioned-MapAnything reconstruction lane with matched
+  756×420 grids, unchanged weights/metric engine and the same 130 prepared
+  views. Old scan state, artifacts, default preprocessing, runtime configs and
+  live geometry remain unchanged. MapAnything uses 32/16 windows for this
+  larger grid; this is not a resolution-only ablation.
+- Recorded native pause/restore before the authorized exclusive GPU window;
+  explicitly stopped the Noesis GPU service as well as its appliance target.
+  Normal producer/gateway readiness and appliance guard health succeeded after
+  restoration, before CPU fusion/derivatives. No unit/engine changes or live
+  scene publication. Failures and recoverable leases remain retained.
+- Rebuilt provider/raw/trajectory evidence, fresh DA3/consensus alignments,
+  diagnostics, point-preserving GLB/PLY/NPZ, 1,364,482 strict 2 cm surfels,
+  measured/explicitly completed meshes, real-photo textures and 90 six-view
+  RGB/normal/wireframe/depth-face render artifacts. The final dense mesh has
+  4,505,160 triangles; inferred area remains labeled at approximately 30.00%.
+- Produced 40k/150k/400k browser levels and a 4K direct-photo blend: 9.08 MB
+  compact / 16.72 MB compatible, one draw/material/texture. Actual browser and
+  unchanged Menon-loader checks pass. Fixes preserve explicit linear COLOR_0
+  during finalization and support opt-in finite larger work limits without
+  weakening quality/provenance gates; rejected UV layouts remain recorded.
+- The experiment is denser but worse on equal-budget withheld static-model
+  depth agreement: common-support median 0.579 m versus 0.304 m for the retained
+  baseline. It is not selected as better geometry or independent physical
+  accuracy. Keep the prior geometry for texture-focused improvement. Focused
+  tests and direct consumers passed; no commit or push. See the
+  [separate larger-grid workflow](../tools/mapanything_phone_scan/HIGH_RES_RECONSTRUCTION.md).
+
 ## 2026-10-07 — Same-geometry Living Room texture comparison
 
 - Kept the existing 400,000 oriented triangles fixed and verified each reused

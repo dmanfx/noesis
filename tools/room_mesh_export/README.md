@@ -13,6 +13,13 @@ The subsequent [same-geometry texture comparison](TEXTURE_TRIAL.md) tests denser
 Its separate preview defaults to a robust photo blend; the original three-level
 mesh trial and its balanced default remain unchanged.
 
+The subsequent [larger-grid reconstruction experiment](../mapanything_phone_scan/HIGH_RES_RECONSTRUCTION.md)
+reruns inference in a separate lane. Its own browser assets use the new bound
+source, with opt-in finite source limits; they must not be described as
+same-geometry derivatives of this original trial. A denser grid was not better
+on the withheld static-depth comparison, so this retained geometry remains the
+preferred source for texture-focused improvement.
+
 ## Source and authority
 
 The input is `final_closed_video_color_v2/surface_mesh.glb`, bound to its

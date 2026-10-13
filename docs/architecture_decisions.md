@@ -2567,6 +2567,37 @@ revision-owned matrices without a global marker dependency and clears revoked
 presentation state on complete authoritative bundles. Missing mappings reject.
 Measured foyer rise remains 0.1905 m; Family/Kitchen window failures stay recorded
 under explicit owner selection. No quality threshold or person position changes.
+
+## ADR-049 — Opt-in reconstruction grid experiments preserve the baseline
+
+Accepted: 2026-10-07, offline reconstruction and presentation only.
+
+Run higher-resolution DA3 and DA3-conditioned MapAnything on the exact retained
+phone cohort in a fresh external lane. A larger grid is an inference option,
+not a new model, metric engine, live pipeline setting, or silently replaced
+scan. Preserve the baseline default preprocessing call and sparse-prior gates;
+use identical selected preprocessing for initial inputs and reliable-prior
+top-up. New outputs require new source-bound static-world alignment. Static
+frames remain independent alignment/validation inputs, never fusion members.
+
+Record the native appliance lease before an owner-authorized exclusive GPU
+window. Stop both the documented appliance target and exact Noesis GPU-owning
+service, verify the GPU owner stopped, and restore the previously active target
+through its normal readiness path on success or failure. Keep a recoverable
+lease for externally interrupted processes. CPU derivatives run after restore.
+This does not change service units, runtime configs or selected engine artifacts.
+
+Explicit finite work limits may accommodate larger saved grids and surfaces;
+legacy defaults and all geometry/support/visibility/provenance gates remain
+unchanged. Resume only identical bound completed stages; preserve failed-stage
+history rather than overwriting old reconstructions or choosing a fallback.
+Rendering smoothness, more supported samples, or passed in-domain alignment
+checks do not establish independent accuracy. Retain equal-budget withheld
+comparison and reject a worse result as a baseline replacement. The October 7
+756×420 experiment has more supported surfels but worse withheld model-depth
+agreement, so the previous geometry remains preferred. See the
+[larger-grid workflow](../tools/mapanything_phone_scan/HIGH_RES_RECONSTRUCTION.md).
+
 ## ADR-050 — Explicit Watch detector experiment profile
 
 Date: 2026-10-09. Status: implemented for owner-requested runtime testing.

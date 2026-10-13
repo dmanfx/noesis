@@ -28,6 +28,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1150,6 +1151,16 @@ def _top_up_preprocessed_depth_priors(
     return reports
 
 
+def _preprocessing_options(process_res: int | None) -> dict[str, Any]:
+    """Keep the baseline crop exactly unchanged unless explicitly overridden."""
+    if process_res is None:
+        return {}
+    if (isinstance(process_res, bool) or not isinstance(process_res, int)
+            or not 294 <= process_res <= 1008 or process_res % 14):
+        raise MapAnythingScanError("--process-res must be a multiple of 14 within 294..1008")
+    return {"resize_mode": "longest_side", "size": process_res}
+
+
 def _run_conditioned_mapanything_windows(
     model: Any,
     raw_views: list[dict[str, Any]],
@@ -1162,9 +1173,12 @@ def _run_conditioned_mapanything_windows(
     require_depth_prior: bool,
     reliable_depth_priors: list[np.ndarray] | None = None,
     random_seed: int = 8_675_309,
+    process_res: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     from tools.mapanything_phone_scan.windowed_inference import _window_ranges
 
+    preprocessing = _preprocessing_options(process_res)
+    preprocess_inputs = partial(preprocess_inputs, **preprocessing)
     ranges = _window_ranges(len(raw_views), max_joint_views, window_overlap_views)
     canonical: list[dict[str, Any] | None] = [None] * len(raw_views)
     canonical_processed: list[dict[str, Any] | None] = [None] * len(raw_views)
@@ -1268,6 +1282,8 @@ def _run_conditioned_mapanything_windows(
             "max_joint_views": max_joint_views,
             "window_overlap_views": window_overlap_views,
             "all_duplicate_depth_gates_passed": True,
+            "preprocessing": preprocessing,
+            "processed_shape_hw": list(expected_shape) if expected_shape else None,
             "windows": reports,
         },
     )
@@ -1324,6 +1340,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--point-budget", type=int, default=600_000)
     parser.add_argument("--max-joint-views", type=int, default=80)
     parser.add_argument("--window-overlap-views", type=int, default=24)
+    parser.add_argument("--process-res", type=int, default=None,
+                        help="Explicit longest-side override (multiple of 14, 294..1008); omitted keeps baseline fixed-mapping preprocessing.")
     parser.add_argument(
         "--trajectory-refinement-report",
         type=Path,
@@ -1343,6 +1361,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    _preprocessing_options(args.process_res)
     if not args.model_id.endswith("-apache"):
         raise MapAnythingScanError("only the Apache-licensed MapAnything model is permitted")
     scan_dir = args.scan_dir.resolve()
@@ -1494,6 +1513,7 @@ def main() -> int:
                         ),
                         reliable_depth_priors=reliable_depth_priors,
                         random_seed=args.random_seed,
+                        process_res=args.process_res,
                     )
                 )
                 del raw_views
@@ -1586,6 +1606,7 @@ def main() -> int:
                 "max_joint_views": args.max_joint_views,
                 "window_overlap_views": args.window_overlap_views,
                 "policy": "overlap_gated_conditioned_windows",
+                "preprocessing": _preprocessing_options(args.process_res),
             },
             "sparse_depth_prior": sparse.metrics,
             "trajectory_refinement": (

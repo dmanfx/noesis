@@ -1,0 +1,345 @@
+{
+  "$defs": {
+    "SemanticArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "path",
+        "sha256"
+      ],
+      "title": "SemanticArtifact",
+      "type": "object"
+    },
+    "SemanticBox": {
+      "additionalProperties": false,
+      "description": "Basis columns are local length, width, height axes in backend Y-up.",
+      "properties": {
+        "basis_row_major": {
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Basis Row Major",
+          "type": "array"
+        },
+        "center_m": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Center M",
+          "type": "array"
+        },
+        "size_m": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Size M",
+          "type": "array"
+        }
+      },
+      "required": [
+        "center_m",
+        "size_m",
+        "basis_row_major"
+      ],
+      "title": "SemanticBox",
+      "type": "object"
+    },
+    "SemanticElement": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Category",
+          "type": "string"
+        },
+        "element_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,95}$",
+          "title": "Element Id",
+          "type": "string"
+        },
+        "geometry": {
+          "$ref": "#/$defs/SemanticBox"
+        },
+        "kind": {
+          "enum": [
+            "wall",
+            "opening",
+            "object"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "physical_qualification": {
+          "const": "not_independently_qualified",
+          "default": "not_independently_qualified",
+          "title": "Physical Qualification",
+          "type": "string"
+        },
+        "review_actor": {
+          "default": "",
+          "maxLength": 96,
+          "title": "Review Actor",
+          "type": "string"
+        },
+        "review_reason": {
+          "default": "",
+          "maxLength": 2000,
+          "title": "Review Reason",
+          "type": "string"
+        },
+        "review_state": {
+          "default": "proposed",
+          "enum": [
+            "proposed",
+            "accepted",
+            "rejected"
+          ],
+          "title": "Review State",
+          "type": "string"
+        },
+        "source_kind": {
+          "default": "model_proposal",
+          "enum": [
+            "model_proposal",
+            "manual_annotation"
+          ],
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "wall_id": {
+          "anyOf": [
+            {
+              "maxLength": 96,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wall Id"
+        }
+      },
+      "required": [
+        "element_id",
+        "kind",
+        "category",
+        "label",
+        "geometry"
+      ],
+      "title": "SemanticElement",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "authority": {
+      "const": "offline_review_and_advisory_context_only",
+      "default": "offline_review_and_advisory_context_only",
+      "title": "Authority",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.scene_semantics",
+      "default": "noesis.scene_semantics",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "conversion_note": {
+      "maxLength": 2000,
+      "minLength": 1,
+      "title": "Conversion Note",
+      "type": "string"
+    },
+    "coordinate_frame": {
+      "const": "backend_world_m",
+      "default": "backend_world_m",
+      "title": "Coordinate Frame",
+      "type": "string"
+    },
+    "elements": {
+      "items": {
+        "$ref": "#/$defs/SemanticElement"
+      },
+      "maxItems": 256,
+      "title": "Elements",
+      "type": "array"
+    },
+    "map_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Map Id",
+      "type": "string"
+    },
+    "prepared_to_backend_rotation": {
+      "maxItems": 9,
+      "minItems": 9,
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "title": "Prepared To Backend Rotation",
+      "type": "array"
+    },
+    "proposal_revision_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Proposal Revision Sha256",
+      "type": "string"
+    },
+    "revision_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Revision Sha256",
+      "type": "string"
+    },
+    "room_membership_authority": {
+      "const": "external_authored_labels_only",
+      "default": "external_authored_labels_only",
+      "title": "Room Membership Authority",
+      "type": "string"
+    },
+    "source_artifacts": {
+      "items": {
+        "$ref": "#/$defs/SemanticArtifact"
+      },
+      "maxItems": 32,
+      "minItems": 1,
+      "title": "Source Artifacts",
+      "type": "array"
+    },
+    "units": {
+      "const": "meters",
+      "default": "meters",
+      "title": "Units",
+      "type": "string"
+    },
+    "world_frame_revision": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "World Frame Revision",
+      "type": "string"
+    },
+    "world_transform_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "World Transform Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "map_id",
+    "revision_sha256",
+    "proposal_revision_sha256",
+    "world_frame_revision",
+    "world_transform_sha256",
+    "source_artifacts",
+    "prepared_to_backend_rotation",
+    "conversion_note",
+    "elements"
+  ],
+  "title": "SceneSemanticMap",
+  "type": "object"
+}

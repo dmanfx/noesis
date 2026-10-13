@@ -20,6 +20,7 @@ from .identity_calibration import (
 )
 from .observation import ObservationEnvelope
 from .scene import SceneRelease
+from .scene_semantics import SceneSemanticMap
 from .scene_prior import (
     ScenePriorCatalog,
     ScenePriorFrameBinding,
@@ -67,6 +68,7 @@ CONTRACT_MODELS = {
     "identity_shadow_evidence": ShadowIdentityEvidenceRecord,
     "observation_envelope": ObservationEnvelope,
     "scene_release": SceneRelease,
+    "scene_semantics": SceneSemanticMap,
     "scene_prior_catalog": ScenePriorCatalog,
     "scene_prior_revision": ScenePriorRevision,
     "support_surfaces": SupportSurfaceSet,
@@ -95,6 +97,7 @@ CONTRACT_MODELS_BY_NAME = {
     "noesis.identity.shadow_score_evidence": ShadowIdentityEvidenceRecord,
     "noesis.observation.person": ObservationEnvelope,
     "noesis.scene.release": SceneRelease,
+    "noesis.scene_semantics": SceneSemanticMap,
     "noesis.scene_prior.catalog": ScenePriorCatalog,
     "noesis.scene_prior.revision": ScenePriorRevision,
     "noesis.support_surfaces": SupportSurfaceSet,
@@ -126,6 +129,7 @@ __all__ = [
     "IdentityOpenSetCalibrationArtifact",
     "ObservationEnvelope",
     "SceneRelease",
+    "SceneSemanticMap",
     "ScenePriorCatalog",
     "ScenePriorFrameBinding",
     "ScenePriorFrameRef",

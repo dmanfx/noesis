@@ -2640,3 +2640,28 @@ delivery cadence from isolated engine timings and detection-quality evidence.
 Build Watch at 960 only from its actual trained checkpoint or a verified new
 export; its fixed 640 graph is not sufficient for an input-declaration-only resize.
 See [the experiment and operating instructions](yolo26_960_experiment.md).
+
+
+## 2026-10-11 — Offline reviewed static semantics from SpatialLM
+
+A strict `noesis.scene_semantics` v1 contract and the isolated
+[static scene review tool](../tools/spatial_scene_review/README.md) preserve
+source hashes, metric frame/revision/transform binding, full upright box bases,
+review decisions and per-element IDs. `element_id` is separate from person
+StableID. Accepted proposals remain physically unqualified and grant only
+local display/advisory context; authored labels retain room-membership authority.
+No runtime producer, tracking constraint, calibration or production selection
+consumes this contract in this change.
+
+Undo preprocessing yaw and the Z-up permutation exactly once; do not repeat
+phone alignment or min-point translation, invent wall thickness, or rescale to
+room dimensions. The lower-room tape record is 4.6736 m × 6.6294 m excluding the
+foyer, with a separate 0.1905 m rise. Endpoint binding and numerical uncertainty
+remain unresolved. Diagnostic floor/opening tolerances are not survey gates.
+
+A bounded advisory consumer rejects mismatched, expired, future, predicted,
+held, lost or conflicting evidence and reports distance to accepted object
+footprints without changing canonical person data. September seeds 42/43/44
+show substantial box/opening/class variability; repeated seeds do not provide
+independent physical corroboration. The source model weights remain under
+CC BY-NC 4.0 for this non-commercial local experiment.

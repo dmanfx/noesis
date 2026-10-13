@@ -1,4 +1,25 @@
 # Noesis upgrade history
+
+## 2026-10-11 — Editable offline Living Room semantic review
+
+Implemented a separate loopback review viewer with measured RGB clouds,
+original/reviewed geometry, metric edits, opening-wall association, labels,
+accept/reject, manual objects, undo/redo, source-bound draft import, immutable
+saved change records, reload and accepted-only exports. The September source
+has 39 proposals; the provisional example accepts 12 wall planes and five
+furniture proposals, rejects a duplicate table and invalid opening, and leaves
+20 proposals pending. Independent tape/photo references remain review evidence.
+
+Ten focused contract/geometry/store/HTTP/context tests passed. Actual browser
+checks exercised save/reload, exact geometry preservation for a label edit,
+metric edit/undo, import mismatch, accepted download, all 536,074 cloud points
+and responsive layout. Float64 position/corner round trips are below 3e-15 m.
+Two extra identical-input seeds took 30.7/25.1 s with 2,908 MiB reserved VRAM;
+model variability remains substantial. The user-authorized GPU lease restored
+all original appliance units, exact launch argv and 13 configuration/env hashes.
+No production semantic consumer was activated. See the
+[offline runbook](../tools/spatial_scene_review/README.md).
+
 ## 2026-10-10 — Preserved YOLO26 960 detector trial
 
 - Added separate 640/960 comparison configurations with the earlier nano

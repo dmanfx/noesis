@@ -788,6 +788,50 @@ export type SceneRelease = {
   readonly validation_report_size_bytes: number;
 };
 
+export type SceneSemanticMap = {
+  readonly contract?: "noesis.scene_semantics";
+  readonly contract_version?: 1;
+  readonly map_id: string;
+  readonly revision_sha256: string;
+  readonly proposal_revision_sha256: string;
+  readonly coordinate_frame?: "backend_world_m";
+  readonly units?: "meters";
+  readonly world_frame_revision: string;
+  readonly world_transform_sha256: string;
+  readonly authority?: "offline_review_and_advisory_context_only";
+  readonly room_membership_authority?: "external_authored_labels_only";
+  readonly source_artifacts: ReadonlyArray<SemanticArtifact>;
+  readonly prepared_to_backend_rotation: readonly [number, number, number, number, number, number, number, number, number];
+  readonly conversion_note: string;
+  readonly elements: ReadonlyArray<SemanticElement>;
+};
+
+export type SemanticArtifact = {
+  readonly role: string;
+  readonly path: string;
+  readonly sha256: string;
+};
+
+export type SemanticBox = {
+  readonly center_m: readonly [number, number, number];
+  readonly size_m: readonly [number, number, number];
+  readonly basis_row_major: readonly [number, number, number, number, number, number, number, number, number];
+};
+
+export type SemanticElement = {
+  readonly element_id: string;
+  readonly kind: "wall" | "opening" | "object";
+  readonly category: string;
+  readonly label: string;
+  readonly geometry: SemanticBox;
+  readonly wall_id?: string | null;
+  readonly review_state?: "proposed" | "accepted" | "rejected";
+  readonly review_actor?: string;
+  readonly review_reason?: string;
+  readonly physical_qualification?: "not_independently_qualified";
+  readonly source_kind?: "model_proposal" | "manual_annotation";
+};
+
 export type ShadowIdentityEvidenceRecord = {
   readonly contract: "noesis.identity.shadow_score_evidence";
   readonly contract_version: 2;

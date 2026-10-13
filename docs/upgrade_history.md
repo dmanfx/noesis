@@ -2200,3 +2200,16 @@ contracts.
 GI/GStreamer pad-probe and older local-only prototype material is retained in
 the checksummed supplemental archive indexed by
 `archive/manifests/supplemental_history_20260826.json`.
+
+
+## 2026-10-11 — Noesis/Menon engineering-agent workspace setup
+
+Installed Agent Team v1.0 with a single private coordination root, repository
+locators, appended instruction blocks, fourteen durable Sol roles and constrained
+Luna xhigh helpers. Existing branches, instructions, permissions and unrelated
+application edits were preserved. The package's 59 disposable standard-library
+checks passed, and native coordinator/lead profile execution was observed on the
+verified executor. The private `TEAM_ROOT/install-report.md` records the exact
+model catalog, role bindings, subsequent pilot outcomes, supported resume action
+and remaining continuity/backup limitations. This setup grants no production or
+application feature assignment.

@@ -217,3 +217,22 @@ tracking/world authority.
 - After changing agent guidance or documentation, run
   `./scripts/check_agents_docs_consistency.py` and `git diff --check`. Docs-only
   work does not trigger application, packaging, or release validation.
+
+<!-- NOESIS-TEAM:BEGIN v1 -->
+## Noesis / Menon engineering team
+For authorized project-team work, read `.noesis-team.json` and resolve the single
+TEAM_ROOT. Verify project/executor and current role/task bindings before mutations.
+Read TEAM_ROOT/charter.md, common.md, own role instructions/status, assigned task,
+and relevant accepted decisions. Read actual instructions/skills for every touched
+repository/subtree, including secondary folders. Never create fallback team state.
+Enter through the project coordinator or your current authorized assigned role.
+Standing roles use Sol high/xhigh; explicit low-level execution helpers use Luna
+xhigh only. Any standing role may direct its own constrained helpers; helpers may
+not delegate. Workers otherwise communicate with their own lead, leads with peer
+leads/coordinator/own specialists, and the reviewer with the coordinator. Shared
+notes are context, not assignments. Preserve one writer per file/resource and
+reconcile uncertain operations/old writers before resuming. Leads own complete
+outcomes; disconnected pieces or missing required evidence are not completion.
+See TEAM_ROOT/reference/docs/WORKFLOWS.md and LUNA_HELPERS.md as needed.
+This block grants no extra permissions and does not override existing repo rules.
+<!-- NOESIS-TEAM:END v1 -->

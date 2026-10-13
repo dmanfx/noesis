@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "project_id": "noesis-menon-engineering",
+  "team_root": "/path/to/existing/private/team-root",
+  "target_host": "your-host",
+  "executor_id": "local",
+  "repository_alias": "noesis"
+}

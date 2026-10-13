@@ -2665,3 +2665,20 @@ footprints without changing canonical person data. September seeds 42/43/44
 show substantial box/opening/class variability; repeated seeds do not provide
 independent physical corroboration. The source model weights remain under
 CC BY-NC 4.0 for this non-commercial local experiment.
+
+
+## 2026-10-11 — Private Noesis/Menon engineering-agent coordination
+
+The Agent Team v1.0 setup uses one private, branch-independent `TEAM_ROOT`
+outside the application checkouts. Each authorized checkout resolves it through
+`.noesis-team.json`; canonical product contracts remain in their existing
+repositories. Fourteen durable roles have project-scoped Sol high/xhigh
+profiles, with constrained Luna xhigh helpers activated only for assigned work.
+Existing repository instructions, permissions, session limits and single-writer
+ownership remain binding. Role notes and transport do not grant application or
+production authority.
+
+Exact host paths, native model catalog, observed session bindings, transport
+adaptation, disposable acceptance evidence, readiness and rollback are recorded
+in `TEAM_ROOT/install-report.md`. Configuration files alone do not establish
+automatic continuation, attachment continuity or host-loss recovery.

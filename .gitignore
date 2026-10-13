@@ -45,6 +45,8 @@ __pycache__/
 /.cursor/debug*.log
 /.cursor/ds8_runtime_last.log
 /.cursor/plans/
+/.scope/
+/.noesis-team.json
 
 # Runtime logs, diagnostics, and local captures
 /logs/

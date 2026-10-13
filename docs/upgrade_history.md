@@ -83,6 +83,32 @@
   for live pose accuracy. Existing engine-maintenance declarations remain
   nano-specific; this change does not extend their model-selection interface.
 
+## 2026-10-05 — Denser, closed same-video room review mesh
+
+- Rechecked the original 68.33-second 8K phone video and exact frame/timestamp
+  identities. All 130 larger lossless texture photos match their original
+  prepared/native frames; no replacement photographs or upsampled inputs.
+- Full accepted-grid export at 2 cm retains 1,083,628 multiview surfels versus
+  the earlier 225,793. Qualified count/confidence-weight visibility votes and
+  actual supporting-camera normal signs repair excessive surface rejection.
+  Original confidence, distinct-view and alignment requirements remain intact.
+- Retained the measured trimmed mesh separately. Explicit presentation closure,
+  complete small closed-component removal and local vertex-fan splitting produce
+  2,867,524 triangles with zero serialized open/nonmanifold edges, inconsistent
+  winding edges or disconnected local vertex fans. Approximately 23.64% of
+  surface area is inferred completion, not measured geometry. Self-intersections
+  and independent physical completeness/accuracy remain unqualified.
+- Per-face photo texture retries remained visibly fragmented and were not made
+  the default output. An explicit robust same-video continuous colour bake
+  samples 98.72% of vertices directly; the remaining 1.28% retain separately
+  labelled interpolated input colour. The 74.34 MB final unlit GLB preserves
+  exact positions, faces and colours through material finalization. RGB/detail
+  are improved but remain visibly noisy, not a photorealistic qualification.
+- Six actual-GLB reference/phone renders have complete image coverage; the
+  interactive RGB/normal consumer is exercised. Outputs remain offline review
+  artifacts. No calibration, live Scene Prior, tracking or runtime replacement,
+  commit or push is performed by this reconstruction retry.
+
 ## 2026-10-05 — Native tracker presence and Menon visual continuity
 
 - Current INACTIVE NvDCF person metadata now carries bounded exact-cohort

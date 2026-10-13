@@ -282,6 +282,43 @@ def test_surfel_support_requires_two_distinct_views() -> None:
     assert two_metrics["support_view_count_max"] == 2
 
 
+def test_full_grid_surfel_export_recovers_odd_pixels_without_changing_support_gates() -> None:
+    depth = np.full((2, 4, 4), 2.0, dtype=np.float32)
+    fused = {
+        "depth": depth,
+        "mask": np.ones_like(depth, dtype=bool),
+        "quality": np.ones_like(depth, dtype=np.float32),
+        "rgb": np.full((2, 4, 4, 3), 128, dtype=np.uint8),
+    }
+    intrinsics = np.tile(np.asarray([[80., 0., 1.5], [0., 80., 1.5], [0., 0., 1.]]), (2, 1, 1))
+    poses = np.tile(np.eye(4), (2, 1, 1))
+    original_mask = fused["mask"].copy()
+    sampled, _, _, sampled_metrics = _surfel_fusion(fused, intrinsics, poses, .02)
+    full, _, _, full_metrics = _surfel_fusion(fused, intrinsics, poses, .02, pixel_stride=1)
+    assert len(sampled) == 4 and len(full) == 16
+    assert sampled_metrics["input_sample_count"] == 8
+    assert full_metrics["input_sample_count"] == 32
+    assert full_metrics["input_pixel_stride"] == 1
+    assert full_metrics["full_resolution_accepted_evidence_used"] is True
+    assert full_metrics["support_view_count_min"] == 2
+    assert full_metrics["minimum_accumulated_weight"] == .80
+    np.testing.assert_array_equal(fused["mask"], original_mask)
+    fused["quality"][:, 1, 1] = .34
+    qualified, _, _, qualified_metrics = _surfel_fusion(fused, intrinsics, poses, .02, pixel_stride=1)
+    assert len(qualified) == 15
+    assert qualified_metrics["input_sample_count"] == 30
+    one = {key: value[:1] for key, value in fused.items()}
+    single, _, _, single_metrics = _surfel_fusion(one, intrinsics[:1], poses[:1], .20, pixel_stride=1)
+    assert len(single) == 0
+    assert single_metrics["single_view_rejected_voxel_count"] > 0
+
+
+@pytest.mark.parametrize("stride", [0, -1, 3, True, None])
+def test_surfel_export_rejects_unbounded_or_invalid_sampling(stride) -> None:
+    with pytest.raises(ValueError, match="pixel stride"):
+        _surfel_fusion({}, np.empty(0), np.empty(0), .04, pixel_stride=stride)
+
+
 def test_heldout_reprojection_counts_large_errors_and_reports_coverage() -> None:
     depth = np.ones((2, 1, 12), dtype=np.float32)
     depth[1] = 5.0

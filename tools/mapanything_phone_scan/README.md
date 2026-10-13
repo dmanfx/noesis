@@ -1277,6 +1277,71 @@ face-to-photo assignment, neutral coverage, patch coherence, and photometric
 acceptance separately. This is an offline presentation export, not publication,
 surveyed accuracy, calibration, or live world authority.
 
+### Dense and explicitly completed room surfaces (offline)
+
+For dense reconstruction from an existing exact phone cohort,
+[`build_dense_review_surfels.py`](build_dense_review_surfels.py) uses all accepted
+grid pixels at a selected 1–4 cm voxel size. The canonical minimum quality,
+sample count, distinct-view count and accumulated weight do not change. Supply
+its directory as `--dense-surfel-dir` to the single-room surface builder.
+The optional `--visibility-policy qualified_consensus` requires two reliable
+agreeing rays and count/weight majorities over free-space contradictions;
+unknown, masked, outside-image and foreground-occluded rays abstain. The default
+`strict_any_view` remains unchanged. Normal signs use qualified supporting rays.
+
+When a closed mesh is explicitly requested,
+[`build_closed_room_review_surface.py`](build_closed_room_review_surface.py)
+retains a separate Poisson envelope and closes its boundaries. The measured
+trimmed mesh is preserved. Its per-face sidecar distinguishes multiview-supported
+triangles from inferred extension and inferred caps; report both counts and
+surface areas. [`clean_completed_surface_mesh.py`](clean_completed_surface_mesh.py)
+can remove complete closed components below a selected face threshold and split
+disconnected local vertex fans without moving retained triangle corners. Closed
+edge incidence and consistent winding are checked after serialization. This is
+not independent physical completeness or a self-intersection qualification.
+
+[`extract_bound_texture_photos.py`](extract_bound_texture_photos.py) decodes
+larger lossless photos from the exact same native-video frame indices in one CPU
+pass. Source video and prepared/native timestamp identities, all-pairs unique
+image correspondence and spatial feature checks must pass. No prepared images
+are upsampled; no intrinsics, poses or source recordings are changed. Supply
+the verified directory as `--texture-photo-dir` to the texture exporter.
+
+For source-label smoothing, `--smoothness-m` selects the physical area/shared-edge
+objective; `--minimum-patch-area-m2` sets region priority and diagnostics, not a
+forced invalid-photo merge. Candidate checkpoints (`--candidate-cache-dir`) are
+source, algorithm and hash bound. `--reuse-assignments-from` also rechecks every
+assigned triangle corner/centroid and facing direction against the new photos.
+
+For completed presentation surfaces, an explicitly selected
+[`build_mesh_texture_visibility.py`](build_mesh_texture_visibility.py) cache
+tests photo occlusion against that same mesh from the exact phone camera. Supply
+it as `--surface-visibility-dir`; this texture-only visibility does **not** assert
+agreement with provider depth or promote inferred surfaces to measurements.
+The original provider-depth texture gate remains the default. All source-camera,
+photo-map, geometry and z-buffer hashes must match. `--crop-selected-photo-regions`
+embeds only exact assigned UV bounding rectangles with a border, without image
+resampling or UV clipping. Neutral material still denotes no eligible photo.
+Existing measured gain, reserved-sample and new-clipping limits remain in force.
+
+When per-face source changes remain visibly fragmented,
+[`bake_continuous_video_color.py`](bake_continuous_video_color.py) is an explicit
+alternative: retain the exact closed geometry and robustly blend four eligible
+original-provider-depth-visible video samples per vertex by default, bounded to
+eight if explicitly selected. It consumes
+the same verified native photos and source/ray-bound accepted photometric gains.
+This opts into cross-view colour blending, not image inpainting or geometric
+correction; it does not change the legacy single-photo texture path. A source
+sidecar records eligible photo identities, weights and sample counts. Vertices
+without an eligible photo retain explicitly interpolated input colour, not a
+claim of measured RGB. glTF vertex colour is stored in linear light and bound to
+a white unlit material; the CPU review consumer converts it for display.
+
+The CPU render wrapper [`render_cpu_review_mesh.py`](render_cpu_review_mesh.py)
+reads the actual GLB and bound cameras; rendered coverage is presentation evidence,
+not surveyed accuracy. These tools neither publish a Scene Prior nor restart the
+native perception application.
+
 ## Detection and tracking integration contract
 
 The intended detection/tracking use is not to rebuild the room continuously.

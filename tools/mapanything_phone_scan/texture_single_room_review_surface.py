@@ -12,8 +12,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
-import importlib
 import inspect
+import importlib
 import json
 import math
 from pathlib import Path
@@ -57,6 +57,7 @@ class PhotoView:
     photo_size: tuple[int, int]
     quality: float
     provenance: dict[str, Any]
+    surface_depth: np.ndarray | None = None
 
 
 def _sha(path: Path) -> str:
@@ -220,11 +221,73 @@ def verified_official_photo_maps(
         return {}, report
 
 
+def bound_texture_photo_rows(args, prepared):
+    directory = getattr(args, "texture_photo_dir", None)
+    if directory is None:
+        return {}, None
+    directory = directory.resolve()
+    path = directory / "bound_texture_photos_manifest.json"
+    manifest = _json(path)
+    prepared_path = args.scan_dir.resolve() / "prepared_frames_manifest.json"
+    _bound_file(manifest["prepared_manifest"], prepared_path, "native texture prepared manifest")
+    source_path = (args.scan_dir.resolve() / prepared["video"]["path"]).resolve()
+    source = manifest["source_video"]
+    if (manifest.get("schema") != "noesis.mapanything.phone_scan.bound_texture_photos.v1"
+            or manifest.get("status") != "verified_all_bound_views"
+            or source.get("sha256") != prepared["video"]["sha256"]
+            or source.get("sha256") != _sha(source_path)
+            or source.get("size_bytes") != source_path.stat().st_size
+            or source.get("rotation_degrees") != 0
+            or manifest["extraction"].get("selection") != "single_decode_pass_exact_decoded_frame_index"
+            or manifest["extraction"].get("prepared_pixels_used_as_output") is not False
+            or manifest["geometry"] != {"source_pixel_geometry": "native_noautorotate_uniform_scale_only",
+                "intrinsics_modified": False, "poses_modified": False, "prepared_manifest_modified": False}
+            or len(manifest["views"]) != len(prepared["frames"])):
+        raise TextureSurfaceError("native texture video, frame count, or pixel geometry binding mismatch")
+    rows = {}
+    for index, (row, frame) in enumerate(zip(manifest["views"], prepared["frames"], strict=True)):
+        photo = row["output_photo"]
+        photo_path = (directory / photo["path"]).resolve()
+        original = row["prepared_photo"]
+        if (row.get("index") != index or row.get("frame_id") != frame["frame_id"]
+                or any(row.get(field) != frame.get(field) for field in
+                       ("source_frame_index", "capture_time_ns", "timestamp_s", "timestamp_source"))
+                or original != {"path": frame["frame"], "sha256": frame["sha256"],
+                                "width": frame["width"], "height": frame["height"]}
+                or row["image_mapping_verification"].get("status") != "verified_unique_same_decoded_frame_geometry"
+                or not photo_path.is_relative_to(directory)
+                or photo.get("sha256") != _sha(photo_path)
+                or photo.get("encoding") != "png_lossless_rgb24"
+                or not 1 <= int(photo["width"]) <= 4096 or not 1 <= int(photo["height"]) <= 4096
+                or int(photo["width"]) * int(photo["height"]) > args.max_input_pixels
+                or int(photo["width"]) * frame["height"] != int(photo["height"]) * frame["width"]):
+            raise TextureSurfaceError(f"native texture view {index} exact-frame/photo binding mismatch")
+        with Image.open(photo_path) as image:
+            if image.size != (photo["width"], photo["height"]):
+                raise TextureSurfaceError(f"native texture view {index} dimensions mismatch")
+        rows[index] = {**row, "resolved_photo": photo_path}
+    return rows, {"manifest": _record(path), "source_video": _record(source_path),
+                  "verified_view_count": len(rows), "prepared_images_upsampled": False,
+                  "camera_intrinsics_and_poses_changed": False}
+
+
+def scaled_photo_map(affine, original_size, photo_size):
+    """Compose only uniform, same-FOV image scaling in pixel-centre coordinates."""
+    scale = np.asarray(photo_size, dtype=np.float64) / np.asarray(original_size, dtype=np.float64)
+    if not np.isfinite(scale).all() or np.any(scale <= 0) or not np.isclose(scale[0], scale[1], atol=1e-8):
+        raise TextureSurfaceError("native texture mapping is not one uniform same-FOV scale")
+    result = np.asarray(affine, dtype=np.float64).copy()
+    result *= scale[:, None]
+    result[:, 2] += .5 * (scale - 1)
+    return result
+
+
 def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[str, Any]]:
     scan, consensus, alignment = args.scan_dir.resolve(), args.consensus_dir.resolve(), args.alignment_dir.resolve()
     prepared_path = scan / "prepared_frames_manifest.json"
     prepared = _json(prepared_path)
     frames = prepared["frames"]
+    texture_rows, texture_photo_report = bound_texture_photo_rows(args, prepared)
     manifest_path = consensus / "consensus_manifest.json"
     consensus_manifest = _json(manifest_path)
     if (consensus_manifest.get("phone_walk_only") is not True
@@ -290,9 +353,14 @@ def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[st
             relative_consensus_origin = np.linalg.inv(pose)
         if not np.allclose(relative_model_origin @ model_pose, relative_consensus_origin @ pose, atol=3e-4, rtol=3e-4):
             raise TextureSurfaceError(f"conditioned RGB source view {index} has a different supplied pose carrier")
-        with Image.open(photo_path) as source:
+        prepared_photo_path = photo_path
+        with Image.open(prepared_photo_path) as source:
             if source.size != (frame["width"], frame["height"]) or math.prod(source.size) > args.max_input_pixels:
                 raise TextureSurfaceError(f"photo size/bound mismatch for view {index}")
+            original_photo_size = _size_at_edge(source.size, args.texture_edge_px)
+        if texture_rows:
+            photo_path = texture_rows[index]["resolved_photo"]
+        with Image.open(photo_path) as source:
             photo_size = _size_at_edge(source.size, args.texture_edge_px)
             photo = np.asarray(source.convert("RGB").resize(photo_size, Image.Resampling.LANCZOS))
         quality = frame.get("quality") or {}
@@ -304,6 +372,8 @@ def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[st
             reason = "texture_only_sharpness_or_luminance_exclusion"
         elif official_maps:
             affine = official_maps[index]
+            if texture_rows:
+                affine = scaled_photo_map(affine, original_photo_size, photo_size)
             image_report = {"status": "verified_byte_exact_official_preprocessing", "feature_fit_used": False,
                             "model_to_photo_row_major": affine.tolist()}
         else:
@@ -319,7 +389,7 @@ def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[st
             "view_index": index, "frame_id": frame["frame_id"],
             "source_frame_index": frame.get("source_frame_index"),
             "capture_time_ns": frame.get("capture_time_ns"), "timestamp_s": frame.get("timestamp_s"),
-            "prepared_photo": _record(photo_path), "consensus_raw": raw_row,
+            "prepared_photo": _record(prepared_photo_path), "consensus_raw": raw_row,
             "conditioned_provider_raw": _record(model_path), "photo_size": list(photo_size),
             "provider_intrinsics": model_k.tolist(), "common_intrinsics": intrinsics.tolist(),
             "camera_to_world": (transform @ pose).tolist(),
@@ -328,6 +398,10 @@ def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[st
             "blur_score": blur, "luminance_p50": luminance,
             "geometry_preserved_when_texture_excluded": True,
         }
+        if texture_rows:
+            provenance["texture_photo"] = _record(photo_path)
+            provenance["native_photo_binding"] = {key: value for key, value in texture_rows[index].items()
+                                                  if key != "resolved_photo"}
         views.append(PhotoView(
             index, depth, mask, confidence, intrinsics, np.linalg.inv(transform @ pose),
             model_k, affine, photo_path, photo_size,
@@ -341,6 +415,7 @@ def load_bound_views(args: argparse.Namespace) -> tuple[list[PhotoView], dict[st
         "alignment_transform": _record(alignment / "phone_ma_to_noesis_world.json"),
         "target": report["target"], "world_from_consensus": transform.tolist(),
         "photo_mapping_verification": official_report,
+        **({"bound_native_texture_photos": texture_photo_report} if texture_photo_report else {}),
     }
 
 
@@ -357,6 +432,23 @@ def project_photo(points: np.ndarray, view: PhotoView) -> tuple[np.ndarray, np.n
 
 def depth_visible(points: np.ndarray, view: PhotoView, *, minimum_quality: float = 0.20) -> tuple[np.ndarray, np.ndarray]:
     camera, z, photo_uv = project_photo(points, view)
+    if view.surface_depth is not None:
+        # An explicit presentation-only alternative: test the exact camera's
+        # z-buffer of this same reconstructed mesh, not raw neural depth. This
+        # does not upgrade inferred geometry to measured support.
+        height, width = view.surface_depth.shape
+        scaled = photo_uv * [width / view.photo_size[0], height / view.photo_size[1]]
+        inside = (np.isfinite(scaled).all(1) & (z > .05) & (z < 12.)
+                  & (photo_uv[:, 0] >= .5) & (photo_uv[:, 0] <= view.photo_size[0] - 1.5)
+                  & (photo_uv[:, 1] >= .5) & (photo_uv[:, 1] <= view.photo_size[1] - 1.5)
+                  & (scaled[:, 0] >= 0) & (scaled[:, 0] < width)
+                  & (scaled[:, 1] >= 0) & (scaled[:, 1] < height))
+        rows = np.flatnonzero(inside)
+        visible = np.zeros(len(points), dtype=bool)
+        pixels = np.floor(scaled[rows]).astype(np.int32)
+        depth = view.surface_depth[pixels[:, 1], pixels[:, 0]]
+        visible[rows] = np.isfinite(depth) & (np.abs(z[rows] - depth) <= np.maximum(.03, .015 * depth))
+        return visible, visible.astype(np.float32)
     h, w = view.depth.shape
     common = camera @ view.intrinsics.T
     common = common[:, :2] / np.where(z > 1e-6, z, 1.0)[:, None]
@@ -809,9 +901,10 @@ def measured_photo_gains(
     return gains, report
 
 
-def export_partition(mesh: trimesh.Trimesh, labels: np.ndarray, views: dict[int, PhotoView], scene: trimesh.Scene, name: str, photos: dict[int, Image.Image]) -> dict[str, Any]:
+def export_partition(mesh: trimesh.Trimesh, labels: np.ndarray, views: dict[int, PhotoView], scene: trimesh.Scene, name: str, photos: dict[int, Image.Image], *, geometry_support: np.ndarray | None = None, crop_photos: bool = False) -> dict[str, Any]:
     areas = mesh.area_faces
     neutral_count = int(np.count_nonzero(labels < 0))
+    embedded_texels, crops = 0, {}
     for label in np.unique(labels):
         rows = np.flatnonzero(labels == label)
         vertices, inverse = np.unique(mesh.faces[rows].reshape(-1), return_inverse=True)
@@ -824,36 +917,186 @@ def export_partition(mesh: trimesh.Trimesh, labels: np.ndarray, views: dict[int,
                     or np.any(photo_uv[:, 0] > view.photo_size[0] - 1.5)
                     or np.any(photo_uv[:, 1] > view.photo_size[1] - 1.5)):
                 raise TextureSurfaceError("texture projection escaped the accepted photo; UV clipping is prohibited")
-            uv = photo_uv / np.asarray(view.photo_size)
+            photo = photos[int(label)]
+            crop = [0, 0, *view.photo_size]
+            if crop_photos:
+                minimum = np.floor(photo_uv.min(0)).astype(int) - 8
+                maximum = np.ceil(photo_uv.max(0)).astype(int) + 9
+                crop = [max(0, int(minimum[0])), max(0, int(minimum[1])),
+                        min(view.photo_size[0], int(maximum[0])), min(view.photo_size[1], int(maximum[1]))]
+                photo = photo.crop(crop)
+            uv = (photo_uv - crop[:2]) / np.asarray(photo.size)
             uv[:, 1] = 1.0 - uv[:, 1]
-            material = PBRMaterial(name=f"exact_phone_view_{label}", baseColorTexture=photos[int(label)],
+            embedded_texels += math.prod(photo.size)
+            crops[str(int(label))] = {"source_photo_size": list(view.photo_size), "crop_xyxy": crop,
+                                      "embedded_size": list(photo.size), "resampling": False}
+            material = PBRMaterial(name=f"exact_phone_view_{label}", baseColorTexture=photo,
                                    baseColorFactor=[255, 255, 255, 255],
                                    metallicFactor=0.0, roughnessFactor=1.0, doubleSided=True)
             part.visual = TextureVisuals(uv=uv, material=material)
-            support_class = "photo_visible_observed_surface"
+            support_class = ("photo_visible_surface_with_explicit_geometry_support" if geometry_support is not None
+                             else "photo_visible_observed_surface")
         else:
             part.visual.vertex_colors = np.tile([136, 142, 146, 255], (len(vertices), 1))
-            support_class = "supported_geometry_photo_unavailable_neutral"
+            support_class = ("geometry_photo_unavailable_neutral_with_explicit_support" if geometry_support is not None
+                             else "supported_geometry_photo_unavailable_neutral")
         part.metadata.update(review_only=True, source_geometry=name, source_view_index=int(label), support_class=support_class)
+        if geometry_support is not None:
+            part.metadata["geometry_support_class_counts"] = {
+                str(index): int(np.count_nonzero(geometry_support[rows] == index)) for index in range(3)}
         node = f"{name}_photo_{label}" if label >= 0 else f"{name}_neutral_photo_unavailable"
         scene.add_geometry(part, geom_name=node, node_name=node)
     return {"triangle_count": len(labels), "photo_triangle_count": len(labels) - neutral_count,
             "neutral_triangle_count": neutral_count, "neutral_area_m2": float(areas[labels < 0].sum()),
-            "total_area_m2": float(areas.sum()), "source_view_count": len(np.unique(labels[labels >= 0]))}
+            "total_area_m2": float(areas.sum()), "source_view_count": len(np.unique(labels[labels >= 0])),
+            "embedded_photo_texel_count": embedded_texels, "photo_region_crops": crops}
+
+
+def completed_geometry_support(manifest: dict[str, Any], name: str, count: int) -> np.ndarray | None:
+    completion = manifest.get("completion")
+    if completion is None:
+        return None
+    record = completion.get("geometry_support", {})
+    path = Path(str(record.get("path", ""))).resolve()
+    _bound_file(record, path, "completed geometry support")
+    if completion.get("geometry_name") != name:
+        raise TextureSurfaceError("completed geometry name differs from its support sidecar")
+    with np.load(path, allow_pickle=False) as data:
+        classes = data["face_support_class"].copy()
+        if (str(data["geometry_name"]) != name or classes.shape != (count,)
+                or not np.issubdtype(classes.dtype, np.integer) or np.any(classes > 2) or np.any(classes < 0)
+                or not np.array_equal(data["face_local_index"], np.arange(count))
+                or data["class_names"].tolist() != ["multi_view_supported", "poisson_inferred", "boundary_cap_inferred"]):
+            raise TextureSurfaceError("completed geometry support is not exact face provenance")
+    return classes.astype(np.uint8)
+
+
+def reusable_photo_assignments(args, mesh_manifest, views):
+    parent_dir = getattr(args, "reuse_assignments_from", None)
+    if parent_dir is None:
+        return None, None
+    parent_path = parent_dir / "texture_manifest.json"
+    parent = _json(parent_path)
+    _bound_file(parent["source"]["mesh"], args.mesh_dir / "surface_mesh.glb", "reused mesh")
+    _bound_file(parent["source"]["mesh_manifest"], args.mesh_dir / "surface_mesh_manifest.json", "reused mesh manifest")
+    if (parent.get("status") != "review_only" or parent.get("accepted_for_canonical_use") is not False
+            or parent["source"]["mesh"]["sha256"] != mesh_manifest["output"]["sha256"]
+            or parent["source"]["mesh_manifest"]["sha256"] != _sha(args.mesh_dir / "surface_mesh_manifest.json")):
+        raise TextureSurfaceError("reused photo assignment has a different geometry source")
+    for field, path in (("prepared_manifest", args.scan_dir / "prepared_frames_manifest.json"),
+                        ("consensus_manifest", args.consensus_dir / "consensus_manifest.json"),
+                        ("alignment_report", args.alignment_dir / "alignment_report.json"),
+                        ("alignment_transform", args.alignment_dir / "phone_ma_to_noesis_world.json")):
+        _bound_file(parent["source"][field], path, "reused " + field)
+    if len(parent["views"]) != len(views):
+        raise TextureSurfaceError("reused assignment source view count changed")
+    for old, new in zip(parent["views"], views, strict=True):
+        current = new.provenance
+        for field in ("frame_id", "source_frame_index", "prepared_photo", "conditioned_provider_raw", "consensus_raw",
+                      "provider_intrinsics", "common_intrinsics", "camera_to_world"):
+            if old[field] != current[field]:
+                raise TextureSurfaceError("reused assignment camera/frame/model evidence changed")
+    path = parent_dir / "face_photo_assignment.npz"
+    _bound_file(parent["output"]["assignments"], path, "reused assignments")
+    records = {}
+    with np.load(path, allow_pickle=False) as data:
+        names = data["geometry_names"].tolist()
+        if len(set(names)) != len(names):
+            raise TextureSurfaceError("reused assignment geometry names are not unique")
+        for index, name in enumerate(names):
+            rows = np.flatnonzero(data["face_geometry_index"] == index)
+            if not np.array_equal(data["face_local_index"][rows], np.arange(len(rows))):
+                raise TextureSurfaceError("reused face assignment ordering is not exact")
+            records[str(name)] = (data["face_source_view"][rows].copy(), parent["geometries"][str(name)]["coherence"])
+    return records, {"manifest": _record(parent_path), "assignments": _record(path),
+                     "new_photo_corner_and_centroid_visibility_rechecked": True}
+
+
+def validate_assigned_photos(mesh, labels, views):
+    if (labels.shape != (len(mesh.faces),) or not np.issubdtype(labels.dtype, np.integer)
+            or np.any(labels < -1)):
+        raise TextureSurfaceError("reused assignment triangle count changed")
+    view_map = {view.index: view for view in views}
+    for label in np.unique(labels[labels >= 0]):
+        if int(label) not in view_map or view_map[int(label)].model_to_photo is None:
+            raise TextureSurfaceError("reused photograph is no longer eligible")
+        view = view_map[int(label)]
+        rows = np.flatnonzero(labels == label)
+        camera_center = np.linalg.inv(view.from_world)[:3, 3]
+        for start in range(0, len(rows), 8192):
+            corners = mesh.vertices[mesh.faces[rows[start:start + 8192]]]
+            centers = corners.mean(1)
+            valid, _ = depth_visible(corners.reshape(-1, 3), view)
+            center_valid, _ = depth_visible(centers, view)
+            normal = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            toward = camera_center - centers
+            cosine = np.abs(np.einsum("ij,ij->i", normal, toward)) / np.maximum(
+                np.linalg.norm(normal, axis=1) * np.linalg.norm(toward, axis=1), 1e-12)
+            if not np.all(valid.reshape(-1, 3).all(1) & center_valid & (cosine >= .17)):
+                raise TextureSurfaceError("reused source does not pass new photo visibility; no stale assignment is exported")
+
+
+def cached_face_candidates(mesh, views, *, top_k, cache_dir, geometry_index, mesh_sha256):
+    if cache_dir is None:
+        return face_candidates(mesh.vertices, mesh.faces, views, top_k=top_k)
+    algorithm = "\n".join(inspect.getsource(function) for function in (face_candidates, depth_visible, project_photo))
+    signature = hashlib.sha256(json.dumps({"mesh_sha256": mesh_sha256, "top_k": top_k,
+        "views": [view.provenance for view in views], "algorithm_sha256": hashlib.sha256(algorithm.encode()).hexdigest()},
+        sort_keys=True, allow_nan=False).encode()).hexdigest()
+    array_path = cache_dir / f"geometry_{geometry_index:04d}.npz"
+    record_path = array_path.with_suffix(".json")
+    if array_path.exists() != record_path.exists():
+        raise TextureSurfaceError("incomplete candidate checkpoint; use a new cache directory")
+    if array_path.exists():
+        record = _json(record_path)
+        if (record.get("schema") != "noesis.pcf.photo_candidate_checkpoint.v1"
+                or record.get("signature") != signature or record.get("array_sha256") != _sha(array_path)):
+            raise TextureSurfaceError("candidate checkpoint source/algorithm/hash mismatch")
+        with np.load(array_path, allow_pickle=False) as data:
+            candidates, scores = data["candidates"].copy(), data["scores"].copy()
+        if (candidates.shape != (len(mesh.faces), top_k) or scores.shape != candidates.shape
+                or not np.issubdtype(candidates.dtype, np.integer) or not np.isfinite(scores).all()
+                or np.any(candidates < -1) or np.any(scores < 0)
+                or not np.isin(candidates[candidates >= 0], [view.index for view in views]).all()
+                or np.any((candidates >= 0) != (scores > 0))):
+            raise TextureSurfaceError("candidate checkpoint contains invalid bounded arrays")
+        print(f"reused exact candidate checkpoint {geometry_index}", flush=True)
+        return candidates, scores
+    candidates, scores = face_candidates(mesh.vertices, mesh.faces, views, top_k=top_k)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(array_path, candidates=candidates, scores=scores)
+    record_path.write_text(json.dumps({"schema": "noesis.pcf.photo_candidate_checkpoint.v1", "signature": signature,
+                                      "array_sha256": _sha(array_path), "face_count": len(mesh.faces)}, indent=2) + "\n")
+    print(f"saved exact candidate checkpoint {geometry_index}", flush=True)
+    return candidates, scores
+
+
+def mesh_work_bounds(args) -> tuple[int, int]:
+    """Opt-in larger offline meshes, without changing default work budgets."""
+    faces = getattr(args, "max_faces", 3_000_000)
+    vertices = getattr(args, "max_vertices", 2_000_000)
+    if (isinstance(faces, bool) or not isinstance(faces, int) or not 1 <= faces <= 5_000_000
+            or isinstance(vertices, bool) or not isinstance(vertices, int) or not 1 <= vertices <= 3_000_000):
+        raise TextureSurfaceError("mesh work bounds exceed finite supported limits")
+    return faces, vertices
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     if args.output_dir.exists():
         raise TextureSurfaceError("use a new texture output directory")
+    mesh_work_bounds(args)
     if not (2 <= args.top_k <= 12 and 1 <= args.label_iterations <= 20
             and 256 <= args.texture_edge_px <= 4096 and 0 <= args.smoothness <= 10
             and 1 <= args.minimum_patch_faces <= 10_000
             and 0 <= args.minimum_texture_blur <= 1_000_000 and 0 <= args.minimum_luminance <= 255
-            and 1 <= args.max_faces <= 2_000_000 and 2 <= args.max_views <= 512
-            and 1 <= args.max_vertices <= 2_000_000 and 1 <= args.max_input_pixels <= 64_000_000
+            and 2 <= args.max_views <= 512
+            and 1 <= args.max_input_pixels <= 64_000_000
             and 1 <= args.max_texture_texels <= 512_000_000 and 128 <= args.photometric_sample_limit <= 100_000):
         raise TextureSurfaceError("texture parameters exceed finite supported bounds")
+    physical_smoothness = getattr(args, "smoothness_m", None)
+    if physical_smoothness is not None and (not math.isfinite(physical_smoothness) or not 0 <= physical_smoothness <= 10):
+        raise TextureSurfaceError("physical texture smoothness is outside finite bounds")
     mesh_dir = args.mesh_dir.resolve()
     mesh_path, mesh_manifest_path = mesh_dir / "surface_mesh.glb", mesh_dir / "surface_mesh_manifest.json"
     mesh_manifest = _json(mesh_manifest_path)
@@ -871,11 +1114,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     _bound_file(input_manifest["source"]["alignment_report"], args.alignment_dir / "alignment_report.json", "mesh alignment")
     _bound_file(input_manifest["source"]["alignment_transform"], args.alignment_dir / "phone_ma_to_noesis_world.json", "mesh alignment transform")
     views, provenance = load_bound_views(args)
+    surface_visibility_dir = getattr(args, "surface_visibility_dir", None)
+    if surface_visibility_dir is not None:
+        from tools.mapanything_phone_scan.build_mesh_texture_visibility import read_bound_visibility
+        provenance["mesh_surface_texture_visibility"] = read_bound_visibility(
+            surface_visibility_dir, views, mesh_manifest["output"]["sha256"])
+    reused, reuse_report = reusable_photo_assignments(args, mesh_manifest, views)
+    if reuse_report is not None:
+        provenance["photo_assignment_reuse"] = reuse_report
     scene_in = trimesh.load(mesh_path, force="scene", process=False)
     parts = []
+    support_parts = []
     total_faces = 0
     total_vertices = 0
-    for node in scene_in.graph.nodes_geometry:
+    for geometry_index, node in enumerate(scene_in.graph.nodes_geometry):
         transform, geometry_name = scene_in.graph[node]
         if not np.allclose(transform, np.eye(4), atol=1e-9):
             raise TextureSurfaceError("source mesh has an unbound node transform")
@@ -886,14 +1138,38 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         total_vertices += len(mesh.vertices)
         if total_faces > args.max_faces or total_vertices > args.max_vertices:
             raise TextureSurfaceError("surface exceeds bounded face/vertex work")
-        candidates, scores = face_candidates(mesh.vertices, mesh.faces, views, top_k=args.top_k)
-        neighbors, weights = face_adjacency(mesh.vertices, mesh.faces)
-        labels, coherence = coherent_labels(candidates, scores, neighbors, weights,
-                                            smoothness=args.smoothness, iterations=args.label_iterations,
-                                            minimum_patch_faces=args.minimum_patch_faces)
+        if reused is None:
+            candidates, scores = cached_face_candidates(mesh, views, top_k=args.top_k,
+                cache_dir=getattr(args, "candidate_cache_dir", None), geometry_index=geometry_index,
+                mesh_sha256=mesh_manifest["output"]["sha256"])
+            neighbors, weights = face_adjacency(mesh.vertices, mesh.faces)
+            if physical_smoothness is None:
+                labels, coherence = coherent_labels(candidates, scores, neighbors, weights,
+                                                    smoothness=args.smoothness, iterations=args.label_iterations,
+                                                    minimum_patch_faces=args.minimum_patch_faces)
+            else:
+                from tools.mapanything_phone_scan.coherent_surface_photo_labels import coherent_labels as physical_labels
+                labels, coherence = physical_labels(mesh.vertices, mesh.faces, candidates, scores, neighbors, weights,
+                    smoothness_m=physical_smoothness, iterations=args.label_iterations,
+                    minimum_patch_area_m2=getattr(args, "minimum_patch_area_m2", .01),
+                    max_faces=args.max_faces, max_vertices=args.max_vertices)
+        else:
+            if str(geometry_name) not in reused:
+                raise TextureSurfaceError("reused assignment omits an input geometry")
+            labels, original_coherence = reused.pop(str(geometry_name))
+            validate_assigned_photos(mesh, labels, views)
+            coherence = {**original_coherence, "reused_exact_labels_new_photos_revalidated": True}
+        support_parts.append(completed_geometry_support(mesh_manifest, str(geometry_name), len(mesh.faces)))
         stride = max(1, math.ceil(len(mesh.faces) / args.photometric_sample_limit))
         sampled_faces = mesh.faces[::stride]
-        parts.append((str(geometry_name), mesh, labels, coherence, mesh.vertices[sampled_faces].mean(1), candidates[::stride]))
+        if reused is None:
+            sampled_candidates = candidates[::stride]
+        else:
+            ids, inverse = np.unique(sampled_faces.reshape(-1), return_inverse=True)
+            sampled_candidates, _ = face_candidates(mesh.vertices[ids], inverse.reshape(-1, 3), views, top_k=args.top_k)
+        parts.append((str(geometry_name), mesh, labels, coherence, mesh.vertices[sampled_faces].mean(1), sampled_candidates))
+    if reused:
+        raise TextureSurfaceError("reused assignment contains non-source geometries")
     if total_faces != mesh_manifest["output"]["triangle_count"]:
         raise TextureSurfaceError("loaded mesh triangle count differs from its manifest")
     used = sorted({int(index) for _, _, labels, _, _, _ in parts for index in np.unique(labels[labels >= 0])})
@@ -924,7 +1200,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     metrics = {}
     labels_all, geometry_ids, local_faces = [], [], []
     for index, (name, mesh, labels, coherence, _, _) in enumerate(parts):
-        metrics[name] = {**export_partition(mesh, labels, view_map, scene, name, photos), "coherence": coherence}
+        metrics[name] = {**export_partition(mesh, labels, view_map, scene, name, photos,
+                                          geometry_support=support_parts[index], crop_photos=getattr(args, "crop_selected_photo_regions", False)), "coherence": coherence}
         labels_all.append(labels)
         geometry_ids.append(np.full(len(labels), index, dtype=np.uint16))
         local_faces.append(np.arange(len(labels), dtype=np.uint32))
@@ -932,9 +1209,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     glb_path = args.output_dir / "textured_surface_mesh.glb"
     glb_path.write_bytes(trimesh.exchange.gltf.export_glb(scene, include_normals=True, tree_postprocessor=_unlit))
     assignment_path = args.output_dir / "face_photo_assignment.npz"
+    support_arrays = ({"face_geometry_support_class": np.concatenate(support_parts),
+                       "geometry_support_class_names": np.asarray(["multi_view_supported", "poisson_inferred", "boundary_cap_inferred"])}
+                      if any(item is not None for item in support_parts) else {})
     np.savez_compressed(assignment_path, face_source_view=np.concatenate(labels_all),
                         face_geometry_index=np.concatenate(geometry_ids), face_local_index=np.concatenate(local_faces),
-                        geometry_names=np.asarray([part[0] for part in parts]))
+                        geometry_names=np.asarray([part[0] for part in parts]), **support_arrays)
     # The actual exported direct consumer must retain every source triangle.
     reloaded = trimesh.load(glb_path, force="scene", process=False)
     exported_faces = sum(len(item.faces) for item in reloaded.geometry.values() if isinstance(item, trimesh.Trimesh))
@@ -949,15 +1229,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "policy": {"geometry_changed": False, "uv_clipping": False, "inpainting": False,
                    "cross_view_colour_blending": False, "photo_colour_policy": "measured_bounded_linear_rgb_gain_if_holdout_passes_else_original_rgb",
                    "illumination": "KHR_materials_unlit", "triangle_visibility": "all_corners_and_centroid",
-                   "depth_tolerance_m": "max(0.05,0.03*source_depth)", "occluded_photo_rejected": True,
+                   "texture_visibility_evidence": ("reconstructed_surface_zbuffer" if surface_visibility_dir else "provider_depth_agreement"),
+                   "depth_tolerance_m": ("max(0.03,0.015*mesh_zbuffer_depth)" if surface_visibility_dir else "max(0.05,0.03*source_depth)"),
+                   "geometry_support_gates_changed": False, "occluded_photo_rejected": True,
+                   "unassigned_photo_region_crop": getattr(args, "crop_selected_photo_regions", False),
                    "unsupported_texture": "neutral_vertex_colour_existing_geometry_preserved"},
+        "geometry_completion": mesh_manifest.get("completion"),
         "parameters": {key: value for key, value in vars(args).items() if not isinstance(value, Path)},
         "views": [view.provenance for view in views], "geometries": metrics, "photometric_normalization": photometric_report,
         "output": {"glb": _record(glb_path), "assignments": _record(assignment_path),
                    "source_triangle_count": total_faces, "exported_triangle_count": exported_faces,
                    "photo_triangle_count": sum(row["photo_triangle_count"] for row in metrics.values()),
                    "neutral_triangle_count": sum(row["neutral_triangle_count"] for row in metrics.values()),
-                   "texture_material_count": len(used), "photo_texel_count": texels},
+                   "texture_material_count": len(used), "photo_texel_count": texels,
+                   "embedded_photo_texel_count": sum(row["embedded_photo_texel_count"] for row in metrics.values())},
         "elapsed_s": time.monotonic() - started,
         "limitations": ["model_predicted_geometry_and_phone_pose_uncertainty_remain",
                         "no_independent_physical_accuracy_claim",
@@ -976,13 +1261,26 @@ def _parser() -> argparse.ArgumentParser:
     for flag in ("mesh-dir", "scan-dir", "consensus-dir", "alignment-dir", "output-dir"):
         parser.add_argument(f"--{flag}", type=Path, required=True)
     parser.add_argument("--texture-edge-px", type=int, default=1920)
+    parser.add_argument("--texture-photo-dir", type=Path,
+                        help="Use independently verified higher-resolution exact native-video frames, never upsample prepared photos.")
+    parser.add_argument("--surface-visibility-dir", type=Path,
+                        help="Opt in to bound same-mesh z-buffer photo visibility; presentation only, not provider depth support.")
     parser.add_argument("--minimum-texture-blur", type=float, default=100.0)
     parser.add_argument("--minimum-luminance", type=float, default=20.0)
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--smoothness", type=float, default=0.8)
+    parser.add_argument("--smoothness-m", type=float,
+                        help="Opt in to physical area/shared-edge region optimization; legacy face-count policy otherwise.")
+    parser.add_argument("--minimum-patch-area-m2", type=float, default=.01)
+    parser.add_argument("--reuse-assignments-from", type=Path,
+                        help="Reuse exact source/geometry-bound labels, revalidating new photo corner/centroid visibility.")
+    parser.add_argument("--candidate-cache-dir", type=Path,
+                        help="Optional source/algorithm/hash-bound candidate checkpoints before label refinement.")
     parser.add_argument("--label-iterations", type=int, default=8)
     parser.add_argument("--minimum-patch-faces", type=int, default=24)
     parser.add_argument("--normalize-measured-exposure", action="store_true")
+    parser.add_argument("--crop-selected-photo-regions", action="store_true",
+                        help="Embed only exact selected-photo UV bounding rectangles plus8-pixel border, without resampling.")
     parser.add_argument("--photometric-sample-limit", type=int, default=20_000)
     parser.add_argument("--max-views", type=int, default=256)
     parser.add_argument("--max-faces", type=int, default=750_000)

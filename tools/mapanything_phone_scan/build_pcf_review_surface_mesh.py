@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -34,6 +35,13 @@ OWNER_CAMERAS = {
     4: "connector_camera_positions",
 }
 OWNER_NAMES = {1: "family", 2: "kitchen", 3: "living", 4: "connector"}
+
+
+@dataclass(frozen=True)
+class SurfaceViewEvidence(ViewEvidence):
+    """Source reliability retained for surface-specific voting, not room joins."""
+
+    quality: np.ndarray | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -117,6 +125,8 @@ def _load_visibility_evidence(
                 mask = np.asarray(row["mask"], dtype=bool).copy()
                 intrinsics = np.asarray(row["intrinsics"], dtype=np.float64).copy()
                 camera_pose = np.asarray(row["camera_pose"], dtype=np.float64)
+                quality = (np.asarray(row["confidence"], dtype=np.float32).copy()
+                           if "confidence" in row.files else None)
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"surface source view visibility evidence cannot be read: {path}"
@@ -130,18 +140,125 @@ def _load_visibility_evidence(
             or not np.isfinite(transform).all()
             or not np.isfinite(camera_pose).all()
             or not np.isfinite(intrinsics).all()
+            or (quality is not None and (
+                quality.shape != depth.shape or not np.isfinite(quality).all()
+                or np.any(quality < 0) or np.any(quality > 1)
+            ))
         ):
             raise ValueError(f"surface source view visibility evidence is malformed: {path}")
         evidence.append(
-            ViewEvidence(
+            SurfaceViewEvidence(
                 view_index=view_index,
                 intrinsics=intrinsics,
                 depth_z=depth,
                 mask=mask,
                 camera_to_world=transform @ camera_pose,
+                quality=quality,
             )
         )
     return evidence
+
+
+def _qualified_surface_depth_votes(
+    points: np.ndarray,
+    views: Sequence[ViewEvidence],
+    *,
+    minimum_depth_m: float = 0.05,
+    maximum_depth_m: float = 12.0,
+    absolute_tolerance_m: float = 0.05,
+    relative_tolerance: float = 0.03,
+    minimum_quality: float = 0.35,
+    chunk_size: int = 8192,
+    normals: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Require qualified multi-view support to outweigh qualified free-space rays.
+
+    Occlusion, missing masks, weak rays and out-of-image observations abstain.
+    Counts are distinct source views. Weights are uncalibrated evidence weights,
+    not probabilities. This does not change the strict cross-room join helper.
+    """
+    values = np.asarray(points, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 3 or not np.isfinite(values).all():
+        raise ValueError("surface samples must be finite Nx3 points")
+    if not views or len(views) > 4096 or len({view.view_index for view in views}) != len(views):
+        raise ValueError("surface voting needs bounded distinct source-view identities")
+    if chunk_size < 1 or chunk_size > 65536:
+        raise ValueError("surface voting chunk size is out of bounds")
+    if not .35 <= minimum_quality <= 1.0:
+        raise ValueError("surface quality may not weaken the 0.35 evidence floor")
+    counts = {name: np.zeros(len(values), dtype=np.uint16) for name in ("support_count", "free_count")}
+    weights = {name: np.zeros(len(values), dtype=np.float64) for name in ("support_weight", "free_weight")}
+    if normals is not None:
+        normals = np.asarray(normals, dtype=np.float64)
+        if normals.shape != values.shape or not np.isfinite(normals).all():
+            raise ValueError("surface normals must be finite and match the point shape")
+        weights["normal_direction_vote"] = np.zeros(len(values), dtype=np.float64)
+    for view in views:
+        depth, mask = np.asarray(view.depth_z), np.asarray(view.mask, dtype=bool)
+        quality = getattr(view, "quality", None)
+        if quality is None:
+            raise ValueError("qualified surface voting requires recorded source confidence")
+        quality = np.asarray(quality)
+        if depth.ndim != 2 or mask.shape != depth.shape or quality.shape != depth.shape:
+            raise ValueError("surface depth/mask/confidence shapes disagree")
+        if not np.isfinite(quality).all() or np.any((quality < 0) | (quality > 1)):
+            raise ValueError("surface confidence must be finite evidence weights in [0, 1]")
+        k, pose = np.asarray(view.intrinsics, dtype=np.float64), np.asarray(view.camera_to_world, dtype=np.float64)
+        if k.shape != (3, 3) or pose.shape != (4, 4) or not np.isfinite(k).all() or not np.isfinite(pose).all():
+            raise ValueError("surface source camera is malformed")
+        world_to_camera = np.linalg.inv(pose)
+        height, width = depth.shape
+        for start in range(0, len(values), chunk_size):
+            block = values[start:start + chunk_size]
+            camera = block @ world_to_camera[:3, :3].T + world_to_camera[:3, 3]
+            z = camera[:, 2]
+            positive = (z >= minimum_depth_m) & (z <= maximum_depth_m)
+            projected = camera @ k.T
+            u = np.rint(projected[:, 0] / np.where(positive, z, 1.)).astype(np.int64)
+            v = np.rint(projected[:, 1] / np.where(positive, z, 1.)).astype(np.int64)
+            inside = positive & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+            indices = np.flatnonzero(inside)
+            measured = depth[v[indices], u[indices]]
+            q = quality[v[indices], u[indices]]
+            valid = (mask[v[indices], u[indices]] & np.isfinite(measured)
+                     & (measured >= minimum_depth_m) & (measured <= maximum_depth_m)
+                     & (q >= minimum_quality))
+            difference = z[indices] - measured
+            tolerance = absolute_tolerance_m + relative_tolerance * np.maximum(measured, z[indices])
+            for label, selected in (("support", valid & (np.abs(difference) <= tolerance)),
+                                    ("free", valid & (difference < -tolerance))):
+                rows = start + indices[selected]
+                counts[label + "_count"][rows] += 1
+                weights[label + "_weight"][rows] += q[selected]
+                if label == "support" and normals is not None and len(rows):
+                    direction = pose[:3, 3] - values[rows]
+                    direction /= np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-12)
+                    weights["normal_direction_vote"][rows] += q[selected] * np.einsum("ij,ij->i", normals[rows], direction)
+    accepted = ((counts["support_count"] >= 2)
+                & (counts["support_count"] > counts["free_count"])
+                & (weights["support_weight"] > weights["free_weight"]))
+    return accepted, {**counts, **weights}
+
+
+def _orient_normals_to_supported_cameras(
+    cloud: o3d.geometry.PointCloud, cameras: np.ndarray,
+    views: Sequence[ViewEvidence],
+) -> dict[str, Any]:
+    """Prefer qualified source-camera hemispheres over an unseen nearest station."""
+    # The legacy estimate is retained only for explicitly counted unresolved
+    # directions; those points still face the subsequent surface support gate.
+    _orient_normals_to_nearest_camera(cloud, cameras)
+    normals = np.asarray(cloud.normals)
+    _, votes = _qualified_surface_depth_votes(np.asarray(cloud.points), views, normals=normals)
+    known = (votes["support_count"] >= 2) & (np.abs(votes["normal_direction_vote"]) > 1e-12)
+    flip = known & (votes["normal_direction_vote"] < 0)
+    normals[flip] *= -1.
+    return {
+        "policy": "qualified_support_weighted_camera_hemisphere_with_explicit_unresolved_legacy_fallback",
+        "qualified_support_oriented_point_count": int(np.count_nonzero(known)),
+        "qualified_camera_normal_flip_count": int(np.count_nonzero(flip)),
+        "unresolved_direction_fallback_count": int(np.count_nonzero(~known)),
+    }
 
 
 def _orient_normals_to_nearest_camera(
@@ -192,14 +309,16 @@ def _triangle_support_mask(
     maximum_depth_m: float = 12.0,
     depth_tolerance_m: float = 0.05,
     depth_tolerance_fraction: float = 0.03,
+    visibility_policy: str = "strict_any_view",
 ) -> tuple[np.ndarray, int, int]:
     """Keep triangles supported by observed points and source-camera rays.
 
     Poisson can span a gap while both endpoints remain close to the input
     cloud.  Testing triangle centroids and edge midpoints catches those
-    unsupported bridges.  Every sample must be supported by at least one
-    retained RGB-D view under its explicit mask/depth tolerance; a free-space
-    contradiction rejects the triangle even when its endpoints are supported.
+    unsupported bridges. The centroid and at least two of four samples need
+    source-ray support. The legacy policy rejects any free-space contradiction;
+    the explicit qualified policy requires at least two qualified distinct views
+    and support dominance in both counts and evidence weight at those samples.
     """
 
     triangles = np.asarray(mesh.triangles)
@@ -226,14 +345,21 @@ def _triangle_support_mask(
         ),
         axis=1,
     ).reshape((-1, 3))
-    sample_supported, _, free_space = _depth_visibility_evidence(
-        samples,
-        view_evidence,
-        minimum_depth_m=minimum_depth_m,
-        maximum_depth_m=maximum_depth_m,
-        absolute_tolerance_m=depth_tolerance_m,
-        relative_tolerance=depth_tolerance_fraction,
-    )
+    if visibility_policy == "qualified_consensus":
+        sample_supported, _ = _qualified_surface_depth_votes(
+            samples, view_evidence, minimum_depth_m=minimum_depth_m,
+            maximum_depth_m=maximum_depth_m, absolute_tolerance_m=depth_tolerance_m,
+            relative_tolerance=depth_tolerance_fraction,
+        )
+        free_space = np.zeros(len(samples), dtype=bool)
+    elif visibility_policy == "strict_any_view":
+        sample_supported, _, free_space = _depth_visibility_evidence(
+            samples, view_evidence, minimum_depth_m=minimum_depth_m,
+            maximum_depth_m=maximum_depth_m, absolute_tolerance_m=depth_tolerance_m,
+            relative_tolerance=depth_tolerance_fraction,
+        )
+    else:
+        raise ValueError("unknown surface visibility policy")
     sample_supported = sample_supported.reshape((-1, 4))
     free_space = free_space.reshape((-1, 4))
     visible = sample_supported[:, 0] & (np.sum(sample_supported, axis=1) >= 2)
@@ -260,6 +386,7 @@ def _reconstruct_owner(
     minimum_component_triangles: int,
     poisson_threads: int = 1,
     view_evidence: Sequence[ViewEvidence] = (),
+    visibility_policy: str = "strict_any_view",
 ) -> tuple[o3d.geometry.TriangleMesh, dict[str, Any]]:
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(points)
@@ -273,7 +400,11 @@ def _reconstruct_owner(
             max_nn=48,
         )
     )
-    _orient_normals_to_nearest_camera(cloud, cameras)
+    if visibility_policy == "qualified_consensus":
+        normal_orientation = _orient_normals_to_supported_cameras(cloud, cameras, view_evidence)
+    else:
+        _orient_normals_to_nearest_camera(cloud, cameras)
+        normal_orientation = {"policy": "nearest_camera_legacy"}
 
     started = time.monotonic()
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -314,6 +445,7 @@ def _reconstruct_owner(
             np.asarray(cloud.points),
             view_evidence,
             support_distance_m,
+            visibility_policy=visibility_policy,
         )
     )
     mesh.remove_triangles_by_mask(~triangle_support)
@@ -337,6 +469,8 @@ def _reconstruct_owner(
         "small_component_removed_triangle_count": removed_component_triangles,
         "poisson_seconds": poisson_seconds,
         "poisson_threads": int(poisson_threads),
+        "visibility_policy": visibility_policy,
+        "normal_orientation": normal_orientation,
     }
 
 
@@ -478,6 +612,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     minimum_component_triangles=args.minimum_component_triangles,
                     poisson_threads=args.poisson_threads,
                     view_evidence=owner_view_evidence.get(owner, ()),
+                    visibility_policy=getattr(args, "visibility_policy", "strict_any_view"),
                 )
                 class_metrics.update(reconstructed)
             if class_mesh is not None and class_mesh.has_triangles():

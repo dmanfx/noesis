@@ -300,11 +300,12 @@ def _write_withheld_points(points: np.ndarray, colors: np.ndarray, path: Path) -
         "coordinate_frame": "backend_world_m_stream_points",
     })
     scene = trimesh.Scene(metadata={"review_only": True, "support_class": "single_view_withheld"})
-    scene.add_geometry(
-        cloud,
-        geom_name="pcf_surface_single_room_uncertain_points",
-        node_name="pcf_surface_single_room_uncertain_points",
-    )
+    if len(points):
+        scene.add_geometry(
+            cloud,
+            geom_name="pcf_surface_single_room_uncertain_points",
+            node_name="pcf_surface_single_room_uncertain_points",
+        )
     path.write_bytes(trimesh.exchange.gltf.export_glb(scene))
     return {
         "path": str(path.resolve()),
@@ -324,6 +325,7 @@ def prepare_input(
     ceiling_mode: str = "full_height",
     ceiling_cutaway_m: float = 1.85,
     full_height_margin_m: float = 0.03,
+    dense_surfel_dir: Path | None = None,
 ) -> dict[str, Any]:
     consensus_dir = consensus_dir.resolve()
     alignment_dir = alignment_dir.resolve()
@@ -346,6 +348,37 @@ def prepare_input(
     accepted_path = consensus_dir / "surfel_points.npz"
     withheld_path = consensus_dir / "surfel_points_single_view.npz"
     consensus_manifest_path = consensus_dir / "consensus_manifest.json"
+    dense_source = None
+    if dense_surfel_dir is not None:
+        dense_surfel_dir = dense_surfel_dir.resolve()
+        dense_manifest_path = dense_surfel_dir / "dense_surfel_manifest.json"
+        dense_source = _json(dense_manifest_path)
+        if (dense_source.get("schema") != "noesis.pcf.dense_surfel_export.v1"
+                or dense_source.get("accepted_for_canonical_use") is not False
+                or dense_source.get("phone_walk_only") is not True
+                or dense_source.get("static_camera_points_included") is not False
+                or dense_source.get("raw_geometry_or_mask_changed") is not False):
+            raise SingleRoomSurfaceError("dense surfel export does not preserve phone-only review authority")
+        for field, path in (("consensus_output_manifest", consensus_dir / "scan_outputs_manifest.json"),
+                            ("consensus_manifest", consensus_manifest_path),
+                            ("alignment_report", alignment_dir / "alignment_report.json"),
+                            ("alignment_transform", alignment_dir / "phone_ma_to_noesis_world.json")):
+            _required_path_binding(dense_source.get("source", {}).get(field),
+                                   label="dense " + field, expected_path=path)
+        if dense_source.get("source", {}).get("raw_views") != raw_rows:
+            raise SingleRoomSurfaceError("dense export does not bind the identical source raw views")
+        metrics = dense_source.get("metrics", {})
+        if (metrics.get("input_pixel_stride") != 1
+                or metrics.get("minimum_sample_quality") != .35
+                or metrics.get("minimum_distinct_views_per_surfel") != 2
+                or metrics.get("minimum_samples_per_surfel") != 2
+                or metrics.get("minimum_accumulated_weight") != .80):
+            raise SingleRoomSurfaceError("dense export altered the canonical support gates")
+        accepted_path, withheld_path = dense_surfel_dir / "surfel_points.npz", dense_surfel_dir / "surfel_points_single_view.npz"
+        for field, path in (("accepted_surfels", accepted_path), ("withheld_surfels", withheld_path)):
+            _required_path_binding(dense_source.get("artifacts", {}).get(field),
+                                   label="dense " + field, expected_path=path)
+        dense_source = _record(dense_manifest_path)
     accepted_points, accepted_colors, accepted_support = _load_points(accepted_path, label="accepted")
     withheld_points, withheld_colors, withheld_support = _load_points(withheld_path, label="withheld")
     if len(accepted_points) < 1 or np.min(accepted_support) < 2:
@@ -436,6 +469,7 @@ def prepare_input(
             "source_raw_view_set_sha256": transform_payload.get("source_raw_view_set_sha256"),
             "accepted_surfels": _record(accepted_path),
             "withheld_surfels": _record(withheld_path),
+            "dense_surfel_export": dense_source,
         },
         "support_metrics": {
             "accepted_multi_view_count": int(len(transformed_accepted)),
@@ -497,6 +531,7 @@ def build_single_room_surface(args: argparse.Namespace) -> dict[str, Any]:
         ceiling_mode=args.ceiling_mode,
         ceiling_cutaway_m=args.ceiling_cutaway_m,
         full_height_margin_m=args.full_height_margin_m,
+        dense_surfel_dir=getattr(args, "dense_surfel_dir", None),
     )
     output_dir = prepared["output_dir"]
     mesh_args = argparse.Namespace(
@@ -512,6 +547,7 @@ def build_single_room_surface(args: argparse.Namespace) -> dict[str, Any]:
         density_percentile=args.density_percentile,
         minimum_component_triangles=args.minimum_component_triangles,
         poisson_threads=args.poisson_threads,
+        visibility_policy=getattr(args, "visibility_policy", "strict_any_view"),
     )
     mesh_report = build_surface_mesh(mesh_args)
     run_report = {
@@ -547,6 +583,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--room-name", required=True)
     parser.add_argument("--owner", type=int, required=True, choices=sorted(OWNER_NAMES))
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--dense-surfel-dir", type=Path,
+                        help="Exact-bound full-grid canonical surfel export of this same consensus.")
     parser.add_argument("--ceiling-mode", choices=("full_height", "cutaway"), default="full_height")
     parser.add_argument("--ceiling-cutaway-m", type=float, default=1.85)
     parser.add_argument("--full-height-margin-m", type=float, default=0.03)
@@ -557,6 +595,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--density-percentile", type=float, default=2.0)
     parser.add_argument("--minimum-component-triangles", type=int, default=64)
     parser.add_argument("--poisson-threads", type=int, default=1)
+    parser.add_argument("--visibility-policy", choices=("strict_any_view", "qualified_consensus"),
+                        default="strict_any_view")
     return parser
 
 

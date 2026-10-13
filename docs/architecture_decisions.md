@@ -45,6 +45,50 @@ valid canonical entity until canonical removal/receipt-anchored expiry, without
 an earlier independent renderer fade. Diagnostic rings, heading helpers and
 detailed labels are behind the shared developer-visuals preference.
 
+## Dense measured geometry and explicit closed room presentation — 2026-10-05
+
+The dense offline surfel export consumes every accepted consensus grid pixel
+with unchanged quality, sample-count, distinct-view and weight requirements.
+The older stride-two export and strict-any-view surface policy remain available.
+An explicit qualified-consensus surface policy requires at least two reliable
+agreeing views and both count and confidence-weight majorities over free-space
+contradictions. Unknown, masked, out-of-frame and foreground-occluded rays
+abstain. Surface normal signs use actual qualified supporting camera rays,
+not an arbitrary nearest camera that may not observe the surface.
+
+A requested closed room mesh is a separate derived presentation, never a claim
+that all of its surface was measured. Preserve the measured trimmed mesh and
+classify every completed triangle as multiview-supported, inferred Poisson
+extension or inferred boundary cap. Remove only complete small closed components
+and split disconnected local vertex fans without moving retained corners.
+Verify the serialized mesh, including winding and local fan identities. Closed
+edges alone do not prove no self-intersections or independent physical accuracy.
+
+Higher-resolution textures are decoded by exact native frame ordinal from the
+same recorded video, not upsampled prepared images or replacement photographs.
+Source/timestamp hashes, unique same-frame image matching and spatial feature
+checks bind all photos. The original model ray intrinsics and poses remain
+unchanged. Physical area/shared-edge-length source-label optimization replaces
+face-count-dependent smoothing only when explicitly selected. An optional
+same-mesh z-buffer texture visibility path is presentation evidence, not provider
+depth agreement; it cannot upgrade an inferred geometry class. Raw-depth texture
+visibility remains the default. Exact UV-region cropping discards only unassigned
+photo pixels without resampling, blending, inpainting or changing geometry.
+
+An explicit continuous-video vertex-colour exporter is a separate presentation
+alternative when per-face photo labels remain fragmented. It robustly blends
+four eligible same-video samples by default (bounded maximum eight) in linear
+light, using original provider depth visibility and the same source-bound
+accepted photometric gains. It retains
+exact serialized vertex positions, face order and local fan identities. A
+per-vertex sidecar distinguishes directly sampled colour from retained
+interpolated input colour. A white glTF unlit material binds the linear vertex
+colours for ordinary consumers. This opts into cross-view colour blending but
+not image inpainting, new geometry, modified source photos or relaxed geometry
+qualification. The legacy single-photo texture export remains unchanged.
+
+These changes never admit calibration, tracking, world state or live Scene Prior
+authority. See the [offline dense/completed workflow](../tools/mapanything_phone_scan/README.md#dense-and-explicitly-completed-room-surfaces-offline).
 
 ## Coherent single-room photo surfaces — 2026-10-04
 

@@ -947,7 +947,11 @@ def _surfel_fusion(
     intrinsics: np.ndarray,
     poses: np.ndarray,
     voxel_m: float,
+    *,
+    pixel_stride: int = 2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    if isinstance(pixel_stride, bool) or pixel_stride not in (1, 2):
+        raise ValueError("surfel pixel stride must be 1 (full evidence) or 2 (review sampling)")
     point_rows: list[np.ndarray] = []
     color_rows: list[np.ndarray] = []
     weight_rows: list[np.ndarray] = []
@@ -955,8 +959,9 @@ def _surfel_fusion(
     for index in range(fused["depth"].shape[0]):
         points = _world_points(fused["depth"][index], intrinsics[index], poses[index])
         selected = fused["mask"][index] & (fused["quality"][index] >= 0.35)
-        selected[1::2, :] = False
-        selected[:, 1::2] = False
+        if pixel_stride == 2:
+            selected[1::2, :] = False
+            selected[:, 1::2] = False
         selected &= np.isfinite(points).all(axis=-1)
         selected &= np.isfinite(fused["depth"][index]) & (
             fused["depth"][index] <= 12.0
@@ -973,6 +978,9 @@ def _surfel_fusion(
             {
                 "method": "confidence_weighted_4cm_surfel_voxels",
                 "voxel_m": float(voxel_m),
+                "input_pixel_stride": int(pixel_stride),
+                "full_resolution_accepted_evidence_used": pixel_stride == 1,
+                "minimum_sample_quality": 0.35,
                 "input_sample_count": 0,
                 "pre_filter_voxel_count": 0,
                 "surfel_count": 0,
@@ -1078,6 +1086,9 @@ def _surfel_fusion(
     return fused_points, fused_colors, fused_weights, {
         "method": "confidence_weighted_4cm_surfel_voxels",
         "voxel_m": float(voxel_m),
+        "input_pixel_stride": int(pixel_stride),
+        "full_resolution_accepted_evidence_used": pixel_stride == 1,
+        "minimum_sample_quality": 0.35,
         "input_sample_count": int(points.shape[0]),
         "pre_filter_voxel_count": voxel_count,
         "pre_filter_single_view_voxel_count": int(

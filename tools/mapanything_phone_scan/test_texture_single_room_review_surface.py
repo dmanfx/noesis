@@ -181,6 +181,46 @@ def test_texture_quality_exclusion_preserves_all_geometry_as_neutral(tmp_path, m
     assert all(view["geometry_preserved_when_texture_excluded"] for view in report["views"])
 
 
+def test_physical_region_policy_is_explicit_and_preserves_direct_export(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    args.smoothness_m = .05
+    report = texture.build(args)
+    assert report["output"]["source_triangle_count"] == report["output"]["exported_triangle_count"] == 2
+    coherence = next(iter(report["geometries"].values()))["coherence"]
+    assert coherence["method"] == "physical_area_edge_length_decreasing_valid_region_moves"
+    assert coherence["candidate_validity_preserved"]
+
+
+def test_completed_geometry_classes_survive_photo_partition_and_assignment(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    path = args.mesh_dir / "surface_mesh_manifest.json"
+    manifest = texture._json(path)
+    scene = trimesh.load(args.mesh_dir / "surface_mesh.glb", force="scene", process=False)
+    name = str(next(iter(scene.geometry)))
+    sidecar = args.mesh_dir / "face_geometry_support.npz"
+    np.savez(sidecar, face_support_class=np.array([0, 2], dtype=np.uint8),
+             face_local_index=np.arange(2), geometry_name=np.asarray(name),
+             class_names=np.asarray(["multi_view_supported", "poisson_inferred", "boundary_cap_inferred"]))
+    manifest["completion"] = {"geometry_name": name, "geometry_support": texture._record(sidecar)}
+    _json(path, manifest)
+    report = texture.build(args)
+    assert report["geometry_completion"] == manifest["completion"]
+    with np.load(args.output_dir / "face_photo_assignment.npz") as data:
+        assert data["face_geometry_support_class"].tolist() == [0, 2]
+    loaded = trimesh.load(args.output_dir / "textured_surface_mesh.glb", force="scene", process=False)
+    for part in loaded.geometry.values():
+        assert part.metadata["support_class"] == "photo_visible_surface_with_explicit_geometry_support"
+        assert part.metadata["geometry_support_class_counts"] == {"0": 1, "1": 0, "2": 1}
+
+
+def test_completed_support_digest_mismatch_is_not_presented_as_observed(tmp_path):
+    path = tmp_path / "bad.npz"
+    np.savez(path, face_support_class=np.array([0, 2]))
+    manifest = {"completion": {"geometry_name": "test", "geometry_support": {**texture._record(path), "sha256": "0" * 64}}}
+    with pytest.raises(texture.TextureSurfaceError, match="digest"):
+        texture.completed_geometry_support(manifest, "test", 2)
+
+
 def _photometric_fixture():
     points = np.asarray([[(5 + 2.5 * (row % 20) - 31.5) / 10,
                           (5 + 5 * (row // 20) - 31.5) / 10, 2.0] for row in range(200)])
@@ -561,3 +601,174 @@ def test_reserved_colour_changes_cannot_change_training_anchor_preselection(monk
     assert after["anchor_preselection_uses_reserved_samples"] is False
     assert after["absolute_colour_calibration_established"] is False
     assert after["disconnected_components_globally_calibrated"] is False
+
+
+def test_candidate_checkpoint_reuses_exact_evidence_and_rejects_source_change(tmp_path, monkeypatch):
+    vertices, faces = _square()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    views, calls = [_view()], []
+    original = texture.face_candidates
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(texture, "face_candidates", counted)
+    options = dict(top_k=2, cache_dir=tmp_path / "cache", geometry_index=0, mesh_sha256="bound-mesh")
+    first = texture.cached_face_candidates(mesh, views, **options)
+    second = texture.cached_face_candidates(mesh, views, **options)
+    assert len(calls) == 1
+    for left, right in zip(first, second, strict=True):
+        np.testing.assert_array_equal(left, right)
+    views[0].provenance["frame_id"] = "changed"
+    with pytest.raises(texture.TextureSurfaceError, match="source/algorithm/hash"):
+        texture.cached_face_candidates(mesh, views, **options)
+
+
+def test_candidate_checkpoint_rejects_partial_or_invalid_labels(tmp_path):
+    vertices, faces = _square()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    options = dict(top_k=2, cache_dir=tmp_path / "cache", geometry_index=0, mesh_sha256="bound-mesh")
+    texture.cached_face_candidates(mesh, [_view()], **options)
+    array_path = options["cache_dir"] / "geometry_0000.npz"
+    record_path = array_path.with_suffix(".json")
+    np.savez_compressed(array_path, candidates=np.full((2, 2), -2), scores=np.zeros((2, 2)))
+    record = texture._json(record_path)
+    record["array_sha256"] = texture._sha(array_path)
+    _json(record_path, record)
+    with pytest.raises(texture.TextureSurfaceError, match="invalid bounded arrays"):
+        texture.cached_face_candidates(mesh, [_view()], **options)
+    record_path.unlink()
+    with pytest.raises(texture.TextureSurfaceError, match="incomplete candidate checkpoint"):
+        texture.cached_face_candidates(mesh, [_view()], **options)
+
+
+def test_bound_assignment_reuse_keeps_labels_and_rejects_changed_camera(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    parent = texture.build(args)
+    args.reuse_assignments_from = args.output_dir
+    args.output_dir = tmp_path / "retextured"
+    new = texture.build(args)
+    with np.load(parent["output"]["assignments"]["path"]) as old_data, np.load(new["output"]["assignments"]["path"]) as new_data:
+        np.testing.assert_array_equal(old_data["face_source_view"], new_data["face_source_view"])
+    assert new["source"]["photo_assignment_reuse"]["new_photo_corner_and_centroid_visibility_rechecked"]
+    views, _ = texture.load_bound_views(args)
+    views[0].provenance["camera_to_world"][0][3] = 0.1
+    manifest = texture._json(args.mesh_dir / "surface_mesh_manifest.json")
+    with pytest.raises(texture.TextureSurfaceError, match="camera/frame/model evidence changed"):
+        texture.reusable_photo_assignments(args, manifest, views)
+
+
+def test_reused_photo_visibility_is_rechecked_without_dropping_invalid_faces():
+    vertices, faces = _square()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    texture.validate_assigned_photos(mesh, np.asarray([0, 0]), [_view()])
+    with pytest.raises(texture.TextureSurfaceError, match="new photo visibility"):
+        texture.validate_assigned_photos(mesh, np.asarray([0, 0]), [_view(depth=1)])
+    with pytest.raises(texture.TextureSurfaceError, match="triangle count"):
+        texture.validate_assigned_photos(mesh, np.asarray([-2, 0]), [_view()])
+
+
+def _bound_native_fixture(args):
+    prepared_path = args.scan_dir / "prepared_frames_manifest.json"
+    prepared = texture._json(prepared_path)
+    source = args.scan_dir / "camera.mp4"
+    source.write_bytes(b"exact synthetic source video")
+    prepared["video"] = {"path": source.name, "sha256": texture._sha(source)}
+    rows = []
+    args.texture_photo_dir = args.scan_dir.parent / "native_photos"
+    (args.texture_photo_dir / "photos").mkdir(parents=True)
+    for index, frame in enumerate(prepared["frames"]):
+        frame.update(source_frame_index=index * 10, capture_time_ns=index * 1_000_000_000,
+                     timestamp_source="fixture_native_timestamp")
+        output = args.texture_photo_dir / "photos" / f"frame_{index:04d}.png"
+        Image.new("RGB", (1024, 1024), (128, 120, 100)).save(output)
+        rows.append({"index": index, "frame_id": frame["frame_id"],
+                     **{key: frame[key] for key in ("source_frame_index", "capture_time_ns", "timestamp_s", "timestamp_source")},
+                     "prepared_photo": {"path": frame["frame"], "sha256": frame["sha256"], "width": 512, "height": 512},
+                     "output_photo": {"path": f"photos/{output.name}", "sha256": texture._sha(output),
+                                      "width": 1024, "height": 1024, "encoding": "png_lossless_rgb24"},
+                     "image_mapping_verification": {"status": "verified_unique_same_decoded_frame_geometry"}})
+    _json(prepared_path, prepared)
+    _json(args.texture_photo_dir / "bound_texture_photos_manifest.json", {
+        "schema": "noesis.mapanything.phone_scan.bound_texture_photos.v1", "status": "verified_all_bound_views",
+        "prepared_manifest": texture._record(prepared_path),
+        "source_video": {**texture._record(source), "rotation_degrees": 0},
+        "extraction": {"selection": "single_decode_pass_exact_decoded_frame_index", "prepared_pixels_used_as_output": False},
+        "geometry": {"source_pixel_geometry": "native_noautorotate_uniform_scale_only", "intrinsics_modified": False,
+                     "poses_modified": False, "prepared_manifest_modified": False}, "views": rows})
+    return prepared
+
+
+def test_native_texture_source_binding_uses_exact_frames_not_prepared_upsampling(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    prepared = _bound_native_fixture(args)
+    rows, report = texture.bound_texture_photo_rows(args, prepared)
+    assert len(rows) == 2 and report["prepared_images_upsampled"] is False
+    assert all(row["resolved_photo"].parent.name == "photos" for row in rows.values())
+    assert report["camera_intrinsics_and_poses_changed"] is False
+    path = args.texture_photo_dir / "bound_texture_photos_manifest.json"
+    manifest = texture._json(path)
+    manifest["views"][0]["source_frame_index"] = 7
+    _json(path, manifest)
+    with pytest.raises(texture.TextureSurfaceError, match="exact-frame/photo binding"):
+        texture.bound_texture_photo_rows(args, prepared)
+
+
+def test_native_texture_changed_video_or_photo_is_rejected(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    prepared = _bound_native_fixture(args)
+    photo = args.texture_photo_dir / "photos" / "frame_0000.png"
+    Image.new("RGB", (1024, 1024), "red").save(photo)
+    with pytest.raises(texture.TextureSurfaceError, match="exact-frame/photo binding"):
+        texture.bound_texture_photo_rows(args, prepared)
+    (args.scan_dir / "camera.mp4").write_bytes(b"changed source")
+    with pytest.raises(texture.TextureSurfaceError, match="pixel geometry binding"):
+        texture.bound_texture_photo_rows(args, prepared)
+
+
+def test_native_same_fov_scale_preserves_pixel_centres_not_camera_intrinsics():
+    original = np.asarray([[8., 0, .1], [0, 8., -.2]])
+    mapped = texture.scaled_photo_map(original, (1280, 720), (2560, 1440))
+    np.testing.assert_allclose(mapped, [[16, 0, .7], [0, 16, .1]])
+    np.testing.assert_array_equal(original, [[8., 0, .1], [0, 8., -.2]])
+    with pytest.raises(texture.TextureSurfaceError, match="uniform same-FOV"):
+        texture.scaled_photo_map(original, (1280, 720), (2560, 1000))
+
+
+def test_native_bound_view_loader_composes_verified_photo_map_and_keeps_depth_k(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    prepared = _bound_native_fixture(args)
+    args.texture_edge_px = 1024
+    suite_path = args.scan_dir.parent / "suite" / "variant_suite_manifest.json"
+    suite = texture._json(suite_path)
+    suite["prepared_frames_manifest_sha256"] = texture._sha(args.scan_dir / "prepared_frames_manifest.json")
+    _json(suite_path, suite)
+    monkeypatch.setattr(texture, "verified_official_photo_maps", lambda *_: (
+        {index: np.asarray([[8., 0, 0], [0, 8., 0]]) for index in range(len(prepared["frames"]))},
+        {"status": "verified_byte_exact_official_preprocessing_all_views"}))
+    views, report = texture.load_bound_views(args)
+    assert report["bound_native_texture_photos"]["verified_view_count"] == 2
+    assert views[0].photo_size == (1024, 1024)
+    assert views[0].photo_path.is_relative_to(args.texture_photo_dir)
+    assert Path(views[0].provenance["prepared_photo"]["path"]).is_relative_to(args.scan_dir / "frames")
+    np.testing.assert_allclose(views[0].model_to_photo, [[16, 0, .5], [0, 16, .5]])
+    np.testing.assert_array_equal(views[0].model_intrinsics, [[20., 0, 31.5], [0, 20., 31.5], [0, 0, 1]])
+    np.testing.assert_array_equal(views[0].intrinsics, views[0].model_intrinsics)
+
+
+def test_selected_photo_crop_preserves_pixels_and_projected_uv_without_resampling():
+    vertices, faces = _square()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    view = _view(image_size=(512, 512))
+    pixels = np.arange(512 * 512 * 3, dtype=np.uint8).reshape(512, 512, 3)
+    scene = trimesh.Scene()
+    report = texture.export_partition(mesh, np.asarray([0, 0]), {0: view}, scene, "test",
+                                      {0: Image.fromarray(pixels)}, crop_photos=True)
+    part = next(iter(scene.geometry.values()))
+    crop = report["photo_region_crops"]["0"]["crop_xyxy"]
+    left, top, right, bottom = crop
+    np.testing.assert_array_equal(np.asarray(part.visual.material.baseColorTexture), pixels[top:bottom, left:right])
+    _, _, original_uv = texture.project_photo(part.vertices, view)
+    np.testing.assert_allclose(part.visual.uv[:, 0] * (right - left) + left, original_uv[:, 0])
+    np.testing.assert_allclose((1 - part.visual.uv[:, 1]) * (bottom - top) + top, original_uv[:, 1])
+    assert report["embedded_photo_texel_count"] < 512 * 512
+    assert report["photo_region_crops"]["0"]["resampling"] is False

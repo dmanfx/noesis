@@ -120,6 +120,20 @@ def test_canonical_command_uses_host_storage_and_baseline_lane(tmp_path: Path) -
     assert argv[argv.index("--rest-port") + 1] == "8080"
 
 
+def test_watch_detector_selection_is_explicit_and_medium_only(tmp_path: Path) -> None:
+    argv = host.canonical_runtime_arguments(
+        storage_base=tmp_path, pgie_profile="yolo26-watch",
+    )
+    assert argv[argv.index("--pgie-profile") + 1] == "yolo26-watch"
+    assert argv[argv.index("--size") + 1] == "m"
+    assert host._parse_args(["run", "--pgie-profile", "yolo26-watch"]).pgie_profile == "yolo26-watch"
+    with pytest.raises(host.NativeRuntimeError, match="only model size m"):
+        host.canonical_runtime_arguments(storage_base=tmp_path, pgie_profile="yolo26-watch", model_size="l")
+    for mode in ("v3dt", "mv3dt"):
+        with pytest.raises(host.NativeRuntimeError, match="baseline lane"):
+            host.canonical_runtime_arguments(storage_base=tmp_path, pgie_profile="yolo26-watch", tracking_mode=mode)
+
+
 @pytest.mark.parametrize("tracking_mode", ["v3dt", "mv3dt"])
 def test_3d_command_is_an_explicit_native_host_lane(tmp_path: Path, tracking_mode: str) -> None:
     storage = tmp_path / "depth"

@@ -235,8 +235,8 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
-_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "rfdetr_keypoint", "wholebody49")
-_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
+_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "yolo26-watch", "rfdetr_seg", "rfdetr", "rfdetr_keypoint", "wholebody49")
+_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "yolo26-watch", "rfdetr_seg", "rfdetr", "wholebody49")
 _YOLO26_DETECT_SIZES = ("n", "s", "m", "l", "x")
 _YOLO26_SEG_SIZES = ("n", "s", "m")
 _PGIE_SIZE_CHOICES = tuple(
@@ -595,18 +595,25 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         label = "YOLO11"
         size_norm = ""
         tensor_name = "input"
-    elif profile_norm == "yolo26":
+    elif profile_norm in ("yolo26", "yolo26-watch"):
         size_norm = str(size or "").strip().lower()
         if size_norm not in _YOLO26_DETECT_SIZES:
             raise SystemExit(f"[FATAL] YOLO26 detection size must be one of {_YOLO26_DETECT_SIZE_HELP} (got: {size})")
         label = f"YOLO26 {size_norm}"
         tensor_name = "images"
+        if profile_norm == "yolo26-watch":
+            if size_norm != "m":
+                raise SystemExit("[FATAL] yolo26-watch supports only --size m")
+            label = "Watch-26m v1 epoch44"
     else:
         raise SystemExit(f"[FATAL] Unsupported YOLO detection profile: {profile}")
 
     if profile_norm == "yolo11":
         onnx_path = (_onnx_dir() / "yolo11m.onnx").resolve()
         engine_path = (_engine_dir() / "yolo11m_b3_fp16.engine").resolve()
+    elif profile_norm == "yolo26-watch":
+        onnx_path = (_onnx_dir() / "watch-26m-v1-e44-b3.onnx").resolve()
+        engine_path = (_engine_dir() / "watch-26m-v1-e44-b3-fp16.engine").resolve()
     else:
         onnx_path = (_onnx_dir() / f"yolo26{size_norm}.onnx").resolve()
         engine_path = (_engine_dir() / f"yolo26{size_norm}_b3_fp16.engine").resolve()
@@ -620,7 +627,7 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         "tensor_name": tensor_name,
         "onnx": onnx_path,
         "engine": engine_path,
-        "labels": (_model_dir() / "coco_labels.txt").resolve(),
+        "labels": ((_pipeline_dir() / "labels_yolo26_watch.txt") if profile_norm == "yolo26-watch" else (_model_dir() / "coco_labels.txt")).resolve(),
         "output": (_build_dir() / f"config_infer_primary_{profile_norm}{size_suffix}.ini").resolve(),
     }
 
@@ -716,6 +723,14 @@ def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger:
             "[FATAL] YOLO detection PGIE template is missing "
             f"model-engine-file/labelfile-path: {template_path}"
         )
+
+    if profile == "yolo26-watch":
+        text, count = re.subn(r"(?m)^num-detected-classes=.*$", "num-detected-classes=1", text, count=1)
+        if count != 1:
+            raise SystemExit(f"[FATAL] YOLO detection template is missing num-detected-classes: {template_path}")
+        text, count = re.subn(r"(?m)^cluster-mode=.*$", "cluster-mode=4", text, count=1)
+        if count != 1:
+            raise SystemExit(f"[FATAL] YOLO detection template is missing cluster-mode: {template_path}")
 
     out_path = assets["output"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -965,6 +980,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         "yolo11": "YOLO11 detection DS9 PGIE",
         "yolo11_seg": "YOLO11-seg DS9 PGIE",
         "yolo26": "YOLO26 detection DS9 PGIE",
+        "yolo26-watch": "Watch-26m detection DS9 PGIE",
         "rfdetr": "RF-DETR detection DS9 PGIE",
         "rfdetr_seg": "RF-DETR DS9 PGIE",
         "rfdetr_keypoint": "RF-DETR keypoint-preview DS9 PGIE",
@@ -976,7 +992,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         label=profile_engine_labels[profile],
     )
 
-    if profile in ("yolo11", "yolo26"):
+    if profile in ("yolo11", "yolo26", "yolo26-watch"):
         label = str(profile).upper()
         preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
         preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
@@ -988,7 +1004,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         preproc_parser.read(preprocess_path, encoding="utf-8")
         preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
         tensor_name = str(preproc_props.get("tensor-name", "") or "").strip()
-        expected_tensor_name = "images" if profile == "yolo26" else "input"
+        expected_tensor_name = "input" if profile == "yolo11" else "images"
         if tensor_name != expected_tensor_name:
             raise SystemExit(
                 f"[FATAL] {label} detection preprocess tensor-name must be {expected_tensor_name!r} "
@@ -1034,6 +1050,12 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         batch_size = str(props.get("batch-size", "") or "").strip()
         if batch_size and batch_size != "3":
             raise SystemExit(f"[FATAL] {label} detection PGIE batch-size must be 3 for DS9 batch (got {batch_size})")
+        if profile == "yolo26-watch":
+            if props.get("num-detected-classes") != "1" or props.get("cluster-mode") != "4":
+                raise SystemExit("[FATAL] Watch detector requires one person class and cluster-mode=4")
+            labels_path = _resolve_pipeline_cfg_path(yaml_path, str(props.get("labelfile-path", "")))
+            if labels_path.read_text(encoding="utf-8").splitlines() != ["person"]:
+                raise SystemExit("[FATAL] Watch detector class 0 must be labelled person")
 
         _require_nonempty_runtime_engine(
             engine_path,
@@ -1411,10 +1433,10 @@ def _materialize_effective_pipeline_yaml(
         raise SystemExit(f"[FATAL] DS9 pipeline YAML must be a mapping (got {type(base_cfg).__name__}): {base_yaml_path}")
 
     overlay: Dict[str, Any] = {}
-    if profile in ("yolo11", "yolo26"):
+    if profile in ("yolo11", "yolo26", "yolo26-watch"):
         if profile == "yolo26" and not pgie_size:
             raise SystemExit(f"[FATAL] YOLO26 detection profile requires --size ({_YOLO26_DETECT_SIZE_HELP})")
-        size_norm = str(pgie_size).strip().lower() if profile == "yolo26" else None
+        size_norm = str(pgie_size).strip().lower() if profile != "yolo11" else None
         assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger)
         overlay = {
             "preprocess": {"config-file": str(assets["preprocess_config"])},
@@ -1913,7 +1935,7 @@ def _parse_args() -> argparse.Namespace:
         choices=_PGIE_SIZE_CHOICES,
         default=None,
         help=(
-            "Model size. YOLO26 detection supports n/s/m/l/x; "
+            "Model size. YOLO26 detection supports n/s/m/l/x; yolo26-watch supports m; "
             "YOLO26 segmentation supports n/s/m; RF-DETR 1.8.3 detection "
             f"supports {_RFDETR_DETECTION_SIZE_HELP}; RF-DETR 1.8.3 "
             f"segmentation supports {_RFDETR_SEGMENTATION_SIZE_HELP}; "
@@ -2070,6 +2092,8 @@ def _resolve_pgie_selection(
         profile = "yolo26"
     if profile not in _PGIE_PROFILES:
         raise SystemExit(f"[FATAL] Unsupported DS9 PGIE profile: {profile}")
+    if profile == "yolo26-watch" and mode != "baseline":
+        raise SystemExit("[FATAL] yolo26-watch is supported only in the baseline lane")
 
     requested_size = getattr(args, "size", None)
     if requested_size is not None and profile not in _SIZED_PGIE_PROFILES:
@@ -2077,6 +2101,8 @@ def _resolve_pgie_selection(
         raise SystemExit(f"[FATAL] --size is only valid with --pgie-profile in: {sized}")
     if profile not in _SIZED_PGIE_PROFILES:
         return profile, None
+    if profile == "yolo26-watch" and requested_size not in (None, "m"):
+        raise SystemExit("[FATAL] yolo26-watch supports only --size m")
     default_size = (
         "s"
         if profile == "wholebody49"

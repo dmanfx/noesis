@@ -2481,3 +2481,21 @@ revision-owned matrices without a global marker dependency and clears revoked
 presentation state on complete authoritative bundles. Missing mappings reject.
 Measured foyer rise remains 0.1905 m; Family/Kitchen window failures stay recorded
 under explicit owner selection. No quality threshold or person position changes.
+## ADR-050 — Explicit Watch detector experiment profile
+
+Date: 2026-10-09. Status: implemented for owner-requested runtime testing.
+
+Expose the person-only Watch-26m v1 epoch44 engine as `yolo26-watch` in both
+DS9 runtime and native supervisor flags. Restrict it to baseline tracking and
+size M; retain stock `yolo26` defaults and independent pose selection. Resolve
+its exact filename under the selected native artifact root, fail on missing
+assets, and never substitute another engine. Use person class 0, one label,
+640×640 RGB/1÷255 preprocessing, batch 3, and `cluster-mode=4` for final
+six-column detections through the existing YOLO parser. Preserve detector
+cadence, person threshold, tracker, pose, ReID, depth and product outputs.
+
+The supplied engine manifest records incomplete six-image FP32 parity and
+synthetic-only prior smoke. Successful loading and live application progress
+establish integration behavior, not improved detection quality or completed
+numerical parity. Matched footage and independent quality evaluation remain
+separate from this authorized test activation.

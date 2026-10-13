@@ -26,6 +26,24 @@
   binding. Software-path and coordinate delivery checks are not independent
   couch-position accuracy qualification. No commit or push.
 
+## 2026-10-09 — Watch-26m detector runtime test
+
+- Added explicit `yolo26-watch` selection to the runtime and native host
+  supervisor, restricted to baseline tracking and size M. Selected the supplied
+  `watch-26m-v1-e44-b3-fp16.engine` through the service override and verified
+  engine/ONNX hashes against its supplied manifest in the host artifact root.
+- Preserved batch 3, 640×640 input, detector interval 1, person threshold 0.25
+  and YOLO26 Small pose. Person-only class 0 uses one label and the existing
+  YOLO parser with clustering disabled for final six-column detections.
+- Focused profile, supervisor and lane tests passed. Live engine-load logs
+  confirmed Watch detection and Small pose; an eight-second authenticated
+  sample received 151 tracking messages across all three sources, class 0
+  only, and 335 world-valid track rows. Tracking/world capability health was
+  healthy and deployment readiness true; mosaic RTP publication resumed.
+- This is owner-requested model testing. The supplied manifest retains failed
+  six-image FP32 parity (4/6 pass); application integration does not establish
+  detection accuracy or resolve that numerical comparison. No commit or push.
+
 ## 2026-10-05 — Native tracker presence and Menon visual continuity
 
 - Current INACTIVE NvDCF person metadata now carries bounded exact-cohort

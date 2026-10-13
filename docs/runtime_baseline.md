@@ -1,6 +1,6 @@
 # Native DeepStream 9.1 runtime baseline
 
-Status: selected native baseline, checked 2026-10-04. Dated performance
+Status: recorded Watch detector baseline, checked 2026-10-09. Dated performance
 measurements below retain their original model/config context.
 
 ## Platform
@@ -25,10 +25,11 @@ does not use Docker, a deployment selector, or a container filesystem.
 - Config: `DS9/config/infer.yaml`.
 - Cameras: Living Room, Kitchen, Family Room via `nvurisrcbin`.
 - Batch: 3 at 1920×1080, live input, 40 ms mux timeout.
-- Detector: YOLO26 FP16, GIE 1. The current configured service passes
-  `--model-size l`; the checked-in base config and older performance reference
-  use M. Read the service command and selected realization, not a document
-  label, before replaying or maintaining engines.
+- Detector experiment: person-only Watch-26m v1 epoch44, FP16, GIE 1,
+  batch 3, 640×640 input. The service selects `--pgie-profile yolo26-watch
+  --model-size m`, loading `watch-26m-v1-e44-b3-fp16.engine`. The stock
+  `yolo26` profile and checked-in base config remain available. This selection
+  is a runtime test, not acceptance of model accuracy or numerical parity.
 - Tracker: NvDCF baseline.
 - ReID: Swin Tiny, 256-dimensional embedding, GIE 3.
 - Pose: YOLO26-n pose, GIE 4.

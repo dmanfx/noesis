@@ -257,13 +257,18 @@ def load_native_config(env: Mapping[str, str] | None = None) -> NativeHostConfig
     )
 
 
-def _runtime_lane(tracking_mode: str) -> dict[str, str]:
+def _runtime_lane(tracking_mode: str, pgie_profile: str | None = None) -> dict[str, str]:
     mode = str(tracking_mode or "").strip().lower()
+    selected_profile = str(pgie_profile or CANONICAL_PROFILE).strip().lower()
+    if selected_profile not in {CANONICAL_PROFILE, "yolo26-watch"}:
+        _fail("native host PGIE profile must be yolo26 or yolo26-watch")
+    if pgie_profile is not None and mode != CANONICAL_TRACKING_MODE:
+        _fail("a PGIE profile override is supported only for the baseline lane")
     if mode == CANONICAL_TRACKING_MODE:
         return {
             "name": "baseline",
             "tracking_mode": CANONICAL_TRACKING_MODE,
-            "pgie_profile": CANONICAL_PROFILE,
+            "pgie_profile": selected_profile,
             "model_size": CANONICAL_SIZE,
             "pipeline_config": PIPELINE_CONFIG,
             "cameras_config": CAMERAS_CONFIG,
@@ -298,14 +303,17 @@ def canonical_runtime_arguments(
     tracking_mode: str = CANONICAL_TRACKING_MODE,
     pipeline_config: str | Path | None = None,
     model_size: str | None = None,
+    pgie_profile: str | None = None,
 ) -> list[str]:
-    lane = _runtime_lane(tracking_mode)
+    lane = _runtime_lane(tracking_mode, pgie_profile)
     if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
         _fail("a pipeline config override is supported only for the baseline lane")
     if model_size is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
         _fail("a model size override is supported only for the baseline lane")
     selected_pipeline = os.fspath(pipeline_config or lane["pipeline_config"])
     selected_size = str(model_size or lane["model_size"]).strip().lower()
+    if lane["pgie_profile"] == "yolo26-watch" and selected_size != "m":
+        _fail("yolo26-watch supports only model size m")
     if selected_size not in {"m", "l"}:
         _fail("model size must be m or l")
     return [
@@ -741,8 +749,9 @@ def build_run_environment(
     evidence_root: Path,
     build_root: Path,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
+    pgie_profile: str | None = None,
 ) -> dict[str, str]:
-    lane = _runtime_lane(tracking_mode)
+    lane = _runtime_lane(tracking_mode, pgie_profile)
     env = {
         key: value
         for key, value in os.environ.items()
@@ -884,9 +893,16 @@ def check_native(
     tracking_mode: str = CANONICAL_TRACKING_MODE,
     pipeline_config: Path | None = None,
     model_size: str | None = None,
+    pgie_profile: str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    lane = _runtime_lane(tracking_mode)
+    lane = _runtime_lane(tracking_mode, pgie_profile)
+    canonical_runtime_arguments(storage_base=config.runtime, tracking_mode=tracking_mode,
+                                model_size=model_size, pgie_profile=pgie_profile)
+    if lane["pgie_profile"] == "yolo26-watch":
+        engine = config.artifacts / "models/engines/watch-26m-v1-e44-b3-fp16.engine"
+        if not engine.is_file() or engine.stat().st_size == 0:
+            _fail(f"Watch detector engine missing or empty: {engine}")
     validate_secret_files(config.secrets)
     platform = verify_platform_versions()
     python_origin: dict[str, Any] = verify_python_origin(config.venv_python)
@@ -902,6 +918,7 @@ def check_native(
         evidence_root=config.runtime / "evidence" / "check" / "runtime",
         build_root=config.runtime / "build" / "check",
         tracking_mode=lane["tracking_mode"],
+        pgie_profile=pgie_profile,
     )
     run_preflight(
         config,
@@ -938,6 +955,7 @@ def build_run_command(
     tracking_mode: str = CANONICAL_TRACKING_MODE,
     pipeline_config: Path | None = None,
     model_size: str | None = None,
+    pgie_profile: str | None = None,
 ) -> list[str]:
     return [
         str(config.venv_python),
@@ -947,6 +965,7 @@ def build_run_command(
             tracking_mode=tracking_mode,
             pipeline_config=pipeline_config,
             model_size=model_size,
+            pgie_profile=pgie_profile,
         )[1:],
     ]
 
@@ -957,8 +976,9 @@ def run_native(
     tracking_mode: str = CANONICAL_TRACKING_MODE,
     pipeline_config: Path | None = None,
     model_size: str | None = None,
+    pgie_profile: str | None = None,
 ) -> NoReturn:
-    lane = _runtime_lane(tracking_mode)
+    lane = _runtime_lane(tracking_mode, pgie_profile)
     occupancy = port_occupancy()
     if occupancy["occupied"]:
         _fail(
@@ -974,6 +994,7 @@ def run_native(
         evidence_root=directories["evidence_root"],
         build_root=directories["build_root"],
         tracking_mode=lane["tracking_mode"],
+        pgie_profile=pgie_profile,
     )
     command = build_run_command(
         config,
@@ -982,6 +1003,7 @@ def run_native(
         tracking_mode=lane["tracking_mode"],
         pipeline_config=pipeline_config,
         model_size=model_size,
+        pgie_profile=pgie_profile,
     )
     os.execve(command[0], command, env)
 
@@ -1011,6 +1033,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("m", "l"),
         help="explicit baseline detector size; the canonical lane default remains unchanged",
     )
+    parser.add_argument(
+        "--pgie-profile", choices=("yolo26", "yolo26-watch"),
+        help="explicit baseline detector profile; yolo26-watch selects Watch-26m v1 epoch44",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1033,6 +1059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tracking_mode=args.tracking_mode,
                 pipeline_config=pipeline_config,
                 model_size=args.model_size,
+                pgie_profile=args.pgie_profile,
             )
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
@@ -1042,6 +1069,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tracking_mode=args.tracking_mode,
             pipeline_config=pipeline_config,
             model_size=args.model_size,
+            pgie_profile=args.pgie_profile,
         )
     except NativeRuntimeError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)

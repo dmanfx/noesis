@@ -449,6 +449,24 @@ def validate_capture_manifest(
             normalized["walk_intent"] = validate_walk_intent(manifest["walk_intent"])
         except ValueError as exc:
             raise CaptureImportError(str(exc)) from exc
+    # Companion identity is separate from phone calibration. Preserve its exact
+    # bounded camera set through native manifest normalization/import, not just
+    # in the raw archive inspected at upload admission.
+    companion = manifest.get("companion_capture")
+    if companion is not None:
+        if (not isinstance(companion, Mapping)
+                or len(json.dumps(companion, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 240000):
+            raise CaptureImportError("Invalid or oversized companion capture reference")
+        primary = companion.get("camera_id")
+        selected = companion.get("camera_ids", [primary])
+        if (
+            not isinstance(primary, str) or not primary.strip()
+            or not isinstance(selected, list) or not 1 <= len(selected) <= 2
+            or any(not isinstance(item, str) or not item.strip() for item in selected)
+            or len(set(selected)) != len(selected) or primary not in selected
+        ):
+            raise CaptureImportError("Companion camera_ids must contain 1–2 unique IDs including camera_id")
+        normalized["companion_capture"] = dict(companion)
     return normalized
 
 

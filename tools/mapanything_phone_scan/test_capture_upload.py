@@ -23,13 +23,15 @@ from .test_browser_capture import _settings
 from .test_companion_upload import CAMERA_ID, CAPTURE_ID, SCAN_ID, SESSION_ID, _FakeCompanionManager
 
 
-def _archive(capture_id: str = CAPTURE_ID, *, paired: bool = False, tag: str = "same") -> bytes:
+def _archive(capture_id: str = CAPTURE_ID, *, paired: bool = False, tag: str = "same", camera_ids: list[str] | None = None) -> bytes:
     manifest = _manifest()
     manifest["capture_id"] = capture_id
     if paired:
         manifest["companion_capture"] = {
             "session_id": SESSION_ID, "camera_id": CAMERA_ID, "phone_capture_id": capture_id,
         }
+        if camera_ids is not None:
+            manifest["companion_capture"]["camera_ids"] = camera_ids
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
         archive.writestr("capture_manifest.json", json.dumps(manifest))
@@ -129,6 +131,27 @@ def test_receipt_precedes_import_and_paired_retry_keeps_exact_identity(tmp_path:
             assert len(calls) == 1
     finally:
         release.set()
+
+
+def test_two_camera_native_receipt_and_retry_keep_exact_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    service = app.state.phone_scan_service
+    service.companion_capture.camera_ids = [CAMERA_ID, "kitchen"]
+    selected = ["kitchen", CAMERA_ID]
+    archive = _archive(paired=True, camera_ids=selected)
+    headers = {**_headers(paired=True), "X-Companion-Camera-Ids": json.dumps(selected)}
+    with TestClient(app) as client:
+        response = client.post("/api/scans/sensor-bundle", content=archive, headers=headers)
+        assert response.status_code == 202, response.text
+        receipt = response.json()["upload_receipt"]
+        assert receipt["companion_camera_ids"] == sorted(selected)
+        done = _wait(client, SCAN_ID, "ready")
+        assert done["upload_receipt"]["companion_camera_ids"] == sorted(selected)
+        duplicate = client.post("/api/scans/sensor-bundle", content=archive, headers=headers)
+        assert duplicate.status_code == 200, duplicate.text
+        mismatch = client.post("/api/scans/sensor-bundle", content=archive, headers={**headers, "X-Companion-Camera-Ids": json.dumps([CAMERA_ID])})
+        assert mismatch.status_code == 409
+        assert client.get(f"/api/scans/{SCAN_ID}").json()["status"] == "ready"
 
 
 def test_import_queue_has_one_worker_and_two_pending_slots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

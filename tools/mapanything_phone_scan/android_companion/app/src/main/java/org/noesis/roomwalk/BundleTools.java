@@ -215,6 +215,7 @@ public final class BundleTools {
         if(!PairedCapture.SCHEMA.equals(reference.optString("schema"))||!captureId.equals(reference.optString("phone_capture_id"))
                 ||!reference.optString("session_id").matches("companion-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}")||reference.optString("camera_id").isEmpty())throw new IOException("Paired recording identity is incomplete; use Finalize paired capture before packaging");
         endpoint(reference.getString("server_origin"),"/");
+        PairedCapture.cameraIds(reference);
     }
     public static final class HttpFailure extends IOException {
         public final int status;
@@ -248,7 +249,7 @@ public final class BundleTools {
         try {
             if(transfer!=null)transfer.attach(conn);
             configureArchive(conn,archive);
-            if(paired!=null){conn.setRequestProperty("X-Companion-Session",paired.getString("session_id"));conn.setRequestProperty("X-Companion-Camera-ID",paired.getString("camera_id"));conn.setRequestProperty("X-Phone-Capture-ID",paired.getString("phone_capture_id"));}
+            if(paired!=null){conn.setRequestProperty("X-Companion-Session",paired.getString("session_id"));conn.setRequestProperty("X-Companion-Camera-ID",paired.getString("camera_id"));conn.setRequestProperty("X-Companion-Camera-Ids",PairedCapture.cameraIds(paired).toString());conn.setRequestProperty("X-Phone-Capture-ID",paired.getString("phone_capture_id"));}
             if(transfer!=null)conn.setRequestProperty("Prefer","respond-async");
             String digest=sendArchive(conn,archive,progress,transfer);
             int code=conn.getResponseCode();String text;
@@ -264,6 +265,7 @@ public final class BundleTools {
             if(paired!=null){JSONObject linked=receipt.optJSONObject("companion_capture");JSONObject phone=linked==null?null:linked.optJSONObject("phone");String id=receipt.getString("id");
                 if(linked==null||phone==null||!id.equals(phone.optString("scan_id"))
                         ||!paired.getString("session_id").equals(linked.optString("session_id"))||!paired.getString("camera_id").equals(linked.optString("camera_id"))
+                        ||!PairedCapture.cameraIds(paired).toString().equals(PairedCapture.cameraIds(linked).toString())
                         ||!paired.getString("phone_capture_id").equals(linked.optString("phone_capture_id")))throw new IOException("The upload receipt does not confirm the paired recording identities; retain this ZIP and retry");
             }
             return receipt;
@@ -281,6 +283,7 @@ public final class BundleTools {
             throw new IOException("RoomWalk did not confirm the exact stored ZIP bytes and capture identity. Retain this ZIP and retry.");
         if(paired!=null){
             if(!paired.getString("session_id").equals(stored.optString("companion_session_id"))||!paired.getString("camera_id").equals(stored.optString("companion_camera_id"))
+                    ||!PairedCapture.cameraIds(paired).toString().equals(PairedCapture.cameraIds(stored.optString("companion_camera_id"),stored.opt("companion_camera_ids")).toString())
                     ||!paired.getString("phone_capture_id").equals(stored.optString("capture_id")))throw new IOException("Stored upload receipt does not match the paired recording identities");
         }else if(!stored.isNull("companion_session_id")||!stored.isNull("companion_camera_id"))throw new IOException("An unpaired upload received an unexpected paired receipt");
     }

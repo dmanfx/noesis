@@ -164,6 +164,35 @@ public final class PairedCaptureInstrumentation extends Instrumentation {
         server=new FakeServer();server.stopFails=true;events=new Events();dir=directory("stop-retry");paired=new PairedCapture(server,events);paired.start(dir,"https://fixture.invalid","living_room");require(events.ready.await(5,TimeUnit.SECONDS),"Recovery fixture starts");paired.stop("user");require(events.stopped.await(5,TimeUnit.SECONDS),"Unconfirmed stop retains reference");paired.close();
         ref=BundleTools.readJson(new File(dir,PairedCapture.FILE));require(ref.getBoolean("needs_recovery"),"Lost stop explicitly requires recovery");server.stopFails=false;ref=PairedCapture.finishSaved(server,dir);require("stopped".equals(ref.getString("status"))&&!ref.getBoolean("needs_recovery")&&server.created==1,"Saved retry finalizes same session without a new recording");
         require("user".equals(server.stopReason),"Saved retry preserves the original clean stop reason");
+        require(PairedCapture.cameraIds(new JSONObject().put("camera_id","family_room")).toString().equals("[\"family_room\"]"),"Legacy saved reference remains an exact singleton");
+        boolean rejected=false;try{PairedCapture.cameraIds("family_room",new JSONArray().put("family_room").put("family_room"));}catch(Exception expected){rejected=true;}require(rejected,"Duplicate camera IDs cannot qualify");
+
+        server=new FakeServer();server.multi=true;events=new Events();dir=directory("two-camera");paired=new PairedCapture(server,events);
+        JSONArray selected=new JSONArray().put("kitchen").put("family_room");paired.start(dir,"https://fixture.invalid","family_room",selected);selected.put("unrelated");
+        require(events.ready.await(5,TimeUnit.SECONDS),"Phone starts only after BOTH requested camera members are ready");
+        paired.stop("user");require(events.stopped.await(5,TimeUnit.SECONDS),"Pair stop finalizes one session");paired.close();
+        ref=BundleTools.readJson(new File(dir,PairedCapture.FILE));
+        require("family_room".equals(ref.getString("camera_id"))&&PairedCapture.cameraIds(ref).toString().equals("[\"family_room\",\"kitchen\"]"),"Primary and detached exact two-camera set survive save");
+        require(!ref.getJSONObject("cameras").getJSONObject("kitchen").has("recorder"),"Transient full recorder data is not duplicated into the retained phone reference");
+        JSONArray probes=ref.getJSONArray("clock_probes");JSONObject probeExample=probes.getJSONObject(0);while(probes.length()<96)probes.put(new JSONObject(probeExample.toString()));
+        require(ref.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length<240000,"Two realistic member statuses and96 clock probes stay within unchanged240000-byte ref limit");
+        ref=PairedCapture.finishSaved(server,dir);require(server.created==1&&ref.getJSONArray("camera_ids").length()==2,"Recovery never creates or upgrades the requested pair");
+        File pairZip=new File(dir,"pair-fixture.zip");
+        try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(pairZip))){
+            zip.putNextEntry(new java.util.zip.ZipEntry("capture_manifest.json"));zip.write(new JSONObject().put("capture_id",dir.getName()).put("companion_capture",ref).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));zip.closeEntry();
+        }
+        JSONObject zipped=BundleTools.pairing(pairZip);require(PairedCapture.cameraIds(zipped).toString().equals(PairedCapture.cameraIds(ref).toString()),"Retained ZIP roundtrip preserves exact pair and primary");
+        JSONObject stored=new JSONObject().put("schema","noesis.phone_capture.upload_receipt.v1").put("status","stored").put("size_bytes",pairZip.length()).put("sha256",sha256(pairZip)).put("capture_id",dir.getName()).put("companion_session_id",ref.getString("session_id")).put("companion_camera_id",ref.getString("camera_id")).put("companion_camera_ids",new JSONArray().put("kitchen").put("family_room"));
+        JSONObject receipt=new JSONObject().put("id","20261017-000000-deadbeef").put("upload_receipt",stored);
+        BundleTools.validateStoredReceipt(receipt,pairZip,sha256(pairZip),ref);require(true,"Stored receipt accepts exact unordered camera set");
+        stored.remove("companion_camera_ids");rejected=false;try{BundleTools.validateStoredReceipt(receipt,pairZip,sha256(pairZip),ref);}catch(Exception expected){rejected=true;}require(rejected,"Receipt cannot silently downgrade pair ZIP to legacy singleton");
+
+        for(int variant=0;variant<2;variant++){
+            server=new FakeServer();server.multi=true;server.omitSet=variant==0;server.missingMemberReady=variant==1;events=new Events();dir=directory("pair-denied-"+variant);paired=new PairedCapture(server,events);
+            paired.start(dir,"https://fixture.invalid","family_room",new JSONArray().put("family_room").put("kitchen"));
+            require(events.stopped.await(5,TimeUnit.SECONDS),"Ignored set or missing peer readiness finalizes without phone start");
+            require(events.ready.getCount()==1&&events.errors>0&&server.stops==1,"A false aggregate recording state cannot release phone start; exact owned session is stopped");paired.close();
+        }
         System.out.println("Lifecycle checks: "+checks);
     }
     private void fixtureUpload()throws Exception{
@@ -195,14 +224,15 @@ public final class PairedCaptureInstrumentation extends Instrumentation {
         public void onPairError(String reason,JSONObject reference){errors++;}
     }
     private static final class FakeServer implements PairedCapture.Transport{
-        int created,posts,clocks,stops,healthChecks;boolean loseFirstStart,wrongIdentity,blockStart,stopFails;String phone,camera,request,status="recording",stopPhoneId,stopReason;
+        int created,posts,clocks,stops,healthChecks;boolean loseFirstStart,wrongIdentity,blockStart,stopFails,multi,omitSet,missingMemberReady;String phone,camera,request,status="recording",stopPhoneId,stopReason;JSONArray cameraIds;
         final List<String> requestIds=new ArrayList<>();final CountDownLatch heartbeat=new CountDownLatch(1),startEntered=new CountDownLatch(1),startRelease=new CountDownLatch(1);
         public Object request(String server,String path,JSONObject body,int timeout)throws Exception{
             if(path.equals("/api/health")){healthChecks++;return new JSONObject().put("status","ok");}
+            if(path.endsWith("/cameras"))return new JSONObject().put("available",true).put("multi_camera_capture",multi).put("max_cameras",multi?2:1).put("cameras",new JSONArray().put(new JSONObject().put("camera_id","family_room").put("available",true)).put(new JSONObject().put("camera_id","kitchen").put("available",true)));
             if(path.endsWith("/clock")){clocks++;return new JSONObject().put("server_received_unix_ns","1750000000000000123").put("server_sent_unix_ns","1750000000000000456").put("server_received_monotonic_ns","1234500000000123").put("server_sent_monotonic_ns","1234500000000456");}
             if(path.equals("/api/companion-captures")&&body==null)return created==0?new JSONArray():new JSONArray().put(response(false));
             if(path.equals("/api/companion-captures")){
-                posts++;requestIds.add(body.getString("client_request_id"));if(created==0){created++;phone=body.getString("phone_capture_id");camera=body.getString("camera_id");request=body.getString("client_request_id");}
+                posts++;requestIds.add(body.getString("client_request_id"));if(created==0){created++;phone=body.getString("phone_capture_id");camera=body.getString("camera_id");cameraIds=PairedCapture.cameraIds(body);request=body.getString("client_request_id");}
                 else if(!request.equals(body.getString("client_request_id")))throw new IOException("Changed retry identity");
                 startEntered.countDown();if(blockStart&&!startRelease.await(5,TimeUnit.SECONDS))throw new IOException("Fixture release timeout");
                 if(loseFirstStart&&posts==1)throw new IOException("Simulated lost start response");return response(wrongIdentity);
@@ -211,6 +241,15 @@ public final class PairedCaptureInstrumentation extends Instrumentation {
             if(path.endsWith("/stop")){stops++;stopPhoneId=body.getString("phone_capture_id");stopReason=body.getString("reason");if(stopFails)throw new IOException("Simulated lost stop response");status="stopped";return response(false);}
             return response(false);
         }
-        private JSONObject response(boolean bad)throws Exception{return new JSONObject().put("session_id","companion-20260909-000000-deadbeef").put("camera_id",bad?"wrong-room":camera).put("phone_capture_id",phone).put("status",status).put("video_status",status).put("tracking_status",status).put("artifact_urls",new JSONObject()).put("provenance",new JSONObject().put("test_fixture",true));}
+        private JSONObject response(boolean bad)throws Exception{
+            JSONObject out=new JSONObject().put("session_id","companion-20260909-000000-deadbeef").put("camera_id",bad?"wrong-room":camera).put("phone_capture_id",phone).put("status",status).put("video_status",status).put("tracking_status",status).put("artifact_urls",new JSONObject()).put("provenance",new JSONObject().put("test_fixture",true));
+            if(multi){
+                if(!omitSet)out.put("camera_ids",new JSONArray(cameraIds.toString()));JSONObject members=new JSONObject();
+                String large=new String(new char[66000]).replace('\0','x');
+                for(int i=0;i<cameraIds.length();i++){String id=cameraIds.getString(i);members.put(id,new JSONObject().put("camera_id",id).put("source_id",i).put("label",id).put("source_reference","camera-secret:"+id).put("readiness",new JSONObject().put("recorder_ready",true).put("tracking_ready",!missingMemberReady||i==0)).put("recorder",new JSONObject().put("transient_status",large)).put("tracking",new JSONObject().put("transient_status",large)).put("artifact_urls",new JSONObject().put("session","/companion-assets/session/"+id+"/session.json")));}
+                out.put("cameras",members);
+            }
+            return out;
+        }
     }
 }

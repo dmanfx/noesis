@@ -389,3 +389,18 @@ def test_canonical_recorder_stops_partial_when_selected_tracking_is_stale(
     assert status["status"] == "failed"
     assert status["error"] == "tracking_stale_timeout"
     recorder.stop("user")
+
+
+def test_canonical_recorder_accepts_only_reduced_observer_limits(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    defaults = sources.ObserverLimits()
+    legacy = CanonicalTrackingRecorder(authority, tmp_path / "legacy", 32)
+    assert legacy._observer.limits.max_file_bytes == defaults.max_file_bytes
+    reduced = sources.ObserverLimits(max_records=16, max_queue_items=defaults.max_queue_items // 2,
+                                     max_queue_bytes=defaults.max_queue_bytes // 2,
+                                     max_file_bytes=defaults.max_file_bytes // 2)
+    recorder = CanonicalTrackingRecorder(authority, tmp_path / "multi", 16, observer_limits=reduced)
+    assert recorder._observer.limits == reduced
+    assert recorder._observer._queue.maxsize == defaults.max_queue_items // 2
+    with pytest.raises(ValueError, match="cannot increase"):
+        CanonicalTrackingRecorder(authority, tmp_path / "bad", 8, observer_limits=reduced)

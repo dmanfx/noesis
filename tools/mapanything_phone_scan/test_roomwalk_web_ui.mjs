@@ -26,7 +26,7 @@ async function fixture(t, { native = true, offline = false, scans = [], health =
     const json = (body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (pathname === "/" || pathname.startsWith("/static/")) {
       const filename = pathname === "/" ? "index.html" : pathname.slice("/static/".length);
-      if (!["index.html", "app.js", "style.css", "browser_capture.js", "companion_capture.js", "native_capture.js", "calibration.js", "path_comparison.js"].includes(filename)) return route.abort();
+      if (!["index.html", "app.js", "style.css", "browser_capture.js", "companion_capture.js", "native_capture.js", "camera_selection.js", "calibration.js", "path_comparison.js"].includes(filename)) return route.abort();
       let source = await readFile(new URL(`./static/${filename}`, import.meta.url), "utf8");
       if (filename === "native_capture.js") source += '\nconst realSend = NativeBridge.prototype.send; NativeBridge.prototype.send = function(action, args = {}) { this.navigate = (url) => window.__nativeCommands.push(JSON.parse(new URL(url).searchParams.get("request"))); return realSend.call(this, action, args); };\n';
       return route.fulfill({ contentType: filename.endsWith(".js") ? "text/javascript" : filename.endsWith(".css") ? "text/css" : "text/html", body: source });
@@ -228,15 +228,16 @@ test("native reconstruction supports explicit phone-only capture with a populate
   const { page, emit, errors } = await fixture(t, { expandDetails: false });
   await emit({ room_camera_index: -1 });
   assert.equal(await page.locator("#native-setup").getAttribute("open"), null);
-  assert.equal(await page.locator('#native-room-camera option[value="-1"]').textContent(), "None · phone-only reconstruction");
-  assert.equal(await page.locator("#native-room-camera").inputValue(), "-1");
+  assert.equal(await page.locator('#native-primary-camera option[value=""]').textContent(), "No static camera · phone-only reconstruction");
+  assert.equal(await page.locator("#native-primary-camera").inputValue(), "");
+  assert.equal(await page.locator("#native-recording-cameras input:checked").count(), 0);
   await page.locator("#native-capture-primary").click();
   assert.deepEqual((await page.evaluate(() => window.__nativeCommands)).at(-1), {
     action: "capture", args: { mode: "reconstruction", carry_protocol: "coverage", accuracy_target_m: 0.1 },
   });
   await emit({ room_camera_index: 0 });
   await page.locator("#native-setup > summary").click();
-  await page.locator("#native-room-camera").selectOption("-1");
+  await page.locator("#native-recording-cameras input:checked").uncheck();
   await page.locator('#native-configuration button[type="submit"]').click();
   assert.equal((await page.evaluate(() => window.__nativeCommands)).at(-1).args.room_camera_index, -1);
   await emit({ room_camera_index: -1, imu_minutes: 1 });

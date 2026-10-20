@@ -9,6 +9,35 @@
 
 export const COMPANION_CAPTURE_SCHEMA = "noesis.phone_capture.companion_ref.v1";
 
+/** Missing camera_ids is the historical SINGLE camera, never an inferred pair. */
+export function normalizeCameraIds(primary, cameraIds = undefined) {
+  if (typeof primary !== "string" || !primary.trim()) throw new Error("A primary room camera is required.");
+  const values = cameraIds === undefined ? [primary] : cameraIds;
+  if (!Array.isArray(values) || values.length < 1 || values.length > 2
+      || values.some((id) => typeof id !== "string" || !id.trim())) throw new Error("Choose one or two room cameras.");
+  const normalized = values.map((id) => id.trim()).sort();
+  if (new Set(normalized).size !== normalized.length || !normalized.includes(primary.trim())) throw new Error("Room cameras must be unique and include the primary camera.");
+  return normalized;
+}
+
+function sameCameraIds(a, b) { return a.length === b.length && a.every((id, index) => id === b[index]); }
+
+function compactCameraStates(values, ids) {
+  const result = {};
+  for (const id of ids) {
+    const row = values?.[id];
+    if (!row || row.camera_id !== id) continue;
+    const urls = {};
+    for (const [key, value] of Object.entries(row.artifact_urls || {}).slice(0, 16)) {
+      if (key.length <= 160 && typeof value === "string" && value.length <= 2048) urls[key] = value;
+    }
+    result[id] = { camera_id: id, source_id: typeof row.source_id === "number" ? row.source_id : safeString(row.source_id).slice(0, 160),
+      label: safeString(row.label, id).slice(0, 160), source_reference: safeString(row.source_reference).slice(0, 512),
+      readiness: { recorder_ready: row.readiness?.recorder_ready === true, tracking_ready: row.readiness?.tracking_ready === true }, artifact_urls: urls };
+  }
+  return result;
+}
+
 export const COMPANION_DEFAULTS = Object.freeze({
   clockProbeTimeoutMs: 3_000,
   startTimeoutMs: 16_000,
@@ -135,6 +164,9 @@ export class CompanionCapture {
     this.camerasAvailable = false;
     this.cameraReason = null;
     this.selectedCameraId = "";
+    this.selectedCameraIds = [];
+    this.multiCameraCapture = false;
+    this.maxCameras = 1;
     this.phoneCaptureId = null;
     this.clientRequestId = null;
     this.session = null;
@@ -161,11 +193,16 @@ export class CompanionCapture {
       camerasAvailable: this.camerasAvailable,
       cameraReason: this.cameraReason,
       selectedCameraId: this.selectedCameraId,
+      selectedCameraIds: this.selectedCameraIds.slice(),
+      multiCameraCapture: this.multiCameraCapture,
+      maxCameras: this.maxCameras,
       phoneCaptureId: this.phoneCaptureId,
       clientRequestId: this.clientRequestId,
       sessionId: session.session_id || null,
       needsServerStop: this.needsServerStop,
       cameraId: session.camera_id || this.selectedCameraId || null,
+      cameraIds: session.camera_ids?.slice() || this.selectedCameraIds.slice(),
+      cameraStates: copyJsonValue(session.cameras || {}),
       videoStatus: session.video_status || null,
       trackingStatus: session.tracking_status || null,
       staticStatus: session.status || null,
@@ -195,7 +232,9 @@ export class CompanionCapture {
 
   get readyToStart() {
     const camera = this.cameras.find((item) => item.camera_id === this.selectedCameraId);
-    return this.camerasAvailable && Boolean(camera?.available) && Boolean(this.selectedCameraId) && !this.hasLiveSession;
+    return this.camerasAvailable && Boolean(camera?.available) && Boolean(this.selectedCameraId) && !this.hasLiveSession
+      && (this.selectedCameraIds.length < 2 || this.multiCameraCapture && this.maxCameras >= 2)
+      && this.selectedCameraIds.every((id) => this.cameras.some((item) => item.camera_id === id && item.available === true));
   }
 
   hasUnsavedWork() {
@@ -274,14 +313,19 @@ export class CompanionCapture {
         ? payload.cameras.filter((camera) => camera?.camera_id).map((camera) => copyJsonValue(camera))
         : [];
       this.camerasAvailable = payload?.available === true && this.cameras.some((camera) => camera.available === true);
+      this.multiCameraCapture = payload?.multi_camera_capture === true;
+      this.maxCameras = payload?.max_cameras === 2 ? 2 : 1;
       this.cameraReason = safeString(payload?.reason) || null;
       this.error = null;
-      if (!this.cameras.some((camera) => camera.camera_id === this.selectedCameraId && camera.available === true)) this.selectedCameraId = "";
+      // Inventory loss never silently changes the explicitly checked set.
+      // Unavailable retained choices stay visible/removable; start stays strict.
       this._emitState();
       return this.status;
     } catch (error) {
       this.cameras = [];
       this.camerasAvailable = false;
+      this.multiCameraCapture = false;
+      this.maxCameras = 1;
       this.cameraReason = error.message;
       this._setError(error, "companion_cameras_unavailable");
       this._emitState();
@@ -290,12 +334,29 @@ export class CompanionCapture {
   }
 
   selectCamera(cameraId) {
+    return this.selectCameras(cameraId, [cameraId]);
+  }
+
+  selectCameras(cameraId, cameraIds) {
+    if (this.hasLiveSession) throw new CompanionCaptureError("Stop the current capture before changing cameras.");
+    if (cameraId === "" && Array.isArray(cameraIds) && cameraIds.length === 0) {
+      this.selectedCameraId = "";
+      this.selectedCameraIds = [];
+      this.error = null;
+      this._emitState();
+      return this.status;
+    }
     const value = safeString(cameraId).trim();
+    const ids = normalizeCameraIds(value, cameraIds);
+    const removingOnly = ids.length < this.selectedCameraIds.length && ids.every((id) => this.selectedCameraIds.includes(id));
     const camera = this.cameras.find((item) => item.camera_id === value);
-    if (!camera || camera.available !== true) {
+    if (!removingOnly && (!camera || camera.available !== true)) {
       throw new CompanionCaptureError("Choose an available room camera before starting the paired capture.", { code: "companion_camera_required" });
     }
+    if (!removingOnly && ids.length > 1 && (!this.multiCameraCapture || this.maxCameras < 2)) throw new CompanionCaptureError("This server does not support two-camera capture.");
+    if (!removingOnly && ids.some((id) => !this.cameras.some((item) => item.camera_id === id && item.available === true))) throw new CompanionCaptureError("Every selected room camera must be available.");
     this.selectedCameraId = value;
+    this.selectedCameraIds = ids;
     this.error = null;
     this._emitState();
     return this.status;
@@ -397,6 +458,8 @@ export class CompanionCapture {
       schema: COMPANION_CAPTURE_SCHEMA,
       session_id: session.session_id || null,
       camera_id: session.camera_id || this.selectedCameraId || null,
+      camera_ids: session.camera_ids?.slice() || this.selectedCameraIds.slice(),
+      cameras: copyJsonValue(session.cameras || {}),
       phone_capture_id: this.phoneCaptureId,
       status: this.state,
       video_status: session.video_status || null,
@@ -418,12 +481,33 @@ export class CompanionCapture {
     this._browserCapture?.setCompanionCapture?.(this._context());
   }
 
-  async start({ cameraId = this.selectedCameraId, phoneCaptureId = null, clientRequestId = null, browserCapture = null } = {}) {
+  _adopt(payload, { initial = false } = {}) {
+    const primary = this.selectedCameraId;
+    const required = initial || this.selectedCameraIds.length > 1;
+    if (required || payload?.camera_id !== undefined || payload?.camera_ids !== undefined) {
+      if (payload?.camera_id !== primary || !sameCameraIds(normalizeCameraIds(payload.camera_id, payload.camera_ids), this.selectedCameraIds)) throw new CompanionCaptureError("The server did not confirm the exact requested room-camera set.", { code: "companion_camera_set_mismatch" });
+    }
+    if ((required || payload?.phone_capture_id !== undefined) && payload?.phone_capture_id !== this.phoneCaptureId) throw new CompanionCaptureError("The companion phone-capture identity changed.", { code: "companion_identity_mismatch" });
+    if (payload?.session_id !== undefined && this.session?.session_id && payload.session_id !== this.session.session_id) throw new CompanionCaptureError("The companion session identity changed.", { code: "companion_identity_mismatch" });
+    const { cameras, ...scalars } = payload || {};
+    this.session = { ...this.session, ...copyJsonValue(scalars), camera_ids: this.selectedCameraIds.slice(),
+      cameras: cameras === undefined ? this.session?.cameras || {} : compactCameraStates(cameras, this.selectedCameraIds) };
+  }
+
+  _membersReady(payload) {
+    return this.selectedCameraIds.length < 2 || this.selectedCameraIds.every((id) => {
+      const member = payload?.cameras?.[id];
+      return member?.camera_id === id && member.readiness?.recorder_ready === true && member.readiness?.tracking_ready === true;
+    });
+  }
+
+  async start({ cameraId = this.selectedCameraId, cameraIds = this.selectedCameraIds.length ? this.selectedCameraIds : undefined, phoneCaptureId = null, clientRequestId = null, browserCapture = null } = {}) {
     if (this.hasLiveSession) throw new CompanionCaptureError("A static companion capture is already active.", { code: "companion_capture_active" });
     const camera = this.cameras.find((item) => item.camera_id === cameraId);
     if (!this.camerasAvailable || !camera || camera.available !== true) {
       throw new CompanionCaptureError("Choose an available room camera before starting the paired capture.", { code: "companion_camera_required" });
     }
+    this.selectCameras(cameraId, normalizeCameraIds(cameraId, cameraIds));
     const requestedPhoneCaptureId = safeString(phoneCaptureId) || this.phoneCaptureId || this.reservePhoneCaptureId();
     if (!requestedPhoneCaptureId) throw new CompanionCaptureError("A phone capture ID is required before starting the static companion.", { code: "phone_capture_id_required" });
     const reusableRequestId = this.phoneCaptureId === requestedPhoneCaptureId ? this.clientRequestId : null;
@@ -441,19 +525,22 @@ export class CompanionCapture {
         timeoutMs: this.limits.startTimeoutMs,
         body: {
           camera_id: cameraId,
+          camera_ids: this.selectedCameraIds.slice(),
           phone_capture_id: requestedPhoneCaptureId,
           client_request_id: this.clientRequestId,
           clock_probes: this.clockProbes.slice(),
         },
       });
-      this.session = copyJsonValue(payload || {});
+      // Retain only the returned session address for idempotent stop if identity validation fails.
+      if (payload?.session_id) this.session = { session_id: payload.session_id };
+      this._adopt(payload, { initial: true });
       const staticReady = statusValue(payload) === "recording"
         && statusHealthy(payload, "video_status", { required: true })
-        && statusHealthy(payload, "tracking_status", { required: true });
+        && statusHealthy(payload, "tracking_status", { required: true }) && this._membersReady(payload);
       if (!staticReady || !payload?.session_id) {
         if (payload?.session_id) {
           const cleanup = await this._stopRequest("phone_start_failed", { bestEffort: true });
-          if (cleanup) this.session = { ...this.session, ...copyJsonValue(cleanup) };
+          if (cleanup) this._adopt(cleanup);
         }
         throw new CompanionCaptureError("The selected static camera did not reach recording and tracking ready state.", { code: "companion_not_ready", status: payload?.status || null });
       }
@@ -464,6 +551,10 @@ export class CompanionCapture {
       return this.status;
     } catch (error) {
       this._stopHeartbeat();
+      if (this.session?.session_id && !TERMINAL_STATUSES.has(statusValue(this.session))) {
+        const cleanup = await this._stopRequest("phone_start_failed", { bestEffort: true });
+        if (cleanup) { try { this._adopt(cleanup); } catch (_) { /* lease/retry remains explicit */ } }
+      }
       this._setError(error, error?.code || "companion_start_failed");
       this.state = "failed";
       this._emitState();
@@ -497,8 +588,8 @@ export class CompanionCapture {
         timeoutMs: this.limits.heartbeatTimeoutMs,
         body: { phone_capture_id: this.phoneCaptureId, clock_probes: this.clockProbes.slice(-1) },
       });
-      this.session = { ...this.session, ...copyJsonValue(payload || {}) };
-      if (TERMINAL_STATUSES.has(statusValue(payload)) || !statusHealthy(payload, "video_status", { required: true }) || !statusHealthy(payload, "tracking_status", { required: true })) {
+      this._adopt(payload);
+      if (TERMINAL_STATUSES.has(statusValue(payload)) || !statusHealthy(payload, "video_status", { required: true }) || !statusHealthy(payload, "tracking_status", { required: true }) || !this._membersReady(payload)) {
         throw new CompanionCaptureError("The static companion camera or tracking stream became unavailable.", { code: "companion_stream_lost", status: payload?.status || null });
       }
       this.lastHeartbeat = {
@@ -620,7 +711,7 @@ export class CompanionCapture {
       const remainingForRequest = Math.max(1, deadline - this._nowMonotonicMs());
       if (remainingForRequest <= 1) break;
       payload = await this._requestJson(`/api/companion-captures/${encodeURIComponent(this.session.session_id)}`, { timeoutMs: Math.min(this.limits.stopTimeoutMs, remainingForRequest) });
-      this.session = { ...this.session, ...copyJsonValue(payload || {}) };
+      this._adopt(payload);
       this._emitState();
     }
     return payload;
@@ -638,13 +729,13 @@ export class CompanionCapture {
       await this._collectClockProbes("stop", 5, { strict: false });
       try {
         const payload = await this._stopRequest(reason);
-        this.session = { ...this.session, ...copyJsonValue(payload || {}) };
+        this._adopt(payload);
         this.state = statusValue(payload) === "finalizing" ? "finalizing" : (statusValue(payload) === "failed" ? "failed" : "stopped");
         this._emitState();
         if (this.state === "finalizing") {
           try {
             const finalPayload = await this._pollFinalization();
-            this.session = { ...this.session, ...copyJsonValue(finalPayload || {}) };
+            this._adopt(finalPayload);
             this.state = statusValue(finalPayload) === "stopped" ? "stopped" : statusValue(finalPayload) === "failed" ? "failed" : "finalizing";
             if (this.state === "finalizing") this.error = new CompanionCaptureError("Static capture finalization is still pending; the phone bundle remains available for retry or download.", { code: "companion_finalization_pending" });
           } catch (error) {

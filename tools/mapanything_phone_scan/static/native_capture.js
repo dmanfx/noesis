@@ -1,3 +1,5 @@
+import { cameraSelection, changeCameraSelection, cameraSelectionMarkup, nativeCameraSelection, nativeCameraIndices } from "./camera_selection.js?v=1.0.0";
+
 /* Native owns acquisition, paired-session leases, files and upload lifetime.
  * This module sends small commands and displays snapshots; it never transports
  * recordings, supplies acquisition timestamps, or starts a second static session.
@@ -240,6 +242,11 @@ export function validateNativeConfiguration(values) {
     if (!Number.isInteger(value) || value < -1 || value > 255) throw new Error("Select a valid camera from the phone's current inventory.");
     configuration[key] = value;
   }
+  if (values.extra_room_camera_index !== undefined) {
+    const value = Number(values.extra_room_camera_index);
+    if (!Number.isInteger(value) || value < -1 || value > 255 || value >= 0 && (configuration.room_camera_index < 0 || value === configuration.room_camera_index)) throw new Error("Choose a distinct additional room camera and a primary camera.");
+    configuration.extra_room_camera_index = value;
+  }
   const minutes = Number(values.imu_minutes);
   if (!Number.isInteger(minutes) || minutes < 1 || minutes > 5) throw new Error("The sensor diagnostic must be between 1 and 5 minutes.");
   configuration.imu_minutes = minutes;
@@ -331,6 +338,7 @@ export class NativeCaptureUI {
     this.snapshot = null;
     this.configDirty = false;
     this.pendingConfiguration = null;
+    this.roomSelection = null;
     this.intentError = null;
     this.captureIntent = { schema: WALK_INTENT_SCHEMA, mode: "reconstruction", target_scan_id: null, carry_protocol: "coverage", accuracy_target_m: 0.1 };
     this.bridge = new NativeBridge({ platform, onSnapshot: (snapshot) => this.receive(snapshot), onError });
@@ -423,7 +431,7 @@ export class NativeCaptureUI {
         <div class="tool-grid">
           <label class="tool-field tool-wide"><span>Trusted Noesis server</span><input id="native-server" class="text-input" type="url" inputmode="url" autocomplete="off" spellcheck="false" required placeholder="https://your-noesis-host:8789" /></label>
           <label class="tool-field"><span>Phone camera</span><select id="native-camera" class="text-input"><option value="-1">Check phone to load cameras…</option></select></label>
-          <label class="tool-field"><span>Static room camera</span><select id="native-room-camera" class="text-input"><option value="-1">Connect to load room cameras…</option></select></label>
+          <div id="native-camera-picker" class="tool-wide"></div>
         </div>
         <p id="native-room-status" class="tool-note">No room-camera status yet.</p>
         <div class="tool-actions"><button type="submit" class="secondary-button" data-native-action="configure" disabled>Apply setup</button><button type="button" class="secondary-button" data-native-action="checkConnection" disabled>Check connection</button></div>
@@ -451,20 +459,42 @@ export class NativeCaptureUI {
 
   configuration() {
     const value = (selector) => this.captureRoot.querySelector(selector).value;
-    return validateNativeConfiguration({ server: value("#native-server"), camera_index: value("#native-camera"), room_camera_index: value("#native-room-camera"), imu_minutes: value("#native-imu-minutes") });
+    const rooms = nativeCameraIndices(this.roomSelection || nativeCameraSelection(this.snapshot || {}), this.snapshot?.room_cameras || []);
+    return validateNativeConfiguration({ server: value("#native-server"), camera_index: value("#native-camera"), ...rooms, imu_minutes: value("#native-imu-minutes") });
+  }
+
+  renderCameraPicker() {
+    const selection = this.roomSelection || nativeCameraSelection(this.snapshot || {});
+    selection.locked = Boolean(this.snapshot?.active || this.snapshot?.busy || this.snapshot?.imu_active || this.pendingConfiguration);
+    const picker = this.captureRoot?.querySelector("#native-camera-picker");
+    if (!picker) return;
+    picker.innerHTML = cameraSelectionMarkup(selection, { fieldsetId: "native-recording-cameras", primarySelectId: "native-primary-camera" });
   }
 
   bind() {
     this.captureRoot?.querySelector("#native-open-library")?.addEventListener("click", () => this.onOpenLibrary());
     const form = this.captureRoot?.querySelector("#native-configuration");
-    form?.addEventListener("input", () => { this.configDirty = true; this.updateButtons(); });
-    form?.addEventListener("change", () => { this.configDirty = true; this.updateButtons(); });
+    const markDirty = (event) => { if (event.target.closest?.("#native-camera-picker")) return; this.configDirty = true; this.updateButtons(); };
+    form?.addEventListener("input", markDirty);
+    form?.addEventListener("change", markDirty);
+    this.captureRoot?.querySelector("#native-camera-picker")?.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!target.matches("input[data-camera-id], select[data-camera-primary]")) return;
+      try {
+        this.roomSelection = changeCameraSelection(this.roomSelection || nativeCameraSelection(this.snapshot || {}), target.matches("[data-camera-primary]")
+          ? { primaryId: target.value } : { cameraId: target.dataset.cameraId, checked: target.checked });
+        this.configDirty = true;
+      } catch (error) { this.onError(error); }
+      this.renderCameraPicker();
+      this.updateButtons();
+    });
     form?.addEventListener("submit", (event) => {
       event.preventDefault();
       try {
         const configuration = this.configuration();
         this.pendingConfiguration = configuration;
         if (!this.perform("configure", configuration)) this.pendingConfiguration = null;
+        this.renderCameraPicker();
       } catch (error) { this.onError(error); }
     });
     for (const root of [this.captureRoot, this.libraryRoot]) root?.addEventListener("click", (event) => {
@@ -498,18 +528,25 @@ export class NativeCaptureUI {
       // Older hosts may not echo imu_minutes; camera and server changes still
       // require an exact acknowledgement before replacing an edited form.
       if (snapshot.server === requested.server && snapshot.camera_index === requested.camera_index && snapshot.room_camera_index === requested.room_camera_index
+          && (requested.extra_room_camera_index === undefined || snapshot.extra_room_camera_index === requested.extra_room_camera_index)
           && (snapshot.imu_minutes === undefined || Number(snapshot.imu_minutes) === requested.imu_minutes)) {
         this.configDirty = false;
         this.pendingConfiguration = null;
       }
     }
+    const receivedSelection = nativeCameraSelection(snapshot);
+    this.roomSelection = !this.configDirty || !this.roomSelection ? receivedSelection
+      : cameraSelection({ cameras: snapshot.room_cameras, selectedIds: this.roomSelection.ids, primaryId: this.roomSelection.primaryId,
+        maxCameras: receivedSelection.advertisedMax, supportedMax: receivedSelection.maximum, locked: receivedSelection.locked });
+    this.renderCameraPicker();
     const setText = (root, selector, value) => { const element = root?.querySelector(selector); if (element) element.textContent = describe(value); };
     setText(this.captureRoot, "#native-status", snapshot.status || "Native status received");
     setText(this.captureRoot, "#native-detail", snapshot.detail);
     setText(this.captureRoot, "#native-room-status", snapshot.room_camera_status || "No room-camera status reported.");
     setText(this.captureRoot, "#native-imu-progress", snapshot.imu_active ? snapshot.imu_progress || "Recording native sensor evidence…" : snapshot.imu_progress || "No sensor diagnostic running.");
     const label = (camera) => typeof camera === "string" ? camera : camera?.label || camera?.name || camera?.camera_id || camera?.id || "Not selected";
-    setText(this.captureRoot, "#native-camera-summary", snapshot.cameras.length ? `Phone: ${label(snapshot.cameras[snapshot.camera_index])} · Room: ${label(snapshot.room_cameras[snapshot.room_camera_index])}` : "Start with Check phone. Connection settings are below when you need them.");
+    const extraRoom = snapshot.room_cameras[snapshot.extra_room_camera_index];
+    setText(this.captureRoot, "#native-camera-summary", snapshot.cameras.length ? `Phone: ${label(snapshot.cameras[snapshot.camera_index])} · Primary: ${label(snapshot.room_cameras[snapshot.room_camera_index])}${extraRoom ? ` + ${label(extraRoom)} · BOTH static cameras required` : ""}` : "Start with Check phone. Connection settings are below when you need them.");
     if (snapshot.cameras.length && (!previous?.cameras?.length || this.configDirty) && snapshot.camera_index < 0) {
       const setup = this.captureRoot?.querySelector("#native-setup");
       if (setup) setup.open = true;
@@ -521,7 +558,6 @@ export class NativeCaptureUI {
     if (!this.configDirty && this.captureRoot) {
       if (typeof snapshot.server === "string") this.captureRoot.querySelector("#native-server").value = snapshot.server;
       this.captureRoot.querySelector("#native-camera").innerHTML = cameraOptions(snapshot.cameras, snapshot.camera_index);
-      this.captureRoot.querySelector("#native-room-camera").innerHTML = cameraOptions(snapshot.room_cameras, snapshot.room_camera_index, { room: true });
       // Retained historical sessions must not widen the short default.
       const diagnosticMinutes = Number(snapshot.imu_minutes);
       if (Number.isInteger(diagnosticMinutes) && diagnosticMinutes >= 1 && diagnosticMinutes <= 5) this.captureRoot.querySelector("#native-imu-minutes").value = diagnosticMinutes;

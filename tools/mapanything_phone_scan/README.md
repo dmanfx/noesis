@@ -430,9 +430,15 @@ remain separate.
 ## Paired static-camera capture
 
 The native RoomWalk companion is the selected phone route. For path refinement
-(and optional reconstruction pairing), select the room camera, open **Capture**,
-and use **Record**. Static encoded
-video and canonical tracking must be ready before the phone recording starts.
+(and optional reconstruction pairing), check the **Cameras to record** for the
+walk, then choose a separate **Primary alignment reference** from those checked
+cameras before opening **Capture** and using **Record**. For Family Room ↔ Kitchen coverage, check both cameras
+and record one continuous phone take through the doorway in both directions.
+RoomWalk 0.5.1 provides this checklist over server 1.14.0's two-camera capture; older captures
+remain exactly single-camera evidence. The primary still chooses the default
+reconstruction/alignment target; the second camera does not change that target.
+Each selected camera's encoded video and canonical tracking must be ready
+before the phone recording starts; failure of either stops the whole session.
 **Stop and save** closes both recordings; **Upload** sends the
 phone bundle with the exact saved static-session reference. Interrupted uploads
 can retry the same saved archive. Keep the app in the foreground during capture.
@@ -457,17 +463,19 @@ The browser recorder also supports paired capture. Existing-video uploads remain
 available separately. Its sequence is:
 
 1. Select **Record phone walk**, allow camera and motion access, and choose the
-   physical **Static room camera** installed in the room. The browser lists
+   **Cameras to record** using the checkboxes, then the primary alignment reference.
+   The current server supports up to two checked cameras; unchecking all keeps
+   reconstruction phone-only. The browser lists
    only cameras resolved through the active native DS9.1 source configuration.
 2. Select **Start recording**. The phone recorder starts only after the
-   selected camera's original encoded video is arriving and its canonical
+   selected cameras' original encoded video is arriving and each canonical
    tracking observer is ready. A camera that is merely configured, or a
    tracking status that is stale or partial, does not pass the start gate.
 3. Walk with the phone while the page sends bounded clock probes and heartbeats.
    **Mark event** is optional and records a user label plus the server receipt
    clock for a visible moment such as a doorway or turn.
 4. Select **Stop and save** when the walk is complete. The page finalizes both sides of
-   the session and exposes saved links for the static Matroska video, packet
+   the session and exposes camera-scoped links for each static Matroska video, packet
    timing, tracking/world records, calibration/runtime provenance, clock
    exchanges, and session metadata. Keep the tab open until saving finishes.
    If upload fails, retry or download the phone bundle from that tab. Closing
@@ -476,7 +484,11 @@ available separately. Its sequence is:
 
 There is one active paired session at a time. Each session is limited to 900
 seconds and the server lease is renewed for at most 45 seconds per heartbeat;
-an abandoned tab therefore cannot hold the lane indefinitely. The static
+an abandoned tab therefore cannot hold the lane indefinitely. Up to two cameras
+share that session, lease and phone archive; video-byte, packet and tracking
+record budgets are partitioned across them, not multiplied. Exact `camera_ids`
+and the primary `camera_id` survive saved captures, packaging and upload retries;
+a changed or missing pair fails closed. The static
 recording is evidence for later alignment, calibration, or validation and is
 kept separate from phone-only view selection and provider fusion. It does not
 change live tracking or establish a common acquisition clock. Browser callback

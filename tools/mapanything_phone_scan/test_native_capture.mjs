@@ -105,6 +105,10 @@ test("native configuration requires a trusted origin and bounded diagnostic inpu
   }
   assert.throws(() => validateNativeConfiguration({ ...values, imu_minutes: 180 }), /1 and 5/);
   assert.throws(() => validateNativeConfiguration({ ...values, camera_index: 1.5 }), /valid camera/);
+  assert.equal(validateNativeConfiguration({ ...values, extra_room_camera_index: "0" }).extra_room_camera_index, 0);
+  assert.equal(validateNativeConfiguration({ ...values, extra_room_camera_index: -1 }).extra_room_camera_index, -1);
+  for (const extra_room_camera_index of [1, 1.5, 256, -2]) assert.throws(() => validateNativeConfiguration({ ...values, extra_room_camera_index }), /distinct additional/);
+  assert.throws(() => validateNativeConfiguration({ ...values, room_camera_index: -1, extra_room_camera_index: 0 }), /primary/);
 });
 
 test("saved capture markup escapes names and IDs and fails closed on disabled actions", () => {

@@ -134,6 +134,20 @@ def _session_context(
     session_id = str(session.get("session_id") or "").strip()
     camera = session.get("camera") if isinstance(session.get("camera"), Mapping) else {}
     camera_id = str(camera.get("camera_id") or session.get("camera_id") or "").strip()
+    selected_camera = _companion_value(companion, "camera_id", "camera.camera_id")
+    cameras = session.get("cameras")
+    if isinstance(cameras, Mapping):
+        selected_camera = str(selected_camera or camera_id)
+        row = cameras.get(selected_camera)
+        if selected_camera not in session.get("camera_ids", []) or not isinstance(row, Mapping) or row.get("camera_id") != selected_camera:
+            raise PairedStaticReferenceError("selected camera is not a member of the companion session")
+        session = {
+            **session,
+            "camera": {key: row[key] for key in ("camera_id", "source_id", "label", "source_reference", "authority") if key in row},
+            "camera_id": selected_camera,
+            **{key: row.get(key, {}) for key in ("artifacts", "recorder", "tracking", "provenance")},
+        }
+        camera_id = selected_camera
     if not session_id or not camera_id or session_dir.name != session_id:
         raise PairedStaticReferenceError("companion session lacks session_id or camera_id")
     supplied_session = _companion_value(companion, "session_id", "id")

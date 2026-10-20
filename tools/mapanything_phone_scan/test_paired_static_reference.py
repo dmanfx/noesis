@@ -296,6 +296,56 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _multi_camera_fixture(tmp_path: Path) -> dict[str, Any]:
+    fixture = _fixture(tmp_path)
+    session = fixture["session"]
+    member = {**session["camera"], "recorder": session["recorder"], "artifacts": {}}
+    member_dir = fixture["session_dir"] / "cameras" / "1"
+    member_dir.mkdir(parents=True)
+    for key, filename in session["artifacts"].items():
+        shutil.move(fixture["session_dir"] / filename, member_dir / filename)
+        member["artifacts"][key] = "cameras/1/" + filename
+    session.update({
+        "camera_id": "kitchen", "camera": {"camera_id": "kitchen"},
+        "camera_ids": ["kitchen", CAMERA_ID],
+        "cameras": {"kitchen": {"camera_id": "kitchen", "artifacts": {}, "recorder": {}}, CAMERA_ID: member},
+        "artifacts": {}, "recorder": {},
+    })
+    _write_json(fixture["session_dir"] / "session.json", session)
+    return fixture
+
+
+def test_paired_reference_selects_member_artifacts_and_exact_calibration(tmp_path: Path) -> None:
+    fixture = _multi_camera_fixture(tmp_path)
+    context = paired._session_context(fixture["scan_dir"], fixture["session_dir"], fixture["companion"])
+    assert context["camera_id"] == CAMERA_ID
+    assert context["video_path"] == fixture["session_dir"] / "cameras/1/static_camera.mkv"
+    assert context["phone_archive_sha256"] == PHONE_ARCHIVE_SHA256
+    context["session"]["_session_dir"] = str(fixture["session_dir"])
+    calibration = paired._calibration_context(context["session"], fixture["calibration_path"], CAMERA_ID)
+    dewarper = paired._dewarper_context(context["session"], calibration)
+    assert dewarper["sha256"] == fixture["dewarper_hash"]
+
+
+@pytest.mark.parametrize("mutation", ["nonmember", "wrong_member_id", "partial", "archive", "escape"])
+def test_paired_member_selection_preserves_authority_checks(tmp_path: Path, mutation: str) -> None:
+    fixture = _multi_camera_fixture(tmp_path)
+    session = fixture["session"]
+    if mutation == "nonmember":
+        fixture["companion"]["camera_id"] = "unknown"
+    elif mutation == "wrong_member_id":
+        session["cameras"][CAMERA_ID]["camera_id"] = "different"
+    elif mutation == "partial":
+        session["cameras"][CAMERA_ID]["recorder"]["partial"] = True
+    elif mutation == "archive":
+        fixture["companion"]["phone"]["archive_sha256"] = "b" * 64
+    else:
+        session["cameras"][CAMERA_ID]["artifacts"]["static_video"] = "../elsewhere.mkv"
+    _write_json(fixture["session_dir"] / "session.json", session)
+    with pytest.raises(paired.PairedStaticReferenceError):
+        paired._session_context(fixture["scan_dir"], fixture["session_dir"], fixture["companion"])
+
+
 class _FixtureModel:
     def to(self, *_args: Any, **_kwargs: Any) -> "_FixtureModel":
         return self

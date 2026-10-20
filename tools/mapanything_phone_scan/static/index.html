@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101312" />
     <title>Noesis · RoomWalk</title>
-    <link rel="stylesheet" href="/static/style.css?v=2.3.0" />
+    <link rel="stylesheet" href="/static/style.css?v=2.4.0" />
     <script type="importmap">
       {
         "imports": {
@@ -96,7 +96,7 @@
           <input id="existing-video" class="visually-hidden" type="file" accept="video/*" />
           <label id="sensor-bundle-label" class="secondary-button capture-button" for="sensor-bundle">Import camera + IMU evidence</label>
           <input id="sensor-bundle" class="visually-hidden" type="file" accept=".zip,.tar,.tgz,.tar.gz,application/zip,application/x-tar,application/gzip" />
-          <p class="microcopy sensor-microcopy"><b>Native paired capture:</b> the RoomWalk Android companion can retain phone video, IMU, and a selected static room camera together. RGB reconstruction works without a calibration job; basic calibration and sensor diagnostics live under Setup.</p>
+          <p class="microcopy sensor-microcopy"><b>Native paired capture:</b> check the static cameras to record for your room-to-room walk, up to the server's advertised limit. Choose the primary alignment reference separately from the checked cameras; changing the reference does not change the recording set. Recording together does not establish acquisition synchronization. RGB reconstruction also works phone-only without a calibration job; basic calibration and sensor diagnostics live under Setup.</p>
           <p id="phone-calibration-note" class="microcopy hidden" role="note"></p>
           <p class="microcopy"><b>Auto-saved:</b> each uploaded walk and every generated asset stay on this Noesis machine. Starting a new walk never overwrites an older one.</p>
         </div>
@@ -111,11 +111,8 @@
               <p id="browser-capture-status" class="browser-capture-status">Camera and motion permission are required.</p>
               <p id="browser-capture-error" class="error-box hidden"></p>
               <div class="companion-capture-box">
-                <label class="field-label" for="companion-camera-select">Static room camera</label>
-                <select id="companion-camera-select" class="text-input companion-camera-select" disabled>
-                  <option value="">Loading room cameras…</option>
-                </select>
-                <p id="companion-camera-status" class="microcopy">Choose the physically installed room camera before starting the walk.</p>
+                <div id="companion-camera-picker"><p class="microcopy">Connect to load cameras to record.</p></div>
+                <p id="companion-camera-status" class="microcopy">Check the cameras to record, then choose a checked camera as the primary reference.</p>
                 <p id="companion-capture-status" class="companion-capture-status">Static capture is required before phone recording starts.</p>
                 <p id="companion-heartbeat-status" class="microcopy">No static session yet</p>
               </div>
@@ -171,6 +168,6 @@
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script type="module" src="/static/app.js?v=2.2.0"></script>
+    <script type="module" src="/static/app.js?v=2.4.0"></script>
   </body>
 </html>

@@ -27,6 +27,9 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
     private ImuCalibrationRecorder imuRecorder;
     private PairedCapture paired;
     private final Selection roomCamera=new Selection();
+    private final Selection extraRoomCamera=new Selection();
+    private boolean roomMultiCameraCapture;
+    private String requestedExtraRoomCameraId="";
     private JSONArray roomCameras=new JSONArray();
     private String roomCamerasOrigin="";
     private final TextState roomCameraStatus=new TextState();
@@ -171,6 +174,8 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
                 .put("status",status.getText()).put("detail",detail.getText()).put("cameras",rows)
                 .put("camera_index",camera.getSelectedItemPosition()).put("room_cameras",roomCameras)
                 .put("room_camera_index",roomCamera.getSelectedItemPosition()).put("room_camera_status",roomCameraStatus.getText())
+                .put("extra_room_camera_index",extraRoomCamera.getSelectedItemPosition()).put("multi_camera_capture",roomMultiCameraCapture).put("supports_camera_ids",true)
+                .put("requested_extra_room_camera_id",requestedExtraRoomCameraId)
                 .put("active",active).put("busy",busy||imuPreparing||captureDialog!=null||pendingCaptureViewer).put("imu_active",imuActive).put("imu_preparing",imuPreparing)
                 .put("imu_progress",imuProgress.getText()).put("imu_minutes",imuMinutes.getText())
                 .put("supports_target_reference",true)
@@ -198,9 +203,10 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
                 BundleTools.endpoint(destination,"/");
                 if(args.has("camera_index")){camera.setSelection(args.getInt("camera_index"));if(selectedCamera()!=null)detail.setText(cameraDescription(selectedCamera()));}
                 if(args.has("room_camera_index")){roomCamera.setSelection(args.getInt("room_camera_index"));JSONObject room=selectedRoomCamera();getPreferences(0).edit().putString("room_camera_id",room==null?"":room.optString("camera_id")).apply();}
+                if(args.has("extra_room_camera_index")){extraRoomCamera.setSelection(args.getInt("extra_room_camera_index"));JSONObject extra=roomCameras.optJSONObject(extraRoomCamera.getSelectedItemPosition());requestedExtraRoomCameraId=extra==null?"":extra.optString("camera_id");getPreferences(0).edit().putString("extra_room_camera_id",requestedExtraRoomCameraId).apply();}
                 if(args.has("imu_minutes")){int minutes=args.getInt("imu_minutes");if(minutes<1||minutes>180)throw new IOException("Choose 1–180 minutes for diagnostics or stationary noise");imuMinutes.setText(Integer.toString(minutes));}
                 boolean changed=!destination.equals(server.getText());server.setText(destination);getPreferences(0).edit().putString("server",destination).apply();
-                if(changed){roomCameras=new JSONArray();roomCamerasOrigin="";shell.connect(destination);}
+                if(changed){roomCameras=new JSONArray();roomCamerasOrigin="";roomMultiCameraCapture=false;shell.connect(destination);}
                 checkConnection();break;
             case "capture":
                 String requestedMode=args.optString("mode",WalkIntent.RECONSTRUCTION);
@@ -287,7 +293,7 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
     private void updateButtons(){
         JSONObject c=selectedCamera();boolean homeReady=!active&&!imuActive&&!imuPreparing&&!busy&&captureDialog==null&&!pendingCaptureViewer;
         boolean previewAvailable=preview!=null&&preview.isAvailable()&&previewReady;
-        boolean canStart=!active&&!imuActive&&!focusBusy&&!busy&&!viewerStarting&&!viewerClosing&&previewAvailable&&(!WalkIntent.requiresPair(captureMode)||selectedRoomCamera()!=null);
+        boolean canStart=!active&&!imuActive&&!focusBusy&&!busy&&!viewerStarting&&!viewerClosing&&previewAvailable&&(calibrationCapture()||roomSelectionValid())&&(!WalkIntent.requiresPair(captureMode)||selectedRoomCamera()!=null);
         captureButton.setEnabled(homeReady&&c!=null&&c.optInt("preview_width")>0&&c.optInt("preview_height")>0);
         if(testButton!=null){
             testButton.setEnabled(canStart&&(fullWalkAvailable(c)||standardTestUseCase(c)>=0));
@@ -485,6 +491,7 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
         try{
             if(previewSurface==null||!previewSurface.isValid()||captureDialog!=dialog)throw new IOException("The camera view closed before recording started");
             JSONObject room=selectedRoomCamera();
+            JSONArray roomIds=calibrationCapture()?null:selectedRoomCameraIds();
             if(WalkIntent.requiresPair(captureMode)&&room==null)throw new IOException("Choose an available room camera before path refinement");
             if(WalkIntent.requiresPair(captureMode)&&!pathReferenceMatchesRoomCamera(room))throw new IOException("The selected PCF is bound to a different room camera");
             String id=new SimpleDateFormat("yyyyMMdd-HHmmss",Locale.US).format(new Date())+"-"+UUID.randomUUID().toString().substring(0,8);
@@ -502,10 +509,12 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
             if(walkIntent==null)throw new IOException("Walk intent is missing; choose reconstruction or path refinement again");
             WalkIntent.validate(walkIntent);
             BundleTools.writeJson(new File(captureDir,"walk_intent.json"),walkIntent);
-            pairedRoomLabel=room==null?"unpaired reconstruction":room.optString("label",room.optString("camera_id"));artifact=null;lastScanId=null;viewerStarting=true;
+            pairedRoomLabel=room==null?"unpaired reconstruction":room.optString("label",room.optString("camera_id"));
+            if(roomIds!=null&&roomIds.length()>1){JSONObject extra=roomCameras.optJSONObject(extraRoomCamera.getSelectedItemPosition());pairedRoomLabel+=" + "+extra.optString("label",extra.optString("camera_id"))+" (primary: "+room.optString("label",room.optString("camera_id"))+")";}
+            artifact=null;lastScanId=null;viewerStarting=true;
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);status.setText(room==null?"Starting reconstruction capture…":"Starting paired room capture…");captureStatus.setText(room==null?"Starting phone…":"Starting room camera…");captureStats.setText(pairedRoomLabel);updateButtons();
             if(room==null){pairFinished=true;onPairReady(captureDir,new JSONObject().put("paired",false));}
-            else paired.start(captureDir,server.getText().toString().trim(),room.getString("camera_id"));
+            else paired.start(captureDir,server.getText().toString().trim(),room.getString("camera_id"),roomIds);
         }catch(Exception error){active=false;getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);finishCaptureViewer(dialog);fail("Could not start recording",error);}
     }
     @Override public void onPairReady(File directory,JSONObject reference){
@@ -610,6 +619,19 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
         if(roomCamera==null||server==null||!roomCamerasOrigin.equals(server.getText().toString().trim().replaceAll("/+$","")))return null;
         JSONObject row=roomCameras.optJSONObject(roomCamera.getSelectedItemPosition());return row!=null&&row.optBoolean("available")?row:null;
     }
+    private JSONArray selectedRoomCameraIds()throws Exception{
+        JSONObject primary=selectedRoomCamera();int index=extraRoomCamera.getSelectedItemPosition();
+        if(index<0&&!requestedExtraRoomCameraId.isEmpty())throw new IOException("The requested additional camera is unavailable; explicitly choose None or reconnect both cameras");
+        if(primary==null){if(index>=0)throw new IOException("Choose a primary room camera for the two-camera walk");return null;}
+        JSONArray ids=new JSONArray().put(primary.getString("camera_id"));
+        if(index>=0){
+            JSONObject extra=roomCameras.optJSONObject(index);
+            if(!roomMultiCameraCapture||extra==null||!extra.optBoolean("available"))throw new IOException("Both room cameras and two-camera capture must be available");
+            ids.put(extra.getString("camera_id"));
+        }
+        return PairedCapture.cameraIds(primary.getString("camera_id"),ids);
+    }
+    private boolean roomSelectionValid(){try{selectedRoomCameraIds();return true;}catch(Exception error){return false;}}
     private void checkConnection(){
         final String destination=server.getText().toString().trim();getPreferences(0).edit().putString("server",destination).apply();busy=true;status.setText("Connecting and loading room cameras…");updateButtons();
         worker.execute(()->{try{
@@ -617,12 +639,15 @@ public final class MainActivity extends Activity implements CaptureEngine.Listen
             ui.post(()->{if(!destroyed)status.setText("Loading room cameras…");});
             Object value=BundleTools.requestJsonValue(this,destination,"/api/companion-captures/cameras",null,5000);if(!(value instanceof JSONObject))throw new IOException("Invalid room-camera inventory");
             JSONObject inventory=(JSONObject)value;JSONArray available=inventory.optJSONArray("cameras");final JSONArray rows=available==null?new JSONArray():available;
-            ui.post(()->{if(destroyed)return;roomCameras=rows;roomCamerasOrigin=destination.replaceAll("/+$","");ArrayList<String> labels=new ArrayList<>();int selected=-1;String prior=getPreferences(0).getString("room_camera_id","");
-                for(int i=0;i<rows.length();i++){JSONObject row=rows.optJSONObject(i);labels.add(row.optString("label",row.optString("camera_id")));if(prior.equals(row.optString("camera_id")))selected=i;}
+            ui.post(()->{if(destroyed)return;roomCameras=rows;roomCamerasOrigin=destination.replaceAll("/+$","");roomMultiCameraCapture=PairedCapture.multiCameraSupported(inventory);ArrayList<String> labels=new ArrayList<>();int selected=-1,extraSelected=-1;String prior=getPreferences(0).getString("room_camera_id",""),extraPrior=getPreferences(0).getString("extra_room_camera_id","");
+                for(int i=0;i<rows.length();i++){JSONObject row=rows.optJSONObject(i);labels.add(row.optString("label",row.optString("camera_id")));if(prior.equals(row.optString("camera_id")))selected=i;if(extraPrior.equals(row.optString("camera_id")))extraSelected=i;}
                 roomCamera.setSize(labels.size());if(!labels.isEmpty())roomCamera.setSelection(selected);
-                busy=false;status.setText(rows.length()>0?"RoomWalk is ready for paired capture":"Room camera unavailable");roomCameraStatus.setText(rows.length()>0?"Select the room camera matching this walk. Record starts phone video + IMU and the room recording.":inventory.optString("reason","No active room-camera source is available"));
+                extraRoomCamera.setSize(labels.size());extraRoomCamera.setSelection(extraSelected);
+                requestedExtraRoomCameraId=extraPrior;
+                busy=false;status.setText(rows.length()>0?"RoomWalk is ready for paired capture":"Room camera unavailable");roomCameraStatus.setText(rows.length()>0?roomMultiCameraCapture?"Choose a primary camera and an additional camera for a continuous two-room walk. BOTH must be ready before the phone starts.":"Select one primary room camera. This server does not advertise two-camera capture.":inventory.optString("reason","No active room-camera source is available"));
+                if(!extraPrior.isEmpty()&&extraSelected<0)roomCameraStatus.setText("Requested additional camera "+extraPrior+" is unavailable. Reconnect it, or explicitly choose None and Apply setup; recording will not silently become single-camera.");
                 JSONObject c=selectedCamera();detail.setText(c==null?"Check phone, choose the cameras, then open Capture.":cameraDescription(c));updateButtons();});
-        }catch(Exception error){ui.post(()->{if(destroyed)return;roomCameras=new JSONArray();roomCamerasOrigin="";roomCameraStatus.setText(error.getMessage());});fail("RoomWalk connection needs attention",error);}});
+        }catch(Exception error){ui.post(()->{if(destroyed)return;roomCameras=new JSONArray();roomCamerasOrigin="";roomMultiCameraCapture=false;roomCameraStatus.setText(error.getMessage());});fail("RoomWalk connection needs attention",error);}});
     }
     private void finalizePair(){
         if(captureDir==null)return;final File directory=captureDir;busy=true;status.setText("Finalizing the selected paired recording…");updateButtons();

@@ -37,7 +37,7 @@ def main() -> None:
     # Package the same UI and bounded viewer module closure as the server.
     # Native capture and saved takes remain available without a connection.
     static = root.parent / 'static'
-    for name in ('index.html', 'style.css', 'app.js', 'browser_capture.js', 'companion_capture.js', 'native_capture.js', 'calibration.js', 'path_comparison.js'):
+    for name in ('index.html', 'style.css', 'app.js', 'browser_capture.js', 'companion_capture.js', 'native_capture.js', 'camera_selection.js', 'calibration.js', 'path_comparison.js'):
         destination = build / 'assets/web/static' / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(static / name, destination)

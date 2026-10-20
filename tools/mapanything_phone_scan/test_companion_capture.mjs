@@ -5,6 +5,7 @@ import {
   COMPANION_CAPTURE_SCHEMA,
   CompanionCapture,
   CompanionCaptureError,
+  normalizeCameraIds,
 } from "./static/companion_capture.js";
 
 function response(body, status = 200) {
@@ -35,7 +36,7 @@ function makeHarness({ startResponse = null, heartbeatResponse = null, stopRespo
     ] });
     if (url.endsWith("/clock")) { now += 4; return response(clock()); }
     if (url === "/api/companion-captures" && options.method === "POST") return response(startResponse || {
-      session_id: "session-1", camera_id: "kitchen-rtsp", phone_capture_id: "phone-1", status: "recording",
+      session_id: "session-1", camera_id: JSON.parse(options.body).camera_id, phone_capture_id: JSON.parse(options.body).phone_capture_id, status: "recording",
       video_status: "recording", tracking_status: "recording", limits: { max_duration_s: 600, lease_s: 45 }, provenance: { revision: "rev-1" },
     });
     if (url.endsWith("/heartbeat")) {
@@ -68,6 +69,127 @@ async function startedCapture(harness, extra = {}) {
   await capture.start({ cameraId: "kitchen-rtsp", phoneCaptureId: "phone-1", browserCapture: browser });
   return { capture, browser };
 }
+
+function multiHarness({ inventoryMulti = true, changeStart = (value) => value, changeHeartbeat = (value) => value, changeStop = (value) => value } = {}) {
+  const h = makeHarness();
+  const base = h.fetchImpl;
+  let identity;
+  const session = (status = "recording") => ({ ...identity, session_id: "session-pair", status,
+    video_status: status, tracking_status: status,
+    cameras: Object.fromEntries(identity.camera_ids.map((id) => [id, { camera_id: id, readiness: { recorder_ready: true, tracking_ready: true }, artifact_urls: { video: `/${id}.mkv` } }])) });
+  h.fetchImpl = async (url, options = {}) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    if (url.endsWith("/cameras")) return response({ available: true, multi_camera_capture: inventoryMulti, max_cameras: 2,
+      cameras: ["kitchen-rtsp", "family-rtsp"].map((id) => ({ camera_id: id, label: id, available: true })) });
+    if (url === "/api/companion-captures" && options.method === "POST") {
+      h.calls.push({ url, body });
+      identity = { camera_id: body.camera_id, camera_ids: body.camera_ids, phone_capture_id: body.phone_capture_id };
+      return response(changeStart(session()));
+    }
+    if (url.endsWith("/heartbeat")) return response(changeHeartbeat(session()));
+    if (url.endsWith("/stop")) { h.calls.push({ url, body }); return response(changeStop(session("stopped"))); }
+    return base(url, options);
+  };
+  return h;
+}
+
+test("camera-set normalization preserves legacy singleton and rejects malformed or expanded sets", () => {
+  assert.deepEqual(normalizeCameraIds("kitchen"), ["kitchen"]);
+  assert.deepEqual(normalizeCameraIds("kitchen", ["kitchen", "family"]), ["family", "kitchen"]);
+  for (const ids of [null, [], ["family"], ["kitchen", "kitchen"], ["kitchen", "family", "third"], ["kitchen", 2]]) assert.throws(() => normalizeCameraIds("kitchen", ids));
+});
+
+test("idle checkbox clear selects phone-only; active session cannot clear its frozen set", async () => {
+  const h = multiHarness();
+  let emitted;
+  const c = new CompanionCapture({ ...h, onStateChange: (s) => { emitted = s; }, limits: { heartbeatMs: 60_000 } });
+  await c.listCameras();
+  c.selectCameras("kitchen-rtsp", ["family-rtsp", "kitchen-rtsp"]);
+  c.selectCameras("", []);
+  assert.equal(c.status.selectedCameraId, ""); assert.deepEqual(c.status.selectedCameraIds, []);
+  assert.deepEqual(emitted.selectedCameraIds, []); assert.equal(c.readyToStart, false);
+  assert.throws(() => c.selectCameras("", undefined));
+  c.selectCamera("kitchen-rtsp");
+  await c.start({ phoneCaptureId: "phone-pair" });
+  assert.throws(() => c.selectCameras("", []), /Stop/);
+  assert.deepEqual(c.status.selectedCameraIds, ["kitchen-rtsp"]);
+  await c.stop();
+});
+
+test("offline retained checks permit strict removals only and never start unavailable pairing", async () => {
+  const h = multiHarness(); const originalFetch = h.fetchImpl;
+  let offline = false;
+  h.fetchImpl = (url, options) => offline && url.endsWith("/cameras")
+    ? Promise.resolve(response({ available: false, multi_camera_capture: true, max_cameras: 2, cameras: [
+      { camera_id: "kitchen-rtsp", available: false }, { camera_id: "family-rtsp", available: false },
+    ] })) : originalFetch(url, options);
+  const c = new CompanionCapture(h);
+  await c.listCameras(); c.selectCameras("family-rtsp", ["family-rtsp", "kitchen-rtsp"]);
+  offline = true; await c.listCameras();
+  assert.deepEqual(c.status.selectedCameraIds, ["family-rtsp", "kitchen-rtsp"]);
+  c.selectCameras("kitchen-rtsp", ["kitchen-rtsp"]);
+  assert.equal(c.readyToStart, false);
+  await assert.rejects(() => c.start(), /available/);
+  assert.throws(() => c.selectCameras("kitchen-rtsp", ["kitchen-rtsp", "family-rtsp"]), /available/);
+  assert.throws(() => c.selectCameras("other", ["other"]), /available/);
+  c.selectCameras("", []); assert.deepEqual(c.status.selectedCameraIds, []);
+});
+
+test("explicit pair preserves primary, exact set, per-camera readiness and detached saved context", async () => {
+  const h = multiHarness();
+  const c = new CompanionCapture({ ...h, limits: { heartbeatMs: 60_000 } });
+  await c.listCameras();c.selectCameras("kitchen-rtsp", ["kitchen-rtsp", "family-rtsp"]);
+  await c.start({ phoneCaptureId: "phone-pair" });
+  assert.equal(c.state, "recording");assert.equal(c.companionContext().camera_id, "kitchen-rtsp");
+  assert.deepEqual(c.companionContext().camera_ids, ["family-rtsp", "kitchen-rtsp"]);
+  assert.deepEqual(h.calls.find((v) => v.body?.camera_ids)?.body.camera_ids, ["family-rtsp", "kitchen-rtsp"]);
+  const old = c.companionContext();old.camera_ids.pop();old.cameras["family-rtsp"].readiness.tracking_ready = false;
+  assert.equal(c.companionContext().camera_ids.length, 2);assert.equal(c.companionContext().cameras["family-rtsp"].readiness.tracking_ready, true);
+  assert.throws(() => c.selectCamera("family-rtsp"), /Stop/);
+  await c.heartbeat();await c.stop();assert.equal(c.state, "stopped");
+});
+
+test("pair fails closed when server ignores camera_ids or omits any current member readiness", async () => {
+  for (const changeStart of [
+    (s) => { delete s.camera_ids;return s; },
+    (s) => { delete s.cameras["family-rtsp"];return s; },
+    (s) => { s.cameras["family-rtsp"].readiness.tracking_ready = false;return s; },
+    (s) => { s.cameras["family-rtsp"].readiness.recorder_ready = "true";return s; },
+    (s) => ({ ...s, camera_id: "family-rtsp" }),
+    (s) => ({ ...s, phone_capture_id: "other" }),
+  ]) {
+    const h=multiHarness({ changeStart });const c=new CompanionCapture({ ...h, limits: { heartbeatMs: 60_000 } });
+    await c.listCameras();c.selectCameras("kitchen-rtsp",["family-rtsp","kitchen-rtsp"]);
+    await assert.rejects(() => c.start({phoneCaptureId:"phone-pair"}));
+    assert.notEqual(c.state,"recording");assert.ok(h.calls.some((v)=>v.url.endsWith('/stop')));
+  }
+});
+
+test("pair requires inventory capability and every selected camera remains bound on heartbeat/finalization", async () => {
+  const unsupported=multiHarness({inventoryMulti:false});const old=new CompanionCapture(unsupported);await old.listCameras();
+  assert.throws(()=>old.selectCameras("kitchen-rtsp",["kitchen-rtsp","family-rtsp"]),/support/);
+  for (const phase of ["heartbeat","stop"]) {
+    const change=(s)=>({...s,camera_ids:["kitchen-rtsp"]});
+    const h=multiHarness(phase==="heartbeat"?{changeHeartbeat:change}:{changeStop:change});
+    const c=new CompanionCapture({...h,limits:{heartbeatMs:60_000}});await c.listCameras();c.selectCameras("kitchen-rtsp",["family-rtsp","kitchen-rtsp"]);await c.start({phoneCaptureId:"phone-pair"});
+    if(phase==="heartbeat")await assert.rejects(()=>c.heartbeat(),/camera/);else await c.stop();
+    assert.equal(c.state,"failed");assert.deepEqual(c.companionContext().camera_ids,["family-rtsp","kitchen-rtsp"]);
+    if(c.needsServerStop) { h.fetchImpl=async()=>response({});c._stopHeartbeat(); }
+  }
+});
+
+test("realistic large server status is compacted without increasing the retained-reference budget", async () => {
+  const h=multiHarness({changeStart:(s)=>{
+    for(const row of Object.values(s.cameras)){
+      row.recorder={transient_status:"x".repeat(66000)};row.tracking={transient_status:"y".repeat(66000)};row.provenance={duplicate_full_runtime:"z".repeat(66000)};
+    }return s;
+  }});
+  const c=new CompanionCapture({...h,limits:{heartbeatMs:60_000}});await c.listCameras();c.selectCameras("kitchen-rtsp",["family-rtsp","kitchen-rtsp"]);await c.start({phoneCaptureId:"phone-pair"});
+  const ref=c.companionContext();assert.equal(ref.cameras["family-rtsp"].recorder,undefined);assert.equal(ref.cameras["family-rtsp"].provenance,undefined);
+  while(ref.clock_probes.length<96)ref.clock_probes.push({...ref.clock_probes[0]});
+  assert.ok(Buffer.byteLength(JSON.stringify(ref))<240000);assert.equal(Object.keys(ref.cameras).length,2);
+  await c.stop();
+});
 
 test("static readiness is explicit and start sends five clock probes before phone start", async () => {
   const harness = makeHarness();

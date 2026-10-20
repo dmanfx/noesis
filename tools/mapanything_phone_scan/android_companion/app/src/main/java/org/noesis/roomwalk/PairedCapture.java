@@ -9,6 +9,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.IOException;
 import java.util.UUID;
+import java.util.TreeSet;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
@@ -37,8 +38,11 @@ public final class PairedCapture {
     public boolean isActive(){return current!=null;}
     public static String phoneStopReason(JSONObject result){return result.optBoolean("partial")?result.optString("stop_reason","phone_interrupted"):"user";}
     public synchronized void start(File directory,String server,String cameraId){
+        start(directory,server,cameraId,null);
+    }
+    public synchronized void start(File directory,String server,String cameraId,JSONArray cameraIds){
         if(closing||current!=null)throw new IllegalStateException("A paired capture is already active");
-        Session session=new Session(directory,server,cameraId);current=session;
+        Session session=new Session(directory,server,cameraId,cameraIds);current=session;
         worker.execute(()->startSession(session));
     }
     public synchronized void stop(String reason){
@@ -55,6 +59,16 @@ public final class PairedCapture {
             if(new File(s.directory,FILE).exists())throw new IOException("Paired capture metadata already exists");
             save(s);state(s,"starting");
             if(!s.stopRequested&&!"ok".equals(object(transport.request(s.server,"/api/health",null,BundleTools.SETUP_TIMEOUT_MS)).optString("status")))throw new IOException("RoomWalk is not ready for paired capture");
+            if(!s.stopRequested&&s.cameraIds.length()>1){
+                JSONObject inventory=object(transport.request(s.server,"/api/companion-captures/cameras",null,5000));
+                if(!multiCameraSupported(inventory))throw new IOException("This server does not support two-camera capture");
+                JSONArray cameras=inventory.optJSONArray("cameras");
+                for(int i=0;i<s.cameraIds.length();i++){
+                    boolean available=false;
+                    for(int j=0;cameras!=null&&j<cameras.length();j++){JSONObject row=cameras.optJSONObject(j);if(row!=null&&s.cameraIds.getString(i).equals(row.optString("camera_id"))&&row.optBoolean("available"))available=true;}
+                    if(!available)throw new IOException("Every selected room camera must be available");
+                }
+            }
             for(int i=0;i<3&&!s.stopRequested;i++)clockProbe(s,transport,"start",3000);
             if(s.stopRequested){finishSession(s);return;}
             JSONObject body=startBody(s);
@@ -119,7 +133,7 @@ public final class PairedCapture {
             JSONArray rows=(JSONArray)value;JSONObject match=null;
             for(int i=0;i<rows.length();i++){
                 JSONObject row=rows.optJSONObject(i);if(row==null)continue;
-                if(s.captureId.equals(row.optString("phone_capture_id"))&&s.cameraId.equals(row.optString("camera_id"))){if(match!=null)throw new IOException("Multiple static sessions claim this phone capture");match=row;}
+                if(s.captureId.equals(row.optString("phone_capture_id"))&&s.cameraId.equals(row.optString("camera_id"))&&s.cameraIds.toString().equals(cameraIds(row).toString())){if(match!=null)throw new IOException("Multiple static sessions claim this phone capture");match=row;}
             }
             if(match==null){
                 // A cancelled start before the POST owns no server resources.
@@ -143,7 +157,7 @@ public final class PairedCapture {
     }
     private static JSONObject startBody(Session s)throws Exception{
         s.startSubmitted=true;save(s);
-        return new JSONObject().put("camera_id",s.cameraId).put("phone_capture_id",s.captureId).put("client_request_id",s.requestId).put("clock_probes",s.probes);
+        return new JSONObject().put("camera_id",s.cameraId).put("camera_ids",new JSONArray(s.cameraIds.toString())).put("phone_capture_id",s.captureId).put("client_request_id",s.requestId).put("clock_probes",s.probes);
     }
     private static JSONObject clockProbe(Session s,Transport transport,String name,int timeout)throws Exception{
         if(s.probes.length()>=MAX_PROBES)throw new IOException("Clock probe bound reached");
@@ -164,21 +178,59 @@ public final class PairedCapture {
         String id=value.optString("session_id"),camera=value.optString("camera_id"),phone=value.optString("phone_capture_id");
         if(!id.matches("companion-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}")||!s.cameraId.equals(camera)||!s.captureId.equals(phone)
                 ||s.sessionId!=null&&!s.sessionId.equals(id))throw new IOException("Companion response identity does not match this phone capture");
-        s.sessionId=id;s.serverStatus=value.optString("status","unknown");s.videoStatus=value.optString("video_status","unknown");s.trackingStatus=value.optString("tracking_status","unknown");
+        s.sessionId=id; // Exact owned address may be stopped even if the server ignored the requested set.
+        if(!s.cameraIds.toString().equals(cameraIds(value).toString()))throw new IOException("Companion response room-camera set does not match this phone capture");
+        s.serverStatus=value.optString("status","unknown");s.videoStatus=value.optString("video_status","unknown");s.trackingStatus=value.optString("tracking_status","unknown");
         s.provenance=value.optJSONObject("provenance");s.artifacts=value.optJSONObject("artifact_urls");
+        s.cameras=compactCameras(value.optJSONObject("cameras"),s.cameraIds);
         if(value.has("error")&&!value.isNull("error"))s.error=bounded(value.optString("error"));
     }
-    private static boolean healthy(Session s){return "recording".equals(s.serverStatus)&&healthyComponent(s.videoStatus)&&healthyComponent(s.trackingStatus);}
+    private static boolean healthy(Session s){
+        if(!"recording".equals(s.serverStatus)||!healthyComponent(s.videoStatus)||!healthyComponent(s.trackingStatus))return false;
+        for(int i=0;s.cameraIds.length()>1&&i<s.cameraIds.length();i++){
+            String id=s.cameraIds.optString(i);JSONObject camera=s.cameras==null?null:s.cameras.optJSONObject(id);JSONObject ready=camera==null?null:camera.optJSONObject("readiness");
+            if(camera==null||!id.equals(camera.optString("camera_id"))||ready==null||!Boolean.TRUE.equals(ready.opt("recorder_ready"))||!Boolean.TRUE.equals(ready.opt("tracking_ready")))return false;
+        }
+        return true;
+    }
     private static boolean healthyComponent(String status){return "recording".equals(status)||"ready".equals(status)||"active".equals(status)||"ok".equals(status)||"healthy".equals(status);}
     private static boolean terminal(String status){return "stopped".equals(status)||"failed".equals(status)||"cancelled".equals(status)||"expired".equals(status)||"interrupted".equals(status)||"partial".equals(status);}
     private static String path(Session s)throws IOException{if(s.sessionId==null)throw new IOException("Static session identity is unavailable");return "/api/companion-captures/"+s.sessionId;}
     private static JSONObject object(Object value)throws IOException{if(!(value instanceof JSONObject))throw new IOException("Expected companion JSON object");return (JSONObject)value;}
     private static void rememberFailure(Session s,String phase,Exception error){try{if(s.failures.length()<MAX_FAILURES)s.failures.put(new JSONObject().put("phase",phase).put("reason",bounded(error.getMessage())).put("client_elapsed_realtime_ns",Long.toString(SystemClock.elapsedRealtimeNanos())));else s.failuresDropped++;}catch(Exception ignored){}}
-    private static JSONObject snapshot(Session s){try{return new JSONObject().put("schema",SCHEMA).put("session_id",s.sessionId==null?JSONObject.NULL:s.sessionId).put("camera_id",s.cameraId).put("phone_capture_id",s.captureId)
+    public static JSONArray cameraIds(JSONObject value)throws Exception{return cameraIds(value.optString("camera_id"),value.opt("camera_ids"));}
+    public static boolean multiCameraSupported(JSONObject inventory){Object count=inventory.opt("max_cameras");return Boolean.TRUE.equals(inventory.opt("multi_camera_capture"))&&count instanceof Number&&((Number)count).doubleValue()==2;}
+    /** Missing set means the legacy singleton. Explicit null, duplicates, or >2 never qualify. */
+    public static JSONArray cameraIds(String primary,Object supplied)throws Exception{
+        if(primary==null||primary.isEmpty())throw new IOException("Primary room camera is missing");
+        JSONArray values=supplied==null?new JSONArray().put(primary):supplied instanceof JSONArray?(JSONArray)supplied:null;
+        if(values==null||values.length()<1||values.length()>2)throw new IOException("Choose one or two room cameras");
+        TreeSet<String> ids=new TreeSet<>();
+        for(int i=0;i<values.length();i++){Object raw=values.get(i);if(!(raw instanceof String)||((String)raw).trim().isEmpty()||!ids.add(((String)raw).trim()))throw new IOException("Room cameras must be unique nonempty IDs");}
+        if(!ids.contains(primary))throw new IOException("Room cameras must include the primary camera");
+        JSONArray result=new JSONArray();for(String id:ids)result.put(id);return result;
+    }
+    /** Full recorder/tracking/provenance evidence stays server-side, not duplicated into phone refs. */
+    private static JSONObject compactCameras(JSONObject values,JSONArray ids)throws Exception{
+        JSONObject out=new JSONObject();
+        for(int i=0;i<ids.length();i++){
+            String id=ids.getString(i);JSONObject row=values==null?null:values.optJSONObject(id);if(row==null||!id.equals(row.optString("camera_id")))continue;
+            JSONObject ready=row.optJSONObject("readiness"),urls=row.optJSONObject("artifact_urls"),links=new JSONObject();
+            if(urls!=null){java.util.Iterator<String> keys=urls.keys();int count=0;while(keys.hasNext()&&count++<16){String key=keys.next();Object raw=urls.opt(key);if(key.length()<=160&&raw instanceof String&&((String)raw).length()<=2048)links.put(key,raw);}}
+            Object source=row.opt("source_id");if(source instanceof String)source=shortText((String)source,160);else if(!(source instanceof Number))source=JSONObject.NULL;
+            out.put(id,new JSONObject().put("camera_id",id).put("source_id",source).put("label",shortText(row.optString("label",id),160)).put("source_reference",shortText(row.optString("source_reference"),512))
+                .put("readiness",new JSONObject().put("recorder_ready",ready!=null&&Boolean.TRUE.equals(ready.opt("recorder_ready"))).put("tracking_ready",ready!=null&&Boolean.TRUE.equals(ready.opt("tracking_ready"))))
+                .put("artifact_urls",links));
+        }
+        return out;
+    }
+    private static String shortText(String value,int size){return value.substring(0,Math.min(value.length(),size));}
+    private static JSONObject snapshot(Session s){try{return new JSONObject().put("schema",SCHEMA).put("session_id",s.sessionId==null?JSONObject.NULL:s.sessionId).put("camera_id",s.cameraId).put("camera_ids",new JSONArray(s.cameraIds.toString())).put("phone_capture_id",s.captureId)
                 .put("client_request_id",s.requestId).put("server_origin",s.server).put("status",s.status).put("server_status",s.serverStatus).put("video_status",s.videoStatus).put("tracking_status",s.trackingStatus)
                 .put("start_submitted",s.startSubmitted).put("needs_recovery",s.needsRecovery).put("stop_reason",s.stopReason).put("error",s.error==null?JSONObject.NULL:s.error)
                 .put("clock_probes",new JSONArray(s.probes.toString())).put("clock_probe_failures",new JSONArray(s.failures.toString())).put("clock_probe_failure_dropped_count",s.failuresDropped)
                 .put("provenance",s.provenance==null?new JSONObject():s.provenance).put("artifact_urls",s.artifacts==null?new JSONObject():s.artifacts)
+                .put("cameras",s.cameras==null?new JSONObject():new JSONObject(s.cameras.toString()))
                 .put("synchronization_verified",false).put("timestamp_provenance","Native phone and server acquisition evidence remain in their original clocks; HTTP clock probes do not prove hardware synchronization");
         }catch(Exception error){throw new IllegalStateException(error);}}
     private static void save(Session s)throws Exception{
@@ -188,21 +240,21 @@ public final class PairedCapture {
     }
     private static Session readSession(File dir)throws Exception{
         JSONObject ref=BundleTools.readJson(new File(dir,FILE));if(!SCHEMA.equals(ref.optString("schema"))||!dir.getName().equals(ref.optString("phone_capture_id")))throw new IOException("Invalid saved paired capture identity");
-        Session s=new Session(dir,ref.getString("server_origin"),ref.getString("camera_id"));s.requestId=ref.getString("client_request_id");s.sessionId=ref.isNull("session_id")?null:ref.optString("session_id",null);
+        Session s=new Session(dir,ref.getString("server_origin"),ref.getString("camera_id"),cameraIds(ref));s.requestId=ref.getString("client_request_id");s.sessionId=ref.isNull("session_id")?null:ref.optString("session_id",null);
         if(s.sessionId!=null&&!s.sessionId.matches("companion-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}"))throw new IOException("Invalid saved static session ID");
         s.status=ref.optString("status");s.serverStatus=ref.optString("server_status");s.videoStatus=ref.optString("video_status");s.trackingStatus=ref.optString("tracking_status");
         s.stopReason=ref.optString("stop_reason","user");s.error=ref.isNull("error")?null:ref.optString("error",null);s.failuresDropped=ref.optInt("clock_probe_failure_dropped_count");
         s.startSubmitted=ref.optBoolean("start_submitted");s.probes=ref.optJSONArray("clock_probes");if(s.probes==null)s.probes=new JSONArray();s.failures=ref.optJSONArray("clock_probe_failures");if(s.failures==null)s.failures=new JSONArray();
-        s.provenance=ref.optJSONObject("provenance");s.artifacts=ref.optJSONObject("artifact_urls");return s;
+        s.provenance=ref.optJSONObject("provenance");s.artifacts=ref.optJSONObject("artifact_urls");s.cameras=compactCameras(ref.optJSONObject("cameras"),s.cameraIds);return s;
     }
     private void state(Session s,String state){JSONObject ref=snapshot(s);main.post(()->listener.onPairState(state,ref));}
     private void error(Session s,String reason){JSONObject ref=snapshot(s);main.post(()->listener.onPairError(bounded(reason),ref));}
     private static String bounded(String text){return text==null?"unknown":text.substring(0,Math.min(text.length(),400));}
     private static final class Session{
-        final File directory;final String server,cameraId,captureId;String requestId=UUID.randomUUID().toString(),sessionId;
+        final File directory;final String server,cameraId,captureId;final JSONArray cameraIds;String requestId=UUID.randomUUID().toString(),sessionId;
         String status="starting",serverStatus="unknown",videoStatus="unknown",trackingStatus="unknown",error;
         volatile String stopReason="user";volatile boolean stopRequested;boolean startSubmitted,needsRecovery,finished;int heartbeats,failuresDropped;
-        JSONArray probes=new JSONArray(),failures=new JSONArray();JSONObject provenance,artifacts;ScheduledFuture<?> heartbeat;
-        Session(File directory,String server,String cameraId){this.directory=directory;this.server=server;this.cameraId=cameraId;captureId=directory.getName();}
+        JSONArray probes=new JSONArray(),failures=new JSONArray();JSONObject provenance,artifacts,cameras;ScheduledFuture<?> heartbeat;
+        Session(File directory,String server,String cameraId,JSONArray requested){this.directory=directory;this.server=server;this.cameraId=cameraId;captureId=directory.getName();try{cameraIds=PairedCapture.cameraIds(cameraId,requested);}catch(Exception error){throw new IllegalArgumentException(error.getMessage(),error);}}
     }
 }

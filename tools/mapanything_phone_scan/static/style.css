@@ -156,6 +156,16 @@ h1 { max-width: 780px; margin: 12px 0 16px; font-size: clamp(2rem, 5.4vw, 4.6rem
 .sensor-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; min-width: 10rem; }
 .sensor-checks { display: flex; flex-wrap: wrap; gap: 7px 14px; margin-top: 10px; color: var(--muted); font-size: 0.78rem; }
 .field-label { color: var(--muted); font-size: 0.78rem; font-weight: 650; }
+.camera-recording-list { min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 12px; }
+.camera-recording-list legend { padding: 0 5px; font-size: 0.82rem; font-weight: 650; }
+.camera-selection-limit { margin: 0 0 7px; color: var(--muted); font-size: 0.72rem; }
+.camera-recording-option { display: flex; align-items: center; gap: 11px; min-height: 44px; padding: 8px; border-radius: 8px; cursor: pointer; }
+.camera-recording-option input { width: 20px; height: 20px; flex: 0 0 auto; accent-color: var(--mint-strong); }
+.camera-recording-option span { overflow-wrap: anywhere; }
+.camera-recording-option small, .camera-primary-reference small { display: block; margin-top: 3px; color: var(--muted); font-size: 0.72rem; line-height: 1.4; }
+.camera-recording-option.is-disabled { opacity: 0.6; cursor: default; }
+.camera-primary-reference { display: block; margin-top: 12px; font-size: 0.8rem; font-weight: 650; }
+.camera-primary-reference select { display: block; width: 100%; margin-top: 6px; }
 .text-input {
   width: 100%;
   margin-bottom: 5px;

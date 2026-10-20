@@ -883,12 +883,14 @@ class PhoneScanService:
         self,
         camera_id: str,
         *,
+        camera_ids: Any = None,
         client_request_id: str | None = None,
         phone_capture_id: str | None = None,
         clock_probes: Any | None = None,
     ) -> dict[str, Any]:
         state = self.companion_capture.start_session(
             camera_id,
+            camera_ids=camera_ids,
             client_request_id=client_request_id,
             phone_capture_id=phone_capture_id,
             clock_probes=clock_probes,
@@ -2097,11 +2099,11 @@ class PhoneScanService:
         session_id = str(recorded.get("session_id") or "")
         if not COMPANION_SESSION_PATTERN.fullmatch(session_id):
             raise HTTPException(409, "The paired static capture has no valid session identity")
-        if recorded.get("camera_id") != camera_id:
+        selected = _companion_camera_ids(recorded.get("camera_id"), recorded.get("camera_ids"))
+        if camera_id not in selected:
             raise HTTPException(
                 422,
-                "This walk must align with its paired static camera: "
-                + str(recorded.get("camera_id") or "unknown"),
+                "This walk must align with a recorded static camera: " + ", ".join(selected),
             )
         try:
             companion = self.companion_capture.public_state(session_id)
@@ -2110,7 +2112,8 @@ class PhoneScanService:
         phone = companion.get("phone") or {}
         recorded_phone = recorded.get("phone") or {}
         if (
-            companion.get("camera_id") != camera_id
+            companion.get("camera_id") != recorded.get("camera_id")
+            or _companion_camera_ids(companion.get("camera_id"), companion.get("camera_ids")) != selected
             or phone.get("scan_id") != state["id"]
             or not companion.get("phone_capture_id")
             or companion.get("phone_capture_id") != recorded.get("phone_capture_id")
@@ -2120,7 +2123,9 @@ class PhoneScanService:
             raise HTTPException(409, "The paired static capture does not match this phone archive")
         if companion.get("status") != "stopped" or companion.get("error"):
             raise HTTPException(409, "Paired alignment requires a successfully finalized static capture")
-        return companion
+        # The primary remains the saved reconstruction default; this explicit
+        # projection selects another retained member without changing the session.
+        return {**companion, "camera_id": camera_id}
 
     def _saved_alignment_target(
         self, scan_id: str, alignment: dict[str, Any]
@@ -3052,15 +3057,33 @@ def _read_sensor_bundle_manifest(
         return None
 
 
+def _companion_camera_ids(camera_id: Any, camera_ids: Any = None) -> list[str]:
+    """Normalize an exact, bounded selection; legacy references stay singleton."""
+    if camera_ids is None:
+        return [camera_id] if camera_id else []
+    if not camera_id and camera_ids == []:
+        return []
+    if (
+        not isinstance(camera_ids, list)
+        or not 1 <= len(camera_ids) <= 2
+        or any(not isinstance(item, str) or not item.strip() or item != item.strip() for item in camera_ids)
+        or len(set(camera_ids)) != len(camera_ids)
+        or camera_id not in camera_ids
+    ):
+        raise HTTPException(422, "Companion camera_ids must contain 1–2 unique cameras including the primary camera_id")
+    return sorted(camera_ids)
+
+
 def _sensor_bundle_pairing_reference(
     manifest: dict[str, Any] | None,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     """Extract the optional companion reference carried by a capture TAR."""
 
     if not isinstance(manifest, dict):
         return {
             "session_id": None,
             "camera_id": None,
+            "camera_ids": [],
             "phone_capture_id": None,
             "capture_id": None,
         }
@@ -3075,12 +3098,14 @@ def _sensor_bundle_pairing_reference(
                 return value.strip()
         return None
 
+    primary = first_string(nested.get("camera_id"), manifest.get("companion_camera_id"))
     return {
         "session_id": first_string(
             nested.get("session_id"), manifest.get("companion_session_id")
         ),
-        "camera_id": first_string(
-            nested.get("camera_id"), manifest.get("companion_camera_id")
+        "camera_id": primary,
+        "camera_ids": _companion_camera_ids(
+            primary, nested.get("camera_ids", manifest.get("companion_camera_ids"))
         ),
         "phone_capture_id": first_string(
             nested.get("phone_capture_id"),
@@ -3336,7 +3361,7 @@ def create_app(
 
     app = FastAPI(
         title="Noesis Multi-View Phone Scan",
-        version="1.13.0",
+        version="1.14.0",
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
@@ -3723,12 +3748,14 @@ def create_app(
     async def companion_capture_cameras() -> dict[str, Any]:
         try:
             rows = await asyncio.to_thread(service.companion_cameras)
-            return {"available": bool(rows), "cameras": rows, "reason": None if rows else "no active camera source is available"}
+            return {"available": bool(rows), "cameras": rows, "multi_camera_capture": True,
+                    "max_cameras": 2, "reason": None if rows else "no active camera source is available"}
         except CompanionCaptureError as exc:
             # Camera inventory is a capability probe.  Returning a bounded
             # unavailable response lets the browser explain the runtime
             # condition and retry after DS9 is healthy again.
-            return {"available": False, "cameras": [], "reason": str(exc)}
+            return {"available": False, "cameras": [], "multi_camera_capture": True,
+                    "max_cameras": 2, "reason": str(exc)}
 
     @app.get("/api/companion-captures", response_model=None)
     async def companion_capture_sessions() -> list[dict[str, Any]]:
@@ -3758,6 +3785,7 @@ def create_app(
             state = await asyncio.to_thread(
                 service.start_companion_capture,
                 camera_id,
+                camera_ids=payload.get("camera_ids"),
                 client_request_id=str(request_id).strip() if request_id else None,
                 phone_capture_id=str(phone_capture_id).strip() if phone_capture_id else None,
                 clock_probes=payload.get("clock_probes"),
@@ -4077,13 +4105,20 @@ def create_app(
             or None
         )
         header_capture_id = str(request.headers.get("x-phone-capture-id") or "").strip() or None
+        raw_camera_ids = request.headers.get("x-companion-camera-ids")
+        try:
+            header_camera_ids = json.loads(raw_camera_ids) if raw_camera_ids is not None else None
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, "X-Companion-Camera-Ids must be a JSON array") from exc
+        if raw_camera_ids is not None and not isinstance(header_camera_ids, list):
+            raise HTTPException(400, "X-Companion-Camera-Ids must be a JSON array")
         if bool(header_session_id) != bool(header_capture_id):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "X-Companion-Session and X-Phone-Capture-ID must be supplied together",
             )
 
-        if header_camera_id and not (header_session_id and header_capture_id):
+        if (header_camera_id or raw_camera_ids is not None) and not (header_session_id and header_capture_id):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "X-Companion-Camera-ID requires X-Companion-Session and X-Phone-Capture-ID",
@@ -4133,6 +4168,12 @@ def create_app(
             companion_session_id = header_session_id or manifest_session_id
             companion_capture_id = header_capture_id or manifest_phone_capture_id
             companion_camera_id = header_camera_id or manifest_camera_id
+            if header_camera_ids is not None:
+                _companion_camera_ids(companion_camera_id, header_camera_ids)
+            if header_camera_ids is not None and manifest_camera_id and (
+                sorted(header_camera_ids) != manifest_reference["camera_ids"]
+            ):
+                raise HTTPException(409, "X-Companion-Camera-Ids does not match the imported companion manifest")
             if companion_session_id and not companion_capture_id:
                 companion_capture_id = manifest_capture_id
             if bool(companion_session_id) != bool(companion_capture_id):
@@ -4161,6 +4202,20 @@ def create_app(
                     "X-Phone-Capture-ID does not match the imported capture manifest",
                 )
 
+            def paired_camera_selection(paired: dict[str, Any]) -> tuple[str | None, list[str]]:
+                primary = str(paired.get("camera_id") or "").strip() or None
+                selected = _companion_camera_ids(primary, paired.get("camera_ids"))
+                if companion_camera_id and companion_camera_id != primary:
+                    raise CompanionCaptureConflict("companion camera ID conflicts with the selected session")
+                # Missing set is a legacy singleton, never an implicit upgrade.
+                declared = _companion_camera_ids(companion_camera_id or primary, header_camera_ids)
+                imported = manifest_reference["camera_ids"] or _companion_camera_ids(primary)
+                if header_camera_ids is None:
+                    declared = imported
+                if declared != selected or imported != selected:
+                    raise CompanionCaptureConflict("companion camera IDs conflict with the selected session")
+                return primary, selected
+
             async def process_upload(
                 queued_scan_id: str | None = None, retained_archive: Path | None = None,
             ) -> JSONResponse:
@@ -4170,6 +4225,7 @@ def create_app(
                 scan_dir_created = False
                 reservation_started = False
                 bound_camera_id: str | None = None
+                bound_camera_ids: list[str] = []
 
                 def cleanup_scan_dir() -> None:
                     if queued_scan_id is not None:
@@ -4231,6 +4287,9 @@ def create_app(
                         scan_dir = service.scan_dir(scan_id)
                         state_payload = service.read_state(scan_id)
                         bound_camera_id = state_payload["upload_receipt"]["companion_camera_id"]
+                        bound_camera_ids = _companion_camera_ids(
+                            bound_camera_id, state_payload["upload_receipt"].get("companion_camera_ids")
+                        )
                         state_payload["upload_import"]["phase"] = "running"
                         state_payload["message"] = "Validating the stored camera and IMU capture"
                         service._write_state_unlocked(scan_id, state_payload)
@@ -4240,15 +4299,7 @@ def create_app(
                                 companion_public = service.companion_capture.public_state(
                                     companion_session_id
                                 )
-                                bound_camera_id = str(companion_public.get("camera_id") or "").strip() or None
-                                if (
-                                    companion_camera_id
-                                    and bound_camera_id
-                                    and companion_camera_id != bound_camera_id
-                                ):
-                                    raise CompanionCaptureConflict(
-                                        "companion camera ID conflicts with the selected session"
-                                    )
+                                bound_camera_id, bound_camera_ids = paired_camera_selection(companion_public)
                                 prior = service.companion_capture.check_phone_archive(
                                     companion_session_id,
                                     companion_capture_id,
@@ -4350,6 +4401,8 @@ def create_app(
                                 status.HTTP_409_CONFLICT,
                                 "Imported capture manifest has no capture_id",
                             )
+                        if (report_reference["camera_ids"] or _companion_camera_ids(bound_camera_id)) != bound_camera_ids:
+                            raise HTTPException(409, "Imported companion camera IDs do not match the paired session")
                     browser_capture = report_schema == BROWSER_CAPTURE_SCHEMA
                     if browser_capture:
                         device = dict(report_manifest.get("device") or {})
@@ -4498,12 +4551,11 @@ def create_app(
                     queue = service.capture_uploads
                     scan_id = queue.lookup(capture_id, companion_session_id)
                     bound_camera_id = None
+                    bound_camera_ids: list[str] = []
                     if companion_session_id and companion_capture_id:
                         try:
                             paired = service.companion_capture.public_state(companion_session_id)
-                            bound_camera_id = str(paired.get("camera_id") or "").strip() or None
-                            if companion_camera_id and bound_camera_id != companion_camera_id:
-                                raise CompanionCaptureConflict("companion camera ID conflicts with the selected session")
+                            bound_camera_id, bound_camera_ids = paired_camera_selection(paired)
                             prior = service.companion_capture.check_phone_archive(
                                 companion_session_id, companion_capture_id, archive_sha256,
                             )
@@ -4528,6 +4580,7 @@ def create_app(
                         "capture_id": capture_id,
                         "companion_session_id": companion_session_id,
                         "companion_camera_id": bound_camera_id,
+                        "companion_camera_ids": bound_camera_ids,
                         "validation_status": "pending",
                         "receive_elapsed_ms": round(receive_elapsed_s * 1000, 3),
                         "receive_mbps": received * 8 / receive_elapsed_s / 1_000_000,
@@ -4540,6 +4593,8 @@ def create_app(
                         )
                         if any(saved.get(key) != receipt[key] for key in identity_fields):
                             raise HTTPException(status.HTTP_409_CONFLICT, "Capture archive conflicts with its stored upload receipt")
+                        if _companion_camera_ids(saved.get("companion_camera_id"), saved.get("companion_camera_ids")) != bound_camera_ids:
+                            raise HTTPException(status.HTTP_409_CONFLICT, "Capture camera set conflicts with its stored upload receipt")
                         for metric in ("receive_elapsed_ms", "receive_mbps"):
                             if metric in saved:
                                 receipt[metric] = saved[metric]

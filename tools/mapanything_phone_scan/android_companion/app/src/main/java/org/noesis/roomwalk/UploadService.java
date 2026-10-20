@@ -141,6 +141,7 @@ public final class UploadService extends Service {
                 if(!BundleTools.endpoint(server,"/").toURI().equals(BundleTools.endpoint(paired.getString("server_origin"),"/").toURI()))throw new IOException("Upload this paired recording to its original RoomWalk server: "+paired.getString("server_origin"));
                 phase(current,"finalizing");JSONObject saved=PairedCapture.finishSaved(getApplicationContext(),archive.getParentFile());
                 for(String key:new String[]{"session_id","camera_id","phone_capture_id"})if(!paired.getString(key).equals(saved.getString(key)))throw new IOException("Saved paired identity differs from the retained ZIP");
+                if(!PairedCapture.cameraIds(paired).toString().equals(PairedCapture.cameraIds(saved).toString()))throw new IOException("Saved room-camera set differs from the retained ZIP");
                 current.transfer.check();phase(current,"connecting");
             }
             JSONObject health=BundleTools.health(getApplicationContext(),server);

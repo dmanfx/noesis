@@ -188,6 +188,32 @@ function emitGenericReadings() {
   FakeGyroscope.latest.emit(20, 0.01, 0.02, 0.03);
 }
 
+test("companion set is detached and a missing legacy set stays singleton without invented peers", () => {
+  const { platform } = makePlatform();
+  const c = new BrowserCapture({ platform });
+  const context = { camera_id: "family", camera_ids: ["kitchen", "family"], session_id: "session", cameras: { kitchen: { readiness: { recorder_ready: true } } } };
+  c.setCompanionCapture(context);context.camera_ids.pop();context.cameras.kitchen.readiness.recorder_ready = false;
+  assert.deepEqual(c._companionCapture.camera_ids, ["family", "kitchen"]);
+  assert.equal(c._companionCapture.cameras.kitchen.readiness.recorder_ready, true);
+  c.setCompanionCapture({camera_id:"family",session_id:"legacy"});assert.deepEqual(c._companionCapture.camera_ids,["family"]);
+  assert.throws(()=>c.setCompanionCapture({camera_id:"family",camera_ids:["kitchen"]}));
+});
+
+test("explicit phone-only start clears stale pairing while omitted context preserves pre-set legacy context", async () => {
+  for (const explicitPhoneOnly of [false, true]) {
+    const { platform } = makePlatform();
+    const c = new BrowserCapture({ platform });
+    await c.open(new FakeVideo());
+    c.video.emitFrame(50, { mediaTime: 0.01 });
+    c.video.emitFrame(60, { mediaTime: 0.02 });
+    emitGenericReadings();
+    c.setCompanionCapture({ camera_id: "family", session_id: "old-failed-session" });
+    c.start(explicitPhoneOnly ? { companionCapture: null } : {});
+    await c.stop("user");
+    assert.equal(c.manifest.companion_capture?.session_id ?? null, explicitPhoneOnly ? null : "old-failed-session");
+  }
+});
+
 test("buildTarArchive produces an uncompressed TAR from Blob parts", async () => {
   const archive = buildTarArchive([
     { name: "capture_manifest.json", data: new Blob(["{}"]) },

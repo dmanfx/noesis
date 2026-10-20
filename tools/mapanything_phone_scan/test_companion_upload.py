@@ -27,6 +27,7 @@ CAMERA_ID = "family-room"
 class _FakeCompanionManager:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
+        self.camera_ids: list[str] | None = None
         self.phone: dict[str, Any] = {
             "capture_id": None,
             "scan_id": None,
@@ -42,6 +43,7 @@ class _FakeCompanionManager:
             "phone_capture_id": self.phone.get("capture_id"),
             "phone": copy.deepcopy(self.phone),
             "status": "recording",
+            **({"camera_ids": self.camera_ids} if self.camera_ids is not None else {}),
         }
 
     def check_phone_archive(
@@ -328,3 +330,93 @@ def test_header_manifest_session_mismatch_conflicts_before_import(
         assert manager.calls == []
         assert list((tmp_path / "scans").glob("20*")) == []
         release.set()
+
+
+@pytest.mark.parametrize("declared", [None, [CAMERA_ID], [CAMERA_ID, "living-room"]])
+def test_pair_upload_rejects_missing_or_wrong_camera_set_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: list[str] | None,
+) -> None:
+    release, started = threading.Event(), threading.Event()
+    app, manager, imports = _test_app(tmp_path, monkeypatch, release, started)
+    manager.camera_ids = [CAMERA_ID, "kitchen"]
+    manifest = _manifest()
+    if declared is not None:
+        manifest["companion_capture"]["camera_ids"] = declared
+    with TestClient(app) as client:
+        response = client.post("/api/scans/sensor-bundle", content=_archive(manifest, archive_tag="pair"), headers=_headers())
+        assert response.status_code == 409, response.text
+        assert imports == []
+        assert not any(call[0] == "reserve_phone_scan_id" for call in manager.calls)
+    release.set()
+
+
+def test_pair_upload_retains_exact_set_and_idempotent_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, started = threading.Event(), threading.Event()
+    app, manager, imports = _test_app(tmp_path, monkeypatch, release, started)
+    manager.camera_ids = [CAMERA_ID, "kitchen"]
+    manifest = _manifest()
+    manifest["companion_capture"]["camera_ids"] = ["kitchen", CAMERA_ID]
+    archive = _archive(manifest, archive_tag="pair")
+    headers = {**_headers(), "X-Companion-Camera-Ids": json.dumps(manager.camera_ids)}
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/scans/sensor-bundle", content=archive, headers=headers)
+            assert response.status_code == 201, response.text
+            assert sorted(response.json()["companion_capture"]["camera_ids"]) == sorted(manager.camera_ids)
+            duplicate = client.post("/api/scans/sensor-bundle", content=archive, headers=headers)
+            assert duplicate.status_code == 200, duplicate.text
+            assert len(imports) == 1
+            wrong = client.post("/api/scans/sensor-bundle", content=archive, headers={**headers, "X-Companion-Camera-Ids": json.dumps([CAMERA_ID])})
+            assert wrong.status_code == 409
+            assert len(imports) == 1
+            release.set()
+    finally:
+        release.set()
+
+
+def test_camera_set_capability_and_start_request_reach_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, started = threading.Event(), threading.Event()
+    app, manager, _ = _test_app(tmp_path, monkeypatch, release, started)
+    service = app.state.phone_scan_service
+    received = []
+    monkeypatch.setattr(service, "companion_cameras", lambda: [{"camera_id": CAMERA_ID}, {"camera_id": "kitchen"}])
+
+    def start(camera_id: str, **kwargs: Any) -> dict[str, Any]:
+        received.append((camera_id, kwargs))
+        return {"session_id": SESSION_ID, "camera_id": camera_id, "camera_ids": kwargs["camera_ids"]}
+
+    monkeypatch.setattr(service, "start_companion_capture", start)
+    with TestClient(app) as client:
+        capability = client.get("/api/companion-captures/cameras").json()
+        assert capability["multi_camera_capture"] is True
+        assert capability["max_cameras"] == 2
+        response = client.post("/api/companion-captures", json={"camera_id": CAMERA_ID, "camera_ids": [CAMERA_ID, "kitchen"], "phone_capture_id": CAPTURE_ID})
+        assert response.status_code == 201
+        assert received[0][0] == CAMERA_ID
+        assert received[0][1]["camera_ids"] == [CAMERA_ID, "kitchen"]
+        assert received[0][1]["phone_capture_id"] == CAPTURE_ID
+
+
+def test_paired_alignment_selects_retained_member_without_rebinding_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, started = threading.Event(), threading.Event()
+    app, manager, _ = _test_app(tmp_path, monkeypatch, release, started)
+    service = app.state.phone_scan_service
+    manager.camera_ids = [CAMERA_ID, "kitchen"]
+    manager.phone.update(capture_id=CAPTURE_ID, scan_id=SCAN_ID, archive_sha256="a" * 64)
+    saved = {**manager.public_state(SESSION_ID), "status": "stopped"}
+    monkeypatch.setattr(manager, "public_state", lambda _: copy.deepcopy(saved))
+    scan = {"id": SCAN_ID, "companion_capture": copy.deepcopy(saved)}
+    selected = service._paired_alignment_companion(scan, "kitchen")
+    assert selected["camera_id"] == "kitchen"
+    assert scan["companion_capture"]["camera_id"] == CAMERA_ID
+    saved["camera_ids"] = [CAMERA_ID]
+    with pytest.raises(phone_app.HTTPException) as error:
+        service._paired_alignment_companion(scan, "kitchen")
+    assert error.value.status_code == 409
+    service.shutdown()

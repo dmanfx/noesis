@@ -1,4 +1,4 @@
-"""Bounded paired capture of one canonical static camera and tracking stream.
+"""Bounded paired capture of selected canonical static cameras and tracking.
 
 This module is intentionally independent of the phone reconstruction workers.
 It owns the short lived companion session used while a browser phone walk is
@@ -30,6 +30,7 @@ from .static_capture_sources import (
     StaticCaptureObserver,
     StaticCaptureSourceError,
     StaticSourceAuthority,
+    ObserverLimits,
     list_active_camera_sources,
     resolve_active_source_authority,
 )
@@ -236,6 +237,8 @@ class GstCompressedRecorder:
         max_bytes: int = 8 * 1024 * 1024 * 1024,
         max_packet_records: int = MAX_PACKET_RECORDS,
         stale_timeout_s: float = 5.0,
+        packet_queue_items: int = 4096,
+        packet_queue_bytes: int = PACKET_QUEUE_BYTES_LIMIT,
     ) -> None:
         if not str(source_uri).lower().startswith(("rtsp://", "rtsps://")):
             raise CompanionCaptureError("companion source must resolve to RTSP")
@@ -243,6 +246,8 @@ class GstCompressedRecorder:
             raise ValueError("recorder limits must be positive")
         if float(stale_timeout_s) <= 0:
             raise ValueError("stale_timeout_s must be positive")
+        if not 1 <= packet_queue_items <= 4096 or not 1 <= packet_queue_bytes <= self.PACKET_QUEUE_BYTES_LIMIT:
+            raise ValueError("packet queue limits are out of bounds")
         self._source_uri = str(source_uri)
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.max_duration_s = float(max_duration_s)
@@ -257,7 +262,8 @@ class GstCompressedRecorder:
         self._bus_thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
         self._packet_writer: threading.Thread | None = None
-        self._packet_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=4096)
+        self._packet_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=packet_queue_items)
+        self._packet_queue_bytes_limit = packet_queue_bytes
         self._packet_queue_bytes = 0
         self._packet_writer_ready = threading.Event()
         self._stop_event = threading.Event()
@@ -487,7 +493,7 @@ class GstCompressedRecorder:
                 self._status["dropped_packet_records"] += 1
                 self._failure("max_packet_records")
                 return
-            if self._packet_queue_bytes + len(encoded) > self.PACKET_QUEUE_BYTES_LIMIT:
+            if self._packet_queue_bytes + len(encoded) > self._packet_queue_bytes_limit:
                 self._status["dropped_packet_records"] += 1
                 self._failure("packet_timing_queue_overflow")
                 return
@@ -957,7 +963,7 @@ class CompanionCaptureManager:
         self.tracking_observer_factory = tracking_observer_factory
         self._lock = threading.RLock()
         self._active_session_id: str | None = None
-        self._runtime: dict[str, tuple[RecorderProtocol, TrackingObserverProtocol, threading.Event]] = {}
+        self._runtime: dict[str, tuple[dict[str, tuple[RecorderProtocol, TrackingObserverProtocol]], threading.Event]] = {}
         self._stop_event = threading.Event()
         self._watchdog = threading.Thread(target=self._watchdog_loop, name="CompanionCaptureLease", daemon=True)
         self._watchdog.start()
@@ -1027,13 +1033,41 @@ class CompanionCaptureManager:
             runtime = self._runtime.get(session_id)
             if runtime is None:
                 return None
-            recorder, observer, _ = runtime
+            components, _ = runtime
             state = self._read(session_id)
-            readiness = state.setdefault("readiness", {})
-            readiness["recorder"] = _status_value(recorder)
-            readiness["tracking"] = _status_value(observer)
+            self._refresh_components(state, components)
             self._write(session_id, state)
             return self._active_component_failure(state)
+
+    @staticmethod
+    def _primary_aliases(state: dict[str, Any]) -> None:
+        """Keep the original single-camera projection and flat primary paths."""
+        cameras = state.get("cameras")
+        if not isinstance(cameras, Mapping):
+            return
+        primary = cameras[state["camera"]["camera_id"]]
+        for key in ("readiness", "artifacts", "provenance", "recorder", "tracking"):
+            if key in primary:
+                state[key] = deepcopy(primary[key])
+        readiness = state.setdefault("readiness", {})
+        for key in ("recorder_ready", "tracking_ready"):
+            readiness[key] = all(row.get("readiness", {}).get(key) is True for row in cameras.values())
+
+    def _refresh_components(
+        self,
+        state: dict[str, Any],
+        components: Mapping[str, tuple[RecorderProtocol, TrackingObserverProtocol]],
+    ) -> None:
+        for camera_id, (recorder, observer) in components.items():
+            row = state["cameras"][camera_id]
+            readiness = row.setdefault("readiness", {})
+            readiness["recorder"] = _status_value(recorder)
+            readiness["tracking"] = _status_value(observer)
+            readiness["recorder_ready"] = self._ready(readiness["recorder"], tracking=False)
+            readiness["tracking_ready"] = self._ready(
+                readiness["tracking"], tracking=True, selected_source_id=row.get("source_id")
+            )
+        self._primary_aliases(state)
 
     def list_cameras(self) -> list[dict[str, Any]]:
         cameras = self.camera_catalog()
@@ -1081,26 +1115,37 @@ class CompanionCaptureManager:
         camera: CompanionCamera,
         output_dir: Path,
         authority: Any | None = None,
+        *,
+        max_records: int | None = None,
+        camera_count: int = 1,
     ) -> TrackingObserverProtocol:
+        record_limit = self.limits.max_tracking_records if max_records is None else max_records
+        default_limits = ObserverLimits()
+        observer_limits = ObserverLimits(
+            max_queue_items=default_limits.max_queue_items // camera_count,
+            max_queue_bytes=default_limits.max_queue_bytes // camera_count,
+            max_file_bytes=default_limits.max_file_bytes // camera_count,
+            max_records=record_limit,
+        )
         if self.tracking_observer_factory is not None:
             factory = self.tracking_observer_factory
             if isinstance(authority, StaticSourceAuthority):
                 try:
-                    return factory(authority, output_dir, self.limits.max_tracking_records)
+                    return factory(authority, output_dir, record_limit)
                 except TypeError:
                     try:
                         return factory(
                             authority=authority,
                             output_dir=output_dir,
-                            max_records=self.limits.max_tracking_records,
+                            max_records=record_limit,
                         )
                     except TypeError:
                         pass
             try:
-                return factory(camera.camera_id, output_dir, self.limits.max_tracking_records)
+                return factory(camera.camera_id, output_dir, record_limit)
             except TypeError:
                 try:
-                    return factory(camera_id=camera.camera_id, output_dir=output_dir, max_records=self.limits.max_tracking_records)
+                    return factory(camera_id=camera.camera_id, output_dir=output_dir, max_records=record_limit)
                 except TypeError:
                     return factory(camera.camera_id, output_dir)
         if authority is not None:
@@ -1108,7 +1153,8 @@ class CompanionCaptureManager:
                 return CanonicalTrackingRecorder(
                     authority,
                     output_dir,
-                    self.limits.max_tracking_records,
+                    record_limit,
+                    observer_limits=observer_limits,
                 )
             except (TypeError, ValueError):
                 # Focused/injected source resolvers can provide only a private
@@ -1131,6 +1177,12 @@ class CompanionCaptureManager:
                 output_dir / "tracking.jsonl",
                 selected_source_id=camera.source_id,
                 initial_provenance=initial_provenance,
+                limits=ObserverLimits(
+                    max_queue_items=observer_limits.max_queue_items,
+                    max_queue_bytes=observer_limits.max_queue_bytes,
+                    max_file_bytes=observer_limits.max_file_bytes,
+                    max_records=min(default_limits.max_records, record_limit),
+                ),
             )
         except Exception as exc:
             return _UnavailableTrackingObserver(
@@ -1158,7 +1210,7 @@ class CompanionCaptureManager:
         state = str(status.get("status") or status.get("state") or "").lower()
         if state not in {"recording", "active", "ready", "started", "healthy", "ok"}:
             return False
-        if status.get("error") not in (None, "") or status.get("writer_error") not in (None, ""):
+        if status.get("error") not in (None, "") or status.get("writer_error") not in (None, "") or status.get("partial") is True:
             return False
         if tracking:
             if status.get("tracking_ready") is not True:
@@ -1194,6 +1246,13 @@ class CompanionCaptureManager:
         """
 
         if state.get("status") not in {"starting", "recording"}:
+            return None
+        cameras = state.get("cameras")
+        if isinstance(cameras, Mapping):
+            for camera_id, row in cameras.items():
+                failure = CompanionCaptureManager._active_component_failure({**row, "status": state["status"]})
+                if failure:
+                    return f"{camera_id}:{failure}" if len(cameras) > 1 else failure
             return None
         readiness = state.get("readiness") if isinstance(state.get("readiness"), Mapping) else {}
         for label in ("recorder", "tracking"):
@@ -1234,6 +1293,11 @@ class CompanionCaptureManager:
 
         if state.get("error") not in (None, ""):
             return False
+        cameras = state.get("cameras")
+        if isinstance(cameras, Mapping):
+            return bool(cameras) and all(
+                CompanionCaptureManager._static_capture_healthy(row) for row in cameras.values()
+            )
         artifacts = state.get("artifacts")
         if not isinstance(artifacts, Mapping) or not artifacts.get("static_video") or not artifacts.get("tracking"):
             return False
@@ -1251,13 +1315,14 @@ class CompanionCaptureManager:
         return True
 
     def _await_readiness(self, session_id: str, ready_event: threading.Event) -> None:
-        deadline = time.monotonic() + self.limits.readiness_timeout_s
+        with self._lock:
+            deadline = float(self._read(session_id)["readiness_deadline_monotonic_s"])
         while time.monotonic() < deadline and not ready_event.is_set():
             with self._lock:
                 runtime = self._runtime.get(session_id)
                 if runtime is None:
                     return
-                recorder, observer, _ = runtime
+                components, _ = runtime
                 # Keep the complete read-modify-write under the manager lock.
                 # Otherwise a concurrent heartbeat/stop can be overwritten by
                 # this worker's stale readiness snapshot.
@@ -1265,24 +1330,8 @@ class CompanionCaptureManager:
                     state = self._read(session_id)
                     if state.get("status") != "starting":
                         return
-                    recorder_status = _status_value(recorder)
-                    tracking_status = _status_value(observer)
-                    recorder_ready = self._ready(recorder_status, tracking=False)
-                    camera_source_id = state.get("camera", {}).get("source_id")
-                    tracking_ready = self._ready(
-                        tracking_status,
-                        tracking=True,
-                        selected_source_id=camera_source_id,
-                    )
-                    state["readiness"].update(
-                        {
-                            "recorder_ready": recorder_ready,
-                            "tracking_ready": tracking_ready,
-                            "recorder": recorder_status,
-                            "tracking": tracking_status,
-                        }
-                    )
-                    if recorder_ready and tracking_ready:
+                    self._refresh_components(state, components)
+                    if state["readiness"]["recorder_ready"] and state["readiness"]["tracking_ready"]:
                         state["status"] = "recording"
                         state["started_at"] = _utc_now()
                         state["readiness"]["ready_at"] = _utc_now()
@@ -1303,12 +1352,28 @@ class CompanionCaptureManager:
         self,
         camera_id: str,
         *,
+        camera_ids: list[str] | None = None,
         client_request_id: str | None = None,
         phone_capture_id: str | None = None,
         clock_probes: Any | None = None,
         await_ready: bool = True,
     ) -> dict[str, Any]:
         camera = self._camera(camera_id)
+        selected_ids = [camera.camera_id] if camera_ids is None else camera_ids
+        if (
+            not isinstance(selected_ids, list)
+            or not 1 <= len(selected_ids) <= 2
+            or any(not isinstance(value, str) or not value or value != value.strip() for value in selected_ids)
+            or len(set(selected_ids)) != len(selected_ids)
+            or camera.camera_id not in selected_ids
+        ):
+            raise CompanionCaptureError("camera_ids must contain one or two unique exact IDs including camera_id")
+        # The primary is stable even when the caller lists it second.
+        selected_ids = [camera.camera_id] + sorted(value for value in selected_ids if value != camera.camera_id)
+        selected_cameras = [camera] + [self._camera(value) for value in selected_ids[1:]]
+        camera_count = len(selected_cameras)
+        if min(self.limits.max_session_bytes, self.limits.max_packet_records, self.limits.max_tracking_records) < camera_count:
+            raise CompanionCaptureError("session limits cannot accommodate every selected camera")
         request_id = str(client_request_id or "").strip() or None
         if request_id and len(request_id) > 160:
             raise CompanionCaptureError("client_request_id is too long")
@@ -1331,7 +1396,8 @@ class CompanionCaptureManager:
                             or (prior.get("phone") or {}).get("capture_id")
                             or ""
                         )
-                        if prior_camera != camera.camera_id or (
+                        prior_ids = prior.get("camera_ids", [prior_camera])
+                        if prior_camera != camera.camera_id or prior_ids != selected_ids or (
                             capture_id and prior_phone and prior_phone != capture_id
                         ):
                             raise CompanionCaptureConflict(
@@ -1341,50 +1407,96 @@ class CompanionCaptureManager:
             if self._active_session_id is not None:
                 active = self._read(self._active_session_id)
                 raise CompanionCaptureBusy(f"companion session {active['session_id']} is already active")
-            source_uri, authority_object = self._resolve_source(camera)
-            authority = _public_authority(authority_object.public_snapshot())
+            # Resolve the complete selection before allocating any recorder.
+            resolved = [(selected, *self._resolve_source(selected)) for selected in selected_cameras]
+            runtime_bindings = {
+                (authority.config_paths.runtime_pid, authority.pipeline_config_sha256, authority.cameras_config_sha256)
+                for _, _, authority in resolved if isinstance(authority, StaticSourceAuthority)
+            }
+            if len(runtime_bindings) > 1:
+                raise CompanionCaptureError("selected cameras do not share one active runtime configuration")
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             session_id = f"companion-{stamp}-{uuid.uuid4().hex[:8]}"
             output_dir = self.session_root / session_id
             output_dir.mkdir(parents=True, exist_ok=False)
-            (output_dir / "runtime_provenance.json").write_text(
-                json.dumps(
-                    {
-                        "schema": "noesis.companion_capture.runtime_provenance.v1",
-                        "camera_id": camera.camera_id,
-                        "source_reference": camera.source_reference,
-                        "authority": authority,
-                        "captured_at": _utc_now(),
-                        "source_clock": "rtsp_source_clock_unverified",
-                        "phone_server_clock_exchange_verified": False,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
+            components: dict[str, tuple[RecorderProtocol, TrackingObserverProtocol]] = {}
+            cameras: dict[str, Any] = {}
             try:
-                recorder = self.recorder_factory(
-                    source_uri,
-                    output_dir,
-                    max_duration_s=self.limits.max_duration_s,
-                    max_bytes=self.limits.max_session_bytes,
-                    max_packet_records=self.limits.max_packet_records,
-                )
-            except TypeError:
-                recorder = self.recorder_factory(source_uri, output_dir)
-            observer = self._make_observer(camera, output_dir, authority_object)
-            observer_snapshot = self._observer_snapshot(observer)
-            if observer_snapshot:
-                try:
-                    (output_dir / "tracking_provenance.json").write_text(
-                        json.dumps(observer_snapshot, indent=2, sort_keys=True),
-                        encoding="utf-8",
+                for index, (selected, source_uri, authority_object) in enumerate(resolved):
+                    # IDs are map keys, never filesystem path components.
+                    prefix = "" if index == 0 else f"cameras/{index}/"
+                    camera_dir = output_dir / prefix
+                    camera_dir.mkdir(parents=True, exist_ok=True)
+                    authority = _public_authority(authority_object.public_snapshot())
+                    (camera_dir / "runtime_provenance.json").write_text(
+                        json.dumps({
+                            "schema": "noesis.companion_capture.runtime_provenance.v1",
+                            "camera_id": selected.camera_id,
+                            "source_reference": selected.source_reference,
+                            "authority": authority,
+                            "captured_at": _utc_now(),
+                            "source_clock": "rtsp_source_clock_unverified",
+                            "phone_server_clock_exchange_verified": False,
+                        }, indent=2, sort_keys=True), encoding="utf-8",
                     )
-                except OSError as exc:
-                    raise CompanionCaptureError(
-                        "tracking provenance artifact could not be written"
-                    ) from exc
+                    try:
+                        recorder = self.recorder_factory(
+                            source_uri, camera_dir,
+                            max_duration_s=self.limits.max_duration_s,
+                            max_bytes=self.limits.max_session_bytes // camera_count,
+                            max_packet_records=self.limits.max_packet_records // camera_count,
+                            packet_queue_items=4096 // camera_count,
+                            packet_queue_bytes=GstCompressedRecorder.PACKET_QUEUE_BYTES_LIMIT // camera_count,
+                        )
+                    except TypeError:
+                        recorder = self.recorder_factory(source_uri, camera_dir)
+                    try:
+                        observer = self._make_observer(
+                            selected, camera_dir, authority_object,
+                            max_records=self.limits.max_tracking_records // camera_count,
+                            camera_count=camera_count,
+                        )
+                    except Exception:
+                        recorder.stop("start_failed")
+                        raise
+                    components[selected.camera_id] = (recorder, observer)
+                    observer_snapshot = self._observer_snapshot(observer)
+                    if observer_snapshot:
+                        (camera_dir / "tracking_provenance.json").write_text(
+                            json.dumps(observer_snapshot, indent=2, sort_keys=True), encoding="utf-8",
+                        )
+                    cameras[selected.camera_id] = {
+                        "camera_id": selected.camera_id,
+                        "source_id": authority.get("source_id", selected.source_id),
+                        "label": selected.label,
+                        "source_reference": selected.source_reference,
+                        "authority": authority,
+                        "artifact_directory": prefix.rstrip("/") or ".",
+                        "readiness": {"deadline_s": self.limits.readiness_timeout_s,
+                                      "recorder_ready": False, "tracking_ready": False},
+                        "artifacts": {
+                            "runtime_provenance": prefix + "runtime_provenance.json",
+                            **({"tracking_provenance": prefix + "tracking_provenance.json"} if observer_snapshot else {}),
+                        },
+                        "provenance": {
+                            "schema": "noesis.companion_capture.provenance.v1",
+                            "camera_source": authority,
+                            "runtime_artifact": prefix + "runtime_provenance.json",
+                            "tracking_artifact": prefix + "tracking_provenance.json" if observer_snapshot else None,
+                            "tracking_observer": observer_snapshot,
+                            "timing": {"static_source_clock": "rtsp_source_clock_unverified",
+                                       "phone_server_clock_exchange_verified": False,
+                                       "acquisition_alignment": "unverified"},
+                        },
+                    }
+            except Exception as exc:
+                for recorder, observer in components.values():
+                    for component in (observer, recorder):
+                        try:
+                            component.stop("start_failed")
+                        except Exception:
+                            pass
+                raise CompanionCaptureError("paired capture participants could not be constructed") from exc
             ready_event = threading.Event()
             now_mono = time.monotonic()
             state: dict[str, Any] = {
@@ -1395,14 +1507,17 @@ class CompanionCaptureManager:
                     "source_id": camera.source_id,
                     "label": camera.label,
                     "source_reference": camera.source_reference,
-                    "authority": authority,
+                    "authority": cameras[camera.camera_id]["authority"],
                 },
+                "camera_ids": selected_ids,
+                "cameras": cameras,
                 "client_request_id": request_id,
                 "phone_capture_id": capture_id,
                 "status": "starting",
                 "created_at": _utc_now(),
                 "started_at": None,
                 "started_monotonic_s": now_mono,
+                "readiness_deadline_monotonic_s": now_mono + self.limits.readiness_timeout_s,
                 "lease": {
                     "duration_s": self.limits.lease_s,
                     "last_heartbeat_at": _utc_now(),
@@ -1421,45 +1536,32 @@ class CompanionCaptureManager:
                 },
                 "markers": [],
                 "clock_exchanges": [],
-                "artifacts": {
-                    "runtime_provenance": "runtime_provenance.json",
-                    **({"tracking_provenance": "tracking_provenance.json"} if observer_snapshot else {}),
-                },
-                "provenance": {
-                    "schema": "noesis.companion_capture.provenance.v1",
-                    "camera_source": authority,
-                    "runtime_artifact": "runtime_provenance.json",
-                    "tracking_artifact": "tracking_provenance.json" if observer_snapshot else None,
-                    "tracking_observer": observer_snapshot,
-                    "timing": {
-                        "static_source_clock": "rtsp_source_clock_unverified",
-                        "phone_server_clock_exchange_verified": False,
-                        "acquisition_alignment": "unverified",
-                    },
-                },
                 "phone": {"capture_id": capture_id, "scan_id": None, "archive_sha256": None},
                 "error": None,
             }
             for probe in raw_clock_probes:
                 self._append_clock_probe_locked(state, probe)
+            self._primary_aliases(state)
             self._write(session_id, state)
-            self._runtime[session_id] = (recorder, observer, ready_event)
+            self._runtime[session_id] = (components, ready_event)
             self._active_session_id = session_id
         try:
-            recorder.start()
-            observer.start()
+            for recorder, observer in components.values():
+                for component in (recorder, observer):
+                    # Serialize admission against stop/watchdog finalization.
+                    # There is one deadline, measured before the first start.
+                    with self._lock:
+                        current = self._read(session_id)
+                        if current["status"] != "starting":
+                            raise CompanionCaptureError("paired capture stopped during startup")
+                        if time.monotonic() >= now_mono + self.limits.readiness_timeout_s:
+                            raise CompanionCaptureError("paired capture readiness timeout")
+                        component.start()
         except Exception as exc:
             # Both starts can fail after allocating native resources.  Stop
             # every participant before releasing the runtime slot so a failed
             # admission cannot leave an RTSP pipeline or writer orphaned.
-            try:
-                observer.stop("start_failed")
-            except Exception:
-                pass
-            try:
-                recorder.stop("start_failed")
-            except Exception:
-                pass
+            self.stop_session(session_id, reason="start_failed")
             with self._lock:
                 state = self._read(session_id)
                 state.update({
@@ -1475,7 +1577,7 @@ class CompanionCaptureManager:
         worker = threading.Thread(target=self._await_readiness, args=(session_id, ready_event), name="CompanionReadiness", daemon=True)
         worker.start()
         if await_ready:
-            ready_event.wait(self.limits.readiness_timeout_s + 0.25)
+            ready_event.wait(max(0, now_mono + self.limits.readiness_timeout_s - time.monotonic()) + 0.25)
         return self.status(session_id)
 
     def _expire_if_needed_locked(self) -> None:
@@ -1496,11 +1598,9 @@ class CompanionCaptureManager:
             runtime = self._runtime.get(session_id)
             if runtime is None:
                 return
-            recorder, observer, _ = runtime
+            components, _ = runtime
             state = self._read(session_id)
-            readiness = state.setdefault("readiness", {})
-            readiness["recorder"] = _status_value(recorder)
-            readiness["tracking"] = _status_value(observer)
+            self._refresh_components(state, components)
             self._write(session_id, state)
 
     @staticmethod
@@ -1731,116 +1831,94 @@ class CompanionCaptureManager:
             self._write(session_id, state)
             runtime = self._runtime.get(session_id)
         errors: list[str] = []
-        recorder_result: Mapping[str, Any] = {}
-        tracking_result: Mapping[str, Any] = {}
+        results: dict[str, dict[str, Any]] = {}
         if runtime is not None:
-            recorder, observer, _ = runtime
-            if str(reason) != "user":
-                mark_partial = getattr(observer, "mark_partial", None)
-                if callable(mark_partial):
+            components, ready_event = runtime
+            ready_event.set()
+            for camera_id, (recorder, observer) in components.items():
+                row_results: dict[str, Any] = {}
+                if str(reason) != "user":
+                    mark_partial = getattr(observer, "mark_partial", None)
+                    if callable(mark_partial):
+                        try:
+                            mark_partial(str(reason))
+                        except Exception as exc:
+                            errors.append(f"{camera_id}:tracking_partial:{type(exc).__name__}: {str(exc)[:300]}")
+                for label, component in (("recorder", recorder), ("tracking", observer)):
                     try:
-                        mark_partial(str(reason))
+                        result = _status_value(component.stop(reason))
                     except Exception as exc:
-                        errors.append(f"tracking_partial:{type(exc).__name__}: {str(exc)[:300]}")
-            try:
-                recorder_result = _status_value(recorder.stop(reason))
-            except Exception as exc:
-                errors.append(f"recorder:{type(exc).__name__}: {str(exc)[:500]}")
-            try:
-                tracking_result = _status_value(observer.stop(reason))
-            except Exception as exc:
-                errors.append(f"tracking:{type(exc).__name__}: {str(exc)[:500]}")
-        for label, result in (("recorder", recorder_result), ("tracking", tracking_result)):
-            if not isinstance(result, Mapping):
-                continue
-            result_error = result.get("error")
-            if result_error not in (None, ""):
-                errors.append(f"{label}:{str(result_error)[:500]}")
-            if str(result.get("status") or result.get("state") or "").lower() in {"failed", "error"}:
-                errors.append(f"{label}:failed")
-            if result.get("partial") is True:
-                errors.append(f"{label}:partial")
+                        errors.append(f"{camera_id}:{label}:{type(exc).__name__}: {str(exc)[:500]}")
+                        result = {"status": "failed", "error": type(exc).__name__}
+                    row_results[label] = result
+                    if result.get("error") not in (None, ""):
+                        errors.append(f"{camera_id}:{label}:{str(result['error'])[:500]}")
+                    if str(result.get("status") or result.get("state") or "").lower() in {"failed", "error"}:
+                        errors.append(f"{camera_id}:{label}:failed")
+                    if result.get("partial") is True:
+                        errors.append(f"{camera_id}:{label}:partial")
+                results[camera_id] = row_results
         with self._lock:
             state = self._read(session_id)
             session_dir = self.session_root / session_id
-            artifacts = state.setdefault("artifacts", {})
-            for key, filename in (
-                ("static_video", "static_camera.mkv"),
-                ("packet_timing", "packet_timing.jsonl"),
-                ("tracking", "tracking.jsonl"),
-                ("markers", "markers.jsonl"),
-            ):
-                if (session_dir / filename).is_file():
-                    artifacts[key] = filename
-            for key, result, candidates in (
-                ("static_video", recorder_result, ("video_path", "static_video_path")),
-                ("packet_timing", recorder_result, ("packet_timing_path", "packet_path")),
-                ("tracking", tracking_result, ("tracking_path", "record_path", "artifact")),
-            ):
-                if key in artifacts:
-                    continue
-                for candidate in candidates:
-                    raw = result.get(candidate) if isinstance(result, Mapping) else None
-                    if not isinstance(raw, str):
-                        continue
-                    path = Path(raw)
-                    if path.is_absolute():
-                        try:
-                            path = path.resolve().relative_to(session_dir.resolve())
-                        except ValueError:
-                            continue
-                    if ".." in path.parts:
-                        continue
-                    if (session_dir / path).is_file():
-                        artifacts[key] = path.as_posix()
-                        break
-            # CanonicalTrackingRecorder reports its bounded tracking and REST
-            # evidence under an artifacts map.  Import only relative files
-            # that actually exist inside this session directory.
-            for source_label, result in (("recorder", recorder_result), ("tracking", tracking_result)):
-                reported = result.get("artifacts") if isinstance(result, Mapping) else None
-                if not isinstance(reported, Mapping):
-                    continue
-                for key, raw in reported.items():
-                    if not isinstance(raw, str):
-                        continue
-                    path = Path(raw)
-                    if path.is_absolute():
-                        try:
-                            path = path.resolve().relative_to(session_dir.resolve())
-                        except ValueError:
-                            continue
-                    if ".." in path.parts or not (session_dir / path).is_file():
-                        continue
-                    artifact_key = str(key)
-                    artifact_key = {
-                        "video": "static_video",
-                        "static_video": "static_video",
-                        "packet_timing": "packet_timing",
-                        "tracking": "tracking",
-                        "markers": "markers",
-                    }.get(artifact_key, artifact_key)
-                    if artifact_key in {"static_video", "packet_timing", "tracking", "markers"}:
-                        artifacts[artifact_key] = path.as_posix()
-                    else:
-                        prefix = "tracking_" if source_label == "tracking" else "recorder_"
-                        artifacts.setdefault(f"{prefix}{artifact_key}", path.as_posix())
-            if recorder_result:
-                state["recorder"] = recorder_result
-            if tracking_result:
-                state["tracking"] = tracking_result
-            state["artifacts"] = artifacts
+            for camera_id, row in state.get("cameras", {}).items():
+                row.update(results.get(camera_id, {}))
+                self._collect_camera_artifacts(session_dir, row)
+                if not row["artifacts"].get("static_video") or not row["artifacts"].get("tracking"):
+                    errors.append(f"{camera_id}:missing_capture_artifact")
+                row["finalized_at"] = _utc_now()
+            self._primary_aliases(state)
             state["finalized_at"] = _utc_now()
             state["error"] = "; ".join(errors) if errors else state.get("error")
             forced_failure = str(reason) not in {"user", "completed", "stopped", "user_stop"}
-            state["status"] = "partial" if forced_failure or errors or not artifacts.get("static_video") or not artifacts.get("tracking") else "stopped"
+            state["status"] = "partial" if forced_failure or errors else "stopped"
             if state.get("phone", {}).get("scan_id"):
-                state["status"] = "complete" if not errors else "partial"
+                state["status"] = "complete" if not errors and not forced_failure else "partial"
             self._write(session_id, state)
             if self._active_session_id == session_id:
                 self._active_session_id = None
             self._runtime.pop(session_id, None)
             return deepcopy(state)
+
+    @staticmethod
+    def _collect_camera_artifacts(session_dir: Path, row: dict[str, Any]) -> None:
+        camera_dir = session_dir / row["artifact_directory"]
+        artifacts = row.setdefault("artifacts", {})
+
+        def relative_file(raw: Any) -> str | None:
+            if not isinstance(raw, str) or ".." in Path(raw).parts:
+                return None
+            path = Path(raw) if Path(raw).is_absolute() else camera_dir / raw
+            try:
+                path.resolve().relative_to(camera_dir.resolve())
+                relative = path.resolve().relative_to(session_dir.resolve())
+            except ValueError:
+                return None
+            return relative.as_posix() if path.is_file() else None
+
+        for key, filename in (("static_video", "static_camera.mkv"), ("packet_timing", "packet_timing.jsonl"),
+                              ("tracking", "tracking.jsonl"), ("markers", "markers.jsonl")):
+            relative = relative_file(filename)
+            if relative:
+                artifacts[key] = relative
+        for key, source, candidates in (
+            ("static_video", "recorder", ("video_path", "static_video_path")),
+            ("packet_timing", "recorder", ("packet_timing_path", "packet_path")),
+            ("tracking", "tracking", ("tracking_path", "record_path", "artifact")),
+        ):
+            for candidate in candidates:
+                relative = relative_file(row.get(source, {}).get(candidate))
+                if relative:
+                    artifacts.setdefault(key, relative)
+                    break
+        for source in ("recorder", "tracking"):
+            for key, raw in (row.get(source, {}).get("artifacts") or {}).items():
+                relative = relative_file(raw)
+                if relative:
+                    artifact_key = {"video": "static_video"}.get(key, key)
+                    if artifact_key not in {"static_video", "packet_timing", "tracking", "markers"}:
+                        artifact_key = f"{source}_{artifact_key}"
+                    artifacts[artifact_key] = relative
 
     def recover_orphans(self) -> None:
         with self._lock:
@@ -1970,10 +2048,17 @@ class CompanionCaptureManager:
         public = deepcopy(state)
         public.pop("client_request_id", None)
         public.pop("started_monotonic_s", None)
+        public.pop("readiness_deadline_monotonic_s", None)
         lease = public.get("lease")
         if isinstance(lease, dict):
             lease.pop("expires_monotonic_s", None)
         camera = public.get("camera") if isinstance(public.get("camera"), Mapping) else {}
+        public.setdefault("camera_ids", [camera.get("camera_id")])
+        if "cameras" not in public:
+            public["cameras"] = {camera.get("camera_id"): {
+                **camera,
+                **{key: deepcopy(public[key]) for key in ("readiness", "recorder", "tracking", "artifacts", "provenance") if key in public},
+            }}
         readiness = public.get("readiness") if isinstance(public.get("readiness"), Mapping) else {}
         recorder = public.get("recorder") if isinstance(public.get("recorder"), Mapping) else None
         tracking = public.get("tracking") if isinstance(public.get("tracking"), Mapping) else None
@@ -2016,16 +2101,22 @@ class CompanionCaptureManager:
                 "clock_probes": public.get("clock_exchanges") or [],
             }
         )
-        artifacts = public.get("artifacts")
-        if isinstance(artifacts, Mapping):
-            public["artifact_urls"] = {
-                key: f"/companion-assets/{session_id}/{value}"
-                for key, value in artifacts.items()
-                if isinstance(value, str)
-                and ".." not in Path(value).parts
-                and not Path(value).is_absolute()
-                and (self.session_root / session_id / value).is_file()
-            }
+        for projection in [public, *public["cameras"].values()]:
+            artifacts = projection.get("artifacts")
+            if isinstance(artifacts, Mapping):
+                projection["artifact_urls"] = {
+                    key: f"/companion-assets/{session_id}/{value}"
+                    for key, value in artifacts.items()
+                    if isinstance(value, str)
+                    and ".." not in Path(value).parts
+                    and not Path(value).is_absolute()
+                    and (self.session_root / session_id / value).is_file()
+                }
+            if projection is not public:
+                readiness = projection.get("readiness") or {}
+                projection.setdefault("recorder", deepcopy(readiness.get("recorder", {})))
+                projection.setdefault("tracking", deepcopy(readiness.get("tracking", {})))
+                projection["status"] = lifecycle_status
         return public
 
     def list_sessions(self) -> list[dict[str, Any]]:

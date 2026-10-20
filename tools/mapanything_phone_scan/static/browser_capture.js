@@ -1,3 +1,5 @@
+import { normalizeCameraIds } from "./companion_capture.js?v=1.1.1";
+
 /**
  * Browser camera + motion capture for the phone-walk review tool.
  *
@@ -283,7 +285,7 @@ export class BrowserCapture {
    * the latest probes, markers, and server status.
    */
   setCompanionCapture(context) {
-    this._companionCapture = context ? copyJsonValue(context) : null;
+    this._companionCapture = context ? { ...copyJsonValue(context), camera_ids: normalizeCameraIds(context.camera_id, context.camera_ids) } : null;
     this._emitState(true);
     return this._companionCapture;
   }
@@ -699,7 +701,7 @@ export class BrowserCapture {
     this._metadataFrameHandle = null;
   }
 
-  start({ captureId = null, companionCapture = null } = {}) {
+  start({ captureId = null, companionCapture = undefined } = {}) {
     if (this.state !== "ready") throw new BrowserCaptureError("Camera and both sensor streams must be ready before recording starts.", { code: "capture_not_ready" });
     if (!this.isReady) throw new BrowserCaptureError("Wait for progressing camera frames and fresh acceleration and rotation readings.", { code: "sensor_readings_required" });
     this._verifyCameraMode();
@@ -708,7 +710,7 @@ export class BrowserCapture {
     this._samples = this._samples || { accelerometer: [], gyroscope: [] };
     this._captureId = captureId ? safeString(captureId).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 120) : this._newCaptureId();
     if (!this._captureId) this._captureId = this._newCaptureId();
-    this._companionCapture = companionCapture ? copyJsonValue(companionCapture) : this._companionCapture;
+    if (companionCapture !== undefined) this.setCompanionCapture(companionCapture);
     this._startedMs = nowFrom(this.performance);
     this._recorderStartCallMs = this._startedMs;
     this.recorder = new this.MediaRecorderCtor(this.stream, { mimeType, videoBitsPerSecond: BROWSER_8K_MODE.videoBitsPerSecond });

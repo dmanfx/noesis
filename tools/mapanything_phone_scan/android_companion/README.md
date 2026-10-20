@@ -2,7 +2,7 @@
 
 A single Android workspace for native recording, optional calibration and the
 RoomWalk reconstruction service. The current native integration is RoomWalk
-0.4.2, versionCode 23; it packages the same web UI and 3D viewer as the browser
+0.5.1, versionCode 25; it packages the same web UI and 3D viewer as the browser
 application. Native recording still uses Camera2, a hardware
 MediaCodec surface encoder, MediaMuxer, and Android sensors; it never substitutes
 WebView camera capture. Native 8K availability is
@@ -60,7 +60,20 @@ separation is not anatomical-position error or certified 10 cm accuracy. The
 retained September 12 comparison is available without relabelling its older
 carry protocol. Dense VIO and original raw recordings stay separate and retained.
 
-RoomWalk 0.4.2/code 23 uses RoomWalk server 1.13.0 or newer. Install it
+For a continuous Family Room ↔ Kitchen reconstruction walk, check **Family Room**
+and **Kitchen** under **Cameras to record** in Capture setup. Choose **Family Room**
+as the separate primary alignment reference, apply setup, then make one continuous
+phone recording in both rooms. The current server supports up to two checked
+cameras. Changing the primary does not change which cameras record; unchecking
+all returns reconstruction to phone-only capture.
+Both static videos and both canonical tracking observers must be ready before
+the phone starts. Stop/save closes the whole session; retained captures, ZIPs,
+upload receipts and retries bind the exact pair. The primary remains the default
+alignment reference; two recordings do not establish synchronized acquisition
+clocks or automatically change live camera calibration. One-camera capture and
+legacy saved takes remain single-camera evidence.
+
+RoomWalk 0.5.1/code 25 uses RoomWalk server 1.14.0 or newer for two-camera capture. Install it
 over the existing app with the same signing key to retain captures and settings.
 The packaged app and intent boundaries were exercised on an emulator; native
 8K recording and path accuracy still require the physical phone.

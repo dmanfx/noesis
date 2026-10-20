@@ -1327,7 +1327,10 @@ class CanonicalTrackingRecorder:
     independent REST/WS snapshots into a fabricated world state.
     """
 
-    def __init__(self, authority: StaticSourceAuthority, output_dir: Path, max_records: int) -> None:
+    def __init__(
+        self, authority: StaticSourceAuthority, output_dir: Path, max_records: int,
+        *, observer_limits: ObserverLimits | None = None,
+    ) -> None:
         if not isinstance(authority, StaticSourceAuthority):
             raise TypeError("CanonicalTrackingRecorder requires StaticSourceAuthority")
         if int(max_records) < 1:
@@ -1335,6 +1338,13 @@ class CanonicalTrackingRecorder:
         self.authority = authority
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.max_records = int(max_records)
+        if observer_limits is not None:
+            defaults = ObserverLimits()
+            if observer_limits.max_records > self.max_records or any(
+                getattr(observer_limits, field) > getattr(defaults, field)
+                for field in ("max_queue_items", "max_queue_bytes", "max_file_bytes")
+            ):
+                raise ValueError("observer_limits cannot increase canonical recorder bounds")
         self.tracking_path = self.output_dir / "tracking.ndjson"
         self.provenance_path = self.output_dir / "provenance.json"
         self.rest_paths = {
@@ -1343,7 +1353,7 @@ class CanonicalTrackingRecorder:
         self._observer = StaticCaptureObserver(
             self.tracking_path,
             selected_source_id=authority.source_id,
-            limits=ObserverLimits(max_records=self.max_records),
+            limits=observer_limits or ObserverLimits(max_records=self.max_records),
         )
         self._lock = threading.RLock()
         self._stop_event = threading.Event()

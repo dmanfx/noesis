@@ -1,6 +1,7 @@
-import BrowserCapture from "./browser_capture.js?v=2.1.0";
-import CompanionCapture from "./companion_capture.js?v=1.0.1";
-import NativeCaptureUI, { isRoomWalkAndroid, pathReferenceForScan, pathSelectionLabel } from "./native_capture.js?v=2.3.0";
+import BrowserCapture from "./browser_capture.js?v=2.2.1";
+import CompanionCapture, { normalizeCameraIds } from "./companion_capture.js?v=1.1.1";
+import NativeCaptureUI, { isRoomWalkAndroid, pathReferenceForScan, pathSelectionLabel } from "./native_capture.js?v=2.5.0";
+import { cameraSelection, changeCameraSelection, cameraSelectionMarkup } from "./camera_selection.js?v=1.0.0";
 import CalibrationUI, { scanCameraSelectionMarkup } from "./calibration.js?v=2.2.0";
 import { createPathComparisonController } from "./path_comparison.js?v=1.0.0";
 
@@ -25,7 +26,8 @@ const browserAccelerometerCount = document.querySelector("#browser-accelerometer
 const browserGyroscopeCount = document.querySelector("#browser-gyroscope-count");
 const browserVideoFrameCount = document.querySelector("#browser-video-frame-count");
 const browserCaptureBytes = document.querySelector("#browser-capture-bytes");
-const companionCameraSelect = document.querySelector("#companion-camera-select");
+const companionCameraPicker = document.querySelector("#companion-camera-picker");
+let companionSelection = cameraSelection();
 const companionCameraStatus = document.querySelector("#companion-camera-status");
 const companionCaptureStatus = document.querySelector("#companion-capture-status");
 const companionHeartbeatStatus = document.querySelector("#companion-heartbeat-status");
@@ -471,34 +473,32 @@ function companionHeartbeatAge(status) {
 }
 
 function renderCompanionCaptureState(status = companionCapture.status) {
-  if (!companionCameraSelect) return;
+  if (!companionCameraPicker) return;
   const pairedRequired = captureMode === "path_refinement";
   const cameras = Array.isArray(status?.cameras) ? status.cameras : [];
   const selected = status?.selectedCameraId || "";
-  const active = ["starting", "recording", "stopping", "finalizing"].includes(status?.state);
-  const options = ['<option value="">Choose the room camera…</option>']
-    .concat(cameras.map((camera) => {
-      const label = camera.label || camera.camera_id;
-      const availability = camera.available === true ? "" : ` · unavailable${camera.reason ? `: ${camera.reason}` : ""}`;
-      return `<option value="${escapeHtml(camera.camera_id)}" ${camera.camera_id === selected ? "selected" : ""} ${camera.available === true ? "" : "disabled"}>${escapeHtml(label)}${escapeHtml(availability)}</option>`;
-    }));
-  const currentOptions = companionCameraSelect.innerHTML;
-  const nextOptions = options.join("");
-  if (currentOptions !== nextOptions) companionCameraSelect.innerHTML = nextOptions;
-  companionCameraSelect.value = selected;
-  companionCameraSelect.disabled = active || !status?.camerasAvailable;
+  const companionActive = ["starting", "recording", "stopping", "finalizing"].includes(status?.state);
+  const active = companionActive
+    || ["recording", "stopping", "finalizing"].includes(browserCapture.status.state);
+  companionSelection = cameraSelection({ cameras, selectedIds: status?.selectedCameraIds || [], primaryId: selected,
+    maxCameras: status?.maxCameras ?? 1, supportedMax: status?.multiCameraCapture ? 2 : 1, locked: active });
+  companionCameraPicker.innerHTML = cameraSelectionMarkup(companionSelection, { fieldsetId: "companion-recording-cameras", primarySelectId: "companion-primary-camera" });
 
   const availableCount = cameras.filter((camera) => camera.available === true).length;
   if (!status?.camerasAvailable) {
-    companionCameraStatus.textContent = pairedRequired
+    companionCameraStatus.textContent = selected
+      ? "Checked static cameras are unavailable. Reconnect them or explicitly uncheck them before recording."
+      : pairedRequired
       ? status?.cameraReason || "No available static room cameras were reported by the appliance."
       : "Pairing is optional for reconstruction; no static room camera is selected.";
+  } else if (companionActive) {
+    companionCameraStatus.textContent = `Recording ${(status.cameraIds || [status.cameraId || selected]).map(cameraLabel).join(" + ")} · primary ${cameraLabel(status.cameraId || selected)}`;
   } else if (active) {
-    companionCameraStatus.textContent = `${availableCount} room camera${availableCount === 1 ? "" : "s"} available · selected ${status.cameraId || selected}`;
+    companionCameraStatus.textContent = "Phone-only recording · camera selection is locked until recording stops.";
   } else if (selected) {
-    companionCameraStatus.textContent = pairedRequired ? "Selected camera is required for path refinement." : "Selected camera will be retained as independent reconstruction reference.";
+    companionCameraStatus.textContent = `${status.selectedCameraIds.map(cameraLabel).join(" + ")} · every checked camera must be ready · primary ${cameraLabel(selected)}`;
   } else {
-    companionCameraStatus.textContent = pairedRequired ? "Choose the physically installed room camera before starting path refinement." : "Optional: choose a static room camera to retain paired reconstruction evidence.";
+    companionCameraStatus.textContent = pairedRequired ? "Check at least one installed room camera before starting path refinement." : "No static cameras checked · phone-only reconstruction.";
   }
 
   const staticStatus = status?.state === "recording"
@@ -999,12 +999,16 @@ function preparedSection(scan) {
 
 function companionCaptureSection(companion) {
   if (!companion) return "";
-  const links = Object.entries(companion.artifact_urls || {})
+  let ids;
+  try { ids = normalizeCameraIds(companion.camera_id, companion.camera_ids); }
+  catch (_) { return '<div class="error-box">The retained static-camera reference is malformed; original evidence remains retained.</div>'; }
+  const artifactRows = ids.length > 1 ? ids.flatMap((id) => Object.entries(companion.cameras?.[id]?.artifact_urls || {}).map(([key, url]) => [`${id}: ${key}`, url])) : Object.entries(companion.artifact_urls || {});
+  const links = artifactRows
     .filter(([, url]) => typeof url === "string" && url)
-    .slice(0, 12)
+    .slice(0, 24)
     .map(([name, url]) => `<a class="artifact-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(name.replaceAll("_", " "))}</a>`)
     .join("");
-  return `<div class="companion-result"><div><span class="eyebrow">Paired static room recording</span><p><b>${escapeHtml(companion.camera_id || "Selected room camera")}</b> · ${escapeHtml(companion.status || "unknown")}</p><p>Retained with this phone walk for independent room reconstruction and alignment.</p><div class="sensor-checks"><span>video: ${escapeHtml(companion.video_status || companion.recorder?.status || "unknown")}</span><span>tracking: ${escapeHtml(companion.tracking_status || companion.tracking?.status || "unknown")}</span><span>${Number(companion.clock_probes?.length || 0)} clock probes</span></div>${companion.error ? `<p class="error-box">${escapeHtml(companion.error)}</p>` : ""}</div>${links ? `<div class="artifact-row">${links}</div>` : ""}</div>`;
+  return `<div class="companion-result"><div><span class="eyebrow">Paired static room recording</span><p><b>${escapeHtml(ids.map(cameraLabel).join(" + "))}</b> · primary ${escapeHtml(companion.camera_id)} · ${escapeHtml(companion.status || "unknown")}</p><p>Retained with this phone walk for independent room reconstruction and alignment.</p><div class="sensor-checks"><span>video: ${escapeHtml(companion.video_status || companion.recorder?.status || "unknown")}</span><span>tracking: ${escapeHtml(companion.tracking_status || companion.tracking?.status || "unknown")}</span><span>${Number(companion.clock_probes?.length || 0)} clock probes</span></div>${companion.error ? `<p class="error-box">${escapeHtml(companion.error)}</p>` : ""}</div>${links ? `<div class="artifact-row">${links}</div>` : ""}</div>`;
 }
 
 function walkIntentReferenceLabel(intent) {
@@ -1917,6 +1921,10 @@ function uploadSensorBundle(file, { fileName = file?.name, fromBrowser = false }
   xhr.setRequestHeader("X-File-Name", encodeURIComponent(uploadName));
   const companion = fromBrowser ? browserCapture.status.manifest?.companion_capture : null;
   if (companion?.session_id) xhr.setRequestHeader("X-Companion-Session", companion.session_id);
+  if (companion?.camera_id) {
+    xhr.setRequestHeader("X-Companion-Camera-ID", companion.camera_id);
+    xhr.setRequestHeader("X-Companion-Camera-Ids", JSON.stringify(normalizeCameraIds(companion.camera_id, companion.camera_ids)));
+  }
   if (companion?.phone_capture_id) xhr.setRequestHeader("X-Phone-Capture-ID", companion.phone_capture_id);
   xhr.upload.addEventListener("progress", (event) => {
     if (!event.lengthComputable) return;
@@ -2055,11 +2063,14 @@ recordPhoneWalkButton.addEventListener("click", async () => {
     });
   }
 });
-companionCameraSelect?.addEventListener("change", (event) => {
+companionCameraPicker?.addEventListener("change", (event) => {
   try {
-    companionCapture.selectCamera(event.currentTarget.value);
+    const target = event.target;
+    if (!target.matches("input[data-camera-id], select[data-camera-primary]")) return;
+    const next = changeCameraSelection(companionSelection, target.matches("[data-camera-primary]")
+      ? { primaryId: target.value } : { cameraId: target.dataset.cameraId, checked: target.checked });
+    companionCapture.selectCameras(next.primaryId, next.ids);
   } catch (error) {
-    event.currentTarget.value = "";
     toastMessage(error.message || String(error));
     renderCompanionCaptureState(companionCapture.status);
   }
@@ -2069,12 +2080,14 @@ browserStartButton.addEventListener("click", async () => {
   let startedStatic = false;
   try {
     activeBrowserIntent = currentWalkIntent();
+    if (companionCapture.status.selectedCameraIds?.length && !companionCapture.readyToStart) throw new Error("Every requested static camera must be available before phone recording starts.");
     const paired = captureMode === "path_refinement" || companionCapture.readyToStart;
     if (captureMode === "path_refinement" && !companionCapture.readyToStart) throw new Error("Choose an available static room camera before starting the paired recording.");
     if (paired) {
       const phoneCaptureId = companionCapture.reservePhoneCaptureId();
       await companionCapture.start({
-        cameraId: companionCameraSelect.value,
+        cameraId: companionCapture.status.selectedCameraId,
+        cameraIds: companionCapture.status.selectedCameraIds,
         phoneCaptureId,
         browserCapture,
       });

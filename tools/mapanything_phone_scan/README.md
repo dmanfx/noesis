@@ -1199,8 +1199,11 @@ independently with screened Poisson, trims triangles that are not supported by
 nearby measurements, and removes only small disconnected components. Rebuilding
 rooms separately prevents an uncertain cross-room registration from inventing
 surfaces across a doorway or room join. The default 4 cm voxel size, 10 cm
-support limit, and 1.85 m ceiling cutaway favor a readable interior without
-claiming unobserved closure.
+support limit, and 1.85 m cutaway favor a readable interior without claiming
+unobserved closure. That legacy cutaway is a height crop, not a ceiling
+classifier: it also removes upper walls. Do not raise that cutoff to implement
+ceiling-specific restoration of an already published mesh; use the staged
+extension below.
 
 ```bash
 python3 tools/mapanything_phone_scan/build_pcf_review_surface_mesh.py \
@@ -1232,6 +1235,90 @@ source point assembly, copies the already reviewed transform without changing
 its yaw, translation, or scale, and binds Menon to the new mesh digest. Both the
 mesh and point variants remain presentation-only; neither changes calibration,
 room registration, canonical world state, or tracking authority.
+
+### Restore supported upper surfaces without a height crop (offline)
+
+`extend_pcf_upper_surfaces.py` extends an exact existing contract-v4 low/high
+mesh pair from its original untrimmed, consistency-gated phone surfels and
+matching RGB-D views. It does not rerun a model or change room edges, catalog,
+calibration, registration status, camera identities, or tracking authority.
+Original mesh buffers/accessors and photo atlases are retained; new owner-local
+triangles are appended only after same-owner distance and qualified support from
+at least two distinct source views. All three corners, centroid and edge
+midpoints must pass. New photo UVs use the retained source view's accepted atlas
+map; rejected/out-of-tile maps use measured RGB rather than clamped imagery.
+
+First discover candidates in a new output directory:
+
+```bash
+python3 -B -m tools.mapanything_phone_scan.extend_pcf_upper_surfaces \
+  --binding "$PCF_BINDING" --high-manifest "$PCF_HIGH_MANIFEST" \
+  --photo-source-manifest "$PCF_PHOTO_SOURCE_MANIFEST" \
+  --pcf-storage-root "$NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT" \
+  --assembly-id "$PCF_MESH_ASSEMBLY_ID" \
+  --output-dir "$PCF_CLASSIFICATION_DIR" --classify-only
+python3 -B -m tools.mapanything_phone_scan.render_pcf_ceiling_evidence \
+  --classification-dir "$PCF_CLASSIFICATION_DIR" \
+  --output-dir "$PCF_CLASSIFICATION_DIR/source_evidence"
+```
+
+Source-view review is required before building. The review JSON binds
+`source_surfels_sha256`, `source_classification` (path/hash/size),
+`candidate_archives` (owner-keyed path/hash/size), and
+`accepted_patch_seed_sha256` (owner-keyed lists, possibly empty). Admit ceilings
+by exact frozen seed-geometry digest, **never a RANSAC discovery ordinal**.
+Flat/high does not distinguish ceiling from furniture, beams or soffits. A
+candidate also needs connected broad plane support and qualified source cameras
+observing its underside. Unclassified or ambiguous points remain retained.
+Optional `protected_source_regions` contains owner-keyed source `view_index`,
+finite `polygon_pixels` and `reason`; it protects only matching measured depth,
+mask and confidence, not an occluded surface behind the labelled pixel.
+
+Every non-classification build requires both the frozen classification and its
+exact source-reviewed admission. Source-chain drift or a changed seed fails
+closed; do not regenerate numeric patch IDs and reuse an old review.
+
+```bash
+python3 -B -m tools.mapanything_phone_scan.extend_pcf_upper_surfaces \
+  --binding "$PCF_BINDING" --high-manifest "$PCF_HIGH_MANIFEST" \
+  --photo-source-manifest "$PCF_PHOTO_SOURCE_MANIFEST" \
+  --pcf-storage-root "$NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT" \
+  --assembly-id "$PCF_MESH_ASSEMBLY_ID" --output-dir "$PCF_STAGE_DIR" \
+  --classification-dir "$PCF_CLASSIFICATION_DIR" \
+  --ceiling-review "$PCF_CEILING_REVIEW"
+python3 -B -m tools.mapanything_phone_scan.verify_pcf_upper_stage \
+  --stage-dir "$PCF_STAGE_DIR" \
+  --report "$PCF_STAGE_DIR/serialized_validation.json" --archive-baseline
+```
+
+The verifier reads the actual serialized float32 triangles and UVs, rechecks
+source rays, retained buffers and low/high room frames, and exercises the
+unchanged strict tracking-review consumer. `--archive-baseline` saves two small
+exact original recipe/selector snapshots inside the stage only. The optional
+`render_pcf_upper_comparison` module takes explicit `--renderer` and
+`--rasterizer` paths and renders old/new low/high GLBs at identical original
+source poses, without height cropping or exposure correction.
+
+This workflow stages `low/manifest.json`, `low/surface_mesh_manifest.json`,
+low/high GLBs, `binding.activation.json`, and `high/tracking_high.json`.
+`binding.validation.json` and `tracking_high.validation.json` are isolated
+pre-activation bindings, **not runtime replacements**. It never writes an active
+selector, recipe, service environment or structural alignment. The authorized
+runtime owner must install the exact low assembly, then pair its selector,
+activation recipe and high-manifest selection with the matching Menon consumer
+change. Do not activate either half alone or reserialize the activation recipe:
+the high manifest binds its exact bytes. For a separately authorized v4-to-v4
+publisher operation, `publish_pcf_review_surface_mesh.py` additionally requires
+`--source-mesh-manifest` and the current exact structural report; never switch
+temporarily to a historical point selector.
+
+No global height limit is used for ceiling classification or the extension.
+The old upper boundary only nominates a bounded extension work region. Vertical
+wall junctions and source-reviewed beam/soffit regions are conservatively
+protected; existing qualified ceiling triangles in the retained base cause a
+build failure instead of silently bypassing their removal. Unsupported closure
+is withheld. Sparse/ambiguous ceiling evidence may therefore remain, and this
+workflow makes neither a gap-free nor an all-ceilings-removed claim.
 
 ### Single-room coherent photo surface (offline)
 

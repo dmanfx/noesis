@@ -48,6 +48,64 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def replacement_descriptor(
+    *, current: dict[str, Any], current_path: Path, storage_root: Path,
+    source_mesh_manifest: Path, mesh_glb: Path, mesh_manifest: Path,
+    assembly_id: str,
+) -> dict[str, Any]:
+    """Prepare a v4-to-v4 replacement without writing any active selector.
+
+    A replacement must preserve the exact untrimmed source and explicitly bind
+    the retained current mesh. It is not a route around current source checks.
+    """
+    artifact, provenance = current.get("artifact", {}), current.get("provenance", {})
+    if (current.get("contract") != "noesis.scene.review_assembly"
+            or current.get("contract_version") != 4
+            or current.get("status") != "review_only"
+            or current.get("accepted_for_canonical_use") is not False
+            or artifact.get("role") != "multiroom_surface_mesh_glb"):
+        raise ValueError("replacement source is not a v4 review mesh")
+    source_glb = (storage_root.resolve() / artifact["relative_path"]).resolve()
+    if storage_root.resolve() not in source_glb.parents:
+        raise ValueError("source mesh escapes PCF storage")
+    if (_sha256(source_glb) != artifact.get("sha256")
+            or source_glb.stat().st_size != artifact.get("size_bytes")
+            or _sha256(source_mesh_manifest) != provenance.get("source_surface_mesh_manifest_sha256")):
+        raise ValueError("replacement source mesh digest mismatch")
+    old, new = _json(source_mesh_manifest), _json(mesh_manifest)
+    source, output = new.get("source", {}), new.get("output", {})
+    if (new.get("contract") != "noesis.pcf.review_surface_mesh"
+            or new.get("status") != "review_only" or new.get("accepted_for_canonical_use") is not False
+            or new.get("coordinate_frame") != current.get("assembly_gauge")
+            or source.get("surfels_manifest_sha256") != provenance.get("source_reintegration_manifest_sha256")
+            or source.get("surfels_npz_sha256") != old.get("source", {}).get("surfels_npz_sha256")
+            or source.get("retained_low_glb_sha256") != artifact.get("sha256")
+            or source.get("retained_low_mesh_manifest_sha256") != _sha256(source_mesh_manifest)
+            or source.get("source_descriptor_sha256") != _sha256(current_path)
+            or output.get("sha256") != _sha256(mesh_glb)
+            or output.get("size_bytes") != mesh_glb.stat().st_size):
+        raise ValueError("replacement mesh does not preserve the exact current source chain")
+    if not assembly_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for c in assembly_id):
+        raise ValueError("assembly id contains unsupported characters")
+    counts = {str(owner):int(row["output_triangle_count"]) for owner,row in new.get("owners", {}).items()}
+    if (set(counts) != set(artifact.get("owner_triangle_counts", {}))
+            or any(value <= 0 for value in counts.values())
+            or sum(counts.values()) != output.get("triangle_count")
+            or not 0 < output.get("size_bytes", 0) <= 64 * 1024 * 1024):
+        raise ValueError("replacement owner/count/size inventory is invalid")
+    descriptor = deepcopy(current)
+    descriptor.update(assembly_id=assembly_id, created_at_us=time.time_ns() // 1000)
+    descriptor["artifact"] = {**artifact, "relative_path":f"review-assemblies/{assembly_id}/multiroom_surface_mesh.glb",
+        **{key:output[key] for key in ("sha256", "size_bytes", "vertex_count", "triangle_count")},
+        "owner_triangle_counts":counts}
+    # No claim that the unchanged legacy triangles passed newer ray/class gates.
+    descriptor["artifact"].pop("support", None)
+    descriptor["provenance"].update(source_glb_sha256=output["sha256"],
+        source_surface_mesh_manifest_sha256=_sha256(mesh_manifest))
+    descriptor.pop("artifact_url", None)
+    return descriptor
+
+
 def publish(args: argparse.Namespace) -> dict[str, Any]:
     storage_root = args.pcf_storage_root.resolve()
     current_path = args.current_descriptor.resolve()
@@ -55,12 +113,12 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
     source_artifact = current.get("artifact", {})
     if (
         current.get("contract") != "noesis.scene.review_assembly"
-        or current.get("contract_version") != 3
+        or current.get("contract_version") not in (3, 4)
         or current.get("status") != "review_only"
         or current.get("accepted_for_canonical_use") is not False
-        or source_artifact.get("role") != "multiroom_points_glb"
+        or source_artifact.get("role") != ({3:"multiroom_points_glb",4:"multiroom_surface_mesh_glb"}.get(current.get("contract_version")))
     ):
-        raise ValueError("current descriptor is not a v3 point review assembly")
+        raise ValueError("current descriptor is not a supported point/mesh review assembly")
     source_glb = (storage_root / source_artifact["relative_path"]).resolve()
     if storage_root not in source_glb.parents:
         raise ValueError("source point GLB escapes PCF storage")
@@ -70,6 +128,13 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
     mesh_manifest = _json(args.mesh_manifest)
     mesh_sha = _sha256(args.mesh_glb)
     mesh_output = mesh_manifest.get("output", {})
+    replacement = None
+    if current["contract_version"] == 4:
+        if getattr(args, "source_mesh_manifest", None) is None:
+            raise ValueError("mesh replacement requires the current source mesh manifest")
+        replacement = replacement_descriptor(current=current,current_path=current_path,storage_root=storage_root,
+            source_mesh_manifest=args.source_mesh_manifest,mesh_glb=args.mesh_glb,
+            mesh_manifest=args.mesh_manifest,assembly_id=args.assembly_id)
     if (
         mesh_manifest.get("contract") != "noesis.pcf.review_surface_mesh"
         or mesh_manifest.get("status") != "review_only"
@@ -164,6 +229,8 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
             "source_point_glb_sha256": source_artifact["sha256"],
             "source_surface_mesh_manifest_sha256": _sha256(args.mesh_manifest),
         }
+        if replacement is not None:
+            descriptor = replacement
         descriptor.pop("artifact_url", None)
         _atomic_json(temporary / "manifest.json", descriptor)
         os.replace(temporary, destination)
@@ -173,8 +240,12 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
 
     structural["assembly_id"] = args.assembly_id
     structural["source"]["review_artifact_sha256"] = mesh_sha
-    structural["source"]["source_point_assembly_id"] = current["assembly_id"]
-    structural["source"]["source_point_artifact_sha256"] = source_artifact["sha256"]
+    if replacement is None:
+        structural["source"]["source_point_assembly_id"] = current["assembly_id"]
+        structural["source"]["source_point_artifact_sha256"] = source_artifact["sha256"]
+    else:
+        structural["source"]["retained_mesh_assembly_id"] = current["assembly_id"]
+        structural["source"]["retained_mesh_artifact_sha256"] = source_artifact["sha256"]
     structural["source"]["surface_mesh_manifest_sha256"] = _sha256(
         args.mesh_manifest
     )
@@ -200,6 +271,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--current-descriptor", type=Path, required=True)
     parser.add_argument("--mesh-glb", type=Path, required=True)
     parser.add_argument("--mesh-manifest", type=Path, required=True)
+    parser.add_argument("--source-mesh-manifest", type=Path,
+                        help="required for v4 mesh-to-mesh replacement; preserves the original source chain")
     parser.add_argument("--source-structural-alignment", type=Path, required=True)
     parser.add_argument(
         "--structural-output",

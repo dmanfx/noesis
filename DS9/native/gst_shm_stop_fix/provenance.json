@@ -1,0 +1,63 @@
+{
+  "repository": "https://github.com/GStreamer/gstreamer",
+  "tag": "1.24.2",
+  "commit": "2d8273151571fcab887cc81de48e87aeb61b5c06",
+  "files": {
+    "gstshm.c": {
+      "upstream_sha256": "03ab32d47124909055ff362925b28d6622ca38ee978a8ac4353343178b922e8f",
+      "upstream_git_blob": "4c18676a5f5a2a5c934e3425c055020eee9fa631",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/gstshm.c"
+    },
+    "gstshmsink.c": {
+      "upstream_sha256": "64b43b25e35ba039fe500e685fe041c7858cfc85d28f0cd9a4bd35b9215b77a3",
+      "upstream_git_blob": "fdbff9da94e1199379b47fec2933c5d8929262db",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/gstshmsink.c"
+    },
+    "gstshmsink.h": {
+      "upstream_sha256": "0bd83f0c6327ce12a210a5012ae9c7a304e8e11dd81d002d69f99fddec9e9cc2",
+      "upstream_git_blob": "241b802a388d4b02b68c74f88a1adabac5157a13",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/gstshmsink.h"
+    },
+    "gstshmsrc.c": {
+      "upstream_sha256": "246d619922ae345586c85529f88d3691aa973398eb473885ef03cd509483907c",
+      "upstream_git_blob": "4c72b45d363b316c439c52bfd0b31e17592f78f1",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/gstshmsrc.c"
+    },
+    "gstshmsrc.h": {
+      "upstream_sha256": "6e6d793d126d8bf01d1daeea1ab4c38395a876cf53e068f1302bad705ae45bf2",
+      "upstream_git_blob": "b14fcd7fd335705b4808f8b211367647d0e7acb2",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/gstshmsrc.h"
+    },
+    "shmpipe.c": {
+      "upstream_sha256": "e64248957e08844adad921d40c4e76141758458a46cb9fadae73b71bee0a81fd",
+      "upstream_git_blob": "4a855c072a877a639797a01b2f1d13ac69162091",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/shmpipe.c"
+    },
+    "shmpipe.h": {
+      "upstream_sha256": "682fd12ef99f3d756a7ab8ab9564e9bf7f349ab60e0cd843237abcb3d473f92c",
+      "upstream_git_blob": "1f746ac4bd12ed6828ebcf6580b73eee9fd4c435",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/shmpipe.h"
+    },
+    "shmalloc.c": {
+      "upstream_sha256": "ea0ff407366801382755b60344290443629913bb2c1c65d318b31e872072b9b6",
+      "upstream_git_blob": "62c2bc751b0f7f4375513825e07e7440450ab715",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/shmalloc.c"
+    },
+    "shmalloc.h": {
+      "upstream_sha256": "0f84be193fb2172485fa30e67a58296f6d4292f57c3560f30329973c1cf16bc4",
+      "upstream_git_blob": "418bcc10edf4cedfa3d72d5f2962bbb4d2c61580",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/shmalloc.h"
+    },
+    "meson.build": {
+      "upstream_sha256": "4d1debd90ee7a730686282e32a86a9ccc6f45655ed5ef66c4bba3f79bc1ccb55",
+      "upstream_git_blob": "c40136b13f57687b869b1b38b229972224b9be55",
+      "upstream_path": "subprojects/gst-plugins-bad/sys/shm/meson.build"
+    },
+    "COPYING": {
+      "upstream_sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551",
+      "upstream_git_blob": "4362b49151d7b34ef83b3067a8f9c9f877d72a0e",
+      "upstream_path": "subprojects/gst-plugins-bad/COPYING"
+    }
+  },
+  "only_source_delta": "      /* Noesis 2026-10-16: stop() deliberately flushes this poll. */\n      if (self->stop && errno == EBUSY)\n        return NULL;\n"
+}

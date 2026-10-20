@@ -139,10 +139,280 @@
       ],
       "title": "Vector3",
       "type": "object"
+    },
+    "WorldAttributionClaim": {
+      "additionalProperties": false,
+      "description": "Lossless bounded scalar copy of one ORIGINAL household claim owner.",
+      "properties": {
+        "acquired_at_s": {
+          "title": "Acquired At S",
+          "type": "number"
+        },
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "clock_basis": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Clock Basis",
+          "type": "string"
+        },
+        "clock_domain": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Clock Domain",
+          "type": "string"
+        },
+        "frame_id": {
+          "minimum": 0,
+          "title": "Frame Id",
+          "type": "integer"
+        },
+        "household_constraint": {
+          "enum": [
+            "eligible",
+            "unresolved",
+            "rejected"
+          ],
+          "title": "Household Constraint",
+          "type": "string"
+        },
+        "household_identity_key": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Household Identity Key"
+        },
+        "household_stable_id": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Household Stable Id"
+        },
+        "household_state": {
+          "enum": [
+            "unknown",
+            "provisional",
+            "resident",
+            "visitor",
+            "handoff"
+          ],
+          "title": "Household State",
+          "type": "string"
+        },
+        "household_visitor_generation": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Household Visitor Generation"
+        },
+        "lifecycle_generation": {
+          "minimum": 0,
+          "title": "Lifecycle Generation",
+          "type": "integer"
+        },
+        "lifecycle_started_frame": {
+          "minimum": 0,
+          "title": "Lifecycle Started Frame",
+          "type": "integer"
+        },
+        "media_time_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Media Time S"
+        },
+        "observation_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "physical_serial": {
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 1,
+          "title": "Physical Serial",
+          "type": "integer"
+        },
+        "raw_id": {
+          "minimum": 0,
+          "title": "Raw Id",
+          "type": "integer"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "source_epoch": {
+          "minimum": 0,
+          "title": "Source Epoch",
+          "type": "integer"
+        },
+        "source_id": {
+          "minimum": 0,
+          "title": "Source Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "physical_serial",
+        "camera_id",
+        "source_id",
+        "source_epoch",
+        "raw_id",
+        "lifecycle_generation",
+        "lifecycle_started_frame",
+        "frame_id",
+        "observation_id",
+        "acquired_at_s",
+        "clock_domain",
+        "media_time_s",
+        "clock_basis",
+        "household_state",
+        "household_identity_key",
+        "household_stable_id",
+        "household_visitor_generation",
+        "household_constraint"
+      ],
+      "title": "WorldAttributionClaim",
+      "type": "object"
+    },
+    "WorldAttributionQuarantine": {
+      "additionalProperties": false,
+      "properties": {
+        "association_revision": {
+          "minimum": 0,
+          "title": "Association Revision",
+          "type": "integer"
+        },
+        "component_entity_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Component Entity Ids",
+          "type": "array"
+        },
+        "conflict_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Conflict Id",
+          "type": "string"
+        },
+        "owners": {
+          "items": {
+            "$ref": "#/$defs/WorldAttributionClaim"
+          },
+          "maxItems": 128,
+          "minItems": 2,
+          "title": "Owners",
+          "type": "array"
+        },
+        "purpose": {
+          "const": "physical_only_quarantine",
+          "default": "physical_only_quarantine",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "reason": {
+          "const": "settled_household_claim_conflict",
+          "default": "settled_household_claim_conflict",
+          "title": "Reason",
+          "type": "string"
+        },
+        "retained_owners": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorldAttributionClaim"
+          },
+          "maxItems": 128,
+          "title": "Retained Owners",
+          "type": "array"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "stable_ids": {
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 128,
+          "title": "Stable Ids",
+          "type": "array"
+        },
+        "status": {
+          "const": "quarantined",
+          "default": "quarantined",
+          "title": "Status",
+          "type": "string"
+        },
+        "subject_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Subject Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "conflict_id",
+        "run_id",
+        "association_revision",
+        "subject_ids",
+        "stable_ids",
+        "owners",
+        "component_entity_ids"
+      ],
+      "title": "WorldAttributionQuarantine",
+      "type": "object"
     }
   },
   "additionalProperties": false,
   "properties": {
+    "attribution_quarantine": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorldAttributionQuarantine"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "calibration_revision": {
       "anyOf": [
         {

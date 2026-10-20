@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,33 @@ def _videos(tmp_path: Path) -> dict[str, Path]:
         video.write_bytes(b"video")
         videos[camera_id] = video
     return videos
+
+
+def test_finite_replay_explicitly_disables_inherited_loop_without_mutating_baseline(tmp_path: Path) -> None:
+    module = _module()
+    baseline = {
+        "sources": [
+            {"uri_secret": "living-room", "file-loop": True, "latency": 123},
+            {"uri_secret": "kitchen", "gpu-id": 0},
+            {"uri_secret": "family-room", "file-loop": False, "dewarper": {"enable": True}},
+        ],
+        "streammux": {"live-source": 1, "batch-size": 3, "width": 1920},
+        "models": {"selected": "unchanged"},
+        "tracker": {"quality": "unchanged"},
+    }
+    before = copy.deepcopy(baseline)
+    videos = _videos(tmp_path)
+    rendered = module.render_replay_config(baseline, videos)
+    assert all(source.get("file-loop") is False for source in rendered["sources"])
+    assert baseline == before
+    expected = copy.deepcopy(before)
+    for source, camera_id in zip(expected["sources"], module.CANONICAL_CAMERA_ORDER):
+        source.pop("uri_secret")
+        source.update(camera_id=camera_id, uri=videos[camera_id].resolve().as_uri())
+        source["file-loop"] = False
+    expected["streammux"]["live-source"] = 0
+    expected["recorded_replay"] = {"realtime": True, "preserve_frames": True}
+    assert rendered == expected
 
 
 def test_render_keeps_pipeline_quality_and_only_rebinds_sources(tmp_path: Path) -> None:

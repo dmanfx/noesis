@@ -89,6 +89,57 @@ def test_feeder_fatal_error_is_observable_and_notified_once() -> None:
     assert failures == [first]
 
 
+@pytest.mark.parametrize('receipt', [None, lambda:False, lambda:None])
+def test_unexpected_eos_remains_fatal_without_exact_producer_receipt(receipt):
+    failures=[]
+    feeder=MosaicH264ShmFeeder('/tmp/not-started-mosaic.sock',on_fatal_error=failures.append,
+                             is_expected_eos=receipt)
+    feeder._on_bus_eos(None,None)
+    assert len(failures)==1 and feeder.fatal_error is failures[0]
+
+
+def test_confirmed_finite_eos_does_not_override_an_earlier_transport_failure():
+    state={'pipeline_eos_seen':False,'pipeline_eos_reason':None}
+    failures=[]
+    feeder=MosaicH264ShmFeeder('/tmp/not-started-mosaic.sock',on_fatal_error=failures.append,
+        is_expected_eos=lambda:state['pipeline_eos_seen'] is True and state['pipeline_eos_reason']=='finite_source')
+    state.update(pipeline_eos_seen=True,pipeline_eos_reason='finite_source')
+    feeder._on_bus_eos(None,None)
+    assert not failures and feeder.fatal_error is None
+    error=RuntimeError('actual transport failure')
+    feeder._record_fatal_error(error)
+    feeder._on_bus_eos(None,None)
+    assert feeder.fatal_error is error and failures==[error]
+
+
+def test_eos_receipt_exception_fails_closed():
+    def unavailable():raise ValueError('no producer receipt')
+    feeder=MosaicH264ShmFeeder('/tmp/not-started-mosaic.sock',is_expected_eos=unavailable)
+    feeder._on_bus_eos(None,None)
+    assert feeder.fatal_error is not None
+
+
+@pytest.mark.parametrize('confirmed,source,domain,code,expected',[
+    (True,'mosaic_h264_shmsrc','gst-resource-error-quark',9,True),
+    (False,'mosaic_h264_shmsrc','gst-resource-error-quark',9,False),
+    (True,'other_source','gst-resource-error-quark',9,False),
+    (True,'mosaic_h264_shmsrc','gst-resource-error-quark',1,False),
+    (True,'mosaic_h264_shmsrc','gst-stream-error-quark',1,False),
+])
+def test_only_confirmed_finite_shm_read_close_is_normal(confirmed,source,domain,code,expected):
+    from types import SimpleNamespace
+    feeder=MosaicH264ShmFeeder('/tmp/not-started-mosaic.sock',is_expected_eos=lambda:confirmed)
+    error=SimpleNamespace(domain=domain,code=code)
+    message=SimpleNamespace(src=SimpleNamespace(get_name=lambda:source),parse_error=lambda:(error,'test'))
+    feeder._on_bus_error(None,message)
+    assert (feeder.fatal_error is None)==expected
+    if expected:
+        message=SimpleNamespace(src=message.src,
+            parse_error=lambda:(SimpleNamespace(domain='gst-stream-error-quark',code=1),'derivative'))
+        feeder._on_bus_error(None,message)
+        assert feeder.fatal_error is None
+
+
 def test_feeder_start_proves_first_au_and_fans_out_complete_buffers(
     tmp_path: Path,
 ) -> None:

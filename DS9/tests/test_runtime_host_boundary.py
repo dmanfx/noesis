@@ -30,6 +30,58 @@ def _load_module():
 host = _load_module()
 
 
+@pytest.mark.parametrize('fault', ['none', 'system', 'wrong_source_factory', 'version', 'missing', 'symlink'])
+def test_p51_shm_selection_exact_owned_path_both_factories(tmp_path, monkeypatch, fault):
+    from types import SimpleNamespace
+    from noesis import native_artifact_provenance
+    owned = tmp_path / 'DS9/gst-plugins'
+    owned.mkdir(parents=True)
+    binary = owned / 'libgstshm.so'
+    attest = mock.Mock(return_value=binary)
+    monkeypatch.setattr(native_artifact_provenance, 'attest_ds9_shm_plugin', attest)
+    if fault == 'symlink':
+        foreign = tmp_path / 'foreign.so'
+        foreign.write_bytes(b'synthetic')
+        binary.symlink_to(foreign)
+    elif fault != 'missing':
+        binary.write_bytes(b'synthetic')
+    calls = []
+    def inspect(command, **kwargs):
+        calls.append((command, kwargs))
+        actual = '/usr/lib/gstreamer-1.0/libgstshm.so' if fault == 'system' or (
+            fault == 'wrong_source_factory' and command[-1] == 'shmsrc') else str(binary)
+        version = '1.24.3' if fault == 'version' else '1.24.2'
+        return SimpleNamespace(returncode=0, stdout=f'  Filename {actual}\n  Version {version}\n')
+    monkeypatch.setattr(host.subprocess, 'run', inspect)
+    config = SimpleNamespace(repo_root=tmp_path)
+    if fault != 'none':
+        with pytest.raises(host.NativeRuntimeError):
+            host.select_owned_shm_plugin(config, {'GST_PLUGIN_PATH': '/old'})
+        return
+    result = host.select_owned_shm_plugin(config, {'GST_PLUGIN_PATH': '/old', 'GST_PLUGIN_PATH_1_0': '/other'})
+    assert result['NOESIS_GST_PLUGIN_DIR'] == str(owned)
+    assert result['GST_PLUGIN_PATH'] == result['GST_PLUGIN_PATH_1_0'] == f'{owned}:/old:/other'
+    assert [c[0][-1] for c in calls] == ['shmsink', 'shmsrc']
+    assert all(c[1]['env'] == result for c in calls)
+    assert attest.call_count == 2
+
+
+def test_p52_shm_provenance_refusal_precedes_gst_inspect(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from noesis import native_artifact_provenance
+    owned = tmp_path / 'DS9/gst-plugins'
+    owned.mkdir(parents=True)
+    (owned / 'libgstshm.so').write_bytes(b'synthetic')
+    def refuse(**_kwargs):
+        raise native_artifact_provenance.DS9NativeArtifactProvenanceError('synthetic source drift')
+    monkeypatch.setattr(native_artifact_provenance, 'attest_ds9_shm_plugin', refuse)
+    inspected = mock.Mock(side_effect=AssertionError('unattested plugin must not load'))
+    monkeypatch.setattr(host.subprocess, 'run', inspected)
+    with pytest.raises(RuntimeError, match='source drift'):
+        host.select_owned_shm_plugin(SimpleNamespace(repo_root=tmp_path), {})
+    inspected.assert_not_called()
+
+
 def _private_directory(path: Path) -> Path:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     path.chmod(0o700)

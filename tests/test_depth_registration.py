@@ -83,6 +83,93 @@ def _entry(camera_id: str = "cam0") -> tuple[CalibrationSnapshot, dict[str, obje
     return snapshot, dav2_profile, mapanything_profile, entry
 
 
+def _r104_current_payload():
+    return json.loads((ROOT / 'DS9/config/depth_registration.json').read_text())
+
+
+def _r104_original_id(payload):
+    if payload.get('occupied_anchor_validation'):
+        hashed={key:value for key,value in payload.items() if key!='registration_id'}
+        short=False
+    else:
+        hashed={key:payload[key] for key in ('camera_id','created_ts_us','raw_range_domain_m',
+            'knots_raw_m','knots_registered_m')}
+        short=True
+    digest=hashlib.sha256(json.dumps(hashed,sort_keys=True,separators=(',',':'),
+        ensure_ascii=True).encode()).hexdigest()
+    return payload['camera_id']+':'+(digest[:12] if short else digest)
+
+
+def test_r104_actual_three_hardened_ids_and_serialization_are_unchanged():
+    from noesis.calibration.depth_registration import DepthRegistrationBundle
+    raw=_r104_current_payload()
+    bundle=DepthRegistrationBundle.from_dict(raw)
+    assert len(bundle.entries)==3 and bundle.to_dict()==raw
+    for camera,entry in bundle.entries.items():
+        assert entry.registration_id==raw['cameras'][camera]['registration_id']
+        assert entry.registration_id==_r104_original_id(raw['cameras'][camera])
+        assert entry.registration_id is entry.registration_id  # No repeated hash allocation.
+
+
+def test_r104_caller_nested_alias_cannot_change_owned_entry():
+    from noesis.calibration.depth_registration import DepthRegistrationEntry
+    payload=_r104_current_payload()['cameras']['family-room']
+    entry=DepthRegistrationEntry.from_dict(payload)
+    original=entry.to_dict();identity=entry.registration_id
+    value=entry.apply(sum(entry.raw_range_domain_m)/2.)
+    payload['occupied_anchor_validation']['fit_raw_range_m'].append('caller-mutation')
+    payload['provenance']['calibration_admission']['session_id']='caller-mutation'
+    payload['knots_registered_m'][0]=999.
+    assert entry.to_dict()==original and entry.registration_id==identity
+    assert entry.apply(sum(entry.raw_range_domain_m)/2.)==value
+    with pytest.raises(TypeError):entry.occupied_anchor_validation['fit_raw_range_m'][0]=999.
+    with pytest.raises(TypeError):entry.provenance['calibration_admission']['session_id']='mutation'
+    with pytest.raises(TypeError):entry.fit_metrics['mutation']=1
+
+
+def test_r104_to_dict_is_deep_detached_plain_json():
+    from noesis.calibration.depth_registration import DepthRegistrationEntry
+    entry=DepthRegistrationEntry.from_dict(_r104_current_payload()['cameras']['kitchen'])
+    exported=entry.to_dict();before=entry.registration_id
+    assert type(exported['occupied_anchor_validation']['fit_raw_range_m']) is list
+    assert type(exported['provenance']['calibration_admission']) is dict
+    exported['occupied_anchor_validation']['fit_raw_range_m'].append(99.)
+    exported['provenance']['calibration_admission']['session_id']='detached'
+    assert entry.registration_id==before and entry.to_dict()!=exported
+    json.dumps(entry.to_dict(),allow_nan=False)
+
+
+def test_r104_replace_reowns_and_recomputes_exact_hardened_id():
+    from noesis.calibration.depth_registration import DepthRegistrationEntry
+    entry=DepthRegistrationEntry.from_dict(_r104_current_payload()['cameras']['living-room'])
+    changed=replace(entry,knots_registered_m=[v+.001 for v in entry.knots_registered_m])
+    assert changed.registration_id!=entry.registration_id
+    assert changed.registration_id==_r104_original_id(changed.to_dict())
+    assert replace(entry).registration_id==entry.registration_id
+    with pytest.raises(TypeError):changed.knots_registered_m[0]=99.
+
+
+def test_r104_legacy_id_and_direct_constructor_inputs_remain_owned():
+    _,_,_,entry=_entry()
+    caller={'nested':{'values':[1.,2.]}}
+    changed=replace(entry,provenance=caller,knots_raw_m=list(entry.knots_raw_m))
+    assert changed.registration_id==_r104_original_id(changed.to_dict())
+    caller['nested']['values'].append(3.)
+    assert changed.to_dict()['provenance']['nested']['values']==[1.,2.]
+    assert len(changed.registration_id.rsplit(':',1)[-1])==12
+
+
+@pytest.mark.parametrize('defect',['recorded-id','tuple-json-list','calibration-shape'])
+def test_r104_hardened_original_plain_shape_and_hash_guards_unchanged(defect):
+    from noesis.calibration.depth_registration import DepthRegistrationBundle
+    raw=_r104_current_payload();payload=raw['cameras']['family-room']
+    if defect=='recorded-id':payload['registration_id']='family-room:'+('0'*64)
+    elif defect=='tuple-json-list':
+        payload['occupied_anchor_validation']['fit_raw_range_m']=tuple(payload['occupied_anchor_validation']['fit_raw_range_m'])
+    else:payload['calibration_fingerprint']['intrinsics']=[[1.]]
+    with pytest.raises(DepthRegistrationError):DepthRegistrationBundle.from_dict(raw)
+
+
 def test_model_profile_fingerprint_keeps_absolute_repo_paths_relative_through_symlink(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     engine_storage = tmp_path / "engine_storage"

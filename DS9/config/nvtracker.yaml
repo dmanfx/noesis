@@ -21,7 +21,7 @@ TrajectoryManagement:
 
 DataAssociator:
   dataAssociatorType: 0
-  associationMatcherType: 0
+  associationMatcherType: 1
   checkClassMatch: 1
   minMatchingScore4Overall: 0.4
   minMatchingScore4SizeSimilarity: 0.35

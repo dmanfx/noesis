@@ -79,11 +79,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: c50a971f9095f9af3c4420d8efcb7675ce1fccdeae4615c6263db8e46e96f5e4
-      output_sha256: 00ad7cf20144825c79a0c3d8050de498a8f6a316959ecf893c1ca31b61e940e9
-      built_at_utc: "2026-08-12T14:47:28Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_native_extensions.sh
+      source_sha256: b6dac81ccb740095e63a4c205691f36932570dfa3f11142ed606378a130f8294
+      output_sha256: 86b84f517dcaacf6af97e3620db6baee7d2149fd299051c94a44c45c44478931
+      built_at_utc: "2026-10-17T01:07:33+00:00"
+      build_host: "native-host:TauntonMainframe (DS9.1/CUDA13.2, Python3.12)"
+      command: bash DS9/scripts/build_noesis_pose_meta_ext.sh
   - id: native.depth_meta
     kind: native_extension
     role: Object-depth user-meta attachment and extraction
@@ -126,11 +126,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: 6b44475041e782b428312931414275f6144e5dd120c1d8894640d0cc89afc9d6
-      output_sha256: 6b32b6961db4c49ba34419f299d3b7ecd33bbaf1eeb8567c11c6c013525d2fb2
-      built_at_utc: "2026-08-12T14:47:52Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_native_extensions.sh
+      source_sha256: d868cfb4dc928591b5c0eb604a95b80e616d18304438717063c29399c26bcaed
+      output_sha256: e350ea33301dd92d2efea1bd00a3ad93d6fff0323b81a6e828ff9805e34aa6a4
+      built_at_utc: "2026-10-16T07:22:34.529584Z"
+      build_host: "native-host:TauntonMainframe (DS9.1/CUDA13.2, Python3.12)"
+      command: bash DS9/scripts/build_noesis_reid_meta_ext.sh
   - id: native.v3dt_meta
     kind: native_extension
     role: V3DT visibility, image-foot, and 3D bbox metadata
@@ -210,9 +210,9 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: f439686765984998cead190bca58408f3bccd99035de0d4413f440faae36edb7
-      output_sha256: 0b3e7270f996972e18ce7b57a6749d7977872dd6105eff01610f8ac3730d31b7
-      built_at_utc: "2026-09-13T14:47:12.477794Z"
+      source_sha256: 63bce06502309f184f7fa699da1a3594f68e797d8c7250c41a7b8590db6270fc
+      output_sha256: f1cc10f4afbc36f29299fcd1e45ffaa7cf6c1b7a0f8d3cdd6f305b0414e3ebae
+      built_at_utc: "2026-10-16T04:51:25.128761Z"
       build_host: "native DS9.1 host (driver 595.71.05)"
       command: NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 ./DS9/gst-plugins/build_noesiseos.sh
   - id: plugin.yolo_seg_tensorrt

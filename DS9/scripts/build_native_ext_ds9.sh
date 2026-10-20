@@ -39,6 +39,10 @@ DS_LIB="${DS_HOME}/lib"
 
 CXXFLAGS=(-O3 -shared -std=c++17 -fPIC)
 LDFLAGS=(-L"${DS_LIB}" -Wl,-rpath,"${DS_LIB}" -lnvds_service_maker -lnvds_meta -lnvdsgst_meta)
+if [[ "${MODULE}" == "noesis_analytics_meta_ext" || "${MODULE}" == "noesis_pose_meta_ext" ]]; then
+  # The installed DS9.1 per-source serialized-event API lives here.
+  LDFLAGS+=(-lnvdsgst_helper)
+fi
 EXTRA_OBJECTS=()
 
 if [[ "${KIND}" == "cuda_runtime" || "${KIND}" == "cuda_npp" ]]; then

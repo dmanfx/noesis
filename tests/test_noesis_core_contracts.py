@@ -530,6 +530,111 @@ def test_contract_compatibility_rejects_unknown_version() -> None:
         )
 
 
+def attribution_r4_record():
+    from noesis_core.contracts.world import WorldAttributionClaim, WorldAttributionQuarantine
+    owners = [WorldAttributionClaim(run_id="run", physical_serial=serial, camera_id="kitchen", source_id=1,
+        source_epoch=0, raw_id=serial, lifecycle_generation=1, lifecycle_started_frame=1,
+        frame_id=2, observation_id=f"synthetic:{serial}:2", acquired_at_s=10.2,
+        clock_domain="synthetic", media_time_s=.2, clock_basis="synthetic",
+        household_state="resident", household_identity_key="synthetic-same", household_stable_id=9,
+        household_visitor_generation=None, household_constraint="eligible") for serial in (1, 2)]
+    payload = dict(status="quarantined", purpose="physical_only_quarantine", reason="settled_household_claim_conflict",
+        run_id="run", association_revision=3, subject_ids=["resident:synthetic-same"], stable_ids=[9],
+        owners=[o.model_dump(mode="json") for o in owners], retained_owners=[],
+        component_entity_ids=["physical:run:1", "physical:run:2"])
+    return WorldAttributionQuarantine(conflict_id=WorldAttributionQuarantine.digest(payload), **payload)
+
+
+@pytest.mark.parametrize("defect", ["digest", "component", "owner", "capacity", "claims", "purpose"])
+def test_attribution_r4_contract_rejects_malformed_or_incomplete_record(defect):
+    from noesis_core.contracts.world import WorldAttributionQuarantine
+    data = attribution_r4_record().model_dump(mode="json")
+    if defect == "digest": data["conflict_id"] = "a" * 64
+    elif defect == "component": data["component_entity_ids"].append("physical:run:99")
+    elif defect == "owner": data["owners"][0]["run_id"] = "foreign"
+    elif defect == "capacity": data["owners"] *= 65
+    elif defect == "claims": data["subject_ids"] = []
+    else: data["purpose"] = "strict"
+    with pytest.raises(ValidationError):
+        WorldAttributionQuarantine.model_validate(data)
+
+
+@pytest.mark.parametrize("defect", ["missing", "sid", "kind", "subject", "generation"])
+def test_attribution_r4_contract_requires_explicit_provisional_physical_subject(defect):
+    from noesis_core.contracts.world import validate_attribution_quarantine
+    record = attribution_r4_record()
+    subject = dict(subject_id="quarantine:run:1", kind="provisional", generation=0)
+    if defect == "missing": record = None
+    elif defect == "sid": subject["stable_id"] = 9
+    elif defect == "kind": subject.update(kind="resident", resident_uuid="synthetic-same")
+    elif defect == "subject": subject["subject_id"] = "quarantine:run:2"
+    else: subject["generation"] = 4
+    with pytest.raises(ValueError):
+        validate_attribution_quarantine("physical:run:1", SubjectRef(**subject), record)
+
+
+def test_attribution_r4_contract_immutable_roundtrip_and_generated_outputs():
+    from noesis_core.contracts.world import WorldAttributionQuarantine
+    record = attribution_r4_record()
+    assert WorldAttributionQuarantine.model_validate_json(record.model_dump_json()) == record
+    with pytest.raises(ValidationError): record.status = "not-quarantined"
+    from scripts.export_noesis_core_schemas import _serialized_schema, _contract_typescript
+    from noesis_core.contracts.world import WorldSnapshot, WorldEvent
+    root = Path(__file__).resolve().parents[1]
+    for name, model in (("world_snapshot", WorldSnapshot), ("world_event", WorldEvent)):
+        assert (root / "contracts/schema" / f"{name}.schema.json").read_text() == _serialized_schema(model)
+    assert (root / "contracts/typescript/noesis-contracts.ts").read_text() == _contract_typescript()
+
+
+def attribution_r19_singleton_payload():
+    data = attribution_r4_record().model_dump(mode="json")
+    data.pop("conflict_id")
+    data["component_entity_ids"] = ["physical:run:1"]
+    data["owners"][1].update(physical_serial=1, camera_id="family-room", source_id=2,
+        household_identity_key="synthetic-other", household_stable_id=10)
+    data["subject_ids"] = ["resident:synthetic-other", "resident:synthetic-same"]
+    data["stable_ids"] = [9, 10]
+    return data
+
+
+@pytest.mark.parametrize("defect", [None, "same-descriptor", "same-member", "unresolved", "unknown", "partial", "extra-entity"])
+def test_attribution_r19_singleton_requires_real_original_divergence(defect):
+    from noesis_core.contracts.world import WorldAttributionQuarantine
+    data = attribution_r19_singleton_payload()
+    a,b = data["owners"]
+    if defect == "same-descriptor":
+        for key in ("household_identity_key", "household_stable_id"): b[key] = a[key]
+    elif defect == "same-member":
+        for key in ("camera_id", "source_id", "raw_id"): b[key] = a[key]
+        b["frame_id"] += 1
+    elif defect == "unresolved": b["household_constraint"] = "unresolved"
+    elif defect == "unknown": b.update(household_state="unknown", household_identity_key=None, household_stable_id=None)
+    elif defect == "partial": data["stable_ids"] = [9]
+    elif defect == "extra-entity": data["retained_owners"] = [dict(a,physical_serial=3)]
+    data["conflict_id"] = WorldAttributionQuarantine.digest(data)
+    if defect:
+        with pytest.raises(ValidationError): WorldAttributionQuarantine.model_validate(data)
+    else:
+        record = WorldAttributionQuarantine.model_validate(data)
+        assert len(record.component_entity_ids) == 1 and len(record.owners) == 2
+
+
+def test_attribution_r19_latest_member_decision_and_generated_minimum():
+    from noesis_core.contracts.world import WorldAttributionQuarantine, WorldAttributionClaim, attribution_conflict_sets
+    data = attribution_r19_singleton_payload()
+    claims = tuple(WorldAttributionClaim(**r) for r in data["owners"])
+    correction = claims[1].model_copy(update={"frame_id":3,"household_identity_key":"synthetic-same","household_stable_id":9})
+    assert attribution_conflict_sets((*claims,correction)) == ((),(),frozenset())
+    from scripts.export_noesis_core_schemas import _serialized_schema, _contract_typescript
+    from noesis_core.contracts.world import WorldSnapshot, WorldEvent
+    root = Path(__file__).resolve().parents[1]
+    for name,model in (("world_snapshot",WorldSnapshot),("world_event",WorldEvent)):
+        actual = (root/'contracts/schema'/f'{name}.schema.json').read_text()
+        assert actual == _serialized_schema(model)
+        assert json.loads(actual)['$defs']['WorldAttributionQuarantine']['properties']['component_entity_ids']['minItems'] == 1
+    assert (root/'contracts/typescript/noesis-contracts.ts').read_text() == _contract_typescript()
+
+
 def test_schema_export_is_deterministic(tmp_path: Path) -> None:
     assert export_schemas(tmp_path, check=False) == []
     assert export_schemas(tmp_path, check=True) == []

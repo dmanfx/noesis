@@ -62,8 +62,11 @@ def _matrix(values: Any, *, label: str) -> np.ndarray:
     return result
 
 
-def load_registration(path: str | Path, *, authored_obj_path: str | Path) -> dict[str, Any]:
+def load_registration(path: str | Path, *, authored_obj_path: str | Path,
+                      evidence_root: Path | None = None) -> dict[str, Any]:
     """Admit only structural mappings; camera-marker registration is retired."""
+    if evidence_root is not None and (not evidence_root.is_absolute() or not evidence_root.is_dir()):
+        raise PresentationRegistrationError("structural evidence root must be an explicit existing absolute directory")
     source = Path(path)
     if not source.is_file() or not 0 < source.stat().st_size <= 512 * 1024:
         raise PresentationRegistrationError("scene presentation artifact is missing or oversized")
@@ -74,4 +77,5 @@ def load_registration(path: str | Path, *, authored_obj_path: str | Path) -> dic
     ):
         raise PresentationRegistrationError("inherited camera-marker registration is retired; a structural registration is required")
     from noesis.calibration.structural_presentation import load_structural_presentation
-    return load_structural_presentation(source, authored_obj_path=authored_obj_path)
+    return load_structural_presentation(source, authored_obj_path=authored_obj_path,
+        **({"root": evidence_root} if evidence_root is not None else {}))

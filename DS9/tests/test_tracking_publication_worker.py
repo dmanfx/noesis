@@ -7,6 +7,76 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_native_stop_latch_is_applied_on_real_actor_before_next_queued_work():
+    from noesis.pipelines import hooks
+    started, release = threading.Event(), threading.Event()
+    events = []
+    actor_threads = []
+    class Observer:
+        mask = 0
+        def snapshot(self): return self.mask
+        def close(self): events.append('observer_closed')
+    observer = Observer()
+    class Ingress:
+        def stop_image_region_source(self, source, *, graph_id):
+            assert source == 1 and graph_id == 'actual-test-graph'
+            actor_threads.append(threading.get_ident()); events.append('source_stopped')
+            return SimpleNamespace(reason='image_region_source_stopped')
+    pipeline = SimpleNamespace(xc3d_source_stop_observer=observer,
+        xc3d_world_quality_ingress=Ingress(),
+        xc3d_source_acquisition=SimpleNamespace(graph_id='actual-test-graph'))
+    def publish(work):
+        actor_threads.append(threading.get_ident()); events.append(work.frame_id)
+        if work.frame_id == 1:
+            started.set(); assert release.wait(2)
+    processor = SimpleNamespace(pipeline=pipeline, _publish_tracking_work=publish)
+    worker = hooks._TrackingPublicationWorker(processor)
+    assert worker.enqueue(_work(hooks, 0, 1)) and started.wait(2)
+    assert worker.enqueue(_work(hooks, 1, 2))
+    assert worker.enqueue(_work(hooks, 0, 3))
+    observer.mask = 2  # Synthetic native boundary; actual Gst events have native harness coverage.
+    release.set(); worker.shutdown(timeout_s=2)
+    assert worker.terminal_failure is None
+    assert events == [1, 'source_stopped', 2, 3, 'observer_closed']
+    assert len(set(actor_threads)) == 1 and actor_threads[0] != threading.get_ident()
+    assert pipeline._xc3d_applied_source_stop_mask == 2
+
+
+@pytest.mark.parametrize('mask', [8, -1, True, '2'])
+def test_stop_barrier_refuses_invalid_native_mask_without_owner_mutation(mask):
+    from noesis.pipelines import hooks
+    pipeline = SimpleNamespace(xc3d_source_stop_observer=SimpleNamespace(snapshot=lambda:mask))
+    with pytest.raises(RuntimeError, match='mask invalid'):
+        hooks._apply_image_source_stop_barriers(SimpleNamespace(pipeline=pipeline))
+    assert not hasattr(pipeline, '_xc3d_applied_source_stop_mask')
+
+
+def test_stop_barrier_refused_binding_does_not_mark_applied_or_silently_continue():
+    from noesis.pipelines import hooks
+    pipeline = SimpleNamespace(xc3d_source_stop_observer=SimpleNamespace(snapshot=lambda:2),
+        xc3d_source_acquisition=SimpleNamespace(graph_id='g'),
+        xc3d_world_quality_ingress=SimpleNamespace(stop_image_region_source=lambda *a,**kw:
+            SimpleNamespace(reason='image_region_owner_availability_binding')))
+    with pytest.raises(RuntimeError, match='owner refused'):
+        hooks._apply_image_source_stop_barriers(SimpleNamespace(pipeline=pipeline))
+    assert not hasattr(pipeline, '_xc3d_applied_source_stop_mask')
+
+
+@pytest.mark.parametrize('world_close', [False, True])
+def test_native_stop_observer_close_failure_is_not_a_successful_quiescence(world_close):
+    from noesis.pipelines import hooks
+    failure = RuntimeError('synthetic failed native disconnect')
+    def close(): raise failure
+    observer = SimpleNamespace(close=close)
+    processor = SimpleNamespace(pipeline=SimpleNamespace(xc3d_source_stop_observer=observer))
+    worker = hooks._TrackingPublicationWorker(processor, world_close=(lambda:None) if world_close else None)
+    with pytest.raises(RuntimeError, match='observer did not quiesce'):
+        worker.shutdown(timeout_s=2)
+    assert worker.terminal_failure is failure and not worker._thread.is_alive()
+    if world_close:
+        assert worker.close_receipt.error is failure and not worker.close_receipt.completed
+
+
 def _receipt(hooks, source: int, frame: int, sequence: int):
     return hooks.TrackingPublicationReceipt(
         source_id=int(source),

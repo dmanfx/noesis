@@ -10,9 +10,11 @@ import math
 import os
 import queue
 import re
+import sys
 import time
 import threading
 from collections import OrderedDict, deque
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -42,8 +44,19 @@ from noesis.calibration.world_fusion_policy import WorldFusionPolicy
 from noesis.calibration.geometry import pixel_to_world
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
-from noesis.metadata.object_depth import ObjectDepthResult, PoseDepthSample
+from noesis.metadata.object_depth import ObjectDepthResult, PoseDepthSample, NativePosePatchSupport
+from noesis.pipelines.source_acquisition import (
+    SourceAcquisitionState, AcquisitionUnavailable, ScopedFrameReceipts, OriginalCohort,
+    PrivateAssociationWork, ordered_current_frames, consume_ordered_current_frames, private_owner_diagnostic,
+    OrderedIdentityProducer, OrderedProducerWork, OrderedAssociationIntegrityError,
+    SelectedSwinIngress, selected_swin_profile, freeze_owner_retention, freeze_owner_availability,
+)
 from noesis.metadata.pose_features import PoseFeatureResult
+from noesis.v3dt_assets import xc3d_world_quality_enabled, registered_body_column_enabled, DS9_ENGINE_ROOT
+from noesis.pipelines.world_quality_adapter import (
+    QualityInput, QualityWork, OriginalBodyDepth, OriginalAnatomyDepth, OriginalQualityRetention, ObservedBodyImagePatch, freeze_swin_work,
+    capture_quality_input, capture_body_support, freeze_quality_work,
+)
 from noesis.mapanything_profiles import (
     get_mapanything_profile,
     resolve_runtime_mapanything_profile,
@@ -111,6 +124,9 @@ from noesis.telemetry.publishers import TrackingPublicationReceipt
 from noesis.telemetry.person_ground_state import (
     HumanGroundConfig,
     PersonGroundState,
+    RegisteredBodyColumnOriginal,
+    RegisteredAnkleOriginal,
+    RegisteredTorsoUpgradeOriginal,
     PoseAnchorCandidate,
     admit_human_ground_output,
     align_inferred_ground_observation,
@@ -460,6 +476,129 @@ class _CorePathInstrumentation:
     serialization_prep: Dict[str, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
     stage_timings: Dict[str, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
     events: deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=512), init=False, repr=False)
+    _ankle_priority: Dict[tuple, dict] = field(default_factory=dict, init=False, repr=False)
+    _ankle_priority_omitted: int = field(default=0, init=False, repr=False)
+
+    def record_pose_probe(self, row):
+        geometry_fields={'pre_iou_parent_bbox_xywh','pre_iou_candidates_seen','pre_iou_scan_complete',
+            'pre_iou_invalid_row_index','pre_iou_candidates'}
+        allowed={'source','raw','frame','pts_ns','producer_status','native_returned',
+            'tensor_count','context_present','context_valid','shape_valid','rows','cols',
+            'qualifying_rows_seen','result','rendezvous_status','finite_rows_seen','padding_rows_seen',
+            'score_pass_rows','class_pass_rows','bbox_pass_rows','center_pass_rows','iou_pass_rows',
+            'max_score','max_iou'} | geometry_fields
+        if (type(row) is not dict or not set(row)<=allowed or any(
+                not (v is None or type(v) is bool or type(v) is int and abs(v)<2**64
+                    or type(v) is float and math.isfinite(v)
+                    or type(v) is str and len(v)<=80) for k,v in row.items() if k not in geometry_fields)):
+            return
+        if any(type(row.get(k)) is not int or row[k]<0 for k in ('source','raw','frame','pts_ns')):
+            return
+        if geometry_fields.intersection(row):
+            if not geometry_fields <= row.keys():return
+            def coordinates(value, size):
+                if value is None:return None
+                if (type(value) not in (list,tuple) or len(value)!=size or any(not (
+                        type(v) is int and abs(v)<2**64 or type(v) is float and math.isfinite(v)) for v in value)):
+                    raise ValueError('invalid diagnostic coordinates')
+                return list(value)
+            count=row['pre_iou_candidates_seen'];invalid=row['pre_iou_invalid_row_index']
+            candidates=row['pre_iou_candidates']
+            if (type(count) is not int or not 0<=count<=300 or type(row['pre_iou_scan_complete']) is not bool
+                    or invalid is not None and (type(invalid) is not int or not 0<=invalid<300)
+                    or type(candidates) not in (list,tuple) or len(candidates)>min(2,count)):
+                return
+            try:
+                parent=coordinates(row['pre_iou_parent_bbox_xywh'],4);copied=[];seen=set()
+                for candidate in candidates:
+                    if (type(candidate) is not dict or set(candidate)!=
+                            {'row_index','score','class_id','iou','bbox_xyxy','torso_unclipped'}):return
+                    index=candidate['row_index'];torso=candidate['torso_unclipped']
+                    if (type(index) is not int or not 0<=index<300 or index in seen
+                            or type(torso) not in (list,tuple) or len(torso)!=4):return
+                    seen.add(index)
+                    for name in ('score','class_id','iou'):
+                        value=candidate[name]
+                        if value is None and name=='iou':continue
+                        if not (type(value) is int and abs(value)<2**64
+                                or type(value) is float and math.isfinite(value)):return
+                    copied.append({**candidate,'bbox_xyxy':coordinates(candidate['bbox_xyxy'],4),
+                        'torso_unclipped':[coordinates(point,3) for point in torso]})
+                row={**row,'pre_iou_parent_bbox_xywh':parent,'pre_iou_candidates':copied}
+            except ValueError:return
+        key=('pose',row['source'],row['raw'])
+        with self._lock:
+            old=self._ankle_priority.get(key)
+            if old is None:
+                if len(self._ankle_priority)>=8:
+                    self._ankle_priority_omitted=min(2**63-1,self._ankle_priority_omitted+1)
+                    return
+                old={'kind':'pose_extraction','generation':None,'lifecycle_available':False}
+                self._ankle_priority[key]=old
+            failed=(row.get('native_returned') is False or row.get('producer_status')=='budget_denied'
+                    or row.get('rendezvous_status') not in (None,'owned_current'))
+            if failed and 'first_pose_failure_frame' not in old:
+                old.update(first_pose_failure_frame=row['frame'],
+                    first_pose_failure=row.get('result') or row.get('rendezvous_status') or row.get('producer_status'))
+            if (row.get('native_returned') is False and row.get('pre_iou_candidates')
+                    and row.get('result') in ('context_no_matching_row','context_ambiguous_rows','context_nonfinite_row')
+                    and 'first_pre_iou_rejection' not in old):
+                old['first_pre_iou_rejection']={name:copy.deepcopy(row[name]) for name in
+                    ('frame','pts_ns','result',*sorted(geometry_fields))}
+            # A consumer lookup must not restamp the producer's latest original.
+            if 'rendezvous_status' in row:
+                old.update(rendezvous_frame=row['frame'],rendezvous_pts_ns=row['pts_ns'],
+                    rendezvous_status=row['rendezvous_status'])
+            else:
+                for name in ('native_returned','tensor_count','context_present','context_valid',
+                        'shape_valid','rows','cols','qualifying_rows_seen','result','finite_rows_seen',
+                        'padding_rows_seen','score_pass_rows','class_pass_rows','bbox_pass_rows',
+                        'center_pass_rows','iou_pass_rows','max_score','max_iou',*geometry_fields):
+                    old.pop(name,None)  # No previous native result grafted onto a denied original.
+                old.update(row)
+
+    def record_ankle_priority(self, row):
+        # Optional private scalars; never another sample or an authority input.
+        allowed={'source','raw','generation','frame','pts_ns','factory_stage','pose_current',
+            'native_measured','original_frame','depth_frame','patch_frame','patch_pts_us',
+            'patch_raster_match','depth_current','filter_frame','local_accepted','cursor_frame',
+            'proof_frame','proof_sample_ts','proof_age_s','proof_present','proof_expired',
+            'binding_present','geometry','proof_transition','caller_quality','factory_geometry','factory_relevant',
+            'first_clear_frame','first_clear_quality','first_clear_contact','first_clear_geometry',
+            'first_clear_binding_present','first_clear_binding_equal','first_clear_age_s',
+            'first_clear_native_measured','first_clear_proof_frame'}
+        if (type(row) is not dict or not set(row)<=allowed or len(row) > 28 or any(type(k) is not str or len(k)>64
+                or not (v is None or type(v) is bool or type(v) is int and abs(v)<2**64
+                    or type(v) is float and math.isfinite(v)
+                    or type(v) is str and len(v)<=80) for k,v in row.items())):
+            return
+        if 'factory_stage' in row and row.get('factory_relevant') is not True:
+            return  # Support-only floor UVs cannot consume a factory-failure slot.
+        key=tuple(row.get(k) for k in ('source','raw','generation'))
+        if any(type(v) is not int or v<0 for v in key):
+            return
+        with self._lock:
+            old=self._ankle_priority.get(key)
+            if old is None:
+                if len(self._ankle_priority)>=8:
+                    self._ankle_priority_omitted=min(2**63-1,self._ankle_priority_omitted+1)
+                    return
+                old={};self._ankle_priority[key]=old
+            stage=row.get('factory_stage')
+            if stage is not None and stage!='ready' and 'first_failure' not in old:
+                old.update(first_failure=stage,first_failure_frame=row.get('frame'))
+            if 'first_clear_frame' in old:
+                row={k:v for k,v in row.items() if not k.startswith('first_clear_')}
+            old.update(row)
+
+    def _ankle_priority_snapshot(self):
+        rows=[copy.deepcopy(r) for r in self._ankle_priority.values()]
+        omitted=self._ankle_priority_omitted
+        while True:
+            result={'records':rows,'omitted_records':omitted,'record_limit':8,'byte_limit':8192}
+            if len(json.dumps(result,sort_keys=True,allow_nan=False,separators=(',',':')).encode())<=8192:
+                return result
+            rows.pop();omitted+=1
 
     def _inc_locked(self, key: str, delta: int = 1) -> int:
         value = int(self.counters.get(key, 0)) + int(delta)
@@ -585,6 +724,7 @@ class _CorePathInstrumentation:
                 "serialization_prep": {k: dict(v) for k, v in self.serialization_prep.items()},
                 "stage_timings": {k: dict(v) for k, v in self.stage_timings.items()},
                 "events": list(self.events),
+                "registered_ankle_priority": self._ankle_priority_snapshot(),
             }
 
     def reset(self) -> None:
@@ -593,6 +733,8 @@ class _CorePathInstrumentation:
             self.serialization_prep.clear()
             self.stage_timings.clear()
             self.events.clear()
+            self._ankle_priority.clear()
+            self._ankle_priority_omitted=0
 
 
 _CORE_PATH_INSTRUMENTATION = _CorePathInstrumentation()
@@ -1270,6 +1412,60 @@ def attach_mapanything_postprocess_hook(
         ) from exc
 
 
+def _require_small_pose_engine(value, selected_engine_root):
+    """Exact logical or canonical realized identity, not a basename exemption.
+
+    DS9_ENGINE_ROOT is the shared selected artifact resolver (including explicit
+    NOESIS_ENGINE_DIR), configured before runtime modules load. The real runtime
+    resolver and graph loader preserve this absolute identity.
+    """
+    logical = 'DS9/models/engines/yolo26n-pose_b3_fp16.engine'
+    expected = (Path(selected_engine_root) / 'yolo26n-pose_b3_fp16.engine').resolve()
+    if not isinstance(value, str) or not value:
+        raise RuntimeError('models.pose.engine must declare the exact selected pose engine')
+    if value == logical:
+        actual = expected
+    elif Path(value).is_absolute():
+        actual = Path(value).resolve()
+    else:
+        raise RuntimeError('models.pose.engine logical identity is not selected yolo26n-pose_b3_fp16')
+    if actual != expected:
+        raise RuntimeError('models.pose.engine does not resolve to selected engine: '
+                           f'actual={actual}, expected={expected}')
+
+
+def _attach_small_pose_native_context(pipeline, component, controller_type):
+    """Use the verified SDK-native factory; Python Probe is not CustomObject."""
+    register = getattr(noesis_analytics_meta_ext, 'register_sender_report_anchor_factory', None)
+    if not callable(register) or register() is not True:
+        raise RuntimeError('small pose ROI context native anchor factory registration failed')
+    name = 'pose_roi_context_anchor'
+    pipeline.ds_pipeline.attach(component.name, 'noesis_xc3d_sr_anchor_v1', name, tips='src')
+    native_anchor = pipeline.ds_pipeline[component.name].find(name)
+    tracker = pipeline.components.get('tracker')
+    if tracker is None:
+        raise RuntimeError('single-pass pose ingress requires the actual NvDCF component')
+    tracker_name = 'pose_tracker_ingress_anchor'
+    pipeline.ds_pipeline.attach(tracker.name, 'noesis_xc3d_sr_anchor_v1', tracker_name, tips='src')
+    tracker_anchor = pipeline.ds_pipeline[tracker.name].find(tracker_name)
+    # Read selected policy once, outside callbacks. Do not invent a detector
+    # suppression threshold, target capacity or shadow-lifetime extension.
+    path = tracker.config.get('ll-config-file')
+    if not isinstance(path, str):
+        raise RuntimeError('single-pass pose selected tracker policy path unavailable')
+    policy = yaml.safe_load(Path(path).read_text())
+    target = policy.get('TargetManagement', {}) if isinstance(policy, dict) else {}
+    iou = target.get('minIouDiff4NewTarget')
+    count = target.get('maxTargetsPerStream')
+    shadow = target.get('maxShadowTrackingAge')
+    if (type(iou) not in (int, float) or not math.isfinite(iou) or not 0 < iou < 1
+            or type(count) is not int or not 0 < count <= 128
+            or type(shadow) is not int or not 0 < shadow <= 10000):
+        raise RuntimeError('single-pass pose selected tracker policy invalid')
+    return controller_type(native_anchor, component.name, tracker_anchor, tracker.name,
+                           float(iou), count, shadow)
+
+
 def attach_pose_feature_hook(
     pipeline: "DeepStreamPipeline",
     *,
@@ -1283,9 +1479,16 @@ def attach_pose_feature_hook(
     pose_cfg = models_cfg.get("pose") or {}
     if not isinstance(pose_cfg, Mapping):
         pose_cfg = {}
+    small_context = pose_cfg.get('xc3d_small_roi_context', False)
+    if type(small_context) is not bool:
+        raise ValueError('models.pose.xc3d_small_roi_context must be a literal boolean')
+    if small_context and not xc3d_world_quality_enabled(pipeline.config):
+        raise ValueError('small pose ROI context is task-only XC3D world quality')
     pose_enabled = bool(pose_cfg.get("enable", True)) and any(
         key in pose_cfg for key in ("config-file-path", "engine", "name")
     )
+    if small_context and not pose_enabled:
+        raise RuntimeError('small pose ROI context requires enabled pose SGIE')
     rfdetr_cfg = models_cfg.get("rfdetr_keypoint") or {}
     if not isinstance(rfdetr_cfg, Mapping):
         rfdetr_cfg = {}
@@ -1300,7 +1503,7 @@ def attach_pose_feature_hook(
 
     env_flag = os.environ.get("NOESIS_POSE_FEATURES_ENABLED", "1")
     if str(env_flag).strip().lower() not in ("1", "true", "yes", "on"):
-        if rfdetr_enabled:
+        if rfdetr_enabled or small_context:
             raise RuntimeError(
                 "RF-DETR keypoint profile requires "
                 "NOESIS_POSE_FEATURES_ENABLED=1"
@@ -1453,16 +1656,40 @@ def attach_pose_feature_hook(
         camera_labels=camera_labels or {},
         cache_max_age_frames=cache_max_age_frames,
         cache_max_bbox_shift=cache_max_bbox_shift,
+        small_roi_context=small_context,
     )
     component.config["_pose_feature_processor"] = processor
+    component.config["_pose_feature_profile"] = (
+        processor.gie_id, processor.model_size, processor.score_threshold, processor.letterbox)
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        if small_context:
+            raise RuntimeError('small pose ROI context requires actual Service Maker/native APIs')
         logger.debug("Stored pose feature processor for lazy execution (pyservicemaker unavailable)")
         return
 
     try:
+        if small_context:
+            controller_type = getattr(noesis_pose_meta_ext, 'SinglePassPoseController', None)
+            if (not callable(controller_type) or BufferOperator is None or rfdetr_enabled
+                    or tensor_source != 'object_sgie' or gie_id != 4
+                    or processor.model_size != (640, 640) or score_threshold != .25 or not letterbox):
+                raise RuntimeError('small pose ROI context selected native profile/API unavailable')
+            _require_small_pose_engine(active_cfg.get('engine'), DS9_ENGINE_ROOT)
+            ini_path = active_cfg.get('config-file-path') or active_cfg.get('config-file')
+            for key, expected in (('network-type', 100), ('batch-size', 3),
+                    ('classifier-async-mode', 0), ('operate-on-gie-id', -1),
+                    ('input-object-min-width', 16), ('input-object-min-height', 16),
+                    ('maintain-aspect-ratio', 1), ('symmetric-padding', 1)):
+                if _read_nvinfer_property_int(ini_path, key) != expected:
+                    raise RuntimeError('small pose ROI context unsupported nvinfer profile: ' + key)
+            for key in ('input-object-max-width', 'input-object-max-height'):
+                if _read_nvinfer_property_int(ini_path, key) not in (None, 0):
+                    raise RuntimeError('small pose ROI context max-size eligibility would change')
+            pipeline.pose_roi_context_controller = _attach_small_pose_native_context(
+                pipeline, component, controller_type)
         probe = Probe("pose_features", _PoseFeatureOperator(processor))
-        pipeline.ds_pipeline.attach(component.name, probe)
+        pipeline.ds_pipeline.attach('world_observation_stage' if small_context else component.name, probe)
         logger.info(
             "Attached pose feature probe to %s (tensor_source=%s)",
             component.name,
@@ -1470,9 +1697,14 @@ def attach_pose_feature_hook(
         )
     except Exception as exc:  # pragma: no cover - depends on DS runtime availability
         logger.exception("Failed to attach pose feature probe")
-        if rfdetr_enabled:
+        if small_context:
+            controller = getattr(pipeline, 'pose_roi_context_controller', None)
+            if controller is not None:
+                controller.close()
+        if rfdetr_enabled or small_context:
             raise RuntimeError(
-                "RF-DETR keypoint pose feature probe attachment failed"
+                (f"small pose ROI context attachment failed: {exc}" if small_context
+                 else "RF-DETR keypoint pose feature probe attachment failed")
             ) from exc
 
 
@@ -1526,10 +1758,19 @@ def attach_object_depth_fusion_hook(
         calibration_resolver=calibration_resolver,
         camera_labels=camera_labels or {},
     )
+    pose_cfg = models_cfg.get("pose") or {}
+    pose_component = pipeline.components.get(str(pose_cfg.get("name") or "yolo26_pose"))
+    if pose_component is not None:
+        fusion_processor.pose_feature_processor = pose_component.config.get("_pose_feature_processor")
+        fusion_processor.pose_profile = pose_component.config.get("_pose_feature_profile")
     depth_component.config["_depth_tracking_frame_processor"] = depth_processor
     fusion_component.config["_object_depth_fusion_processor"] = fusion_processor
     setattr(pipeline, "depth_tracking_frame_processor", depth_processor)
     setattr(pipeline, "object_depth_fusion_processor", fusion_processor)
+    from noesis.v3dt_assets import xc3d_candidate_enabled
+    depth_processor.xc3d_exact_acquisition = xc3d_candidate_enabled(pipeline.config)
+    fusion_processor.xc3d_exact_acquisition = xc3d_candidate_enabled(pipeline.config)
+    fusion_processor.original_depth_rendezvous_enabled = xc3d_world_quality_enabled(pipeline.config)
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
         logger.debug("Stored depth tracking processors for lazy execution (pyservicemaker unavailable)")
@@ -1627,9 +1868,24 @@ def attach_analytics_telemetry_hook(
     try:
         probe = Probe("analytics_telemetry", _AnalyticsTelemetryOperator(processor))
         pipeline.ds_pipeline.attach(attach_component.name, probe)
+        if (pipeline.config.get('xc3d_image_regions') or {}).get('enabled') is True:
+            # The event observer is native-only. The publication actor consumes
+            # its fixed source-stop latch, never the streaming callback thread.
+            if noesis_analytics_meta_ext.register_sender_report_anchor_factory() is not True:
+                raise RuntimeError('image source stop anchor registration failed')
+            name = 'xc3d_source_stop_anchor'
+            pipeline.ds_pipeline.attach(attach_component.name, 'noesis_xc3d_sr_anchor_v1', name, tips='src')
+            anchor = pipeline.ds_pipeline[attach_component.name].find(name)
+            pipeline.xc3d_source_stop_observer = noesis_analytics_meta_ext.SourceStopObserver(anchor, attach_component.name)
+        pipeline.xc3d_analytics_attachment_status = {"status": "attached"}
         logger.info("Attached analytics telemetry probe to %s", attach_component.name)
-    except Exception:  # pragma: no cover - depends on DS runtime availability
+    except Exception as exc:  # pragma: no cover - depends on DS runtime availability
+        # Scalar-only diagnostic; source/SDK objects must not survive teardown.
+        pipeline.xc3d_analytics_attachment_status = {"status": "failed",
+            "error_type": type(exc).__name__, "reason": str(exc)[:512]}
         logger.exception("Failed to attach analytics telemetry probe")
+        if (pipeline.config.get('xc3d_image_regions') or {}).get('enabled') is True:
+            raise
 
 
 def attach_identity_v2_post_resolution_osd_hook(
@@ -3956,6 +4212,14 @@ class _DepthObservationResult:
     registration_id: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _StrongCurrentColumnPose:
+    """ROI-conditioned posed semantics ONLY for the named column method."""
+    original: OriginalCohort
+    depth: ObjectDepthResult
+    joint_confidences: Tuple[float, float, float, float]
+
+
 @dataclass
 class _AlignedDepthFrame:
     key: FrameKey
@@ -5504,6 +5768,7 @@ class PoseFeatureProcessor:
     letterbox: bool = True
     tensor_source: str = "object_sgie"
     model_label: str = "yolo26-pose"
+    small_roi_context: bool = False
     match_min_iou: float = 0.7
     match_ambiguity_margin: float = 0.05
     camera_labels: Mapping[int, str] = field(default_factory=dict)
@@ -5517,6 +5782,180 @@ class PoseFeatureProcessor:
     _debug_missing: int = field(default=0, init=False, repr=False)
     _rfdetr_diag_last_log: float = field(default=0.0, init=False, repr=False)
     _pose_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _pose_turns: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _pose_candidates: Dict[int, tuple] = field(default_factory=dict, init=False, repr=False)
+    _current_pose_results: Dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _pose_inflight: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _pose_inflight_last: Dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _pose_diagnostic_range: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        config=getattr(self.pipeline,'config',{})
+        raw=os.environ.get('NOESIS_XC3D_POSE_DIAGNOSTIC_RANGE','')
+        if (not raw or not xc3d_world_quality_enabled(config)
+                or not config.get('xc3d_image_regions',{}).get('enabled')
+                or not os.environ.get('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S','').strip()):
+            return
+        try:
+            values=tuple(int(v) for v in raw.split(':'))
+            source,person,first,last=values
+            if not (0<=source<3 and 0<=person<2**63 and 0<=first<=last<2**31 and last-first<128):
+                return
+            self._pose_diagnostic_range=values
+        except (TypeError,ValueError):
+            return
+
+    def _pose_probe_selected(self, cohort):
+        selected=self._pose_diagnostic_range
+        return selected is not None and cohort[0:2]==selected[0:2] and selected[2]<=cohort[2]<=selected[3]
+
+    def _record_pose_probe(self, cohort, **values):
+        try:
+            if self._pose_probe_selected(cohort):
+                _CORE_PATH_INSTRUMENTATION.record_pose_probe(dict(
+                    source=cohort[0],raw=cohort[1],frame=cohort[2],pts_ns=cohort[3],**values))
+        except Exception:
+            pass  # Diagnostics cannot alter the extraction or lookup.
+
+    def _early_anchor_enabled(self):
+        return self.tensor_source == 'object_sgie' and xc3d_world_quality_enabled(
+            getattr(getattr(self, 'pipeline', None), 'config', {}))
+
+    def _pose_run_binding(self, source):
+        pipeline = getattr(self, 'pipeline', None)
+        acquisition = getattr(pipeline, 'xc3d_source_acquisition', None)
+        epochs = getattr(acquisition, 'epochs', ())
+        return (getattr(acquisition, 'run_id', None), getattr(acquisition, 'graph_id', None),
+                epochs[source] if 0 <= source < len(epochs) else None,
+                (self.gie_id, self.model_size, self.score_threshold, self.letterbox))
+
+    def _clear_pose_source(self, source):
+        controller = getattr(self.pipeline, 'pose_roi_context_controller', None)
+        reset = getattr(controller, 'reset_source', None)
+        if callable(reset):
+            reset(int(source))
+        self._current_pose_results.pop(source, None)
+        self._pose_inflight_last.pop(source, None)
+        for key in tuple(self._pose_inflight):
+            if key[0] == source:
+                self._pose_inflight.pop(key, None)
+
+    def _begin_pose_original(self, source, frame, pts, receipt):
+        """Scalar-only rendezvous, not a temporal pose estimate or vote TTL.
+
+        At most 64 original cohorts/128 attempted objects each; two seconds is
+        storage eviction only. Every reader still supplies the exact original.
+        """
+        now = time.monotonic()
+        binding = self._pose_run_binding(source)
+        scope = receipt.get('original_buffer_scope') if isinstance(receipt, Mapping) else None
+        old = self._pose_inflight_last.get(source)
+        token = (binding, frame, pts, scope)
+        if old is not None:
+            if old[0] != binding:
+                self._clear_pose_source(source)
+            elif frame < old[1] or pts < old[2] or (frame == old[1] and token != old):
+                self._clear_pose_source(source)
+                return None  # No new epoch authority: never alias a wrap/reorder.
+            elif token == old:
+                return None  # Even after eviction, no repeated original spend.
+        self._pose_inflight_last[source] = token
+        for key, entry in tuple(self._pose_inflight.items()):
+            if now - entry[0] > 2.0:
+                self._pose_inflight.pop(key, None)
+        key = (source, frame, pts)
+        if key in self._pose_inflight:
+            return None  # duplicate callback cannot spend this original twice
+        while len(self._pose_inflight) >= 64:
+            self._pose_inflight.popitem(last=False)
+        results = {}
+        self._pose_inflight[key] = (now, binding, results)
+        return results
+
+    def _fair_pose_objects(self, objects, source_id, frame_id, media_pts_ns):
+        # ServiceMaker AbstractIterator<T> owns its current T. No wrapper may
+        # survive advancement, even within this callback. Plan from PRIOR scalar
+        # identities only, then finish each live object's work before next().
+        if source_id not in self._pose_turns and len(self._pose_turns)>=64:
+            old=next(iter(self._pose_turns))
+            self._pose_turns.pop(old,None);self._pose_candidates.pop(old,None)
+            self._current_pose_results.pop(old,None)
+        previous=dict(self._pose_candidates.get(source_id,()))
+        budget=self._features_per_frame_max()
+        turn=self._pose_turns.get(source_id,0)+1
+        ordered=sorted(previous,key=lambda key:(previous[key],key))
+        # At budget>=2 keep one opportunistic slot for a live object: disappeared
+        # reservations cannot leave a busy frame with no attempt. The remaining
+        # slot(s) honor oldest scalar service, including sustained newcomers.
+        reservations=max(1,budget-1) if budget else 0
+        selected=set(ordered[:reservations])
+        initial=not previous
+        self._current_pose_results[source_id]=(frame_id,media_pts_ns,{})
+        candidates={};seen=set();remaining=budget
+        for index,obj in enumerate(objects):
+            if index>=128:
+                _increment_core_counter("detection_wake.pose_object_capacity_skipped")
+                break
+            try:
+                bbox=_rect_to_bbox(obj.rect_params)
+                if int(obj.class_id)==0 and bbox is not None:
+                    raw=int(getattr(obj,"object_id",-1))
+                    key=(raw,tuple(bbox))
+                    if 0<=raw<2**63 and key in seen:
+                        _increment_core_counter("detection_wake.pose_duplicate_object_skipped")
+                        continue
+                    seen.add(key)
+                    # Bbox is NOT a scheduling identity: motion must not starve
+                    # the person. All actual extraction/sharing still binds the
+                    # current original bbox/frame/PTS/profile, never this plan.
+                    scalar=(raw,0) if 0<=raw<2**63 else (-1,index)
+                    attempt=initial or scalar in selected or (budget>=2 and remaining==budget)
+                    if not initial and scalar not in previous and len(selected)<budget:
+                        selected.add(scalar);attempt=True
+                    attempt=attempt and remaining>0
+                    if attempt:remaining-=1
+                    candidates[scalar]=2*turn if attempt else previous.get(scalar,2*turn-1)
+                    if attempt and scalar in selected:
+                        selected.remove(scalar)
+                        for candidate in ordered:
+                            if candidate not in candidates and candidate not in selected:
+                                selected.add(candidate)
+                                if len(selected)>=reservations:break
+                    yield index,obj,attempt
+            except (AttributeError,TypeError,ValueError):
+                continue
+        self._pose_candidates[source_id]=tuple(sorted(candidates.items()))
+        self._pose_turns[source_id]=turn
+
+    def _owned_pose_result(self, cohort, bbox, profile):
+        def finish(found,value,status):
+            self._record_pose_probe(cohort,rendezvous_status=status)
+            return found,value
+        if self.tensor_source!="object_sgie" or profile!=(self.gie_id,self.model_size,self.score_threshold,self.letterbox):
+            return finish(False,None,'profile_mismatch')
+        source,raw,frame,pts=cohort
+        if self._early_anchor_enabled():
+            pipeline = getattr(self, 'pipeline', None)
+            if getattr(pipeline, '_xc3d_applied_source_stop_mask', 0) & (1 << source):
+                return finish(False,None,'source_stopped')
+            entry = self._pose_inflight.get((source, frame, pts))
+            if entry is None:
+                return finish(False,None,'original_missing')
+            if entry[1] != self._pose_run_binding(source):
+                return finish(False,None,'binding_mismatch')
+            if time.monotonic()-entry[0] > 2.0:
+                return finish(False,None,'original_expired')
+            key = (raw, tuple(float(v) for v in bbox[:4]))
+            if key not in entry[2]:
+                return finish(False,None,'object_or_bbox_missing')
+            value=entry[2][key]
+            return finish(True,value,'owned_negative' if value is None else 'owned_current')
+        current=self._current_pose_results.get(source)
+        if current is None or pts is None or pts<=0 or current[:2]!=(frame,pts):
+            return False,None
+        key=(raw,tuple(float(v) for v in bbox[:4]))
+        if key not in current[2]:return False,None
+        return True,current[2][key]
 
     def _features_per_frame_max(self) -> int:
         return _read_env_int("NOESIS_POSE_FEATURES_PER_FRAME_MAX", 2, min_value=0)
@@ -5952,14 +6391,17 @@ class PoseFeatureProcessor:
     def _extract_pose_native(
         self,
         obj_meta: Any,
+        diagnostics=None,
     ) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
         if noesis_pose_meta_ext is None:
+            if diagnostics is not None:diagnostics['result']='native_unavailable'
             return None
         extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_keypoints", None)
         if extract_obj is None or not callable(extract_obj):
+            if diagnostics is not None:diagnostics['result']='entrypoint_unavailable'
             return None
         try:
-            payload = extract_obj(
+            args = (
                 obj_meta,
                 int(self.gie_id),
                 int(self.model_size[0]),
@@ -5967,7 +6409,12 @@ class PoseFeatureProcessor:
                 float(self.score_threshold),
                 bool(self.letterbox),
             )
+            payload = extract_obj(*args) if diagnostics is None else extract_obj(*args,diagnostics)
         except Exception:
+            if diagnostics is not None:diagnostics['result']='extraction_exception'
+            return None
+        if self._early_anchor_enabled() and (not isinstance(payload, dict) or
+                set(payload) != {'score', 'keypoints_abs', 'keypoints_roi'}):
             return None
         return self._decode_native_pose_payload(payload)
 
@@ -6145,7 +6592,7 @@ class PoseFeatureProcessor:
                 self._rfdetr_diag_last_log = now
         return matches
 
-    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any, *, source_receipt=None) -> None:
         object_items = getattr(frame_meta, "object_items", None) or []
         rfdetr_matches: Dict[
             int, Tuple[float, np.ndarray, np.ndarray]
@@ -6162,6 +6609,22 @@ class PoseFeatureProcessor:
         source_id = self._frame_source_id(frame_meta)
         frame_id = self._frame_id(frame_meta)
         ts_us = self._frame_timestamp_us(frame_meta)
+        pts_ns = int(_meta_lookup(frame_meta, 'buf_pts', 'buffer_pts', 'pts', default=0) or 0)
+        early_anchor = self._early_anchor_enabled()
+        inflight = None
+        anchor_budget = 0
+        if early_anchor:
+            original = _xc3d_depth_source_frame(source_receipt, source_id, pts_ns // 1000)
+            if original is None:
+                _increment_core_counter('detection_wake.pose_rendezvous_original_missing')
+                return
+            source_id = source_receipt['source_id']
+            frame_id, pts_ns = original, source_receipt['original_pts_ns']
+            ts_us = pts_ns // 1000
+            inflight = self._begin_pose_original(source_id, frame_id, pts_ns, source_receipt)
+            if inflight is None:
+                return
+            anchor_budget = _read_env_int('NOESIS_POSE_ANCHOR_NATIVE_EXTRACTS_PER_FRAME_MAX', 1, min_value=0)
         debug = str(os.environ.get("NOESIS_POSE_FEATURE_DEBUG", "")).strip().lower() in (
             "1",
             "true",
@@ -6188,7 +6651,9 @@ class PoseFeatureProcessor:
                 )
                 self._missing_native_logged = True
         pose_budget = self._features_per_frame_max()
-        for object_index, obj_meta in enumerate(object_items):
+        indexed_objects=(self._fair_pose_objects(object_items,source_id,frame_id,pts_ns)
+            if self.tensor_source=="object_sgie" else ((i,obj,True) for i,obj in enumerate(object_items)))
+        for object_index, obj_meta, pose_selected in indexed_objects:
             if debug:
                 self._debug_objects += 1
             try:
@@ -6209,7 +6674,8 @@ class PoseFeatureProcessor:
             roi_w = float(bbox[2])
             roi_h = float(bbox[3])
             stable_id = self._stable_id_for_track(source_id, track_id)
-            cached_payload = self._cached_pose_payload(
+            cached_payload = None if (self.small_roi_context and 16<=min(roi_w,roi_h)<128
+                and roi_w/roi_h<=.65) else self._cached_pose_payload(
                 source_id,
                 track_id,
                 bbox,
@@ -6217,34 +6683,60 @@ class PoseFeatureProcessor:
                 ts_us,
                 stable_id,
             )
-            if cached_payload is not None and self._attach_pose_payload(
-                batch_meta,
-                attach_obj,
-                obj_meta,
-                cached_payload,
-            ):
-                _increment_core_counter("detection_wake.pose_feature_cache_hit")
-                if debug:
-                    self._debug_attached += 1
-                continue
             score = 0.0
             kpts_abs: Optional[np.ndarray] = None
             kpts_for_features: Optional[np.ndarray] = None
             kpts_roi: Optional[np.ndarray] = None
             native: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
+            probe_cohort=(source_id,track_id,frame_id,pts_ns)
+            native_diag={} if self._pose_probe_selected(probe_cohort) else None
             native_start_ns = time.perf_counter_ns()
             if self.tensor_source == "rfdetr_pgie_frame":
                 native = rfdetr_matches.get(object_index)
             else:
-                if pose_budget <= 0:
+                if pose_budget <= 0 or not pose_selected:
                     _increment_core_counter(
                         "detection_wake.pose_feature_budget_skipped"
                     )
                     if debug:
                         self._debug_missing += 1
+                    if early_anchor and anchor_budget > 0:
+                        anchor_budget -= 1
+                        native = (self._extract_pose_native(obj_meta) if native_diag is None else
+                                  self._extract_pose_native(obj_meta,diagnostics=native_diag))
+                        self._record_pose_probe(probe_cohort,producer_status='anchor_attempt',
+                            native_returned=native is not None,**(native_diag or {}))
+                        result = None
+                        if native is not None:
+                            score0, roi0, absolute0 = native
+                            result = dict(source_id=source_id, object_id=track_id, frame_id=frame_id,
+                                ts_us=ts_us, bbox=list(bbox), score=float(score0),
+                                keypoints_abs=absolute0.tolist(), keypoints_roi=roi0.tolist())
+                        if 0 <= track_id < 2**63:
+                            inflight[(track_id, tuple(bbox))] = result
+                        _increment_core_counter('detection_wake.pose_anchor_early_attempt')
+                        _increment_core_counter('detection_wake.pose_anchor_early_current' if result is not None
+                                                else 'detection_wake.pose_anchor_early_negative')
+                    elif early_anchor:
+                        self._record_pose_probe(probe_cohort,producer_status='budget_denied')
+                    if cached_payload is not None and self._attach_pose_payload(batch_meta,attach_obj,obj_meta,cached_payload):
+                        _increment_core_counter("detection_wake.pose_feature_cache_hit")
                     continue
                 pose_budget -= 1
-                native = self._extract_pose_native(obj_meta)
+                native = (self._extract_pose_native(obj_meta) if native_diag is None else
+                          self._extract_pose_native(obj_meta,diagnostics=native_diag))
+                self._record_pose_probe(probe_cohort,producer_status='feature_attempt',
+                    native_returned=native is not None,**(native_diag or {}))
+                if 0<=track_id<2**63:
+                    result=None
+                    if native is not None:
+                        score0,roi0,absolute0=native
+                        result={"source_id":source_id,"object_id":track_id,"frame_id":frame_id,
+                            "ts_us":ts_us,"bbox":list(bbox),"score":float(score0),
+                            "keypoints_abs":absolute0.tolist(),"keypoints_roi":roi0.tolist()}
+                    self._current_pose_results[source_id][2][(track_id,tuple(bbox))]=result
+                    if inflight is not None:
+                        inflight[(track_id, tuple(bbox))] = result
             _record_core_stage_timing("pose_feature.native_extract", native_start_ns)
             if native is not None:
                 _increment_core_counter("detection_wake.pose_feature_native_extract")
@@ -6253,6 +6745,8 @@ class PoseFeatureProcessor:
             else:
                 if debug:
                     self._debug_missing += 1
+                if cached_payload is not None and self._attach_pose_payload(batch_meta,attach_obj,obj_meta,cached_payload):
+                    _increment_core_counter("detection_wake.pose_feature_cache_hit")
                 continue
 
             if kpts_abs is None or kpts_for_features is None:
@@ -6663,18 +7157,23 @@ class _DepthTrackingFrameProcessor:
             logger.exception("Native DAv2 GPU depth capture failed")
             return None
 
-    def handle_servicemaker_frame(self, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, frame_meta: Any, *, source_receipt: Any = None) -> None:
         frame_w, frame_h = _canonical_frame_size(frame_meta, self.fallback_frame_size)
         if frame_w <= 0 or frame_h <= 0:
             return
+        source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        pts_us = _frame_pts_key_us(frame_meta)
+        if getattr(self, "xc3d_exact_acquisition", False):
+            original_frame = _xc3d_depth_source_frame(source_receipt, source_id, pts_us)
+            if original_frame is None:
+                return
+            frame_id = original_frame
         depth_device_frame = self._capture_depth_frame(frame_meta, frame_w, frame_h)
         if depth_device_frame is None:
             return
         depth_w = int(getattr(depth_device_frame, "depth_width", frame_w) or frame_w)
         depth_h = int(getattr(depth_device_frame, "depth_height", frame_h) or frame_h)
-        source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
-        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
-        pts_us = _frame_pts_key_us(frame_meta)
         frame = _AlignedDepthFrame(
             key=(source_id, frame_id, pts_us),
             source_id=source_id,
@@ -6695,6 +7194,36 @@ class _DepthTrackingFrameProcessor:
         _increment_core_counter("depth_tracking_device_frames_total")
 
 
+@dataclass(slots=True)
+class _DepthSamplingWork:
+    """Callback-local accounting only; never evidence or retained SDK state."""
+    no_native_pose_work: bool = False
+    previous: tuple | None = None
+    claimed: tuple | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OriginalPoseDepthPlan:
+    """Compact original-only native sampling plan; no SDK/device/mask pointers."""
+    source_id: int
+    frame_id: int
+    pts_us: int
+    raw_id: int
+    bbox: tuple
+    score: float
+    image_size: tuple
+    keypoints: tuple
+    contact_capsules: tuple
+    contact_uv: tuple | None
+    visible_ankles: int
+    torso_capsule: tuple | None
+    torso_uv: tuple | None
+    shoulder_capsule: tuple | None
+    shoulder_uv: tuple | None
+    sample_limit: int
+    ingress_monotonic_s: float
+
+
 @dataclass
 class _ObjectDepthFusionProcessor:
     depth_store: _AlignedDepthFrameStore
@@ -6705,8 +7234,353 @@ class _ObjectDepthFusionProcessor:
     depth_every_n_frames: int
     calibration_resolver: Any | None = None
     camera_labels: Mapping[int, str] = field(default_factory=dict)
+    pose_feature_processor: Any | None = None
+    pose_profile: tuple | None = None
     _result_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _depth_retry_tracks: set[Tuple[int, int]] = field(default_factory=set, init=False, repr=False)
+    _original_plans: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _original_plan_attempts: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _actual_depth_attempts: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _original_plan_lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+    _accepted_depth_sources: Dict[int, tuple] = field(default_factory=dict, init=False, repr=False)
+    _accepted_depth_members: Dict[Tuple[int,int], tuple] = field(default_factory=dict, init=False, repr=False)
+    # Scalar scheduling state only: never keep SDK wrappers beyond iterator advance.
+    _sample_service: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _sample_service_sequence: int = field(default=0, init=False, repr=False)
+    _sampling_trace: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _sampling_trace_targets: tuple = field(default_factory=lambda: tuple(float(v) for v in
+        os.environ.get('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S','').split(',') if v.strip()), init=False, repr=False)
+
+    def _sampling_event(self, key, event, **values):
+        # Optional scalar inspection only, in the existing <=4 target windows.
+        if (len(self._sampling_trace_targets)>4 or not any(
+                abs(key[3]/1e9-target)<=.100000001 for target in self._sampling_trace_targets)):
+            return
+        with self._original_plan_lock:
+            if event=='entry':
+                # Same scalar frame/PTS after an actual run/epoch change must
+                # never inherit an older run's diagnostic events or binding.
+                self._sampling_trace.pop(key,None)
+            item=self._sampling_trace.setdefault(key,dict(source_id=key[0],raw_id=key[1],
+                frame_id=key[2],pts_ns=key[3],events=[],binding=None))
+            if event not in item['events'] and len(item['events'])<12:
+                item['events'].append(event)
+            item.update(values)
+            while len(self._sampling_trace)>128:
+                self._sampling_trace.popitem(last=False)
+
+    def _sampling_plan_event(self, plan, event, work=None):
+        # Plans own microsecond PTS. Never choose between ambiguous ns originals.
+        with self._original_plan_lock:
+            keys=[k for k in self._sampling_trace if k[:3]==(plan.source_id,plan.raw_id,plan.frame_id)
+                  and k[3]//1000==plan.pts_us]
+            if len(keys)==1:
+                binding=self._sampling_trace[keys[0]].get('binding')
+                if (work is None and binding is not None or work is not None
+                        and binding!=self._sampling_binding(work.rows[0])):
+                    return  # No old-run/epoch late event grafted onto a reused key.
+        if len(keys)==1:
+            self._sampling_event(keys[0],event)
+
+    @staticmethod
+    def _sampling_binding(row):
+        o,l=row.original,row.evidence.lifecycle
+        return (o.run_id,o.graph_id,o.camera_id,o.source_id,o.source_clock_epoch,
+                l.source_epoch,l.tracker_id,l.generation,l.frame_id,o.pts_ns)
+
+    def sampling_disposition(self, row):
+        o,l=row.original,row.evidence.lifecycle
+        key=(o.source_id,l.tracker_id,o.original_frame,o.pts_ns)
+        with self._original_plan_lock:
+            item=self._sampling_trace.get(key)
+            if item is None or item.get('binding')!=self._sampling_binding(row):
+                return {'available':False,'reason':'exact_original_sampling_trace_unavailable'}
+            return {**item,'events':tuple(item['events']),'available':True}
+
+    def _attach_sampling_payload(self,batch,obj,payload,key):
+        attached=self._attach_object_depth_payload(batch,obj,payload)
+        self._sampling_event(key,'attached' if attached else 'attach_failed',
+            attachment_cached=bool(payload.get('measurement_cached',False)),
+            attachment_measurement_frame=payload.get('measurement_frame_id'))
+        return attached
+
+    def accept_original_depth_work(self, work, originals):
+        """Reconcile OPTIONAL sampling state after the real ordered owner accepts F.
+
+        A backward PTS is not a reset signal. Only an advancing accepted source
+        epoch or a current native lifecycle barrier can retire its old cadence,
+        cache/retry and pending-plan state. No person/clock authority is issued.
+        """
+        if (type(work) is not QualityWork or work.denial is not None or work.private is None
+                or work.private.denial is not None or work.private.original is None):
+            return False
+        original=work.private.original
+        source=work.continuity.source_id
+        identity=(original.run_id,original.graph_id,work.continuity.source_epoch,original.source_clock_epoch)
+        sequence=(work.continuity.frame_id,original.pts_ns)
+        if (type(source) is not int or not 0<=source<3 or original.source_id!=source
+                or work.private.clock_epoch!=identity[3] or work.private.media_pts_ns!=original.pts_ns):
+            return False
+        current={}
+        for row in work.rows:
+            life=row.evidence.lifecycle
+            matches=[o.stamp for o in originals.values() if
+                (o.stamp.member.run_id,o.stamp.member.camera_id,o.stamp.member.source_id,
+                 o.stamp.member.source_epoch,o.stamp.member.raw_id,o.stamp.member.lifecycle_generation,
+                 o.stamp.frame_id,o.stamp.acquired_at_s)==
+                (original.run_id,original.camera_id,source,life.source_epoch,life.tracker_id,
+                 life.generation,life.frame_id,original.pts_ns/1e9)]
+            if len(matches)!=1 or life.source_epoch!=identity[2] or life.frame_id!=sequence[0]:
+                return False
+            current[(source,life.tracker_id)]=(identity+(life.generation,matches[0].lifecycle_started_frame),life)
+        with self._original_plan_lock:
+            previous=self._accepted_depth_sources.get(source)
+            if previous is not None:
+                old,old_sequence=previous
+                if (identity[:2]!=old[:2] or identity[2]<old[2] or identity[3]<old[3]
+                        or identity[2]==old[2] and (identity[3]!=old[3]
+                            or sequence[0]<=old_sequence[0] or sequence[1]<=old_sequence[1])):
+                    return False  # Replayed/old work never rearms the sampler.
+            source_reset=previous is not None and identity!=previous[0]
+            def future_hint(hint, frame):
+                return (type(hint) is tuple and len(hint)>=5 and hint[:2]==identity[:2]
+                    and (hint[2:4]>identity[2:4] or hint[2:4]==identity[2:4] and frame>sequence[0]))
+            keys=(set(self._original_plan_attempts)|set(self._result_cache)|self._depth_retry_tracks
+                  |set(self._sample_service)|set(self._actual_depth_attempts)
+                  |set(self._accepted_depth_members)|{k[:2] for k in self._original_plans})
+            for key in keys:
+                if key[0]!=source:
+                    continue
+                accepted=current.get(key)
+                binding,life=accepted if accepted is not None else (None,None)
+                if not (source_reset or binding is None or self._accepted_depth_members.get(key)!=binding
+                        or life.disposition in {'new','reappeared'}):
+                    continue
+                # A later callback may already have sealed a NEW-epoch plan.
+                # Preserve its true budget marker; never rearm/resample it.
+                kept=[]
+                for plan_key,(plan,sealed) in tuple(self._original_plans.items()):
+                    if plan_key[:2]!=key:
+                        continue
+                    hint=None
+                    if sealed is not None:
+                        birth=sealed.private.original
+                        owner=sealed.rows[0].evidence.lifecycle
+                        hint=(birth.run_id,birth.graph_id,owner.source_epoch,birth.source_clock_epoch,owner.generation)
+                    if (future_hint(hint,plan.frame_id) or
+                            binding is not None and hint==binding[:5] and plan.frame_id>=life.frame_id):
+                        kept.append(plan.pts_us)
+                    else:
+                        del self._original_plans[plan_key]
+                if kept:self._original_plan_attempts[key]=max(kept)
+                else:self._original_plan_attempts.pop(key,None)
+                entry=self._result_cache.get(key)
+                if (entry is not None and not future_hint(entry.get('_original_depth_binding'),entry.get('_original_attempt_frame',-1))
+                        and (binding is None or entry.get('_original_depth_binding')!=binding[:5]
+                             or entry.get('_original_attempt_frame',-1)<life.frame_id)):
+                    self._result_cache.pop(key,None)
+                self._depth_retry_tracks.discard(key)
+                self._sample_service.pop(key,None)
+                actual=self._actual_depth_attempts.get(key)
+                if (actual is not None and not future_hint(actual[2],actual[1])
+                        and not (actual[2] is None and actual[1]>sequence[0])
+                        and (binding is None or actual[2]!=binding[:5] or actual[1]<life.frame_id)):
+                    self._actual_depth_attempts.pop(key,None)
+                _increment_core_counter('object_depth_original_cadence_boundary_reset')
+            self._accepted_depth_sources[source]=(identity,sequence)
+            self._accepted_depth_members={k:v for k,v in self._accepted_depth_members.items() if k[0]!=source}
+            self._accepted_depth_members.update({k:v[0] for k,v in current.items()})
+        return True
+
+    def _prepare_original_pose_plan(self, frame_meta, obj_meta, *, frame_id, pts_us, source_id, bbox,
+                                    pose_cohort=None):
+        trace_key=pose_cohort or (source_id,int(obj_meta.object_id),frame_id,
+            int(_meta_lookup(frame_meta,'buf_pts','buffer_pts','pts',default=0) or 0))
+        # Only the existing native pose-capsule lane is supported. Never retain
+        # a segmentation mask or introduce a host ROI fallback for late work.
+        if self._extract_instance_mask_payload(obj_meta):
+            self._sampling_event(trace_key,'plan_mask_unsupported')
+            return None
+        joints = (self._attached_pose_keypoints(obj_meta, bbox,
+            current_cohort=pose_cohort or (source_id, int(obj_meta.object_id), frame_id,
+                int(_meta_lookup(frame_meta, 'buf_pts', 'buffer_pts', 'pts', default=0) or 0)))
+            if getattr(self, 'xc3d_exact_acquisition', False)
+            else self._attached_pose_keypoints(obj_meta, bbox))
+        if joints is None:
+            self._sampling_event(trace_key,'plan_pose_unavailable')
+            return None
+        width,height = _canonical_frame_size(frame_meta, self.fallback_frame_size)
+        if width <= 8 or height <= 8:
+            self._sampling_event(trace_key,'plan_raster_unavailable')
+            return None
+        x,y,w,h = bbox
+        crop=(max(0,int(math.floor(x))),max(0,int(math.floor(y))),
+              min(width,int(math.ceil(x+w))),min(height,int(math.ceil(y+h))))
+        if crop[2] <= crop[0] or crop[3] <= crop[1]:
+            return None
+        body,contact,uv,visible,capsules=self._pose_capsule_masks(joints,crop_rect=crop,bbox=bbox)
+        if not np.any(body):
+            self._sampling_event(trace_key,'plan_body_geometry_unavailable')
+            return None
+        torso,torso_uv=self._pose_torso_capsule_geometry(joints,bbox=bbox)
+        shoulder,shoulder_uv=self._pose_shoulder_capsule_geometry(joints,bbox=bbox)
+        if not np.any(contact):
+            capsules,uv,visible=(),None,0
+        freeze=lambda value:tuple(float(v) for v in value) if value is not None else None
+        return _OriginalPoseDepthPlan(source_id,frame_id,pts_us,int(obj_meta.object_id),tuple(bbox),
+            float(obj_meta.confidence),(width,height),tuple(tuple(float(v) for v in p) for p in joints),
+            tuple(tuple(float(v) for v in c) for c in capsules),freeze(uv),visible,
+            freeze(torso),freeze(torso_uv),freeze(shoulder),freeze(shoulder_uv),
+            _read_env_int('NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES',4096,min_value=128),time.monotonic())
+
+    def _retain_original_pose_plan(self, plan):
+        if plan is None:
+            return
+        key=(plan.source_id,plan.raw_id,plan.frame_id,plan.pts_us)
+        with self._original_plan_lock:
+            self._original_plans[key]=(plan,None)
+            self._original_plan_attempts[(plan.source_id,plan.raw_id)]=plan.pts_us
+            while len(self._original_plans)>64:
+                self._original_plans.popitem(last=False)
+                _increment_core_counter('object_depth_original_plan_capacity_drop')
+            while len(self._original_plan_attempts)>64:
+                self._original_plan_attempts.popitem(last=False)
+
+    def _release_plan_reservation_locked(self,plan):
+        key=(plan.source_id,plan.raw_id)
+        newer=any(other is not plan and (other.source_id,other.raw_id)==key
+                  and other.pts_us>=plan.pts_us for other,_ in self._original_plans.values())
+        if self._original_plan_attempts.get(key)==plan.pts_us and not newer:
+            self._original_plan_attempts.pop(key,None)
+
+    def _discard_original_plan_locked(self,key,plan):
+        current=self._original_plans.get(key)
+        if current is None or current[0] is not plan:
+            return False
+        del self._original_plans[key]
+        self._release_plan_reservation_locked(plan)
+        return True
+
+    def seal_original_depth_work(self, work):
+        """Callback seals immutable F lifecycle/pose; late worker never sees SDK."""
+        if type(work) is not QualityWork:
+            return
+        # This happens on EVERY native callback, including publication-throttled
+        # ones. Raw-ID reuse/short-gap reappearance cannot carry F across a
+        # missed ACTIVE observation merely because a generation was retained.
+        source=work.continuity.source_id
+        current={r.evidence.lifecycle.tracker_id:r.evidence.lifecycle for r in work.rows}
+        with self._original_plan_lock:
+            for key,(plan,sealed) in tuple(self._original_plans.items()):
+                if plan.source_id!=source:
+                    continue
+                life=current.get(plan.raw_id)
+                old_life=sealed.rows[0].evidence.lifecycle if sealed is not None else None
+                if (work.denial is not None or life is None
+                        or old_life is not None and (life.key!=old_life.key
+                            or life.frame_id>old_life.frame_id and life.disposition!='continuous')):
+                    del self._original_plans[key]
+                    self._release_plan_reservation_locked(plan)
+                    _increment_core_counter('object_depth_original_plan_native_barrier')
+        if work.denial is not None or work.private is None:
+            return
+        for row in work.rows:
+            life,body,original=row.evidence.lifecycle,row.evidence.body,row.original
+            trace_key=(original.source_id,life.tracker_id,original.original_frame,original.pts_ns)
+            with self._original_plan_lock:
+                if trace_key in self._sampling_trace:
+                    self._sampling_trace[trace_key]['binding']=self._sampling_binding(row)
+                actual=self._actual_depth_attempts.get((original.source_id,life.tracker_id))
+                if (actual is not None and actual[:2]==(original.pts_ns//1000,original.original_frame)
+                        and actual[3]==original.pts_ns):
+                    self._actual_depth_attempts[(original.source_id,life.tracker_id)]=(
+                        actual[0],actual[1],(original.run_id,original.graph_id,life.source_epoch,
+                            original.source_clock_epoch,life.generation),actual[3])
+            key=(original.source_id,life.tracker_id,original.original_frame,original.pts_ns//1000)
+            with self._original_plan_lock:
+                entry=self._result_cache.get(key[:2])
+                if (entry is not None and entry.get('_sample_ts_us')==original.pts_ns//1000
+                        and entry.get('measurement_frame_id')==original.original_frame
+                        and entry.get('measurement_ts_us')==original.pts_ns//1000):
+                    entry['_original_depth_binding']=(original.run_id,original.graph_id,life.source_epoch,
+                        original.source_clock_epoch,life.generation)
+                    entry['_original_attempt_frame']=original.original_frame
+                pending=self._original_plans.get(key)
+                if pending is None or pending[1] is not None:
+                    continue
+                plan=pending[0]
+                if (body is None or row.evidence.measurements is None
+                        or row.denial not in (None,'world_quality_depth_not_exact_current')
+                        or life.disposition not in {'new','continuous'}
+                        or body.keypoints!=plan.keypoints or body.bbox_xywh!=plan.bbox
+                        or body.image_size!=plan.image_size or life.frame_id!=plan.frame_id):
+                    del self._original_plans[key]
+                    self._release_plan_reservation_locked(plan)
+                    if trace_key in self._sampling_trace:
+                        self._sampling_trace[trace_key]['events'].append('plan_seal_refused')
+                    _increment_core_counter('object_depth_original_plan_seal_refused')
+                    continue
+                self._original_plans[key]=(plan,replace(work,rows=(row,),
+                    ingress_monotonic_s=plan.ingress_monotonic_s))
+                # Already holding the plan lock; append directly, no nested lock.
+                if trace_key in self._sampling_trace:
+                    self._sampling_trace[trace_key]['events'].append('plan_sealed')
+
+    def drain_original_depth_work(self, originals, context, now, telemetry):
+        """ONE FIFO actor, <=2 original attempts; query-only, never waits for D(F)."""
+        with self._original_plan_lock:
+            pending=tuple(self._original_plans.items())
+        result=[]
+        attempted=0
+        times={i.binding.source_id:i.evaluation_max_s for i in context.intervals}
+        for key,(plan,work) in pending:
+            expired=not 0 <= now-plan.ingress_monotonic_s <= .35
+            if work is None and not expired:
+                continue
+            if not expired:
+                row,=work.rows
+                life=row.evidence.lifecycle
+                current=[o.stamp for o in originals.values() if
+                    (o.stamp.member.run_id,o.stamp.member.source_id,o.stamp.member.source_epoch,
+                     o.stamp.member.raw_id,o.stamp.member.lifecycle_generation)==
+                    (row.original.run_id,life.source_id,life.source_epoch,life.tracker_id,life.generation)]
+                expired=(len(current)!=1 or current[0].lifecycle_started_frame>life.frame_id
+                    or current[0].frame_id<life.frame_id or current[0].acquired_at_s!=times.get(life.source_id)
+                    or not 0 <= current[0].acquired_at_s-row.original.pts_ns/1e9 <= .35)
+            if expired:
+                with self._original_plan_lock:
+                    self._discard_original_plan_locked(key,plan)
+                self._sampling_plan_event(plan,'plan_expired_or_lifecycle_refused',work)
+                _increment_core_counter('object_depth_original_plan_expired_or_lifecycle_refused')
+                continue
+            if attempted>=2:
+                break
+            if not self._actual_depth_due((plan.source_id,plan.raw_id),plan.pts_us):
+                continue
+            depth,age,_=self.depth_store.resolve(source_id=plan.source_id,frame_id=plan.frame_id,
+                pts_us=plan.pts_us,max_age_frames=0,wait_ms=0.)
+            if depth is None:
+                continue
+            binding=(row.original.run_id,row.original.graph_id,life.source_epoch,
+                row.original.source_clock_epoch,life.generation)
+            with self._original_plan_lock:
+                current=self._original_plans.get(key)
+                if (current is None or current[0] is not plan or current[1] is not work
+                        or not self._claim_actual_depth_attempt_locked((plan.source_id,plan.raw_id),
+                            plan.pts_us,plan.frame_id,binding,row.original.pts_ns)):
+                    continue
+                del self._original_plans[key]
+            attempted+=1  # Consume once even if sample/projection fails.
+            self._sampling_plan_event(plan,'late_sample_attempt',work)
+            self._record_sample_service((plan.source_id,plan.raw_id))
+            completed=telemetry._complete_original_depth_plan(self,plan,work,depth)
+            if completed is not None:
+                self._sampling_plan_event(plan,'late_sample_completed',work)
+                result.append(completed)
+                _increment_core_counter('object_depth_original_plan_completed')
+            else:
+                self._sampling_plan_event(plan,'late_sample_no_result',work)
+        return tuple(result)
 
     def _max_objects_per_frame(self) -> int:
         return _read_env_int("NOESIS_OBJECT_DEPTH_MAX_OBJECTS_PER_FRAME", 2, min_value=0)
@@ -6830,33 +7704,90 @@ class _ObjectDepthFusionProcessor:
 
     def _sample_due(self, *, source_id: int, obj_meta: Any, pts_us: int) -> bool:
         key = self._track_key(source_id, obj_meta)
+        return self._sample_due_key(key, pts_us)
+
+    def _sample_due_key(self, key, pts_us: int) -> bool:
         if key is None:
             return True
+        if getattr(self,'original_depth_rendezvous_enabled',False):
+            reservation=self._original_plan_attempts.get(key)
+            if reservation is not None and int(pts_us)<=reservation:
+                return False  # A reservation still fences replay/backward PTS.
+            if not self._actual_depth_due(key,pts_us):
+                return False
         entry = self._result_cache.get(key)
         if not isinstance(entry, dict):
             return True
         max_hz = self._max_hz_per_track()
         if max_hz <= 0.0:
             return False
+        try:
+            sample_ts_us = int(entry.get("_sample_ts_us", 0) or 0)
+        except Exception:
+            sample_ts_us = 0
+        if entry.get('_no_native_pose_work') is True and int(pts_us) <= sample_ts_us:
+            return False  # Retry newer originals, never replay the same no-op.
         # A previous sample attempt had no ready secondary depth frame.  Do
         # not let the old valid cache cadence hide the next completed DAv2
         # frame; retry once per incoming frame until sampling succeeds.
         if key in self._depth_retry_tracks:
             return True
-        try:
-            sample_ts_us = int(entry.get("_sample_ts_us", 0) or 0)
-        except Exception:
-            sample_ts_us = 0
         if sample_ts_us <= 0:
             return True
         min_interval_us = int(1_000_000.0 / max(1e-6, float(max_hz)))
         return (int(pts_us) - sample_ts_us) >= min_interval_us
 
+    def _actual_depth_due(self,key,pts_us):
+        previous=self._actual_depth_attempts.get(key)
+        hz=self._max_hz_per_track()
+        return previous is None or (hz>0 and int(pts_us)-previous[0]>=int(1_000_000/hz))
+
+    def _claim_actual_depth_attempt(self,key,pts_us,frame_id,binding=None,pts_ns=None,*,_work=None):
+        if key is None or not getattr(self,'original_depth_rendezvous_enabled',False):
+            return True  # Non-rendezvous/default source behavior unchanged.
+        with self._original_plan_lock:
+            previous = self._actual_depth_attempts.get(key)
+            claimed = self._claim_actual_depth_attempt_locked(key,pts_us,frame_id,binding,pts_ns)
+            if claimed and _work is not None:
+                _work.previous = previous
+                _work.claimed = self._actual_depth_attempts[key]
+            return claimed
+
+    def _release_no_work_attempt(self, key, work):
+        if key is None or work is None or not work.no_native_pose_work or work.claimed is None:
+            return
+        with self._original_plan_lock:
+            # Never overwrite a later real attempt or sealed lifecycle binding.
+            if self._actual_depth_attempts.get(key) == work.claimed:
+                if work.previous is None:
+                    del self._actual_depth_attempts[key]
+                else:
+                    self._actual_depth_attempts[key] = work.previous
+
+    def _claim_actual_depth_attempt_locked(self,key,pts_us,frame_id,binding=None,pts_ns=None):
+        if not self._actual_depth_due(key,pts_us):
+            return False
+        self._actual_depth_attempts[key]=(int(pts_us),int(frame_id),binding,
+            int(pts_ns) if pts_ns is not None else int(pts_us)*1000)
+        while len(self._actual_depth_attempts)>64:
+            self._actual_depth_attempts.popitem(last=False)
+        return True
+
+    def _record_sample_service(self, key) -> None:
+        if key is None:
+            return
+        with self._original_plan_lock:
+            self._sample_service_sequence += 1
+            self._sample_service[key] = self._sample_service_sequence
+            while len(self._sample_service) > 64:
+                self._sample_service.popitem(last=False)
+        _increment_core_counter('object_depth_fair_ready_attempt')
+
     def _cache_result(self, *, source_id: int, pts_us: int, obj_meta: Any, result: ObjectDepthResult) -> None:
         key = self._track_key(source_id, obj_meta)
         if key is None:
             return
-        payload = result.to_dict()
+        payload = result.to_native_dict()
         payload["_sample_ts_us"] = int(pts_us)
         self._result_cache[key] = payload
         max_entries = max(8, _read_env_int("NOESIS_OBJECT_DEPTH_CACHE_MAX_TRACKS", 64, min_value=1))
@@ -7031,7 +7962,37 @@ class _ObjectDepthFusionProcessor:
         self,
         obj_meta: Any,
         bbox: Tuple[float, float, float, float],
+        *, current_cohort: tuple | None = None,
     ) -> Optional[np.ndarray]:
+        if obj_meta is None:
+            return None
+        if current_cohort is not None:
+            processor = self.pose_feature_processor
+            profile = self.pose_profile
+            if (not isinstance(processor, PoseFeatureProcessor) or profile is None
+                    or processor.tensor_source != 'object_sgie'
+                    or (processor.gie_id, processor.model_size, processor.score_threshold,
+                        processor.letterbox) != profile
+                    or int(obj_meta.object_id) != current_cohort[1]):
+                _increment_core_counter('object_depth_pose_current_binding_unavailable')
+                return None
+            found, owned = processor._owned_pose_result(current_cohort, bbox, profile)
+            if found:
+                _increment_core_counter('object_depth_pose_owned_found')
+                # An exact attempted-but-negative result is authoritative; do
+                # not replace it with a held feature JSON or extract again.
+                if (owned is None or not _AnalyticsTelemetryProcessor._pose_payload_is_current(owned, current_cohort)
+                        or tuple(owned.get('bbox', ())) != tuple(bbox)):
+                    _increment_core_counter('object_depth_pose_owned_negative')
+                    return None
+                points = _AnalyticsTelemetryProcessor._keypoints_abs_from_pose_payload(self, owned, bbox)
+                if (points is None or points.shape != (17, 3) or not np.isfinite(points).all()
+                        or np.any(points[:, 2] < 0) or np.any(points[:, 2] > 1)):
+                    _increment_core_counter('object_depth_pose_owned_negative')
+                    return None
+                _increment_core_counter('object_depth_pose_owned_current_reused')
+                return points
+            _increment_core_counter('object_depth_pose_owned_missing')
         if obj_meta is None or noesis_pose_meta_ext is None:
             return None
         extract_pose = getattr(noesis_pose_meta_ext, "extract_pose_features", None)
@@ -7042,6 +8003,8 @@ class _ObjectDepthFusionProcessor:
         except Exception:
             return None
         if raw_payload is None:
+            if current_cohort is not None:
+                _increment_core_counter('object_depth_pose_attached_missing')
             return None
         if isinstance(raw_payload, Mapping):
             payload = dict(raw_payload)
@@ -7051,6 +8014,11 @@ class _ObjectDepthFusionProcessor:
             except Exception:
                 return None
         if not isinstance(payload, Mapping):
+            return None
+        if current_cohort is not None and (
+                not _AnalyticsTelemetryProcessor._pose_payload_is_current(payload, current_cohort)
+                or tuple(payload.get('bbox', ())) != tuple(bbox)):
+            _increment_core_counter('object_depth_pose_attached_not_current')
             return None
 
         src_bbox = payload.get("bbox")
@@ -7084,6 +8052,10 @@ class _ObjectDepthFusionProcessor:
                     return None
             points = np.asarray(rows, dtype=np.float32)
             if points.shape == (17, 3) and np.isfinite(points).all():
+                if current_cohort is not None and (np.any(points[:, 2] < 0) or np.any(points[:, 2] > 1)):
+                    return None
+                if current_cohort is not None:
+                    _increment_core_counter('object_depth_pose_attached_current')
                 return points
 
         raw_abs = payload.get("keypoints_abs")
@@ -7100,6 +8072,10 @@ class _ObjectDepthFusionProcessor:
         points_abs = np.asarray(rows_abs, dtype=np.float32)
         if points_abs.shape != (17, 3) or not np.isfinite(points_abs).all():
             return None
+        if current_cohort is not None and (np.any(points_abs[:, 2] < 0) or np.any(points_abs[:, 2] > 1)):
+            return None
+        if current_cohort is not None:
+            _increment_core_counter('object_depth_pose_attached_current')
         return points_abs
 
     def _pose_capsule_masks(
@@ -7207,10 +8183,25 @@ class _ObjectDepthFusionProcessor:
         # Rasterize the diagnostic/fallback mask from the exact continuous
         # predicate used by the CUDA sampler.  Pixel centers are absolute
         # aligned-frame coordinates, matching the native +0.5 convention.
-        grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
-        point_x = np.asarray(grid_x, dtype=np.float32) + 0.5
-        point_y = np.asarray(grid_y, dtype=np.float32) + 0.5
         for ax, ay, bx, by, line_radius, ankle_radius in contact_capsules:
+            # The predicate has support only near this lower-leg segment and
+            # ankle disk. Keep absolute float32 pixel centers and the exact
+            # arithmetic below, but do not allocate person-sized float grids.
+            # The precision margin also preserves legacy float32 aliasing for
+            # large absolute origins; one pixel alone is not sufficient there.
+            magnitude = max(1.0, abs(ax), abs(ay), abs(bx), abs(by),
+                            abs(x0), abs(y0), abs(x1), abs(y1))
+            padding = max(1.0, 16.0 * np.finfo(np.float32).eps * magnitude)
+            end_radius = max(line_radius, ankle_radius)
+            patch_x0 = max(x0, int(math.floor(min(ax-line_radius, bx-end_radius)-padding)))
+            patch_y0 = max(y0, int(math.floor(min(ay-line_radius, by-end_radius)-padding)))
+            patch_x1 = min(x1, int(math.ceil(max(ax+line_radius, bx+end_radius)+padding)))
+            patch_y1 = min(y1, int(math.ceil(max(ay+line_radius, by+end_radius)+padding)))
+            if patch_x1 <= patch_x0 or patch_y1 <= patch_y0:
+                continue
+            grid_y, grid_x = np.ogrid[patch_y0:patch_y1, patch_x0:patch_x1]
+            point_x = np.asarray(grid_x, dtype=np.float32) + 0.5
+            point_y = np.asarray(grid_y, dtype=np.float32) + 0.5
             dx = float(bx) - float(ax)
             dy = float(by) - float(ay)
             length_sq = (dx * dx) + (dy * dy)
@@ -7218,7 +8209,7 @@ class _ObjectDepthFusionProcessor:
                 t = ((point_x - float(ax)) * dx + (point_y - float(ay)) * dy) / length_sq
                 t = np.clip(t, 0.0, 1.0)
             else:
-                t = np.zeros((height, width), dtype=np.float32)
+                t = np.zeros((patch_y1-patch_y0, patch_x1-patch_x0), dtype=np.float32)
             nearest_x = float(ax) + (t * dx)
             nearest_y = float(ay) + (t * dy)
             segment_active = (
@@ -7229,7 +8220,8 @@ class _ObjectDepthFusionProcessor:
                 np.square(point_x - float(bx)) + np.square(point_y - float(by))
                 <= float(ankle_radius) * float(ankle_radius)
             )
-            contact_mask[np.asarray(segment_active | ankle_active)] = 1
+            patch = contact_mask[patch_y0-y0:patch_y1-y0, patch_x0-x0:patch_x1-x0]
+            patch[np.asarray(segment_active | ankle_active)] = 1
 
         contact_uv = [
             float(x0) + (sum(float(point[0]) for point in contact_points) / len(contact_points)),
@@ -7243,8 +8235,8 @@ class _ObjectDepthFusionProcessor:
             contact_capsules,
         )
 
+    @staticmethod
     def _pose_torso_capsule_geometry(
-        self,
         keypoints: np.ndarray,
         *,
         bbox: Tuple[float, float, float, float],
@@ -7361,8 +8353,9 @@ class _ObjectDepthFusionProcessor:
         anchor_uv = [0.5 * (ax + bx), 0.5 * (ay + by)]
         return capsule, [float(anchor_uv[0]), float(anchor_uv[1])]
 
+    @staticmethod
     def _pose_shoulder_capsule_geometry(
-        self, keypoints: np.ndarray, *, bbox: Tuple[float, float, float, float],
+        keypoints: np.ndarray, *, bbox: Tuple[float, float, float, float],
     ) -> Tuple[Optional[Tuple[float, float, float, float, float, float]], Optional[List[float]]]:
         """Sample the observed shoulder band without constructing covered hips."""
         if not isinstance(keypoints, np.ndarray) or keypoints.shape[0] < 17 or keypoints.shape[1] < 3:
@@ -7848,6 +8841,8 @@ class _ObjectDepthFusionProcessor:
         torso_uv: Optional[Sequence[float]] = None,
         shoulder_capsule: Optional[Sequence[float]] = None,
         shoulder_uv: Optional[Sequence[float]] = None,
+        sample_limit: int | None = None,
+        _work: _DepthSamplingWork | None = None,
     ) -> Optional[ObjectDepthResult]:
         device = getattr(depth_frame, "depth_device_frame", None)
         if device is None or not np.any(body_mask):
@@ -7864,6 +8859,7 @@ class _ObjectDepthFusionProcessor:
             return None
         samples: List[PoseDepthSample] = []
         stats_by_source: Dict[str, Mapping[str, Any]] = {}
+        private_support = []
         for source, capsules, uv in plans:
             if source == "pose_shoulder_support" and any(
                 sample.anchor_source == "pose_torso_support" and sample.evidence_reason is None
@@ -7874,7 +8870,7 @@ class _ObjectDepthFusionProcessor:
             try:
                 stats = sampler(
                     [list(capsule) for capsule in capsules],
-                    _read_env_int("NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES", 4096, min_value=128),
+                    sample_limit if sample_limit is not None else _read_env_int("NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES", 4096, min_value=128),
                 )
             except Exception:
                 # A failed patch is unavailable evidence, not permission to
@@ -7893,13 +8889,23 @@ class _ObjectDepthFusionProcessor:
                 _increment_core_counter("object_depth_gpu_roi_copies_total")
             stats_by_source[source] = stats
             samples.append(self._pose_depth_sample(source, uv, stats, area=area, visible_ankles=visible_ankles))
+            # Detach the SAME sampled geometry, not a second sample or a radius
+            # inferred from area/count. Missing raster leaves this cue absent.
+            width, height = getattr(depth_frame, "frame_w", 0), getattr(depth_frame, "frame_h", 0)
+            if samples[-1].evidence_reason is None and samples[-1].evidence_quality != 'rejected' and width > 8 and height > 8:
+                try:
+                    private_support.append(NativePosePatchSupport(source, uv, capsules, (width, height),
+                        int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+                        _frame_pts_key_us(frame_meta)))
+                except (TypeError, ValueError, OverflowError):
+                    _increment_core_counter("object_depth_private_support_unavailable")
         fields = self._pose_depth_selection(samples)
         selected_source = fields.get("anchor_source") or (samples[-1].anchor_source if samples else "")
         stats = stats_by_source.get(str(selected_source), {})
         frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
         ts_us = _frame_pts_key_us(frame_meta)
         _increment_core_counter("detection_wake.object_depth_pose_capsule_stats")
-        return ObjectDepthResult(
+        result = ObjectDepthResult(
             source_id=int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
             frame_id=frame_id, object_id=int(getattr(obj_meta, "object_id", -1)),
             class_id=int(getattr(obj_meta, "class_id", -1)), bbox=bbox,
@@ -7918,8 +8924,11 @@ class _ObjectDepthFusionProcessor:
             mask_area_px=max(0, int(stats.get("sampled_capsule_area_px", 0) or 0)),
             model=self.depth_model_name, ts_us=ts_us,
             measurement_frame_id=frame_id, measurement_ts_us=ts_us,
-            measurement_age_us=0, measurement_cached=False, **fields,
+            measurement_age_us=0, measurement_cached=False, native_pose_support=tuple(private_support), **fields,
         )
+        if _work is not None and not plans:
+            _work.no_native_pose_work = True  # Exact zero sampling calls, not a status heuristic.
+        return result
 
     def _sample_person_mask_stats_native(
         self,
@@ -8278,6 +9287,8 @@ class _ObjectDepthFusionProcessor:
         frame_meta: Any,
         obj_meta: Any,
         depth_frame: _AlignedDepthFrame,
+        *, original_cohort: tuple | None = None,
+        _work: _DepthSamplingWork | None = None,
     ) -> Optional[ObjectDepthResult]:
         bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
         if bbox is None:
@@ -8315,7 +9326,12 @@ class _ObjectDepthFusionProcessor:
         pose_shoulder_uv = None
         pose_keypoints = None
         if not mask_payload:
-            pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox)
+            cohort = original_cohort or (
+                int(_meta_lookup(frame_meta, 'source_id', 'pad_index', default=0) or 0),
+                int(obj_meta.object_id),
+                int(_meta_lookup(frame_meta, 'frame_number', 'frame_num', default=0) or 0),
+                int(_meta_lookup(frame_meta, 'buf_pts', 'buffer_pts', 'pts', default=0) or 0))
+            pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox, current_cohort=cohort)
             if pose_keypoints is not None:
                 (
                     pose_body_mask,
@@ -8358,6 +9374,7 @@ class _ObjectDepthFusionProcessor:
                 torso_uv=pose_torso_uv,
                 shoulder_capsule=pose_shoulder_capsule,
                 shoulder_uv=pose_shoulder_uv,
+                _work=_work,
             )
             if native_pose_result is not None:
                 return replace(native_pose_result, pose_joint_confidences=tuple(
@@ -8513,13 +9530,30 @@ class _ObjectDepthFusionProcessor:
             evidence_reason=anchor.anchor_rejection_reason,
         )
 
-    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any) -> None:
+    def handle_servicemaker_frame(self, batch_meta: Any, frame_meta: Any, *, source_receipt: Any = None) -> None:
         source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
         frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
         pts_us = _frame_pts_key_us(frame_meta)
+        pose_pts_ns = int(_meta_lookup(frame_meta, 'buf_pts', 'buffer_pts', 'pts', default=0) or 0)
+        if getattr(self, "xc3d_exact_acquisition", False):
+            original_frame = _xc3d_depth_source_frame(source_receipt, source_id, pts_us)
+            if original_frame is None:
+                return
+            frame_id = original_frame
+            pose_pts_ns = source_receipt['original_pts_ns']
         depth_frame: Optional[_AlignedDepthFrame] = None
         depth_frame_resolved = False
         samples_remaining = self._max_objects_per_frame()
+        # Plan from owned scalar keys, not a retained/reordered SDK object list.
+        # A newly visible key waits at most the next callback for a reserved slot.
+        with self._original_plan_lock:
+            service = tuple(self._sample_service.items())
+            new_priority = self._sample_service_sequence
+        due = [key for key,_ in sorted(service,key=lambda item:item[1])
+               if key[0] == source_id and self._sample_due_key(key,pts_us)]
+        scheduled = set(due[:samples_remaining])
+        unreserved = max(0,samples_remaining-len(scheduled))
+        current_keys = set()
         for obj_meta in getattr(frame_meta, "object_items", None) or []:
             try:
                 class_id = int(getattr(obj_meta, "class_id", -1))
@@ -8530,6 +9564,20 @@ class _ObjectDepthFusionProcessor:
             bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
             if bbox is None:
                 continue
+            sample_key = self._track_key(source_id,obj_meta)
+            trace_key=(source_id,sample_key[1] if sample_key is not None else -1,frame_id,pose_pts_ns)
+            self._sampling_event(trace_key,'entry',bbox=tuple(bbox),
+                pose_profile=self.pose_profile)
+            if sample_key is not None:
+                if len(current_keys)<64:
+                    current_keys.add(sample_key)
+                with self._original_plan_lock:
+                    # New churn cannot accumulate ancient, never-served debt
+                    # ahead of a persistent person. All new keys in THIS frame
+                    # share its pre-attempt service frontier (not a timestamp).
+                    self._sample_service.setdefault(sample_key,new_priority)
+                    while len(self._sample_service)>64:
+                        self._sample_service.popitem(last=False)
             cached_payload = self._cached_payload(
                 source_id=source_id,
                 frame_id=frame_id,
@@ -8538,25 +9586,34 @@ class _ObjectDepthFusionProcessor:
                 bbox=bbox,
             )
             if not self._sample_due(source_id=source_id, obj_meta=obj_meta, pts_us=pts_us):
-                if cached_payload is not None and self._attach_object_depth_payload(
+                actual=self._actual_depth_attempts.get(sample_key)
+                self._sampling_event(trace_key,'cadence',cache_available=cached_payload is not None,
+                    plan_reservation_pts_us=self._original_plan_attempts.get(sample_key),
+                    actual_attempt_pts_us=actual[0] if actual is not None else None)
+                if cached_payload is not None and self._attach_sampling_payload(
                     batch_meta,
                     obj_meta,
                     cached_payload,
+                    trace_key,
                 ):
                     _increment_core_counter("detection_wake.object_depth_cache_hit")
                 else:
                     _increment_core_counter("detection_wake.object_depth_cadence_skipped")
                 continue
-            if samples_remaining <= 0:
-                if cached_payload is not None and self._attach_object_depth_payload(
+            if samples_remaining <= 0 or sample_key not in scheduled and unreserved<=0:
+                self._sampling_event(trace_key,'budget',cache_available=cached_payload is not None)
+                if cached_payload is not None and self._attach_sampling_payload(
                     batch_meta,
                     obj_meta,
                     cached_payload,
+                    trace_key,
                 ):
                     _increment_core_counter("detection_wake.object_depth_budget_cache_hit")
                 else:
                     _increment_core_counter("detection_wake.object_depth_budget_skipped")
                 continue
+            if sample_key not in scheduled:
+                unreserved -= 1
             samples_remaining -= 1
             sample_start_ns = time.perf_counter_ns()
             if not depth_frame_resolved:
@@ -8564,11 +9621,24 @@ class _ObjectDepthFusionProcessor:
                     source_id=source_id,
                     frame_id=frame_id,
                     pts_us=pts_us,
-                    max_age_frames=max(0, int(self.depth_every_n_frames) - 1),
+                    max_age_frames=(0 if getattr(self,'original_depth_rendezvous_enabled',False)
+                                    else max(0, int(self.depth_every_n_frames) - 1)),
                     wait_ms=self._exact_frame_wait_ms(),
                 )
                 depth_frame_resolved = True
             if depth_frame is None:
+                self._sampling_event(trace_key,'no_depth')
+                if getattr(self,'original_depth_rendezvous_enabled',False):
+                    previous=self._original_plan_attempts.get(sample_key)
+                    hz=self._max_hz_per_track()
+                    if previous is not None and (hz<=0 or pts_us-previous<int(1_000_000/hz)):
+                        self._sampling_event(trace_key,'plan_reservation_active',plan_reservation_pts_us=previous)
+                    else:
+                        plan=self._prepare_original_pose_plan(frame_meta,obj_meta,
+                            frame_id=frame_id,pts_us=pts_us,source_id=source_id,bbox=bbox,
+                            pose_cohort=(source_id,int(obj_meta.object_id),frame_id,pose_pts_ns))
+                        self._retain_original_pose_plan(plan)
+                        self._sampling_event(trace_key,'plan_retained' if plan is not None else 'plan_unavailable')
                 track_key = self._track_key(source_id, obj_meta)
                 if track_key is not None:
                     self._depth_retry_tracks.add(track_key)
@@ -8581,19 +9651,34 @@ class _ObjectDepthFusionProcessor:
                 # carries explicit cached/age provenance, so preserve it while
                 # the retry stays armed instead of creating a one-frame depth
                 # hole.
-                if cached_payload is not None and self._attach_object_depth_payload(
+                if cached_payload is not None and self._attach_sampling_payload(
                     batch_meta,
                     obj_meta,
                     cached_payload,
+                    trace_key,
                 ):
                     _increment_core_counter(
                         "detection_wake.object_depth_pending_cache_hit"
                     )
                 continue
             else:
-                result = self._sample_person_result(frame_meta, obj_meta, depth_frame)
+                work = (_DepthSamplingWork() if getattr(self,'original_depth_rendezvous_enabled',False)
+                        else None)
+                if not self._claim_actual_depth_attempt(sample_key,pts_us,frame_id,pts_ns=pose_pts_ns,_work=work):
+                    self._sampling_event(trace_key,'actual_attempt_cadence')
+                    if cached_payload is not None:
+                        self._attach_sampling_payload(batch_meta,obj_meta,cached_payload,trace_key)
+                    continue
+                self._record_sample_service(sample_key)
+                self._sampling_event(trace_key,'sample_attempt')
+                result = self._sample_person_result(frame_meta, obj_meta, depth_frame,
+                    original_cohort=(source_id, int(obj_meta.object_id), frame_id, pose_pts_ns),
+                    _work=work)
+                self._release_no_work_attempt(sample_key, work)
             if result is None:
+                self._sampling_event(trace_key,'sample_no_result')
                 continue
+            self._sampling_event(trace_key,'sample_result',sample_status=str(result.status))
             depth_tensor_age_us = max(0, int(pts_us) - int(depth_frame.pts_us))
             result = replace(
                 result,
@@ -8606,13 +9691,39 @@ class _ObjectDepthFusionProcessor:
             _increment_core_counter("detection_wake.object_depth_sampled")
             track_key = self._track_key(source_id, obj_meta)
             if track_key is not None:
-                self._depth_retry_tracks.discard(track_key)
+                if work is not None and work.no_native_pose_work:
+                    self._depth_retry_tracks.add(track_key)
+                else:
+                    self._depth_retry_tracks.discard(track_key)
             self._cache_result(source_id=source_id, pts_us=pts_us, obj_meta=obj_meta, result=result)
-            self._attach_object_depth_payload(
+            if track_key is not None and work is not None and work.no_native_pose_work:
+                self._result_cache[track_key]['_no_native_pose_work'] = True
+            self._attach_sampling_payload(
                 batch_meta,
                 obj_meta,
-                result.to_dict(),
+                result.to_native_dict(),
+                trace_key,
             )
+        with self._original_plan_lock:
+            for key in tuple(self._sample_service):
+                if key[0]==source_id and key not in current_keys:
+                    del self._sample_service[key]
+
+
+def _xc3d_depth_source_frame(receipt, source, pts_us):
+    if not isinstance(receipt, Mapping) or receipt.get("receipt_valid") is not True:
+        return None
+    original = receipt.get("original_frame")
+    pts_ns = receipt.get("original_pts_ns")
+    if (type(original) is not int or original < 0 or type(pts_ns) is not int
+        or receipt.get("sdk_source_id") != source or receipt.get("original_sdk_source_id") != source
+        or receipt.get("original_source_id") != receipt.get("source_id")
+        or receipt.get("original_batch_id") != receipt.get("slot")
+        or type(receipt.get("original_buffer_scope")) is not int or receipt["original_buffer_scope"] <= 0
+        or receipt.get("original_ntp_ns") != receipt.get("post_tracker_ntp_ns")
+        or pts_ns // 1000 != pts_us or receipt.get("post_tracker_pts_ns") != pts_ns):
+        return None
+    return original
 
 
 class _DepthTrackingFrameOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DS runtime
@@ -8621,12 +9732,18 @@ class _DepthTrackingFrameOperator(_BatchMetadataOperatorBase):  # pragma: no cov
         self.processor = processor
 
     def handle_metadata(self, batch_meta: Any) -> None:  # type: ignore[override]
+        candidate = getattr(self.processor, "xc3d_exact_acquisition", False)
+        source_rows = _xc3d_private_batch_receipts(batch_meta) if candidate else None
         frame_items = getattr(batch_meta, "frame_items", None)
         if frame_items is None:
             return
         for frame_meta in frame_items:
             try:
-                self.processor.handle_servicemaker_frame(frame_meta)
+                if not candidate:
+                    self.processor.handle_servicemaker_frame(frame_meta)
+                else:
+                    receipt = _xc3d_private_frame_receipt(source_rows, batch_meta, frame_meta)
+                    self.processor.handle_servicemaker_frame(frame_meta, source_receipt=receipt)
             except Exception:
                 logger.exception("Failed to capture aligned DAv2 depth frame within batch metadata")
 
@@ -8637,12 +9754,18 @@ class _ObjectDepthFusionOperator(_BatchMetadataOperatorBase):  # pragma: no cove
         self.processor = processor
 
     def handle_metadata(self, batch_meta: Any) -> None:  # type: ignore[override]
+        candidate = getattr(self.processor, "xc3d_exact_acquisition", False)
+        source_rows = _xc3d_private_batch_receipts(batch_meta) if candidate else None
         frame_items = getattr(batch_meta, "frame_items", None)
         if frame_items is None:
             return
         for frame_meta in frame_items:
             try:
-                self.processor.handle_servicemaker_frame(batch_meta, frame_meta)
+                if not candidate:
+                    self.processor.handle_servicemaker_frame(batch_meta, frame_meta)
+                else:
+                    receipt = _xc3d_private_frame_receipt(source_rows, batch_meta, frame_meta)
+                    self.processor.handle_servicemaker_frame(batch_meta, frame_meta, source_receipt=receipt)
             except Exception:
                 logger.exception("Failed to fuse object depth within batch metadata")
 
@@ -8897,6 +10020,11 @@ class _TrackingPublicationWork:
     # it must never derive a second generation from a later snapshot.
     continuity: TrackingContinuityUpdate | None = None
     source_epoch: int = 0
+    # Detached, immutable, exact work evidence. No SDK object/latest source map.
+    xc3d_private_evidence: PrivateAssociationWork | None = None
+    identity_producer_work: OrderedProducerWork | None = None
+    world_quality_work: QualityWork | None = None
+    historical_quality_work: tuple[QualityWork, ...] = ()
     admitted_at_ns: int = field(default_factory=time.perf_counter_ns)
 
 
@@ -9107,6 +10235,230 @@ class _ShadowIdentityWorker:
             raise TimeoutError("shadow identity worker did not quiesce")
 
 
+@dataclass(frozen=True)
+class _WorldActorCloseReceipt:
+    target: object = field(repr=False)
+    completed: bool
+    error: BaseException | None
+    thread_id: int
+
+
+def _current_body_image_patches(keypoints, bbox, *, pose_is_current):
+    """Reuse existing observed-joint geometry, NOT a depth sampling operation.
+
+    No inference/extraction or 3D point is created. These own current pixels can
+    survive to the actor even when optional registered depth is unavailable.
+    """
+    if pose_is_current is not True:
+        return ()
+    try:
+        patches=[]
+        for basis,build in (
+            ('pose_torso_support',_ObjectDepthFusionProcessor._pose_torso_capsule_geometry),
+            ('pose_shoulder_support',_ObjectDepthFusionProcessor._pose_shoulder_capsule_geometry)):
+            capsule,uv=build(keypoints,bbox=bbox)
+            if capsule is not None and uv is not None:
+                patches.append(ObservedBodyImagePatch(basis,tuple(float(v) for v in uv),
+                    tuple(float(v) for v in capsule)))
+        return tuple(patches)
+    except (TypeError,ValueError,IndexError,OverflowError):
+        return ()
+
+
+def _finalize_world_quality_inputs(pending):
+    """Owned same-callback rows AFTER final identity overlay; no SDK re-extraction."""
+    if len(pending) > 128:
+        raise ValueError("world_quality_member_capacity")
+    return [capture_quality_input(*row) for row in pending]
+
+
+def _apply_image_source_stop_barriers(processor):
+    """Actor-only revocation before any next queued source/peer publication.
+
+    Stops can conservatively revoke old queued measurements too. They never
+    drop their canonical cohort or fabricate a native tracker lifecycle event.
+    An in-progress transaction finishes on this actor before its next barrier.
+    """
+    pipeline = getattr(processor, 'pipeline', None)
+    observer = getattr(pipeline, 'xc3d_source_stop_observer', None)
+    if observer is None:
+        return
+    mask = observer.snapshot()
+    if type(mask) is not int or mask < 0 or mask > 7:
+        raise RuntimeError('image source stop mask invalid')
+    old = getattr(pipeline, '_xc3d_applied_source_stop_mask', 0)
+    if mask & old != old:
+        raise RuntimeError('image source stop latch regressed')
+    ingress = getattr(pipeline, 'xc3d_world_quality_ingress', None)
+    acquisition = getattr(pipeline, 'xc3d_source_acquisition', None)
+    if ingress is None or acquisition is None:
+        raise RuntimeError('image source stop actual owner unavailable')
+    for source in range(3):
+        bit = 1 << source
+        if mask & bit and not old & bit:
+            result = ingress.stop_image_region_source(source, graph_id=acquisition.graph_id)
+            if result.reason != 'image_region_source_stopped':
+                raise RuntimeError('image source stop owner refused: ' + result.reason)
+            old |= bit
+            pipeline._xc3d_applied_source_stop_mask = old
+            pose_cfg = getattr(pipeline, 'config', {}).get('models', {}).get('pose', {})
+            component = getattr(pipeline, 'components', {}).get(pose_cfg.get('name', 'yolo26_pose'))
+            pose = getattr(component, 'config', {}).get('_pose_feature_processor')
+            if isinstance(pose, PoseFeatureProcessor):
+                pose._clear_pose_source(source)
+            _increment_core_counter('tracking.source_stop_barrier_total')
+
+
+class _PublicationWorkerDiagnostics:
+    """Task-only location sampler; never retains frames, locals or work items."""
+
+    ENV = "NOESIS_TRACKING_PUBLICATION_DIAGNOSTICS"
+    MAX_SAMPLES = 750
+    MAX_STACKS = 256
+    MAX_DEPTH = 24
+    MAX_BYTES = 96 * 1024
+    DURATION_S = 15.0
+    PERIOD_S = .020
+    START_WAIT_S = 60.0
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._stacks = {}
+        self._bytes = 0
+        self._samples = 0
+        self._omitted = 0
+        self._error = None
+        self._stages = {}
+        self._started = None
+        self._ended = None
+        self._created = None
+        self._target_ident = None
+
+    def start(self, target_ident):
+        self._created = time.monotonic()
+        self._target_ident = target_ident
+        try:
+            self._thread = threading.Thread(target=self._sample, args=(target_ident,),
+                name="NoesisPublicationDiagnostics", daemon=True)
+            self._thread.start()
+        except Exception as exc:
+            self._error = type(exc).__name__
+            self._thread = None
+
+    def arm(self):
+        # Scalar actor action only; thread was already started before work.
+        if self._started is None:
+            self._started = time.monotonic()
+
+    def _capture(self, target_ident):
+        frames = sys._current_frames()
+        frame = frames.get(target_ident)
+        locations = []
+        try:
+            while frame is not None and len(locations) < self.MAX_DEPTH:
+                code = frame.f_code
+                if len(code.co_filename) > 512 or len(code.co_name) > 128:
+                    return None  # Omit rather than misreport truncated locations.
+                locations.append((code.co_filename, code.co_name, frame.f_lineno))
+                frame = frame.f_back
+        finally:
+            # _current_frames owns references to EVERY Python thread's stack.
+            # Release all references before waiting; only scalar locations live.
+            del frame
+            frames.clear()
+        return tuple(locations)
+
+    def _sample(self, target_ident):
+        try:
+            while self._started is None:
+                if self._stop.wait(self.PERIOD_S):
+                    return
+                if time.monotonic() - self._created >= self.START_WAIT_S:
+                    self._error = 'no_work_before_start_bound'
+                    return
+            deadline = self._started + self.DURATION_S
+            while self._samples < self.MAX_SAMPLES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop.wait(min(self.PERIOD_S, remaining)):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                stack = self._capture(target_ident)
+                self._samples += 1
+                if stack is None:
+                    self._omitted += 1
+                    continue
+                if stack in self._stacks:
+                    self._stacks[stack] += 1
+                else:
+                    size = len(json.dumps(stack, ensure_ascii=True).encode('ascii')) + 64
+                    if len(self._stacks) < self.MAX_STACKS and self._bytes + size <= self.MAX_BYTES:
+                        self._stacks[stack] = 1
+                        self._bytes += size
+                    else:
+                        self._omitted += 1
+        except Exception as exc:
+            self._error = type(exc).__name__
+        finally:
+            self._ended = time.monotonic()
+
+    @contextmanager
+    def stage(self, name, item_count):
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            try:
+                self.record_stage(name, start, item_count)
+            except Exception as exc:
+                self._error = type(exc).__name__  # Never replace a real refusal.
+
+    def record_stage(self, name, start, item_count):
+        elapsed = max(0, time.perf_counter_ns() - start)
+        row = self._stages.setdefault(name, [0, 0, 0])
+        row[0] += 1
+        row[1] += elapsed
+        row[2] = max(row[2], elapsed)
+        _record_core_stage_timing('tracking.worker_diagnostic.' + name, start,
+                                  item_count=item_count)
+
+    def close(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=.5)
+            if self._thread.is_alive():
+                # Optional diagnostics cannot poison canonical publication.
+                return {'contract': 'noesis.publication_worker_diagnostics.v1',
+                        'error': 'sampler_not_quiesced', 'stacks': [],
+                        'sample_counts_available': False}
+        summary = {'contract': 'noesis.publication_worker_diagnostics.v1',
+            'samples': self._samples, 'omitted_samples': self._omitted,
+            'worker_thread_ident': self._target_ident,
+            'window_started_monotonic_s': self._started,
+            'stack_scope': 'first_dequeued_work_15s_leaf_to_root',
+            'stage_scope': 'worker_lifetime_inclusive_wall_not_cpu',
+            'duration_s': max(0., (self._ended or time.monotonic()) - self._started)
+                if self._started is not None else 0.,
+            'period_s': self.PERIOD_S, 'error': self._error,
+            'stacks': [{'locations': stack, 'count': count}
+                       for stack, count in self._stacks.items()],
+            'stages_ns': {name: {'count': row[0], 'total': row[1], 'max': row[2]}
+                          for name, row in self._stages.items()}}
+        if len(json.dumps(summary, sort_keys=True, ensure_ascii=True).encode('ascii')) > self.MAX_BYTES:
+            # Bound the actual final wire/log JSON, not merely stack entries.
+            # Do not truncate a location or lose the count of omitted samples.
+            summary['omitted_samples'] += sum(row['count'] for row in summary['stacks'])
+            summary['stacks'] = []
+            summary['stacks_omitted_reason'] = 'final_json_byte_bound'
+        if len(json.dumps(summary, sort_keys=True, ensure_ascii=True).encode('ascii')) > self.MAX_BYTES:
+            # Defensive optional-diagnostic failure, never a canonical refusal.
+            summary = {'contract': 'noesis.publication_worker_diagnostics.v1',
+                'samples': self._samples, 'omitted_samples': self._samples,
+                'error': 'summary_byte_bound', 'stacks': []}
+        return summary
+
+
 class _TrackingPublicationWorker:
     """One bounded FIFO worker for tracking + paired BEV output.
 
@@ -9125,9 +10477,12 @@ class _TrackingPublicationWorker:
         failure_callback: Optional[Callable[[BaseException], None]] = None,
         max_pending_per_source: int = 16,
         max_pending_total: int = 64,
+        world_close: Callable[[], None] | None = None,
     ) -> None:
         self._processor = processor
         self._failure_callback = failure_callback
+        self._world_close = world_close
+        self.close_receipt: _WorldActorCloseReceipt | None = None
         self._condition = threading.Condition(threading.Lock())
         self._pending: Dict[int, deque[_TrackingPublicationWork]] = {}
         self._pending_total = 0
@@ -9142,6 +10497,9 @@ class _TrackingPublicationWorker:
         self._inflight = False
         self._last_frame_by_source: Dict[int, int] = {}
         self._last_epoch_by_source: Dict[int, int] = {}
+        self.diagnostics = (_PublicationWorkerDiagnostics()
+            if os.environ.get(_PublicationWorkerDiagnostics.ENV) == '1' else None)
+        self.diagnostics_summary = None
         self._thread = threading.Thread(
             target=self._run,
             name="NoesisTrackingPublication",
@@ -9255,11 +10613,62 @@ class _TrackingPublicationWorker:
             except Exception:
                 logger.exception("Tracking publication failure callback failed")
 
-    def _run(self) -> None:  # pragma: no cover - exercised by focused worker tests
+    def _run(self) -> None:
+        try:
+            if self.diagnostics is not None:
+                self.diagnostics.start(threading.get_ident())
+            self._drain()
+        finally:
+            if self._world_close is not None:
+                error = None
+                try:
+                    quality = getattr(getattr(self._processor, 'pipeline', None), 'xc3d_world_quality_ingress', None)
+                    if quality is not None:
+                        quality.close_image_region_run()
+                    self._world_close()
+                    # Media/SGIE may still be running after publication drains.
+                    # The runtime owns these paired native probes until its
+                    # actual EOS + wait-completion quiescence proof.
+                    try:
+                        pipeline=getattr(self._processor,'pipeline',None)
+                        ingress=getattr(pipeline,'xc3d_swin_ingress',None)
+                        if ingress is not None:
+                            quality=getattr(pipeline,'xc3d_world_quality_ingress',None)
+                            logger.info('Original Swin FIFO producer summary: %s',json.dumps({
+                                'producer':ingress.cache.producer_summary(),
+                                'pair_examples':tuple(getattr(quality,'swin_pair_examples',{}).values())},sort_keys=True))
+                    except Exception:
+                        logger.warning('Original Swin producer diagnostics unavailable')
+                except BaseException as exc:
+                    error = exc
+                    logger.exception("Canonical World actor close failed")
+                self.close_receipt = _WorldActorCloseReceipt(
+                    getattr(self._world_close, "__self__", None), error is None, error, threading.get_ident())
+            observer = getattr(getattr(self._processor, 'pipeline', None), 'xc3d_source_stop_observer', None)
+            if observer is not None:
+                try:
+                    observer.close()
+                except BaseException as exc:
+                    self._observer_close_error = exc
+                    self._fail_terminal(exc)
+                    if self.close_receipt is not None:
+                        self.close_receipt = replace(self.close_receipt, completed=False, error=exc)
+            if self.diagnostics is not None:
+                try:
+                    self.diagnostics_summary = self.diagnostics.close()
+                    logger.info('Publication worker diagnostic summary: %s',
+                        json.dumps(self.diagnostics_summary, sort_keys=True, ensure_ascii=True))
+                except Exception:
+                    # Never change publication/World failure or close receipts.
+                    logger.warning('Publication worker diagnostics unavailable')
+
+    def _drain(self) -> None:  # pragma: no cover - exercised by focused worker tests
         while True:
             work = self._take()
             if work is None:
                 return
+            if self.diagnostics is not None:
+                self.diagnostics.arm()
             item_started_ns = time.perf_counter_ns()
             _record_core_stage_timing(
                 "tracking.publication_worker_queue_wait",
@@ -9285,6 +10694,7 @@ class _TrackingPublicationWorker:
                         "tracking publication worker received a non-advancing frame "
                         f"for source {work.source_id}: {work.frame_id} <= {last_frame}"
                     )
+                _apply_image_source_stop_barriers(self._processor)
                 self._processor._publish_tracking_work(work)
                 self._last_frame_by_source[int(work.source_id)] = int(work.frame_id)
                 _increment_core_counter(
@@ -9309,7 +10719,7 @@ class _TrackingPublicationWorker:
                     item_count=len(work.tracks),
                 )
 
-    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0):
         with self._condition:
             self._stopping = True
             self._condition.notify_all()
@@ -9319,6 +10729,11 @@ class _TrackingPublicationWorker:
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             raise TimeoutError("tracking publication worker did not quiesce")
+        if getattr(self, '_observer_close_error', None) is not None:
+            raise RuntimeError('native source stop observer did not quiesce') from self._observer_close_error
+        if self.close_receipt is not None and self.close_receipt.error is not None:
+            raise RuntimeError("canonical World actor close failed") from self.close_receipt.error
+        return self.close_receipt
 
 
 @dataclass
@@ -9464,6 +10879,7 @@ class _AnalyticsTelemetryProcessor:
     _last_bev_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _last_tracking_enqueue_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
     _last_tracking_enqueue_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _depth_priority_pending: Dict[int, _TrackingPublicationWork] = field(default_factory=dict, init=False, repr=False)
     _last_observed_tracker_keys_by_sensor: Dict[int, frozenset[int]] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -9509,6 +10925,9 @@ class _AnalyticsTelemetryProcessor:
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
+        self._ankle_priority_diagnostic_enabled=bool(
+            (getattr(self.pipeline,'config',{}) or {}).get('xc3d_image_regions',{}).get('enabled') is True
+            and os.environ.get('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S',''))
         try:
             models_cfg = getattr(self.pipeline, "config", {}).get("models", {}) or {}
             reid_cfg = models_cfg.get("reid") or {}
@@ -9829,6 +11248,7 @@ class _AnalyticsTelemetryProcessor:
             # rather than silently returning to legacy room-policy behavior.
             self._world_resolver = UniversalWorldMeasurementResolver(
                 config=WorldMeasurementResolverConfig(
+                    registered_body_column=registered_body_column_enabled(self.pipeline.config),
                     max_hypotheses=int(self._world_resolver_diag_max_candidates),
                     max_compatible_distance_m=float(
                         self._world_resolver_max_disagreement_m
@@ -9952,9 +11372,11 @@ class _AnalyticsTelemetryProcessor:
     def _ensure_tracking_publication_worker(self) -> _TrackingPublicationWorker:
         worker = self._tracking_publication_worker
         if worker is None:
+            quality = getattr(self.pipeline, "xc3d_world_quality_ingress", None)
             worker = _TrackingPublicationWorker(
                 self,
                 failure_callback=getattr(self.tracking_pub, "_report_failure", None),
+                world_close=quality.world.close if quality is not None else None,
             )
             self._tracking_publication_worker = worker
         return worker
@@ -9991,7 +11413,8 @@ class _AnalyticsTelemetryProcessor:
         footpoints: Sequence[Footpoint],
         shadow_tracker_ids: Sequence[int] = (),
         terminated_tracker_ids: Sequence[int] = (),
-    ) -> TrackingContinuityUpdate:
+        xc3d_private_evidence: PrivateAssociationWork | None = None,
+    ) -> TrackingContinuityUpdate | tuple[TrackingContinuityUpdate, PrivateAssociationWork]:
         """Stamp one lifecycle on the rows shared by OSD, BEV, and worker.
 
         This runs after all public rows have been assembled but before
@@ -10049,6 +11472,23 @@ class _AnalyticsTelemetryProcessor:
             )
             self._source_epoch_by_sensor[source] = int(continuity.source_epoch)
             self._last_source_frame_by_sensor[source] = (frame, observed)
+            private = xc3d_private_evidence
+            if private is not None:
+                try:
+                    # Explicit R10-A1 read-only constructor scalar; NEVER a
+                    # default/manager TTL, private owner ledger or later query.
+                    bound = self._tracking_lifecycle._reappearance_grace_ns
+                    if type(bound) is not int or bound < 0:
+                        raise AcquisitionUnavailable("owner_grace_bound_invalid")
+                    retained = self._tracking_lifecycle.identity_retention_keys(
+                        source, media_pts_ns=continuity.media_pts_ns, max_gap_ns=bound)
+                    if (private.source_id, private.canonical_frame, private.media_pts_ns) != (
+                            continuity.source_id, continuity.frame_id, continuity.media_pts_ns):
+                        raise AcquisitionUnavailable("same_canonical_owner_cohort_required")
+                    private = replace(private, owner_retention=freeze_owner_retention(
+                        continuity, retained, bound, private.original))
+                except (AcquisitionUnavailable, AttributeError, TypeError, ValueError):
+                    private = replace(private, owner_retention=None)
 
         self._stamp_footpoint_lifecycles(footpoints, tracks)
         for track in tracks:
@@ -10062,7 +11502,7 @@ class _AnalyticsTelemetryProcessor:
                 max_gap_ns=int(manager.identity_reappearance_grace_ns),
             )
             prune(source, retained_keys)
-        return continuity
+        return (continuity, private) if xc3d_private_evidence is not None else continuity
 
     @staticmethod
     def _valid_world_media_pts_ns(value: Any) -> Optional[int]:
@@ -10153,7 +11593,12 @@ class _AnalyticsTelemetryProcessor:
 
     def _clear_world_source_state(self, source: int) -> None:
         """Discard world state and timebase at a physical source boundary."""
-
+        getattr(self,'_depth_priority_pending',{}).pop(int(source),None)
+        pose_cfg = getattr(self.pipeline, 'config', {}).get('models', {}).get('pose', {})
+        component = getattr(self.pipeline, 'components', {}).get(pose_cfg.get('name', 'yolo26_pose'))
+        pose = getattr(component, 'config', {}).get('_pose_feature_processor')
+        if isinstance(pose, PoseFeatureProcessor):
+            pose._clear_pose_source(source)
         source_id = int(source)
         self._world_clock_by_sensor.pop(source_id, None)
         for key in tuple(self._world_state_by_track):
@@ -10291,7 +11736,12 @@ class _AnalyticsTelemetryProcessor:
         ):
             raise RuntimeError("tracking continuity receipt does not match work cohort")
         self._stamp_footpoint_lifecycles(work.footpoints, work.tracks)
-        lease = self.publication_gate.acquire()
+        worker = getattr(self, "_tracking_publication_worker", None)
+        fifo_admitted = worker is not None and worker._thread is threading.current_thread()
+        diagnostic = getattr(worker, 'diagnostics', None) if fifo_admitted else None
+        # Real FIFO work was admitted by the media callback before gate closure.
+        # It must drain with WS alive, not request a NEW callback admission.
+        lease = nullcontext() if fifo_admitted else self.publication_gate.acquire()
         if lease is None:
             raise RuntimeError(
                 "runtime publication gate rejected an admitted tracking cohort"
@@ -10302,25 +11752,104 @@ class _AnalyticsTelemetryProcessor:
             # published lifecycle immediately before the tracking publish;
             # never publish the media-time preview carried by the cohort.
             continuity = self._tracking_lifecycle.prepare_publication(continuity)
-            tracking_receipt = _require_tracking_publication_receipt(
-                self.tracking_pub.publish(
-                    int(work.source_id),
-                    work.tracks,
-                    frame_metadata={
-                        "camera_id": str(work.camera_id),
-                        "frame_id": int(work.frame_id),
-                        "source_epoch": int(work.source_epoch),
-                        "tracker_lifecycle_tombstones": list(continuity.tombstones),
-                        "observed_at_us": int(work.observed_at_us),
-                        **({"tracker_lifecycle_evidence": continuity.presence_evidence()}
-                           if continuity.media_pts_ns is not None else {}),
-                        **dict(work.temporal_contract),
-                    },
-                ),
-                source_id=int(work.source_id),
-                frame_id=int(work.frame_id),
-                observed_at_us=int(work.observed_at_us),
-            )
+            quality_ingress = getattr(self.pipeline, "xc3d_world_quality_ingress", None)
+            if quality_ingress is not None:
+                if work.world_quality_work is None:
+                    raise RuntimeError("world_quality_exact_queued_work_required")
+                fusion=getattr(self.pipeline,'object_depth_fusion_processor',None)
+                if type(fusion) is _ObjectDepthFusionProcessor and getattr(fusion,'original_depth_rendezvous_enabled',False):
+                    inspection=getattr(getattr(quality_ingress,'projective_bridge',None),'_body_diagnostic',None)
+                    if inspection is not None:
+                        # Read-only EXACT-original debug lookup; never a quality input.
+                        inspection.sampling_lookup=fusion.sampling_disposition
+                    def resolve_original_depth(originals,context,now):
+                        # stage invokes this only AFTER exact FIFO/source/native
+                        # owner validation and current observations/reset barriers.
+                        fusion.accept_original_depth_work(work.world_quality_work,originals)
+                        return fusion.drain_original_depth_work(originals,context,now,self)
+                    with diagnostic.stage('quality_ingress_stage',len(work.tracks)) if diagnostic else nullcontext():
+                        quality_ingress.stage(work.world_quality_work,work.tracks,
+                            historical_quality=work.historical_quality_work,
+                            original_depth_resolver=resolve_original_depth)
+                elif work.historical_quality_work:
+                    with diagnostic.stage('quality_ingress_stage',len(work.tracks)) if diagnostic else nullcontext():
+                        quality_ingress.stage(work.world_quality_work, work.tracks,
+                            historical_quality=work.historical_quality_work)
+                else:
+                    with diagnostic.stage('quality_ingress_stage',len(work.tracks)) if diagnostic else nullcontext():
+                        quality_ingress.stage(work.world_quality_work, work.tracks)
+            producer = getattr(self.pipeline, "xc3d_ordered_identity_producer", None)
+            if producer is not None and work.identity_producer_work is not None:
+                # ONE ordered actor, BEFORE tracking_pub.publish/World prepare.
+                # Private extraction unavailability does not skip canonical work.
+                with diagnostic.stage('identity_producer_prepare',len(work.tracks)) if diagnostic else nullcontext():
+                    prepared_identity = producer.prepare(work.identity_producer_work)
+                ingress = getattr(self.pipeline, "xc3d_world_ingress", None)
+                if ingress is not None:
+                    ingress.stage(work.identity_producer_work, prepared_identity)
+                elif (prepared_identity.contributions or prepared_identity.withdrawn_members or
+                        prepared_identity.retired_keys):
+                    raise OrderedAssociationIntegrityError("actual_world_ingress_provider_unavailable")
+                if prepared_identity.status != "ready":
+                    _increment_core_counter("xc3d.identity_producer_unavailable_total")
+            with diagnostic.stage('tracking_publish_world_commit',len(work.tracks)) if diagnostic else nullcontext():
+                tracking_receipt = _require_tracking_publication_receipt(
+                    self.tracking_pub.publish(
+                        int(work.source_id),
+                        work.tracks,
+                        frame_metadata={
+                            "camera_id": str(work.camera_id),
+                            "frame_id": int(work.frame_id),
+                            "source_epoch": int(work.source_epoch),
+                            "tracker_lifecycle_tombstones": list(continuity.tombstones),
+                            "observed_at_us": int(work.observed_at_us),
+                            **({"tracker_lifecycle_evidence": continuity.presence_evidence()}
+                               if continuity.media_pts_ns is not None else {}),
+                            **dict(work.temporal_contract),
+                        },
+                    ),
+                    source_id=int(work.source_id),
+                    frame_id=int(work.frame_id),
+                    observed_at_us=int(work.observed_at_us),
+                )
+            # The successful canonical FIFO transaction is the ONLY private
+            # lineage mutation boundary. Newer media/reset cannot revoke an
+            # older queued receipt. No unaccepted Identity service is invoked.
+            private_owner = getattr(self.pipeline, "xc3d_private_owner_state", None)
+            if private_owner is not None and work.xc3d_private_evidence is not None:
+                try:
+                    retained = work.xc3d_private_evidence.owner_retention
+                    if retained is not None and (retained.source_id, retained.source_epoch,
+                            retained.frame_id, retained.observed_at_us, retained.media_pts_ns) != (
+                            continuity.source_id, continuity.source_epoch, continuity.frame_id,
+                            continuity.observed_at_us, continuity.media_pts_ns):
+                        raise AcquisitionUnavailable("exact_queued_owner_retention_cohort_required")
+                    private = private_owner.consume_owner_work(
+                        work.xc3d_private_evidence, int(work.source_epoch), work.tracks)
+                    ingress = getattr(self.pipeline, "xc3d_swin_ingress", None)
+                    if ingress is not None and work.xc3d_private_evidence.original is not None:
+                        ingress.cache.bind_owner(work.xc3d_private_evidence.original,
+                            int(work.source_epoch), int(work.frame_id), private.get("members", ()),
+                            owner_retention=work.xc3d_private_evidence.owner_retention,
+                            diagnostic_status=private.get("status"),
+                            diagnostic_terminated=work.xc3d_private_evidence.terminated)
+                        if quality_ingress is not None:
+                            quality_ingress.bind_published_swin(ingress.cache,
+                                work.xc3d_private_evidence.original)
+                    private_diagnostic = private_owner_diagnostic(
+                        work.xc3d_private_evidence, int(work.source_epoch), private)
+                except Exception as exc:
+                    private_owner.reset(work.xc3d_private_evidence.source_id,
+                                        "ordered_private_integrity_failure")
+                    private_diagnostic = {"status": "acquisition_unavailable",
+                               "reason": str(exc) if isinstance(exc, AcquisitionUnavailable) else "ordered_private_validation_failed",
+                               "source_id": work.xc3d_private_evidence.source_id,
+                               "source_epoch": int(work.source_epoch), "canonical_frame": int(work.frame_id),
+                               "media_pts_ns": work.xc3d_private_evidence.media_pts_ns, "members": []}
+                    _increment_core_counter("xc3d.association_unavailable_total")
+                self.pipeline.xc3d_private_owner_diagnostics.append(
+                    (int(work.source_id), int(work.source_epoch), int(work.frame_id),
+                     private_diagnostic))
             # Advance the estimator's public-output watermark only after the
             # canonical world transaction has admitted the exact coordinate.
             # Enqueue alone is insufficient: a rejected queued point must not
@@ -10411,6 +11940,65 @@ class _AnalyticsTelemetryProcessor:
                     work.frame_id,
                 )
 
+    @staticmethod
+    def _priority_depth_members(work, *, measured_only=False):
+        if (type(work) is not QualityWork or work.denial is not None or work.private is None
+                or work.private.owner_retention is None):
+            return frozenset()
+        return frozenset((r.evidence.lifecycle.source_id, r.evidence.lifecycle.source_epoch,
+            r.evidence.lifecycle.tracker_id, r.evidence.lifecycle.generation) for r in work.rows
+            if r.denial is None and r.current_measured and (measured_only or
+                r.depth_current and r.evidence.resolution is not None
+                and r.evidence.resolution.selected_kind == 'registered_depth'))
+
+    @classmethod
+    def _priority_depth_current(cls, work):
+        return bool(cls._priority_depth_members(work))
+
+    def _priority_depth_continues(self, pending, quality, continuity, tracks):
+        """Only the same complete current native roster can defer its cached successor."""
+        if (quality is None or quality.denial is not None or quality.private is None
+                or quality.private.owner_retention is None or continuity.tombstones
+                or continuity.terminated_tracker_ids or quality.private.terminated
+                or getattr(self.pipeline,'_xc3d_applied_source_stop_mask',0)&(1<<pending.source_id)):
+            return False
+        old=pending.xc3d_private_evidence;new=quality.private
+        a,b=old.original,new.original
+        if a is None or b is None:return False
+        if ((a.run_id,a.graph_id,a.camera_id,a.source_id,a.source_clock_epoch,a.timestamp_origin,old.clock_epoch,
+                pending.source_epoch)!=(b.run_id,b.graph_id,b.camera_id,b.source_id,b.source_clock_epoch,
+                    b.timestamp_origin,new.clock_epoch,continuity.source_epoch)
+                or b.original_frame<=a.original_frame or b.pts_ns<=a.pts_ns
+                or continuity.observed_at_us<=pending.observed_at_us
+                or old.owner_retention.keys!=new.owner_retention.keys
+                or old.owner_retention.shadow!=new.owner_retention.shadow):
+            return False
+        keys=lambda rows:{(r.get('tracker_id'),r.get('tracker_lifecycle_generation')) for r in rows}
+        return keys(pending.tracks)==keys(tracks)
+
+    def _take_depth_ordered_history(self, history, work):
+        if history is None:return ()
+        before=[]
+        for value in history.take():
+            original=value.private.original
+            limit=work if original.source_id==work.source_id else self._depth_priority_pending.get(original.source_id)
+            bound=(limit.frame_id if limit is not None
+                and value.continuity.source_epoch==limit.source_epoch else None)
+            if bound is not None and original.original_frame>=bound:
+                if not (original.source_id==work.source_id and original.original_frame==work.frame_id
+                        and value.private.original==getattr(work.xc3d_private_evidence,'original',None)):
+                    history.retain(value)  # Future originals cannot precede the selected old packet.
+            else:
+                # A newly superseded pending original can be older than work
+                # already retained on its source. Restore only that known
+                # source order; never compare different cameras' media clocks.
+                index=next((i for i,old in enumerate(before)
+                    if old.private.original.source_id==original.source_id
+                    and old.continuity.source_epoch==value.continuity.source_epoch
+                    and old.private.original.original_frame>original.original_frame),len(before))
+                before.insert(index,value)
+        return tuple(before)
+
     def _enqueue_tracking_publication(
         self,
         *,
@@ -10425,6 +12013,10 @@ class _AnalyticsTelemetryProcessor:
         force: bool,
         identity_v2_primitives: Optional[Sequence[IdentityFramePrimitive]] = None,
         world_now_ts: Optional[float] = None,
+        xc3d_private_evidence: PrivateAssociationWork | None = None,
+        identity_producer_work: OrderedProducerWork | None = None,
+        world_quality_inputs: Sequence[QualityInput] = (),
+        world_quality_denial: str | None = None,
     ) -> bool:
         frame_id = int(
             _meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0
@@ -10436,7 +12028,50 @@ class _AnalyticsTelemetryProcessor:
         )
         count = len(tracks)
         interval = self._tracking_interval_for_frame(count)
-        if not self._publish_gate_due(
+        quality_work = None
+        original_history = None
+        if xc3d_world_quality_enabled(getattr(self.pipeline, "config", {}) or {}):
+            raw_media = temporal_contract.get("media_pts_ns")
+            quality_work = (QualityWork(xc3d_private_evidence, continuity, (), world_quality_denial,
+                raw_media if type(raw_media) is int else None) if world_quality_denial else
+                freeze_quality_work(xc3d_private_evidence, continuity, world_quality_inputs, raw_media_pts_ns=raw_media))
+            # Original availability is stamped BEFORE throttle and never renewed
+            # on later FIFO delivery. This is not camera capture-clock evidence.
+            original_ingress = time.monotonic()
+            quality_work = replace(quality_work, ingress_monotonic_s=original_ingress,
+                owner_availability=freeze_owner_availability(xc3d_private_evidence, continuity,
+                    getattr(self.pipeline, 'source_progress_monitor', None),
+                    ingress_monotonic_s=original_ingress)
+                if (getattr(self.pipeline, 'config', {}) or {}).get('xc3d_image_regions', {}).get('enabled') is True
+                else None)
+            quality_work = freeze_swin_work(quality_work,getattr(self.pipeline,'xc3d_swin_ingress',None))
+            fusion = getattr(self.pipeline, 'object_depth_fusion_processor', None)
+            if type(fusion) is _ObjectDepthFusionProcessor and getattr(fusion,'original_depth_rendezvous_enabled',False):
+                fusion.seal_original_depth_work(quality_work)
+            original_history = getattr(self, '_xc3d_original_quality_history', None)
+            if original_history is None:
+                original_history = OriginalQualityRetention(include_barriers=True)
+                self._xc3d_original_quality_history = original_history
+        depth_priority=bool(quality_work is not None and quality_work.private is not None
+            and quality_work.private.source_id==int(sensor_id)==continuity.source_id and 0<=int(sensor_id)<3
+            and getattr(quality_work.private.original,'camera_id',None)==str(camera_id)
+            and (getattr(self.pipeline,'config',{}) or {}).get('xc3d_image_regions',{}).get('enabled') is True)
+        if not depth_priority:self._depth_priority_pending.pop(int(sensor_id),None)
+        pending=self._depth_priority_pending.get(int(sensor_id)) if depth_priority else None
+        if pending is not None and not self._priority_depth_continues(pending,quality_work,continuity,tracks):
+            self._depth_priority_pending.pop(int(sensor_id),None);pending=None
+        current_depth=depth_priority and self._priority_depth_current(quality_work)
+        pending_members=(self._priority_depth_members(pending.world_quality_work)
+            if pending is not None else frozenset())
+        current_qualified=bool(pending_members and pending_members <=
+            self._priority_depth_members(quality_work, measured_only=True))
+        if pending is not None and (force or current_qualified):
+            # Every depth-priority member needs its OWN current successor.
+            # Another person's floor/depth cannot erase an unrefreshed row.
+            # Existing urgent first-metric/lifecycle dispatch still wins.
+            if original_history is not None:original_history.retain(pending.world_quality_work)
+            self._depth_priority_pending.pop(int(sensor_id),None);pending=None
+        due=self._publish_gate_due(
             self._last_tracking_enqueue_ts_by_sensor,
             self._last_tracking_enqueue_count_by_sensor,
             sensor_id=int(sensor_id),
@@ -10446,7 +12081,10 @@ class _AnalyticsTelemetryProcessor:
             counter_prefix="tracking",
             update=False,
             force=bool(force),
-        ):
+        )
+        if not due and (not current_depth or pending is not None):
+            if original_history is not None:
+                original_history.retain(quality_work)
             return False
 
         # Keep the conversion explicit and typed for the canonical worker
@@ -10469,6 +12107,9 @@ class _AnalyticsTelemetryProcessor:
                 not in {
                     "world_resolver",
                     "_world_force_first_metric_publication",
+                    "_xc3d_quality_resolver",
+                    "_xc3d_body_depth",
+                    "_xc3d_anatomy_depths",
                 }
             }
             copied = _copy_public_scalar(public_track)
@@ -10482,6 +12123,10 @@ class _AnalyticsTelemetryProcessor:
             item_count=len(copied_tracks),
         )
 
+        public_temporal = dict(_copy_public_scalar(dict(temporal_contract)) or {})
+        if (quality_work is not None and quality_work.denial is None and
+                quality_work.raw_media_pts_ns == 0 and continuity.media_pts_ns is None):
+            public_temporal["media_pts_ns"] = None  # Preserve canonical unavailable, raw scalar stays private.
         work = _TrackingPublicationWork(
             source_id=int(sensor_id),
             camera_id=str(camera_id),
@@ -10490,8 +12135,8 @@ class _AnalyticsTelemetryProcessor:
             now_ts=float(now_ts),
             timestamp_us=timestamp_us,
             tracks=copied_tracks,
-            footpoints=list(footpoints),
-            temporal_contract=dict(_copy_public_scalar(dict(temporal_contract)) or {}),
+            footpoints=copy.deepcopy(list(footpoints)) if depth_priority else list(footpoints),
+            temporal_contract=public_temporal,
             world_filter_ts=(
                 float(world_now_ts)
                 if world_now_ts is not None
@@ -10499,7 +12144,26 @@ class _AnalyticsTelemetryProcessor:
             ),
             continuity=continuity,
             source_epoch=int(continuity.source_epoch),
+            xc3d_private_evidence=xc3d_private_evidence,
+            identity_producer_work=(identity_producer_work if identity_producer_work is not None else
+                (self.pipeline.xc3d_ordered_identity_producer.native_unavailable_work(
+                    int(sensor_id), int(continuity.source_epoch), int(frame_id), xc3d_private_evidence)
+                 if getattr(self.pipeline, "xc3d_ordered_identity_producer", None) is not None else None)),
+            world_quality_work=quality_work,
+            historical_quality_work=(),
         )
+        if not due:
+            if pending is not None and original_history is not None:
+                original_history.retain(pending.world_quality_work)
+            self._depth_priority_pending[int(sensor_id)]=work
+            return False
+        if pending is not None:
+            self._depth_priority_pending.pop(int(sensor_id),None)
+            if original_history is not None:original_history.retain(quality_work)
+            work=replace(pending,admitted_at_ns=time.perf_counter_ns())
+            identity_v2_primitives=None  # Never restamp current shadow primitives onto the old cohort.
+        work=replace(work,historical_quality_work=self._take_depth_ordered_history(original_history,work)
+            if depth_priority else original_history.take() if original_history is not None else ())
         canonical_backlogged_before_enqueue = (
             self._canonical_publication_backlogged()
         )
@@ -10639,7 +12303,7 @@ class _AnalyticsTelemetryProcessor:
                 )
         return True
 
-    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0):
         failures: List[BaseException] = []
         shadow_worker = self._shadow_identity_worker
         if shadow_worker is not None:
@@ -10648,16 +12312,21 @@ class _AnalyticsTelemetryProcessor:
             except BaseException as exc:
                 failures.append(exc)
         worker = self._tracking_publication_worker
+        if worker is None and getattr(self.pipeline, "xc3d_world_quality_ingress", None) is not None:
+            worker = self._ensure_tracking_publication_worker()
         if worker is not None:
             try:
                 worker.shutdown(wait=wait, timeout_s=timeout_s)
             except BaseException as exc:
                 failures.append(exc)
+            finally:
+                self.world_actor_close_receipt = worker.close_receipt
         if failures:
             raise RuntimeError(
                 "analytics telemetry workers did not quiesce: "
                 + "; ".join(str(error) for error in failures)
             ) from failures[0]
+        return getattr(self, "world_actor_close_receipt", None)
 
     def get_active_track_map(
         self,
@@ -10748,6 +12417,10 @@ class _AnalyticsTelemetryProcessor:
 
     def _tracking_mode_is_mv3dt(self) -> bool:
         return str(self._tracking_mode or "").strip().lower() == "mv3dt"
+
+    def _xc3d_independent_world_enabled(self) -> bool:
+        from noesis.v3dt_assets import xc3d_candidate_enabled
+        return self._tracking_mode_is_mv3dt() and xc3d_candidate_enabled(self.pipeline.config)
 
     def _world_calibration_snapshot(
         self,
@@ -11080,15 +12753,30 @@ class _AnalyticsTelemetryProcessor:
             _REID_NATIVE_MISSING_LOGGED = True
         return None
 
-    def handle_servicemaker_frame(self, frame_meta: Any, *, tracker_lifecycle: Any = None) -> None:
+    def _current_owned_swin_embedding(self, obj_meta, original):
+        ingress = getattr(self.pipeline, "xc3d_swin_ingress", None)
+        if ingress is None:
+            return self._extract_reid_embedding_servicemaker(obj_meta)
+        value = ingress.cache.exact(original, int(obj_meta.object_id))
+        # CURRENT frame compact result shared by existing consumers. No second
+        # SDK copy and no prior vector silently treated as current inference.
+        return np.asarray(value.vector, dtype=np.float32) if value is not None else None
+
+    def handle_servicemaker_frame(self, frame_meta: Any, *, tracker_lifecycle: Any = None,
+                                 xc3d_private_evidence: PrivateAssociationWork | None = None,
+                                 native_frame_context: Any = None) -> None:
         lease = self.publication_gate.acquire()
         if lease is None:
             _increment_core_counter("runtime_publication_gate_rejected_frames_total")
             return
         with lease:
-            self._handle_servicemaker_frame_admitted(frame_meta, tracker_lifecycle=tracker_lifecycle)
+            self._handle_servicemaker_frame_admitted(frame_meta, tracker_lifecycle=tracker_lifecycle,
+                                                    xc3d_private_evidence=xc3d_private_evidence,
+                                                    native_frame_context=native_frame_context)
 
-    def _handle_servicemaker_frame_admitted(self, frame_meta: Any, *, tracker_lifecycle: Any = None) -> None:
+    def _handle_servicemaker_frame_admitted(self, frame_meta: Any, *, tracker_lifecycle: Any = None,
+                                          xc3d_private_evidence: PrivateAssociationWork | None = None,
+                                          native_frame_context: Any = None) -> None:
         """Extract tracking telemetry for one Service Maker frame."""
         frame_start_ns = time.perf_counter_ns()
         try:
@@ -11097,6 +12785,10 @@ class _AnalyticsTelemetryProcessor:
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
             temporal_contract = _frame_temporal_contract(frame_meta, observed_at_s=now_ts)
+            world_quality_inputs: List[QualityInput] = []
+            world_quality_pending = []
+            world_quality_denial: str | None = None
+            world_quality = xc3d_world_quality_enabled(getattr(self.pipeline, "config", {}) or {})
             identity_v2_service = getattr(self.pipeline, "identity_v2_service", None)
             identity_v2_authoritative = bool(
                 identity_v2_service is not None
@@ -11233,7 +12925,8 @@ class _AnalyticsTelemetryProcessor:
                         else:
                             reid_budget_remaining = max(0, reid_budget_remaining - 1)
                             reid_start_ns = time.perf_counter_ns()
-                            emb = self._extract_reid_embedding_servicemaker(obj_meta)
+                            emb = self._current_owned_swin_embedding(obj_meta,
+                                xc3d_private_evidence.original if xc3d_private_evidence is not None else None)
                             _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
                             if emb is None:
                                 _increment_core_counter("detection_wake.reid_emb_missing")
@@ -11308,13 +13001,16 @@ class _AnalyticsTelemetryProcessor:
                     raw.get("bbox") or [],
                     current_cohort=(
                         (source_id, track_id, frame_id, temporal_contract.get("media_pts_ns"))
-                        if self._tracking_mode == "v3dt" else None
+                        if self._tracking_mode == "v3dt" or self._xc3d_independent_world_enabled() or world_quality else None
                     ),
                     current_cohort_status=pose_current_evidence,
+                    native_frame_context=native_frame_context,
                 )
                 _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
                 depth_extract_start_ns = time.perf_counter_ns()
                 depth_result = self._extract_object_depth_result(obj_meta)
+                original_cohort = (xc3d_private_evidence.original
+                                   if xc3d_private_evidence is not None else None)
                 _record_core_stage_timing("object_depth.extract_meta", depth_extract_start_ns)
                 pose_present = bool(id_diag.get("pose_present", False))
                 if not pose_present:
@@ -11408,6 +13104,15 @@ class _AnalyticsTelemetryProcessor:
                         public_track[key] = raw.get(key)
 
                 world_augment_start_ns = time.perf_counter_ns()
+                if original_cohort is not None:
+                    public_track["_xc3d_original_frame_id"] = original_cohort.original_frame
+                    public_track["_xc3d_current_original"] = original_cohort
+                    public_track["_xc3d_native_pose_measured"] = bool(
+                        isinstance(tracker_lifecycle, Mapping)
+                        and tracker_lifecycle.get("shadow_available") is True
+                        and tracker_lifecycle.get("terminated_available") is True
+                        and tracker_id_int not in shadow_tracker_ids
+                        and tracker_id_int not in terminated_tracker_ids)
                 self._augment_track_with_world(
                     sensor_id,
                     camera_id,
@@ -11418,6 +13123,8 @@ class _AnalyticsTelemetryProcessor:
                     depth_result=depth_result,
                     world_now_ts=float(world_now_ts),
                 )
+                public_track.pop("_xc3d_current_original", None)
+                public_track.pop("_xc3d_native_pose_measured", None)
                 if public_track.pop(
                     "_world_force_first_metric_publication",
                     False,
@@ -11427,9 +13134,25 @@ class _AnalyticsTelemetryProcessor:
                     "analytics.world_augment",
                     world_augment_start_ns,
                 )
+                quality_resolver = public_track.pop("_xc3d_quality_resolver", (None, None))
+                body_depth = public_track.pop("_xc3d_body_depth", None)
+                anatomy_depths = public_track.pop("_xc3d_anatomy_depths", ())
                 public_fields_start_ns = time.perf_counter_ns()
                 self._apply_scene_prior_shadow(camera_id, public_track)
                 self._apply_public_depth_fields(public_track, depth_result)
+                if world_quality:
+                    try:
+                        if len(world_quality_pending) >= 128:
+                            raise ValueError("world_quality_member_capacity")
+                        world_quality_pending.append((public_track, identity_observation,
+                            quality_resolver[0], quality_resolver[1], depth_result,
+                            capture_body_support(public_track, identity_observation, pose_kpts_abs,
+                                pose_is_current=pose_current_evidence.get("current") is True,
+                                image_patches=_current_body_image_patches(pose_kpts_abs,public_track.get('bbox'),
+                                    pose_is_current=pose_current_evidence.get("current") is True)), body_depth, anatomy_depths))
+                    except ValueError as exc:
+                        world_quality_denial = str(exc)[:200]
+                public_track.pop("_xc3d_original_frame_id", None)
                 _record_core_stage_timing(
                     "analytics.public_fields",
                     public_fields_start_ns,
@@ -11591,6 +13314,12 @@ class _AnalyticsTelemetryProcessor:
                             primitive.public_track.get("dwell_time")
                         )
 
+            if world_quality:
+                try:
+                    world_quality_inputs = _finalize_world_quality_inputs(world_quality_pending)
+                except ValueError as exc:
+                    world_quality_denial = str(exc)[:200]
+
             mgr = getattr(self.pipeline, "stable_id_mgr", None)
             observe_fn = getattr(mgr, "observe_copresence", None)
             if callable(observe_fn) and not identity_v2_authoritative:
@@ -11621,7 +13350,7 @@ class _AnalyticsTelemetryProcessor:
                 tracks.append(synthetic)
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
-            continuity = self._prepare_tracking_cohort(
+            prepared_cohort = self._prepare_tracking_cohort(
                 sensor_id=int(sensor_id),
                 camera_id=str(camera_id),
                 frame_id=int(frame_id),
@@ -11631,7 +13360,12 @@ class _AnalyticsTelemetryProcessor:
                 footpoints=footpoints,
                 shadow_tracker_ids=shadow_tracker_ids,
                 terminated_tracker_ids=terminated_tracker_ids,
+                xc3d_private_evidence=xc3d_private_evidence,
             )
+            if xc3d_private_evidence is not None:
+                continuity, xc3d_private_evidence = prepared_cohort
+            else:
+                continuity = prepared_cohort
             alive_ids = {item.tracker_id for item in continuity.active_lifecycles}
             self._clear_absent_world_state(sensor_id, alive_ids, now_ts=float(world_now_ts))
             for tracker_id in terminated_tracker_ids:
@@ -11712,6 +13446,9 @@ class _AnalyticsTelemetryProcessor:
                     identity_v2_primitives if identity_v2_shadow else None
                 ),
                 world_now_ts=float(world_now_ts),
+                xc3d_private_evidence=xc3d_private_evidence,
+                world_quality_inputs=world_quality_inputs,
+                world_quality_denial=world_quality_denial,
             )
             _record_core_stage_timing(
                 "analytics.post_frame",
@@ -14446,7 +16183,41 @@ class _AnalyticsTelemetryProcessor:
         *,
         current_cohort: Optional[Tuple[int, int, int, Optional[int]]] = None,
         current_cohort_status: Optional[Dict[str, bool]] = None,
+        native_frame_context: Any = None,
     ) -> Optional[np.ndarray]:
+        native_current_context = False
+        pose_cfg=getattr(self.pipeline,"config",{}).get("models",{}).get("pose",{})
+        component=getattr(self.pipeline,"components",{}).get(pose_cfg.get("name","yolo26_pose"))
+        processor=getattr(component,"config",{}).get("_pose_feature_processor")
+        if isinstance(processor, PoseFeatureProcessor) and processor._early_anchor_enabled():
+            self._pose_anchor_native_remaining = 0  # Already owned upstream for this exact original.
+        if current_cohort is not None:
+            try:matching_object=int(obj_meta.object_id)==int(current_cohort[1])
+            except (AttributeError,TypeError,ValueError,OverflowError):matching_object=False
+            if not matching_object:
+                if current_cohort_status is not None:current_cohort_status["current"]=False
+                return None
+            if isinstance(processor,PoseFeatureProcessor):
+                source,raw,frame,pts=current_cohort
+                live_bbox=_rect_to_bbox(getattr(obj_meta,"rect_params",None))
+                native_current_context=bool(
+                    processor.tensor_source=="object_sgie"
+                    and (processor.gie_id,processor.model_size,processor.score_threshold,processor.letterbox)==
+                        (self._pose_anchor_gie_id,self._pose_anchor_model_size,
+                         self._pose_anchor_score_threshold,self._pose_anchor_letterbox)
+                    and all(type(v) is int and v>=0 for v in (source,raw,frame))
+                    and type(pts) is int and pts>0
+                    and self._pose_original_context_matches(native_frame_context,current_cohort)
+                    and live_bbox is not None and tuple(live_bbox)==tuple(bbox))
+                found,owned=processor._owned_pose_result(current_cohort,bbox,
+                    (self._pose_anchor_gie_id,self._pose_anchor_model_size,
+                     self._pose_anchor_score_threshold,self._pose_anchor_letterbox))
+                if found:
+                    points=self._keypoints_abs_from_pose_payload(owned,bbox) if owned is not None else None
+                    if current_cohort_status is not None:
+                        current_cohort_status["current"]=bool(points is not None and self._pose_payload_is_current(owned,current_cohort))
+                    _increment_core_counter("detection_wake.pose_anchor_owned_result_reused")
+                    return points
         payload = self._extract_pose_payload_for_anchor(obj_meta)
         if current_cohort_status is not None:
             # The pose-feature cache rewrites frame/PTS after transporting old
@@ -14456,7 +16227,7 @@ class _AnalyticsTelemetryProcessor:
                 current_cohort is not None
                 and self._pose_payload_is_current(payload, current_cohort)
             )
-        if payload is not None:
+        if payload is not None and (current_cohort is None or self._pose_payload_is_current(payload,current_cohort)):
             keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
             if keypoints_abs is not None:
                 _increment_core_counter("detection_wake.pose_anchor_payload_hit")
@@ -14466,6 +16237,12 @@ class _AnalyticsTelemetryProcessor:
             # The fallback can still serve existing pose consumers, but must
             # not inherit provenance from a payload whose joints were invalid.
             current_cohort_status["current"] = False
+        # In task mode the SAME original's existing fallback allowance has
+        # moved to the upstream live-object callback. A miss/eviction is not
+        # permission to spend it again or decode another original's tensor.
+        if isinstance(processor, PoseFeatureProcessor) and processor._early_anchor_enabled():
+            _increment_core_counter('detection_wake.pose_anchor_early_budget_owned')
+            return None
         if obj_meta is not None and noesis_pose_meta_ext is not None:
             if int(self._pose_anchor_native_remaining) <= 0:
                 _increment_core_counter("detection_wake.pose_anchor_native_budget_skipped")
@@ -14487,11 +16264,56 @@ class _AnalyticsTelemetryProcessor:
                 if isinstance(payload, dict):
                     keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
                     if keypoints_abs is not None:
+                        if current_cohort_status is not None:
+                            # Installed synchronous nvinfer attaches raw tensor
+                            # output to batch.frames[j].obj_meta after dequeue;
+                            # cached classifier labels/pose JSON are NOT this
+                            # API. The native decoder accepts only current UID
+                            # tensor metadata and returns exactly these fields.
+                            # No old payload gets a current frame/time stamp.
+                            current_cohort_status["current"]=bool(
+                                native_current_context
+                                and set(payload)=={"score","keypoints_abs","keypoints_roi"}
+                                and np.isfinite(keypoints_abs).all()
+                                and ((keypoints_abs[:,2]>=0)&(keypoints_abs[:,2]<=1)).all())
                         _increment_core_counter("detection_wake.pose_anchor_native_extract")
                         return keypoints_abs
 
         _increment_core_counter("detection_wake.pose_anchor_missing")
         return None
+
+    def _pose_original_context_matches(self, context, cohort):
+        """SAME callback original receipt, not mutable latest-producer state.
+
+        Operator constructs this only after SAME-batch ScopedFrameReceipts.lookup
+        while the exact frame/object iterator positions are live. No context is
+        retained, no SDK copy, and canonical and original frame IDs stay distinct.
+        """
+        try:
+            work,row,key=context
+            original=work.original
+            acquisition=getattr(self.pipeline,"xc3d_source_acquisition",None)
+            source,raw,frame,pts=cohort
+            return bool(type(work) is PrivateAssociationWork and work.denial is None
+                and original is not None and isinstance(row,Mapping)
+                and type(key) is tuple and len(key)==6
+                and all(type(v) is int and v>=0 for v in key)
+                and row.get("receipt_valid") is True
+                and type(row.get("scope")) is int and row["scope"]>0
+                and type(original.buffer_scope) is int and original.buffer_scope>0
+                and (original.run_id,original.graph_id)==(acquisition.run_id,acquisition.graph_id)
+                and work.clock_epoch==original.source_clock_epoch
+                and (work.source_id,work.canonical_frame,work.media_pts_ns)==(source,frame,pts)
+                and key==(original.slot,source,original.sdk_source_id,frame,pts,original.ntp_ns)
+                and (row.get("slot"),row.get("original_batch_id"),row.get("source_id"),
+                     row.get("original_source_id"),row.get("sdk_source_id"),row.get("original_sdk_source_id"),
+                     row.get("post_tracker_frame"),row.get("original_frame"),
+                     row.get("post_tracker_pts_ns"),row.get("original_pts_ns"),
+                     row.get("post_tracker_ntp_ns"),row.get("original_ntp_ns"),row.get("original_buffer_scope"))==
+                    (original.slot,original.slot,source,source,original.sdk_source_id,original.sdk_source_id,
+                     frame,original.original_frame,pts,pts,original.ntp_ns,original.ntp_ns,original.buffer_scope))
+        except (TypeError,AttributeError,ValueError):
+            return False
 
     @staticmethod
     def _pose_payload_is_current(
@@ -15028,13 +16850,14 @@ class _AnalyticsTelemetryProcessor:
     def _resolve_bbox_floor_anchor(
         bbox: Optional[Sequence[float]],
     ) -> Optional[_PoseAnchorCandidate]:
-        """Return a conservative detector-bottom contact for an unposed person.
+        """Return a detector-bottom image reference for an unposed person.
 
         A class-0 tracker row can be valid while pose/depth has no contact
         evidence (the common far/partially occluded case).  The detector
-        silhouette's bottom-center is the only image contact available then;
-        keep it explicitly lower-confidence and never use it for a height
-        lock.  Callers gate this fallback by posture/lifecycle evidence.
+        silhouette's bottom-center is an image reference only: a furniture-
+        truncated box does not observe ground contact. Keep the diagnostic
+        lower-confidence and never use it for floor projection or a height
+        lock. Callers gate image continuity by posture/lifecycle evidence.
         """
 
         if bbox is None or len(bbox) < 4:
@@ -15102,7 +16925,8 @@ class _AnalyticsTelemetryProcessor:
         body-depth sample and must never be projected to the floor as if it
         were an ankle.  Only observed lower-body/ankle support (or the pose
         leg-floor construction, which has its own admission checks) may
-        generate a floor-ray hypothesis.
+        generate a floor-ray hypothesis. A detector bbox can terminate on
+        furniture: its bottom is an image reference, not observed ground contact.
         """
 
         if anchor is None:
@@ -15114,7 +16938,6 @@ class _AnalyticsTelemetryProcessor:
             "pose_single_ankle_floor",
             "pose_ankle_support",
             "pose_leg_floor",
-            "bbox_bottom",
         }:
             return True
         if source != "person_mask_floor":
@@ -15214,7 +17037,9 @@ class _AnalyticsTelemetryProcessor:
         )
         if (
             depth_result.depth_tensor_frame_id is not None
-            and int(depth_result.depth_tensor_frame_id) != measurement_frame_id
+            and int(depth_result.depth_tensor_frame_id) != int(
+                (track or {}).get("_xc3d_original_frame_id", measurement_frame_id)
+            )
         ):
             return False
         measurement_ts_us = (
@@ -16449,6 +18274,193 @@ class _AnalyticsTelemetryProcessor:
             registration_id=registration_id,
         )
 
+    def _original_body_depth_receipt(self, *, cohort, depth_result, selected_observation,
+                                     selected_anchor, calib, track, pose_is_current, flip_u, flip_v,
+                                     anatomy_sample=None, diagnostic=None):
+        """Reuse one accepted original anatomy patch, without changing World.
+
+        The selected body's existing computation is reused. An alternate patch
+        uses its OWN UV/range through the same registration/projection, no new
+        tensor extraction/sample. Frame/raster/currentness failures stay absent.
+        """
+        def unavailable(stage):
+            if diagnostic is not None:diagnostic['factory_stage']=stage
+            return None
+        if pose_is_current is not True:
+            return unavailable('pose_not_current')
+        if (depth_result is None or not self._depth_measurement_is_current(depth_result, track=track)):
+            return unavailable('depth_not_current')
+        eligible = [s for s in depth_result.pose_depth_samples
+                    if s.anchor_source in {"pose_torso_support", "pose_shoulder_support"}
+                    and s.evidence_reason is None and s.evidence_quality != "rejected"]
+        if anatomy_sample is not None:
+            eligible = [s for s in depth_result.pose_depth_samples if s == anatomy_sample
+                and s.anchor_source == 'pose_ankle_support' and s.evidence_reason is None
+                and s.evidence_quality != 'rejected']
+        # The native sampler suppresses shoulder on a successful torso. Refuse
+        # ambiguous hand-built/foreign metadata rather than pick a convenient one.
+        if len(eligible) != 1:
+            return unavailable('anatomy_sample_count')
+        sample, = eligible
+        patches = [p for p in depth_result.native_pose_support
+                   if p.anchor_source == sample.anchor_source and p.anchor_uv == sample.anchor_uv]
+        if len(patches) != 1:
+            return unavailable('private_patch_count')
+        patch, = patches
+        if diagnostic is not None:
+            diagnostic.update(patch_frame=patch.measurement_frame_id,patch_pts_us=patch.measurement_ts_us,
+                patch_raster_match=patch.image_size==tuple(track.get('image_size',()))==tuple(getattr(calib,'image_size',()) or ()))
+        if (patch.image_size != tuple(track.get("image_size", ()))
+                or patch.image_size != tuple(getattr(calib, "image_size", ()) or ())):
+            return unavailable('private_patch_raster')
+        if ((patch.measurement_frame_id, patch.measurement_ts_us) !=
+                (depth_result.measurement_frame_id, depth_result.measurement_ts_us)):
+            return unavailable('private_patch_original')
+        reused = (selected_anchor is not None
+                  and depth_result.anchor_source == sample.anchor_source
+                  and depth_result.anchor_uv == sample.anchor_uv
+                  and depth_result.anchor_depth_m == sample.depth_median
+                  and selected_anchor.contact_basis == 'depth:' + sample.anchor_source)
+        observation = selected_observation if reused else None
+        if observation is None:
+            alternate = replace(depth_result, status="ok", anchor_source=sample.anchor_source,
+                anchor_uv=sample.anchor_uv, anchor_depth_m=sample.depth_median,
+                anchor_sample_count=sample.sample_count, anchor_valid_fraction=sample.valid_fraction,
+                anchor_depth_spread_m=_depth_spread_from_bounds(sample.depth_p10, sample.depth_p90),
+                evidence_quality=sample.evidence_quality, evidence_reason=None)
+            anchor = self._resolve_person_depth_anchor(alternate)
+            if anchor is None:
+                return unavailable('anatomy_anchor_unavailable')
+            observation = self._depth_observation_from_anchor(calib=calib, anchor=anchor,
+                depth_result=alternate, flip_u=flip_u, flip_v=flip_v, track=track)
+        if (observation.reason != "ok" or observation.world_point is None
+                or observation.registration_status not in {"ok", "raw_passthrough"}
+                or observation.raw_depth_m is None or observation.registered_depth_m is None):
+            return unavailable('original_projection_unavailable')
+        point = tuple(float(v) for v in observation.world_point)
+        if len(point) != 3 or not all(math.isfinite(v) for v in point):
+            return unavailable('original_point_nonfinite')
+        return OriginalBodyDepth(cohort, patch, point, float(observation.raw_depth_m),
+            float(observation.registered_depth_m), observation.registration_status,
+            observation.registration_id, (bool(flip_u), bool(flip_v)))
+
+    def _original_anatomy_depth_receipts(self, *, body_receipt, depth_result, **context):
+        """Keep already sampled ankle+torso, at most ONE extra scalar projection.
+
+        No shoulder substitute, extra native sample, raw registered interval,
+        or change to singular body/public World selection. Unavailable stays ().
+        """
+        if body_receipt is None or body_receipt.patch.anchor_source != 'pose_torso_support' or depth_result is None:
+            return ()
+        torso = [s for s in depth_result.pose_depth_samples if s.anchor_source == 'pose_torso_support'
+                 and s.anchor_uv == body_receipt.patch.anchor_uv and s.evidence_reason is None
+                 and s.evidence_quality != 'rejected']
+        ankles = [s for s in depth_result.pose_depth_samples if s.anchor_source == 'pose_ankle_support'
+                  and s.evidence_reason is None and s.evidence_quality != 'rejected']
+        if len(torso) != 1 or len(ankles) != 1:
+            return ()
+        ankle = self._original_body_depth_receipt(depth_result=depth_result, anatomy_sample=ankles[0], **context)
+        if ankle is None:
+            return ()
+        def freeze(receipt, sample):
+            interval = self._original_registered_anatomy_interval(sample, receipt, context['calib'])
+            return OriginalAnatomyDepth(receipt, sample, interval, 'camera_z_m' if interval is not None else None)
+        return (freeze(ankle, ankles[0]), freeze(body_receipt, torso[0]))
+
+    def _original_registered_anatomy_interval(self, sample, receipt, calib):
+        """Observed central camera-Z support, NEVER truth/confidence bounds.
+
+        Check the SAME accepted registration over the ENTIRE quantile interval,
+        including every intersected knot segment. Median-only success cannot
+        hide an out-of-domain endpoint or plateau. No raw passthrough promotion.
+        """
+        from noesis.calibration.depth_registration import DepthRegistrationEntry, DepthRegistrationManager
+        manager = self.depth_registration
+        if (type(manager) is not DepthRegistrationManager or receipt.registration_status != 'ok'
+                or getattr(calib, 'unit_scale', None) != 1.0):
+            return None
+        entry = manager.bundle.entries.get(str(getattr(calib, 'camera_id', '')))
+        if type(entry) is not DepthRegistrationEntry or entry.registration_id != receipt.registration_id:
+            return None
+        lo, mid, hi = sample.depth_p10, sample.depth_median, sample.depth_p90
+        if (any(type(v) not in (int,float) or not math.isfinite(v) or v <= 0 for v in (lo,mid,hi))
+                or not lo <= mid <= hi or not entry.raw_range_domain_m[0] <= lo <= hi <= entry.raw_range_domain_m[1]
+                or not 2 <= len(entry.knots_raw_m) <= 128
+                or len(entry.knots_registered_m) != len(entry.knots_raw_m)):
+            return None
+        raw, registered = entry.knots_raw_m, entry.knots_registered_m
+        for i in range(len(raw)-1):
+            if raw[i] <= hi and raw[i+1] >= lo:
+                span = registered[i+1]-registered[i]
+                tolerance = 1e-9*max(1.,abs(registered[i]),abs(registered[i+1]))
+                if (not all(math.isfinite(v) for v in (raw[i],raw[i+1],registered[i],registered[i+1]))
+                        or raw[i+1] <= raw[i] or span <= tolerance):
+                    return None
+        values = tuple(manager.apply(camera_id=entry.camera_id, raw_depth_m=v) for v in (lo,mid,hi))
+        if (any(status != 'ok' or identity != receipt.registration_id or value is None
+                or not math.isfinite(value) or value <= 0 for value,status,identity in values)
+                or values[1][0] != receipt.registered_depth_m
+                or not values[0][0] <= values[1][0] <= values[2][0]):
+            return None
+        return (float(values[0][0]), float(values[2][0]))
+
+    def _complete_original_depth_plan(self, fusion, plan, work, depth_frame):
+        """Sample exact D(F) with sealed F scalars, without touching public N.
+
+        Called only by the ordered actor after current owner reconciliation.
+        Missing exact binding means absence, never a different calibration,
+        host-frame fallback, retimestamp or World/filter invocation.
+        """
+        from types import SimpleNamespace
+        row,=work.rows
+        ev=row.evidence
+        if ((depth_frame.source_id,depth_frame.frame_id,depth_frame.pts_us)!=
+                (plan.source_id,plan.frame_id,plan.pts_us)
+                or (depth_frame.frame_w,depth_frame.frame_h)!=plan.image_size):
+            return None
+        provider=getattr(self,'bev_calibration',None)
+        if provider is None or not callable(getattr(provider,'snapshot',None)):
+            return None
+        cohort=ev.measurements.cohort
+        calib=provider.snapshot(plan.source_id,cohort.camera_id)
+        contract=getattr(calib,'frame_contract',None)
+        if (contract is None or getattr(calib,'camera_calibration_sha256',None)!=cohort.calibration_revision
+                or contract.target_frame.frame_id!=cohort.world_frame
+                or contract.target_frame.revision!=cohort.world_revision
+                or contract.transform_sha256!=cohort.world_transform_sha256
+                or tuple(getattr(calib,'image_size',()))!=plan.image_size):
+            return None
+        frame=SimpleNamespace(source_id=plan.source_id,frame_number=plan.frame_id,buf_pts=plan.pts_us*1000)
+        obj=SimpleNamespace(object_id=plan.raw_id,class_id=0,confidence=plan.score)
+        depth=fusion._sample_pose_capsule_result_native(frame,obj,bbox=plan.bbox,depth_frame=depth_frame,
+            crop_rect=(0,0,*plan.image_size),body_mask=True,contact_mask=bool(plan.contact_capsules),
+            contact_uv=plan.contact_uv,visible_ankles=plan.visible_ankles,contact_capsules=plan.contact_capsules,
+            torso_capsule=plan.torso_capsule,torso_uv=plan.torso_uv,shoulder_capsule=plan.shoulder_capsule,
+            shoulder_uv=plan.shoulder_uv,sample_limit=plan.sample_limit)
+        if depth is None:
+            return None
+        depth=replace(depth,depth_tensor_frame_id=plan.frame_id,depth_tensor_ts_us=plan.pts_us,
+            depth_tensor_age_frames=0,depth_tensor_age_us=0,
+            pose_joint_confidences=tuple(p[2] for p in plan.keypoints))
+        track={'source_id':plan.source_id,'tracker_id':plan.raw_id,'frame_id':plan.frame_id,
+            'media_pts_ns':row.original.pts_ns,'image_size':plan.image_size,'bbox':plan.bbox,
+            '_xc3d_original_frame_id':row.original.original_frame}
+        anchor=self._resolve_person_depth_anchor(depth)
+        if anchor is None:
+            return None
+        selected=self._depth_observation_from_anchor(calib=calib,anchor=anchor,depth_result=depth,
+            flip_u=False,flip_v=False,track=track)
+        context=dict(cohort=cohort,depth_result=depth,selected_observation=selected,selected_anchor=anchor,
+            calib=calib,track=track,pose_is_current=True,flip_u=False,flip_v=False)
+        body_depth=self._original_body_depth_receipt(**context)
+        anatomy=self._original_anatomy_depth_receipts(body_receipt=body_depth,**context)
+        if body_depth is None:
+            return None
+        changed=replace(ev,depth=depth,body_depth=body_depth,anatomy_depths=anatomy)
+        # F stays history-only. Do not recompute resolution, change its original
+        # selected World/time/covariance/current_measured, or emit a publication.
+        return replace(work,rows=(replace(row,evidence=changed,depth_current=True,denial=None),))
+
     @staticmethod
     def _covariance_matrix_from_projection(
         center: Optional[np.ndarray],
@@ -16638,6 +18650,7 @@ class _AnalyticsTelemetryProcessor:
         occlusion_fraction: float,
         flip_u: bool,
         flip_v: bool,
+        body_column: bool = False,
     ) -> Optional[Matrix3]:
         """Propagate UV, depth-spread, and registration uncertainty."""
 
@@ -16689,12 +18702,16 @@ class _AnalyticsTelemetryProcessor:
             if point is None:
                 return None
             grounded = np.asarray(point, dtype=np.float64).copy()
-            support_height, reference, ambiguous = self._support_at_world_xz(
-                calib, float(grounded[0]), float(grounded[2]),
-            )
-            if ambiguous or reference != support_surface:
-                return None
-            grounded[1] = float(support_height) if support_height is not None else float(calib.floor_y)
+            if body_column:
+                # Projection reference, not an observed contact/support claim.
+                grounded[1] = float(calib.floor_y)
+            else:
+                support_height, reference, ambiguous = self._support_at_world_xz(
+                    calib, float(grounded[0]), float(grounded[2]),
+                )
+                if ambiguous or reference != support_surface:
+                    return None
+                grounded[1] = float(support_height) if support_height is not None else float(calib.floor_y)
             return grounded
 
         return self._covariance_matrix_from_projection(
@@ -17343,6 +19360,82 @@ class _AnalyticsTelemetryProcessor:
             bool(strong_internal_proof),
         )
 
+    def _strong_current_column_pose(self, *, track, keypoints, pose_is_current, depth_result):
+        if (not registered_body_column_enabled(getattr(getattr(self, "pipeline", None), "config", {}) or {})
+                or pose_is_current is not True or track.get("_xc3d_native_pose_measured") is not True
+                or track.get("identity_lifecycle_disposition") != "continuous"
+                or type(track.get("class_id")) is not int or track.get("class_id") != 0
+                or not self._depth_measurement_is_current(depth_result, track=track)
+                or type(track.get("_xc3d_current_original")) is not OriginalCohort):
+            return None
+        try:
+            if isinstance(track.get("confidence"), bool):
+                return None
+            confidence = float(track.get("confidence"))
+            points = np.asarray(keypoints, dtype=np.float64)
+            original = track["_xc3d_current_original"]
+            if (not math.isfinite(confidence) or not 0. < confidence <= 1.
+                    or points.shape != (17, 3) or not np.all(np.isfinite(points))
+                    or np.any(points[:, 2] < 0.) or np.any(points[:, 2] > 1.)
+                    or min(float(points[i, 2]) for i in (5, 6, 11, 12)) < .75
+                    or tuple(depth_result.pose_joint_confidences) != tuple(float(v) for v in points[:, 2])
+                    or tuple(depth_result.bbox) != tuple(track.get("bbox", ()))
+                    or (original.source_id, original.camera_id, original.pts_ns, original.original_frame) !=
+                        (track.get("source_id"), track.get("camera_id"), track.get("media_pts_ns"),
+                         track.get("_xc3d_original_frame_id"))):
+                return None
+            capsule, uv = _ObjectDepthFusionProcessor._pose_torso_capsule_geometry(points, bbox=tuple(depth_result.bbox))
+            samples = [s for s in depth_result.pose_depth_samples if s.anchor_source == "pose_torso_support"
+                and s.evidence_quality in {"good", "estimated"} and s.evidence_reason is None
+                and s.sample_count > 0 and s.valid_fraction > 0 and s.depth_median is not None]
+            patches = [p for p in depth_result.native_pose_support if p.anchor_source == "pose_torso_support"]
+            if (capsule is None or len(samples) != 1 or len(patches) != 1
+                    or patches[0].capsules != (tuple(capsule),)
+                    or tuple(uv) != samples[0].anchor_uv or patches[0].anchor_uv != samples[0].anchor_uv
+                    or patches[0].image_size != tuple(track.get("image_size", ()))
+                    or patches[0].measurement_frame_id != depth_result.measurement_frame_id
+                    or patches[0].measurement_ts_us != original.pts_ns // 1000):
+                return None
+            s = samples[0]
+            torso = replace(depth_result, anchor_source=s.anchor_source, anchor_uv=s.anchor_uv,
+                anchor_depth_m=s.depth_median, anchor_sample_count=s.sample_count,
+                anchor_valid_fraction=s.valid_fraction,
+                anchor_depth_spread_m=_depth_spread_from_bounds(s.depth_p10, s.depth_p90),
+                evidence_quality=s.evidence_quality, evidence_reason=None)
+            _increment_core_counter("object_depth_strong_current_column_pose")
+            return _StrongCurrentColumnPose(original, torso, tuple(float(points[i, 2]) for i in (5, 6, 11, 12)))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+
+    def _append_strong_posed_column(self, candidates, *, proof, track, calib, posture, flip_u, flip_v,
+                                    occlusion_fraction, image_motion_supported):
+        # Never upgrade person_anchor/ordinary depth/floor state. This separate
+        # branch projects ONLY its own genuine torso and emits ONLY the new method.
+        if (type(proof) is not _StrongCurrentColumnPose or len(candidates) >= 4
+                or posture not in {"unknown", "standing", "sitting", "lying"}
+                or any(c.get("method") == "registered_body_column" for c in candidates)):
+            return
+        anchor = self._resolve_person_depth_anchor(proof.depth)
+        if anchor is None:
+            return
+        observation = self._depth_observation_from_anchor(calib=calib, anchor=anchor,
+            depth_result=proof.depth, flip_u=flip_u, flip_v=flip_v, track=track)
+        if (observation.reason != "ok" or observation.registration_status != "ok"
+                or observation.world_point is None or observation.registration_id is None
+                or not self._admit_world_observation_range(calib.camera_id, calib=calib,
+                    world_candidate=observation.world_point, track=track)):
+            return
+        self._append_universal_world_candidates(candidates, sensor_id=track["source_id"],
+            track=track, camera_id=calib.camera_id, calib=calib, floor_candidate=None,
+            floor_ray_admitted=False, anchor_candidate=None, pose_uv=None, contact_basis=None,
+            posture=posture, observed_posture=posture, occlusion_fraction=occlusion_fraction,
+            image_motion_supported=image_motion_supported,
+            depth_obs=observation.world_point, depth_weight=observation.weight, depth_observation=observation,
+            depth_result=proof.depth, person_anchor=anchor, reject_current_geometry=False,
+            flip_u=flip_u, flip_v=flip_v, registered_column_only=True)
+        if any(c.get("method") == "registered_body_column" for c in candidates):
+            _increment_core_counter("object_depth_strong_posed_column_candidate")
+
     def _append_universal_world_candidates(
         self,
         candidates: List[Dict[str, Any]],
@@ -17367,6 +19460,8 @@ class _AnalyticsTelemetryProcessor:
         reject_current_geometry: bool,
         flip_u: bool,
         flip_v: bool,
+        observed_posture: Optional[str] = None,
+        registered_column_only: bool = False,
     ) -> None:
         """Append the bounded, camera-agnostic geometric hypotheses.
 
@@ -17378,6 +19473,10 @@ class _AnalyticsTelemetryProcessor:
         ground footprint at the calibrated floor elevation.
         """
 
+        # Safety may retain a non-upright posture through current UNKNOWN.
+        # That policy is not a new observation of a seat/couch. Keep floor
+        # safety and covariance unchanged; body support uses current evidence.
+        depth_posture = str(posture if observed_posture is None else observed_posture)
         floor_anchor = (
             anchor_candidate
             if self._anchor_is_verified_ground_contact(anchor_candidate)
@@ -17458,6 +19557,11 @@ class _AnalyticsTelemetryProcessor:
                 )
             except (TypeError, ValueError, IndexError, OverflowError):
                 return
+            body_column = bool(registered_body_column_enabled(getattr(getattr(self, "pipeline", None), "config", {}) or {})
+                and depth_posture in {"unknown", "standing", "sitting", "lying"} and depth_result is not None
+                and depth_result.anchor_source == "pose_torso_support"
+                and depth_observation.registration_status == "ok"
+                and depth_observation.registration_id is not None and self.depth_registration is not None)
             depth_covariance = self._depth_candidate_covariance(
                 calib,
                 anchor_uv=(float(person_anchor.u), float(person_anchor.v)),
@@ -17495,7 +19599,7 @@ class _AnalyticsTelemetryProcessor:
             ):
                 depth_support_state = "floor"
             elif (
-                str(posture) in ("sitting", "lying")
+                depth_posture in ("sitting", "lying")
                 and depth_registration_supported
                 and depth_anchor_source
                 in ("torso_core", "pose_torso_support", "pose_shoulder_support")
@@ -17508,11 +19612,11 @@ class _AnalyticsTelemetryProcessor:
                 # support distinct because its body-to-support geometry is not
                 # equivalent to the seated torso plane.
                 depth_support_state = (
-                    "seat" if str(posture) == "sitting" else "couch"
+                    "seat" if depth_posture == "sitting" else "couch"
                 )
-            candidates.append(
-                {
+            registered_candidate = {
                     "candidate_id": "registered_depth",
+                    "method": None,
                     "kind": "registered_depth",
                     "position": depth_position,
                     "covariance": depth_covariance,
@@ -17520,7 +19624,7 @@ class _AnalyticsTelemetryProcessor:
                     "contact_basis": str(person_anchor.contact_basis or person_anchor.source),
                     "support_state": depth_support_state,
                     "confidence": max(0.35, min(1.0, 0.45 + 0.55 * float(depth_weight))),
-                    "posture": str(posture),
+                    "posture": depth_posture,
                     "occlusion": float(occlusion_fraction),
                     "motion_consistency": 1.0 if image_motion_supported else 0.75,
                     "support_score": depth_support_fraction,
@@ -17547,7 +19651,103 @@ class _AnalyticsTelemetryProcessor:
                     "correlation_group": f"registered_depth:{int(sensor_id)}:{int(track.get('tracker_id', -1))}",
                     "pcf": self._world_prior_evidence(camera_id, depth_position),
                 }
-            )
+            if not registered_column_only:
+                candidates.append(registered_candidate)
+
+            if body_column:
+                column_position = np.asarray(depth_obs, dtype=np.float64).copy()
+                column_position[1] = float(calib.floor_y)
+                column_covariance = self._depth_candidate_covariance(
+                    calib, anchor_uv=(float(person_anchor.u), float(person_anchor.v)),
+                    registered_depth_m=float(depth_observation.registered_depth_m),
+                    depth_result=depth_result, depth_candidate=column_position,
+                    posture=depth_posture, occlusion_fraction=float(occlusion_fraction),
+                    flip_u=flip_u, flip_v=flip_v, body_column=True)
+                if column_covariance is not None:
+                    candidates.append({**registered_candidate, "candidate_id": "registered_body_column",
+                        "method": "registered_body_column", "anchor": "registered_body_column",
+                        "contact_basis": "depth:registered_body_column", "position": column_position,
+                        "covariance": column_covariance, "support_state": "unknown", "support_surface": None,
+                        "pcf": self._world_prior_evidence(camera_id, column_position)})
+
+    def _body_column_fallback_set(
+        self, measurement_set: WorldMeasurementSet, *, contact_basis: Mapping[str, str],
+        track: Mapping[str, Any], state: Optional[_WorldAnchorState], detector_confidence: float,
+        now_ts: Optional[float] = None, display_output=None,
+    ) -> WorldMeasurementSet:
+        """Keep ordinary current authority ahead of the NEW estimated fallback.
+
+        All originals remain in the bounded diagnostic set. Ineligible legacy
+        body/gravity candidates cannot win a score tie and then veto the column.
+        This is not a grant, a new support proof, or a PCF threshold change.
+        """
+        columns = tuple(h for h in measurement_set.hypotheses if h.method == "registered_body_column" and h.valid)
+        if not columns:
+            return measurement_set
+        eligible = []
+        for candidate in measurement_set.hypotheses:
+            if (not candidate.valid or candidate.method is not None
+                    or not self._resolver_candidate_is_ground_footprint_supported(candidate,
+                        contact_basis=contact_basis.get(candidate.candidate_id))):
+                continue
+            if candidate.kind == "pose_scale" and candidate.anchor == "upright_body_plane":
+                try:
+                    count = int(track.get("world_upright_body_anchor_count") or 0)
+                    scatter = float(track.get("world_upright_body_scatter_m", math.inf))
+                    height = float(track.get("world_upright_body_height_m", math.nan))
+                    cold = state is None or state.world_x is None
+                    verified = (count >= 5 or cold and count == 4) and scatter <= .50 and 1. <= height <= 2.25
+                except (TypeError, ValueError, OverflowError):
+                    verified = False
+                if not (verified and not self._world_resolver._pcf_strong_conflict(candidate)
+                        and detector_confidence >= max(.58, self._min_unposed_detection_confidence)
+                        and candidate.confidence >= .68 and candidate.support_score >= .74
+                        and candidate.source_reliability >= .82):
+                    continue
+            elif candidate.kind == "floor_ray":
+                if (detector_confidence < self._min_unposed_detection_confidence
+                        or ((state is None or state.world_x is None)
+                            and (candidate.ray_incidence_sin is None or candidate.ray_incidence_sin < .20))):
+                    continue
+            eligible.append(candidate)
+        qualified = []
+        for candidate in eligible:  # At most three ordinary hypotheses; no new geometry/extraction.
+            ordinary_set = measurement_set.model_copy(update={"hypotheses": (candidate,)})
+            resolved = self._world_resolver.resolve(ordinary_set)
+            if (resolved.status == "measured" and (resolved.quality != "weak"
+                    or self._weak_resolver_measurement_is_ground_supported(resolved, ordinary_set,
+                        state=state, image_motion_supported=bool(track.get("world_image_motion_supported")),
+                        depth_corroborated=bool(track.get("world_floor_depth_corroborated")),
+                        contact_basis_by_candidate=contact_basis))):
+                if (candidate.kind == 'floor_ray' and resolved.quality == 'weak'
+                        and state is not None and state.world_x is not None and now_ts is not None):
+                    # Support permits temporal consensus; it is not CURRENT
+                    # physical admission. A pending/rejected weaker floor must
+                    # not erase the independently qualified column before its
+                    # own three-original consensus can run. Trial only this
+                    # bounded candidate on detached state, using the SAME gates.
+                    trial=copy.deepcopy(state)
+                    basis=self._person_ground_consensus_contact_basis(
+                        contact_basis.get(candidate.candidate_id) or candidate.anchor)
+                    update_human_cv_filter(trial,
+                        measurement=np.array([resolved.position.x,resolved.position.y,resolved.position.z]),
+                        floor_y=float(resolved.position.y),now_ts=float(now_ts),quality='weak',
+                        config=self._human_ground_cfg,contact_basis=basis,
+                        image_motion_supported=bool(track.get('world_image_motion_supported')),
+                        verified_reacquire_support=basis in {'pose_ankle_floor','pose_single_ankle_floor'},
+                        registered_ankle_binding=self._registered_ankle_binding(track,candidate),
+                        selected_geometry_kind='floor_ray',
+                        media_pts_ns=self._valid_world_media_pts_ns(track.get('media_pts_ns')),
+                        display_output=display_output)
+                    if not trial.measurement_accepted:
+                        continue
+                qualified.append(candidate)
+        eligible = qualified
+        selected_ids = {h.candidate_id for h in (eligible or columns)}
+        return measurement_set.model_copy(update={"hypotheses": tuple(
+            h if h.candidate_id in selected_ids else h.model_copy(update={"valid": False,
+                "rejection_reason": "ordinary_priority_over_body_column" if eligible else "ordinary_footprint_not_eligible"})
+            for h in measurement_set.hypotheses)})
 
     def _world_prior_evidence(
         self,
@@ -17719,6 +19919,7 @@ class _AnalyticsTelemetryProcessor:
                     candidate_id=str(candidate.get("candidate_id") or candidate.get("kind") or "candidate"),
                     cohort=cohort,
                     kind=str(candidate.get("kind") or "floor_ray"),  # type: ignore[arg-type]
+                    method=candidate.get("method"),
                     position=point,
                     covariance=covariance,
                     anchor=str(candidate.get("anchor") or candidate.get("contact_basis") or "unknown"),
@@ -17907,6 +20108,7 @@ class _AnalyticsTelemetryProcessor:
             "world_resolver",
             "world_covariance",
             "world_support_surface",
+            "_xc3d_quality_resolver",
         ):
             track.pop(field_name, None)
         # A resolver covariance describes the raw current measurement.  It is
@@ -17924,6 +20126,10 @@ class _AnalyticsTelemetryProcessor:
                 item_count=len(measurement_set.hypotheses),
             )
         track["world_quantity"] = "ground_footprint"
+        if xc3d_world_quality_enabled(getattr(getattr(self, "pipeline", None), "config", {}) or {}):
+            # Immutable <=4 scalar hypotheses/resolution; never SDK metadata or
+            # request-gated diagnostic JSON. PGS/public fields decide freshness.
+            track["_xc3d_quality_resolver"] = (measurement_set, result)
         track["world_posture"] = str(result.posture)
         track["world_support_state"] = str(result.support_state)
         diagnostics_enabled = bool(self._world_resolver_diagnostics_enabled)
@@ -18185,6 +20391,167 @@ class _AnalyticsTelemetryProcessor:
             raise RuntimeError("accepted canonical measurement covariance is invalid")
         track["world_covariance"] = values
 
+    def _registered_ankle_binding(self, track, selected):
+        original = track.get('_xc3d_current_original')
+        if ((getattr(self.pipeline, 'config', {}) or {}).get('xc3d_image_regions', {}).get('enabled') is not True
+                or track.get('_xc3d_native_pose_measured') is not True
+                or type(original) is not OriginalCohort or not isinstance(selected, WorldMeasurementHypothesis)):
+            return None
+        c = selected.cohort
+        if ((original.camera_id, original.source_id, original.pts_ns, original.original_frame) !=
+                (c.camera_id, c.source_id, track.get('media_pts_ns'), track.get('_xc3d_original_frame_id'))
+                or (c.frame_id, c.observed_at_us, c.tracker_id, c.tracker_lifecycle_generation) !=
+                (track.get('frame_id'), track.get('observed_at_us'), track.get('tracker_id'),
+                 track.get('tracker_lifecycle_generation')) or not c.world_transform_sha256):
+            return None
+        return (original.run_id, original.graph_id, original.source_clock_epoch, original.timestamp_origin,
+            c.track_key, c.tracker_lifecycle_generation, c.camera_id, c.source_id, c.tracker_id,
+            c.world_frame, c.world_revision, c.calibration_revision, c.world_transform_sha256, c.pcf_revision)
+
+    def _registered_ankle_original(self, *, track, selected, depth_result, depth_observation,
+                                   person_anchor, measurement, now_ts, calib, pose_is_current,
+                                   flip_u=False, flip_v=False):
+        diagnostic={} if getattr(self,'_ankle_priority_diagnostic_enabled',False) else None
+        def finish(stage, result=None):
+            if diagnostic is not None:
+                try:
+                    diagnostic.setdefault('factory_stage',stage)
+                    self._record_ankle_priority(track,diagnostic,pose_current=pose_is_current,
+                        depth_frame=getattr(depth_result,'measurement_frame_id',None),
+                        factory_geometry=getattr(selected,'kind',None),
+                        factory_relevant=bool(getattr(selected,'kind',None)=='registered_depth'
+                            and depth_result is not None and depth_result.anchor_source=='pose_ankle_support'
+                            and self._depth_measurement_is_current(depth_result,track=track)))
+                except Exception:
+                    pass
+            return result
+        binding = self._registered_ankle_binding(track, selected)
+        if binding is None:
+            return finish('binding')
+        if (depth_result is None or not selected.valid
+                or selected.kind != 'registered_depth' or selected.method is not None
+                or selected.anchor != 'person_mask_floor' or selected.support_state != 'floor'
+                or person_anchor is None or person_anchor.contact_basis != 'depth:pose_ankle_support'
+                or depth_result.anchor_source != 'pose_ankle_support'):
+            return finish('selected_anatomy_or_support')
+        if depth_observation.registration_status != 'ok' or not depth_observation.registration_id:
+            return finish('registration')
+        samples = [s for s in depth_result.pose_depth_samples if s.anchor_source == 'pose_ankle_support'
+            and s.anchor_uv == depth_result.anchor_uv and s.depth_median == depth_result.anchor_depth_m
+            and s.evidence_reason is None and s.evidence_quality != 'rejected']
+        if len(samples) != 1:
+            return finish('selected_sample_count')
+        receipt = self._original_body_depth_receipt(cohort=selected.cohort, depth_result=depth_result,
+            selected_observation=depth_observation, selected_anchor=person_anchor, calib=calib,
+            track=track, pose_is_current=pose_is_current, flip_u=flip_u, flip_v=flip_v,
+            anatomy_sample=samples[0], diagnostic=diagnostic)
+        if receipt is None:
+            return finish('original_receipt_unavailable')
+        if receipt.registration_status != 'ok' or receipt.registration_id != depth_observation.registration_id:
+            return finish('original_registration')
+        if (float(measurement[0]),float(measurement[2])) != (receipt.original_point[0],receipt.original_point[2]):
+            return finish('resolved_xz_mismatch')
+        if (selected.position.x,selected.position.z) != (receipt.original_point[0],receipt.original_point[2]):
+            return finish('hypothesis_xz_mismatch')
+        original = track['_xc3d_current_original']
+        return finish('ready',RegisteredAnkleOriginal(binding+(receipt.registration_id, depth_result.model),
+            selected.cohort.frame_id, original.pts_ns, selected.cohort.observed_at_us,
+            float(now_ts), (float(measurement[0]), float(measurement[2]))))
+
+    def _record_ankle_priority(self, track, values, **extra):
+        if not getattr(self,'_ankle_priority_diagnostic_enabled',False):return
+        try:
+            row={'source':track.get('source_id'),'raw':track.get('tracker_id'),
+                'generation':track.get('tracker_lifecycle_generation')}
+            if 'factory_stage' in values:
+                row.update(frame=track.get('frame_id'),pts_ns=track.get('media_pts_ns'),
+                    native_measured=track.get('_xc3d_native_pose_measured'),
+                    original_frame=track.get('_xc3d_original_frame_id'))
+            row.update(values);row.update(extra)
+            _CORE_PATH_INSTRUMENTATION.record_ankle_priority(row)
+        except Exception:
+            pass  # Optional inspection can never change filter/World outcomes.
+
+    def _record_ankle_filter_state(self, track, state, prior, now_ts, binding, geometry, quality, contact):
+        if not getattr(self,'_ankle_priority_diagnostic_enabled',False):return
+        try:
+            cursor=state.ankle_original_cursor;proof=state.accepted_ankle_original
+            if cursor is None and prior is None and proof is None:return
+            age=float(now_ts)-(proof.sample_ts if proof is not None else prior.sample_ts) if proof is not None or prior is not None else None
+            row={'filter_frame':track.get('frame_id'),
+                'local_accepted':bool(state.measurement_accepted),
+                'cursor_frame':cursor.frame_id if cursor is not None else None,
+                'proof_frame':proof.frame_id if proof is not None else None,
+                'proof_sample_ts':proof.sample_ts if proof is not None else None,
+                'proof_age_s':age,'proof_present':proof is not None,
+                'proof_expired':age>self._human_ground_cfg.reacquire_max_gap_s if age is not None else None,
+                'binding_present':binding is not None,'geometry':geometry,
+                'proof_transition':('harvested' if prior is None and proof is not None else
+                    'cleared' if prior is not None and proof is None else 'unchanged')}
+            if prior is not None and proof is None:
+                row.update(first_clear_frame=track.get('frame_id'),first_clear_quality=quality,
+                    first_clear_contact=contact,first_clear_geometry=geometry,
+                    first_clear_binding_present=binding is not None,
+                    first_clear_binding_equal=prior.binding[:-2]==binding,
+                    first_clear_age_s=age,first_clear_native_measured=track.get('_xc3d_native_pose_measured'),
+                    first_clear_proof_frame=prior.frame_id)
+            self._record_ankle_priority(track,row)
+        except Exception:
+            pass
+
+    def _registered_column_original(self, *, track, selected, depth_result, measurement, now_ts,
+                                    covariance=None, torso_upgrade=False):
+        """Bind a task-only reanchor input to its ORIGINAL registered torso.
+
+        No query of latest native ownership, no new sample, and no floor proof.
+        Resolver/current quality and PCF admission still happen before this call.
+        """
+        receipt = track.get("_xc3d_body_depth")
+        original = track.get("_xc3d_current_original")
+        if (not registered_body_column_enabled(getattr(self.pipeline, "config", {}) or {})
+                or type(receipt) is not OriginalBodyDepth or type(original) is not OriginalCohort
+                or not isinstance(selected, WorldMeasurementHypothesis)
+                or not selected.valid or selected.kind != "registered_depth"
+                or (not torso_upgrade and (selected.method != "registered_body_column"
+                    or selected.anchor != "registered_body_column" or selected.support_state != "unknown"))
+                or (torso_upgrade and (selected.method is not None or selected.anchor != "person_body_projection"
+                    or (selected.posture, selected.support_state) not in {('sitting', 'seat'), ('lying', 'couch')}))
+                or selected.cohort != receipt.cohort
+                or receipt.patch.anchor_source != "pose_torso_support"
+                or receipt.registration_status != "ok" or not receipt.registration_id
+                or not self._depth_measurement_is_current(depth_result, track=track)):
+            return None
+        c = selected.cohort
+        try:
+            point = tuple(float(v) for v in measurement)
+            if ((original.camera_id, original.source_id, original.pts_ns) !=
+                    (c.camera_id, c.source_id, track.get("media_pts_ns"))
+                    or original.original_frame != track.get("_xc3d_original_frame_id")
+                    or (c.frame_id, c.observed_at_us, c.tracker_id, c.tracker_lifecycle_generation) !=
+                        (track.get("frame_id"), track.get("observed_at_us"), track.get("tracker_id"),
+                         track.get("tracker_lifecycle_generation"))
+                    or receipt.patch.measurement_frame_id != depth_result.measurement_frame_id
+                    or receipt.patch.measurement_ts_us != original.pts_ns // 1000
+                    or not c.world_transform_sha256
+                    or (point[0], point[2]) != (receipt.original_point[0], receipt.original_point[2])
+                    or (point[0], point[2]) != (selected.position.x, selected.position.z)):
+                return None
+            binding = (original.run_id, original.graph_id, original.source_clock_epoch,
+                original.timestamp_origin, c.track_key, c.tracker_lifecycle_generation,
+                c.camera_id, c.source_id, c.tracker_id, c.world_frame, c.world_revision,
+                c.calibration_revision, c.world_transform_sha256, c.pcf_revision,
+                receipt.registration_id, depth_result.model)
+            cov = np.asarray((covariance or selected.covariance).values, dtype=np.float64).reshape(3, 3)
+            horizontal = tuple(float(v) for v in cov[np.ix_((0, 2), (0, 2))].reshape(-1))
+            token = RegisteredBodyColumnOriginal(binding, c.frame_id, original.pts_ns,
+                c.observed_at_us, float(now_ts), (point[0], point[2]), horizontal)
+            if torso_upgrade:
+                return RegisteredTorsoUpgradeOriginal(token, str(selected.posture), str(selected.support_state),
+                    float(self._world_resolver.config.agreement_mahalanobis_sq))
+            return token
+        except (TypeError, ValueError, IndexError, OverflowError, AttributeError):
+            return None
+
     def _update_world_state(
         self,
         state: Optional[_WorldAnchorState],
@@ -18199,6 +20566,11 @@ class _AnalyticsTelemetryProcessor:
         contact_basis: Optional[str] = None,
         image_motion_supported: bool = False,
         verified_reacquire_support: bool = False,
+        registered_column_original: Optional[RegisteredBodyColumnOriginal] = None,
+        registered_torso_upgrade: Optional[RegisteredTorsoUpgradeOriginal] = None,
+        registered_ankle_original: Optional[RegisteredAnkleOriginal] = None,
+        registered_ankle_binding: Optional[Tuple[object, ...]] = None,
+        selected_geometry_kind: Optional[str] = None,
         verified_first_output_pose_floor_seed: bool = False,
         defer_weak_seed: bool = False,
         media_pts_ns: Optional[int] = None,
@@ -18235,6 +20607,11 @@ class _AnalyticsTelemetryProcessor:
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
             verified_reacquire_support=bool(verified_reacquire_support),
+            registered_column_original=registered_column_original,
+            registered_torso_upgrade=registered_torso_upgrade,
+            registered_ankle_original=registered_ankle_original,
+            registered_ankle_binding=registered_ankle_binding,
+            selected_geometry_kind=selected_geometry_kind,
             verified_first_output_pose_floor_seed=bool(
                 verified_first_output_pose_floor_seed
             ),
@@ -18257,6 +20634,11 @@ class _AnalyticsTelemetryProcessor:
         contact_basis: Optional[str] = None,
         image_motion_supported: bool = False,
         verified_reacquire_support: bool = False,
+        registered_column_original: Optional[RegisteredBodyColumnOriginal] = None,
+        registered_torso_upgrade: Optional[RegisteredTorsoUpgradeOriginal] = None,
+        registered_ankle_original: Optional[RegisteredAnkleOriginal] = None,
+        registered_ankle_binding: Optional[Tuple[object, ...]] = None,
+        selected_geometry_kind: Optional[str] = None,
         verified_first_output_pose_floor_seed: bool = False,
         defer_weak_seed: bool = False,
         media_pts_ns: Optional[int] = None,
@@ -18265,6 +20647,7 @@ class _AnalyticsTelemetryProcessor:
         ] = None,
     ) -> np.ndarray:
         """Record pre-filter evidence and apply the shared physical filter."""
+        prior_ankle = getattr(state,'accepted_ankle_original',None)
         track["world_prefilter_measurement"] = [
             float(measurement[0]),
             float(floor_y),
@@ -18289,6 +20672,11 @@ class _AnalyticsTelemetryProcessor:
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
             verified_reacquire_support=bool(verified_reacquire_support),
+            registered_column_original=registered_column_original,
+            registered_torso_upgrade=registered_torso_upgrade,
+            registered_ankle_original=registered_ankle_original,
+            registered_ankle_binding=registered_ankle_binding,
+            selected_geometry_kind=selected_geometry_kind,
             verified_first_output_pose_floor_seed=bool(
                 verified_first_output_pose_floor_seed
             ),
@@ -18297,6 +20685,8 @@ class _AnalyticsTelemetryProcessor:
             display_output=display_output,
         )
         if state is not None:
+            self._record_ankle_filter_state(track,state,prior_ankle,now_ts,
+                registered_ankle_binding,selected_geometry_kind,quality,contact_basis)
             # A physical reject advances only the bounded process model.  The
             # pre-filter prediction above is useful for accepted observations,
             # but after a long reject run it can be stale/unbounded diagnostic
@@ -18397,6 +20787,11 @@ class _AnalyticsTelemetryProcessor:
         """
 
         support_state = str(getattr(candidate, "support_state", "") or "")
+        if (getattr(candidate, "method", None) == "registered_body_column"
+                and candidate.kind == "registered_depth" and candidate.anchor == "registered_body_column"
+                and candidate.posture in {"unknown", "standing", "sitting", "lying"} and support_state == "unknown"
+                and str(contact_basis or "") == "depth:registered_body_column"):
+            return True
         if support_state == "floor":
             return True
         kind = str(getattr(candidate, "kind", "") or "")
@@ -18469,6 +20864,9 @@ class _AnalyticsTelemetryProcessor:
         )
         if selected is None:
             return False
+        if (getattr(selected, "method", None) == "registered_body_column"
+                and str(resolved.reason) == "selected_hypothesis_strongly_conflicts_with_pcf"):
+            return False
         kind = str(selected.kind)
         anchor = str(selected.anchor or "").strip().lower()
         selected_contact_basis = (contact_basis_by_candidate or {}).get(
@@ -18493,6 +20891,9 @@ class _AnalyticsTelemetryProcessor:
             or not anchor
         ):
             return False
+
+        if getattr(selected, "method", None) == "registered_body_column":
+            return str(resolved.reason) != "selected_hypothesis_strongly_conflicts_with_pcf"
 
         if seated_projection:
             return bool(
@@ -19042,6 +21443,7 @@ class _AnalyticsTelemetryProcessor:
         """Remove an untrusted world result at the canonical publication boundary."""
 
         track["world_valid"] = False
+        track["world_measurement_accepted"] = False
         track["world_quality"] = "invalid"
         track["world_quality_reason"] = str(reason or "world_observation_invalid")
         track.pop("world", None)
@@ -19051,6 +21453,17 @@ class _AnalyticsTelemetryProcessor:
         track.pop("world_transform_sha256", None)
         track.pop("world_support_surface", None)
         track.pop("world_covariance", None)
+
+    @staticmethod
+    def _publish_ground_state_fields(track: Dict[str, Any], state: _WorldAnchorState) -> None:
+        """Keep local filter diagnostics separate from final output admission."""
+        for key, value in state.as_public_fields().items():
+            if value is not None:
+                track[key] = value
+        # A local filter accept cannot restore a vote removed by the final
+        # coordinate/provenance gate. Do not mutate the filter or its evidence.
+        if track.get("world_valid") is False:
+            track["world_measurement_accepted"] = False
 
     def _set_track_image_base_from_world(
         self,
@@ -19482,6 +21895,11 @@ class _AnalyticsTelemetryProcessor:
                     default_frame_id=self._world_frame,
                 )
             )
+
+            if xc3d_world_quality_enabled(getattr(self.pipeline, "config", {}) or {}):
+                # ORIGINAL calibration-to-target source revision, separately
+                # from the camera artifact SHA. Never relabel the emitted XYZ.
+                track["calibration_revision"] = getattr(calib, "calibration_frame_revision", None)
             # Native V3DT bbox3d metadata is produced in the current backend
             # world frame, but older bridge payloads do not carry the active
             # revision digest. Bind that one trusted producer to the current
@@ -19620,6 +22038,7 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if state is None:
                     track["world_valid"] = False
+                    track["world_measurement_accepted"] = False
                     track["world_quality"] = "invalid"
                     track["world_quality_reason"] = rejection_reason
                     track.pop("world", None)
@@ -19708,9 +22127,7 @@ class _AnalyticsTelemetryProcessor:
                     state.trail_append_allowed = False
                     track["world_estimator_evaluated"] = True
                     self._invalidate_world_track(track, reason)
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
                     return
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
                 if (
@@ -19752,6 +22169,7 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     track["world_estimator_evaluated"] = True
                     track["world_valid"] = False
+                    track["world_measurement_accepted"] = False
                     track["world_quality"] = "invalid"
                     track["world_quality_reason"] = str(
                         state.measurement_rejection_reason or "physical_measurement_rejected"
@@ -19759,9 +22177,7 @@ class _AnalyticsTelemetryProcessor:
                     track.pop("world", None)
                     track.pop("world_source", None)
                     state.trail_append_allowed = False
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
                     return
 
             image_uv = None
@@ -19819,9 +22235,7 @@ class _AnalyticsTelemetryProcessor:
                 track["world_estimator_evaluated"] = True
                 self._invalidate_world_track(track, rejection_reason)
                 if state is not None:
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
                 return
 
             if state is not None:
@@ -19924,9 +22338,7 @@ class _AnalyticsTelemetryProcessor:
                         track,
                         "canonical_continuity_provenance_unavailable",
                     )
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
                     return
                 else:
                     track.pop("world_prediction_provenance", None)
@@ -19964,9 +22376,7 @@ class _AnalyticsTelemetryProcessor:
                 track.pop("world_calibration_sha256", None)
             track["world_source"] = str(world_source_label)
             if state is not None:
-                for key, value in state.as_public_fields().items():
-                    if value is not None:
-                        track[key] = value
+                self._publish_ground_state_fields(track, state)
                 if world_source_label in ("anchor_hold", "cv_prediction"):
                     track["trail_segment_id"] = int(
                         state.last_output_trail_segment_id
@@ -20086,7 +22496,17 @@ class _AnalyticsTelemetryProcessor:
         world_now_ts: Optional[float] = None,
     ) -> None:
         """Calculate world coordinates for a track if calibration is available."""
-        if self._tracking_mode_is_v3dt():
+        independent_candidate = self._xc3d_independent_world_enabled()
+        if independent_candidate:
+            # Preserve correlated vendor metadata as diagnostic bbox3d only.
+            # Reuse this same canonical resolver below with original current
+            # pose/registered DAv2/support inputs; never use peer-fused native
+            # coordinates as independent corroboration or run a second estimator.
+            if track.get("world_source") == "bbox3d":
+                for name in ("world", "world_valid", "world_source", "world_quality",
+                             "world_quality_reason", "world_frame_revision", "world_transform_sha256"):
+                    track.pop(name, None)
+        if self._tracking_mode_is_v3dt() and not independent_candidate:
             has_bbox3d_world = bool(
                 isinstance(track.get("bbox3d"), Mapping)
                 and track.get("world_source") == "bbox3d"
@@ -20162,6 +22582,9 @@ class _AnalyticsTelemetryProcessor:
                     default_frame_id=self._world_frame,
                 )
             )
+
+            if xc3d_world_quality_enabled(getattr(self.pipeline, "config", {}) or {}):
+                track["calibration_revision"] = getattr(calib, "calibration_frame_revision", None)
 
             bbox = track.get("bbox")
             if not bbox or len(bbox) < 4:
@@ -20478,6 +22901,7 @@ class _AnalyticsTelemetryProcessor:
                     kpts_abs=pose_kpts_abs,
                     bbox=bbox,
                     posture=posture,
+                    observed_posture=raw_classified_posture,
                     now_ts=float(now_ts),
                     evidence_ts=float(observation_ts),
                     config=self._human_ground_cfg,
@@ -20581,6 +23005,8 @@ class _AnalyticsTelemetryProcessor:
                 if posture != "sitting":
                     self._clear_seated_torso_height_reference(state)
             depth_result = self._person_depth_for_posture(depth_result, str(posture))
+            strong_posed_column = self._strong_current_column_pose(track=track, keypoints=pose_kpts_abs,
+                pose_is_current=pose_is_current, depth_result=depth_result)
             person_anchor = self._resolve_person_depth_anchor(depth_result)
             if (
                 person_anchor is not None
@@ -20598,12 +23024,17 @@ class _AnalyticsTelemetryProcessor:
                 # filter along a body-range ray. Keep the range branch exact-
                 # cohort, confidence-gated, lifecycle-backed, and limited to
                 # seated or explicitly lower-body-occluded observations.
+                # A held safety posture may select a qualified patch, but
+                # cannot itself supply fresh observed non-upright context.
                 partial_body_without_floor_contact = bool(
                     str(person_anchor.contact_basis) == "depth:pose_shoulder_support"
                     and not self._anchor_is_verified_ground_contact(pose_anchor)
                 )
                 exact_current_non_upright_torso = bool(
-                    (posture in ("sitting", "lying") or partial_body_without_floor_contact)
+                    (raw_classified_posture in ("sitting", "lying") or partial_body_without_floor_contact
+                     or (registered_body_column_enabled(getattr(self.pipeline, "config", {}) or {})
+                         and raw_classified_posture in {"unknown", "standing", "sitting", "lying"} and pose_is_current
+                         and str(person_anchor.contact_basis) == "depth:pose_torso_support"))
                     and self._depth_measurement_is_current(
                         depth_result,
                         track=track,
@@ -20618,8 +23049,12 @@ class _AnalyticsTelemetryProcessor:
                     or exact_current_non_upright_torso
                 )
                 torso_context_supported = bool(
-                    posture in ("sitting", "lying")
+                    raw_classified_posture in ("sitting", "lying")
                     or partial_body_without_floor_contact
+                    or (registered_body_column_enabled(getattr(self.pipeline, "config", {}) or {})
+                        and raw_classified_posture in {"unknown", "standing", "sitting", "lying"} and pose_is_current
+                        and str(person_anchor.contact_basis) == "depth:pose_torso_support"
+                        and self._depth_measurement_is_current(depth_result, track=track))
                     or (
                         occlusion_assessment is not None
                         and occlusion_assessment.active
@@ -20746,10 +23181,10 @@ class _AnalyticsTelemetryProcessor:
             # contact-producing branches: small/far people often have no
             # usable pose payload and the native depth capsule reports
             # ``no_ground_contact``.  Preserve a bounded detector-bottom
-            # hypothesis for that case so the universal resolver has a
-            # current candidate.  A torso-only depth anchor is useful range
+            # image reference for that case, NOT a verified floor hypothesis.
+            # A torso-only depth anchor is useful range
             # evidence, but it is not a floor contact; do not let its mere
-            # presence suppress the independent detector-bottom hypothesis.
+            # presence suppress the detector-bottom image reference.
             # Never use this fallback for a seated/lying posture;
             # pose-without-contact requires an already walking or height-
             # locked lifecycle, while a genuinely unposed row may start from
@@ -20757,8 +23192,8 @@ class _AnalyticsTelemetryProcessor:
             if not self._anchor_is_verified_ground_contact(anchor_candidate):
                 # This branch is reached only when neither pose nor depth has
                 # verified ground contact. Depth status is diagnostic here:
-                # an error/not-ready/ambiguous torso result must not suppress
-                # the independently guarded detector-bottom floor hypothesis.
+                # keep the bbox image reference without promoting its bottom
+                # to floor contact, regardless of a torso result's status.
                 depth_allows_bbox = True
                 # Tracker confidence may establish nonpublishing geometric
                 # continuity for a cold row, but only detector confidence may
@@ -20817,7 +23252,7 @@ class _AnalyticsTelemetryProcessor:
                     if bbox_anchor is not None:
                         # Keep ``person_anchor`` untouched below so its
                         # registered-depth hypothesis is appended alongside
-                        # this independent floor-contact hypothesis.
+                        # the bbox image reference (not ground contact).
                         anchor_candidate = bbox_anchor
 
             contact_basis = (
@@ -20827,8 +23262,8 @@ class _AnalyticsTelemetryProcessor:
             )
             image_motion_supported = False
             if state is not None:
-                # The guarded detector-bottom fallback is itself an exact-
-                # cohort image contact: it was admitted above only for a
+                # The guarded detector-bottom fallback is an exact-cohort
+                # image-motion reference, NOT observed ground contact, for a
                 # confident, upright class-0 lifecycle with usable geometry.
                 # Let its *multi-observation motion* corroborate a physical
                 # reanchor. This does not make one bbox row authoritative;
@@ -21057,7 +23492,9 @@ class _AnalyticsTelemetryProcessor:
             # must not discard an independently valid registered-depth
             # observation.  The resolver can adjudicate that depth sample
             # against the separate gravity reconstruction hypothesis.
-            if force_occlusion_gravity and person_anchor is not None:
+            if (force_occlusion_gravity or (
+                    registered_body_column_enabled(getattr(getattr(self, "pipeline", None), "config", {}) or {})
+                    and anchor_candidate is None)) and person_anchor is not None:
                 depth_observation = self._depth_observation_from_anchor(
                     calib=calib,
                     anchor=person_anchor,
@@ -21417,9 +23854,12 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     hit = None
 
+            measured_seated_height = None
             if (
                 state is not None
                 and posture == "sitting"
+                # A held safety class is not a new observed seated sample.
+                and raw_classified_posture == "sitting"
                 and pose_torso_reference_uv_calib is not None
                 and depth_obs is not None
                 and not reject_current_geometry
@@ -21438,7 +23878,7 @@ class _AnalyticsTelemetryProcessor:
                         ) if person_anchor is not None else None),
                     )
                 )
-                if measured_seated_height is not None:
+                if measured_seated_height is not None and not registered_body_column_enabled(self.pipeline.config):
                     self._record_seated_torso_height_reference(
                         state,
                         height_scene=float(measured_seated_height[0]),
@@ -21463,6 +23903,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_uv=pose_uv_for_candidate,
                     contact_basis=contact_basis,
                     posture=str(posture),
+                    observed_posture=str(raw_classified_posture),
                     occlusion_fraction=float(occlusion_fraction),
                     image_motion_supported=bool(image_motion_supported),
                     depth_obs=depth_obs,
@@ -21584,6 +24025,9 @@ class _AnalyticsTelemetryProcessor:
                     )
                 seated_pose_semantic_ready = bool(
                     posture == "sitting"
+                    # Current torso UV cannot turn a held seat model into a
+                    # fresh measurement while current posture is unresolved.
+                    and raw_classified_posture == "sitting"
                     and pose_torso_reference_uv_calib is not None
                     and state is not None
                     and state.seated_torso_height_scene is not None
@@ -22118,6 +24562,9 @@ class _AnalyticsTelemetryProcessor:
                                 }
                             )
 
+                self._append_strong_posed_column(universal_candidates, proof=strong_posed_column,
+                    track=track, calib=calib, posture=raw_classified_posture, flip_u=flip_u, flip_v=flip_v,
+                    occlusion_fraction=occlusion_fraction, image_motion_supported=image_motion_supported)
                 cohort = self._world_measurement_cohort(
                     sensor_id,
                     camera_id,
@@ -22132,6 +24579,27 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if measurement_set is None:
                     raise RuntimeError("unable to construct exact world measurement cohort")
+                measurement_set = self._body_column_fallback_set(measurement_set,
+                    contact_basis={str(c.get("candidate_id")): str(c.get("contact_basis") or "") for c in universal_candidates},
+                    track=track, state=state, detector_confidence=current_detector_semantic_confidence,
+                    now_ts=float(now_ts),display_output=display_recovery_reference_at_entry)
+                if xc3d_world_quality_enabled(getattr(self.pipeline, "config", {}) or {}):
+                    try:
+                        track["_xc3d_body_depth"] = self._original_body_depth_receipt(
+                            cohort=cohort, depth_result=depth_result, selected_observation=depth_observation,
+                            selected_anchor=person_anchor, calib=calib, track=track,
+                            pose_is_current=pose_is_current, flip_u=flip_u, flip_v=flip_v)
+                        track["_xc3d_anatomy_depths"] = self._original_anatomy_depth_receipts(
+                            body_receipt=track["_xc3d_body_depth"], depth_result=depth_result,
+                            cohort=cohort, selected_observation=depth_observation,
+                            selected_anchor=person_anchor, calib=calib, track=track,
+                            pose_is_current=pose_is_current, flip_u=flip_u, flip_v=flip_v)
+                    except (TypeError, ValueError, OverflowError):
+                        # Optional private support cannot invalidate or repair
+                        # the independently computed public World observation.
+                        track.pop("_xc3d_body_depth", None)
+                        track.pop("_xc3d_anatomy_depths", None)
+                        _increment_core_counter("object_depth_private_receipt_unavailable")
                 resolver_contact_basis_by_candidate = {
                     str(candidate.get("candidate_id")): str(
                         candidate.get("contact_basis")
@@ -22418,7 +24886,8 @@ class _AnalyticsTelemetryProcessor:
                     if resolved.fused and {"floor_ray", "registered_depth"}.issubset(contributor_kinds):
                         world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
                     elif selected_kind == "registered_depth":
-                        world_source = "person_anchor_depth_only"
+                        world_source = ("registered_body_column" if selected_resolver_candidate.method == "registered_body_column"
+                                        else "person_anchor_depth_only")
                     elif selected_kind == "floor_ray":
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
                     elif selected_kind == "pose_scale":
@@ -22428,6 +24897,8 @@ class _AnalyticsTelemetryProcessor:
                     else:
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
                     filter_quality = str(resolved.quality)
+                    if world_source == "registered_body_column":
+                        filter_quality = "weak"  # Existing three-original consensus, not a one-patch seed.
                     selected_non_upright_projection = bool(
                         selected_resolver_candidate is not None
                         and self._resolver_candidate_is_ground_footprint_supported(
@@ -22570,6 +25041,9 @@ class _AnalyticsTelemetryProcessor:
                         if filter_quality in ("good", "estimated")
                         else "estimated"
                     )
+                    if world_source == "registered_body_column":
+                        track["world_posture"] = str(selected_resolver_candidate.posture)
+                        track["world_support_state"] = "unknown"
                     depth_weight_for_admission = float(
                         next(
                             (
@@ -22638,6 +25112,23 @@ class _AnalyticsTelemetryProcessor:
                         if isinstance(resolved_surface, SupportSurfaceReference)
                         else float(calib.floor_y)
                     )
+                    ankle_original = None
+                    ankle_factory_relevant=bool(selected_kind=='registered_depth'
+                        and selected_contact_basis=='depth:pose_ankle_support' and not depth_measurement_not_current)
+                    if ankle_factory_relevant:
+                        self._record_ankle_priority(track,{'caller_quality':filter_quality})
+                    if (not resolved.fused and selected_contact_basis == 'depth:pose_ankle_support'
+                            and filter_quality in {'good','estimated'}):
+                        ankle_original = self._registered_ankle_original(
+                            track=track, selected=selected_resolver_candidate, depth_result=depth_result,
+                            depth_observation=depth_observation, person_anchor=person_anchor,
+                            measurement=resolved_hit, now_ts=now_ts, calib=calib,
+                            pose_is_current=pose_is_current, flip_u=flip_u, flip_v=flip_v)
+                    elif selected_contact_basis == 'depth:pose_ankle_support':
+                        self._record_ankle_priority(track,{'factory_stage':
+                            'not_invoked_fused' if resolved.fused else 'not_invoked_quality',
+                            'pose_current':pose_is_current,'depth_current':not depth_measurement_not_current,
+                            'factory_geometry':selected_kind,'factory_relevant':ankle_factory_relevant})
                     hit = self._update_track_world_state(
                         track,
                         state,
@@ -22667,6 +25158,23 @@ class _AnalyticsTelemetryProcessor:
                         verified_reacquire_support=bool(
                             verified_reacquire_support
                         ),
+                        registered_column_original=(self._registered_column_original(
+                            track=track, selected=selected_resolver_candidate, depth_result=depth_result,
+                            measurement=resolved_hit, now_ts=now_ts, covariance=resolved.covariance)
+                            if world_source == "registered_body_column" else None),
+                        registered_ankle_binding=self._registered_ankle_binding(track, selected_resolver_candidate),
+                        # Range geometry is independent of the anatomy/UV
+                        # provenance retained in selected_contact_basis.
+                        selected_geometry_kind=str(selected_resolver_candidate.kind),
+                        registered_ankle_original=ankle_original,
+                        registered_torso_upgrade=(self._registered_column_original(
+                            track=track, selected=selected_resolver_candidate, depth_result=depth_result,
+                            measurement=resolved_hit, now_ts=now_ts, covariance=resolved.covariance,
+                            torso_upgrade=True)
+                            if (state is not None and state.accepted_metric_contact_basis == 'depth:registered_body_column'
+                                and not resolved.fused and verified_reacquire_support
+                                and filter_quality in {'good', 'estimated'}
+                                and selected_contact_basis == 'depth:pose_torso_support') else None),
                         verified_first_output_pose_floor_seed=bool(
                             verified_first_output_pose_floor_seed
                         ),
@@ -22680,6 +25188,12 @@ class _AnalyticsTelemetryProcessor:
                         display_output=display_recovery_reference_at_entry,
                     )
                     if state is None or bool(state.measurement_accepted):
+                        if (state is not None and measured_seated_height is not None
+                                and registered_body_column_enabled(self.pipeline.config)
+                                and world_source != "registered_body_column"):
+                            self._record_seated_torso_height_reference(state,
+                                height_scene=float(measured_seated_height[0]),
+                                uncertainty_scene=float(measured_seated_height[1]), basis="registered_pose_torso_depth")
                         if state is not None:
                             surface_changed = (
                                 state.active_support_surface != resolved_surface
@@ -23117,6 +25631,8 @@ class _AnalyticsTelemetryProcessor:
                     floor_y=float(calib.floor_y),
                     now_ts=float(now_ts),
                     config=self._human_ground_cfg,
+                    registered_ankle_binding=self._registered_ankle_binding(
+                        track, selected_resolver_candidate),
                     prior_output=(
                         kinematic_output_reference_at_entry
                         or output_reference_at_entry
@@ -23729,9 +26245,7 @@ class _AnalyticsTelemetryProcessor:
                     track["world_estimator_evaluated"] = True
                     self._invalidate_world_track(track, rejection_reason)
                     if state is not None:
-                        for key, value in state.as_public_fields().items():
-                            if value is not None:
-                                track[key] = value
+                        self._publish_ground_state_fields(track, state)
                     return
                 track["world_estimator_evaluated"] = True
                 if self._world_resolver_enabled:
@@ -23971,9 +26485,7 @@ class _AnalyticsTelemetryProcessor:
                                 track,
                                 "canonical_continuity_provenance_unavailable",
                             )
-                            for key, value in state.as_public_fields().items():
-                                if value is not None:
-                                    track[key] = value
+                            self._publish_ground_state_fields(track, state)
                             return
                     elif world_source in ("anchor_hold", "cv_prediction"):
                         # The queue-visible commit snapshot is the only
@@ -24028,9 +26540,7 @@ class _AnalyticsTelemetryProcessor:
                                 track,
                                 "canonical_continuity_provenance_unavailable",
                             )
-                            for key, value in state.as_public_fields().items():
-                                if value is not None:
-                                    track[key] = value
+                            self._publish_ground_state_fields(track, state)
                             return
 
                 if world_source in (
@@ -24120,9 +26630,7 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     track.pop("world_source", None)
                 if state is not None:
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
                     if world_source in (
                         "anchor_hold",
                         "cv_prediction",
@@ -24193,6 +26701,7 @@ class _AnalyticsTelemetryProcessor:
             else:
                 track["world_estimator_evaluated"] = True
                 track["world_valid"] = False
+                track["world_measurement_accepted"] = False
                 track["world_quality"] = "invalid"
                 track["world_quality_reason"] = str(fallback_reason or "no_floor_intersection")
                 track.pop("world_source", None)
@@ -24201,9 +26710,7 @@ class _AnalyticsTelemetryProcessor:
                 track.pop("world_prediction_provenance", None)
                 if state is not None:
                     state.trail_append_allowed = False
-                    for key, value in state.as_public_fields().items():
-                        if value is not None:
-                            track[key] = value
+                    self._publish_ground_state_fields(track, state)
         except Exception as exc:
             # A calibration/refinement failure must not preserve arbitrary
             # pre-existing world_valid state or let a partial point cross the
@@ -25428,10 +27935,13 @@ class _IdentityV2PostResolutionOsdOperator(
 
 def _tracker_lifecycle_ids_for_frame(
     evidence: Any, *, source_id: int, frame_id: int, media_pts_ns: int,
+    record_counters: bool = True,
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Accept only native INACTIVE person receipts from this exact frame/PTS."""
     if evidence is None:
         return (), ()
+    if isinstance(evidence, Mapping) and evidence.get("lifecycle_unavailable"):
+        raise ValueError(str(evidence["lifecycle_unavailable"]))
     if not isinstance(evidence, Mapping) or any(
         type(evidence.get(field)) is not int or evidence.get(field) != expected
         for field, expected in (("source_id", source_id), ("frame_id", frame_id), ("media_pts_ns", media_pts_ns))
@@ -25448,6 +27958,8 @@ def _tracker_lifecycle_ids_for_frame(
     ):
         if rows and available is not True:
             raise ValueError("native tracker lifecycle rows have no metadata receipt")
+        if destination is terminated_ids and rows and evidence.get("termination_boundary") not in (None, "complete_buffer_source_barrier"):
+            raise ValueError("native termination is not at its complete-buffer source barrier")
         for row in rows:
             tracker = row.get("tracker_id") if isinstance(row, Mapping) else None
             if isinstance(tracker, bool) or not isinstance(tracker, int) or not 0 <= tracker < (1 << 64) - 1 or type(row.get("class_id")) is not int or row.get("class_id") != 0:
@@ -25455,20 +27967,108 @@ def _tracker_lifecycle_ids_for_frame(
             if destination is shadow_ids:
                 # TENTATIVE IDs cannot bootstrap canonical presence. An
                 # archived/stale sample likewise is not current alive proof.
-                if row.get("tracker_state") != 2 or row.get("tracker_frame_id") != frame_id:
+                if row.get("tracker_frame_id") != frame_id:
+                    raise ValueError("native shadow sample has no exact current-frame match")
+                if row.get("tracker_state") != 2:
                     continue
             if tracker in destination:
                 raise ValueError("duplicate native tracker lifecycle ID")
             destination.add(tracker)
-    _increment_core_counter("tracking.native_shadow_ids_total", len(shadow_ids))
-    _increment_core_counter("tracking.native_terminated_ids_total", len(terminated_ids))
+    if record_counters:
+        _increment_core_counter("tracking.native_shadow_ids_total", len(shadow_ids))
+        _increment_core_counter("tracking.native_terminated_ids_total", len(terminated_ids))
     return tuple(sorted(shadow_ids - terminated_ids)), tuple(sorted(terminated_ids))
+
+
+def _xc3d_private_batch_receipts(batch_meta):
+    try:
+        return ScopedFrameReceipts(batch_meta, noesis_analytics_meta_ext.extract_source_acquisition(batch_meta),
+                                   frame_key=noesis_analytics_meta_ext.extract_frame_identity)
+    except Exception:
+        _increment_core_counter("xc3d.private_batch_extract_failed_total")
+        return None
+
+
+def _xc3d_private_frame_receipt(receipts, batch_meta, frame_meta):
+    try:
+        if receipts is None:
+            raise AcquisitionUnavailable("private_batch_unavailable")
+        return receipts.lookup(batch_meta, frame_meta)
+    except Exception:
+        _increment_core_counter("xc3d.association_unavailable_total")
+        return None
 
 
 class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: _AnalyticsTelemetryProcessor) -> None:
         super().__init__()
         self._processor = processor
+        from noesis.v3dt_assets import xc3d_candidate_enabled
+        candidate = xc3d_candidate_enabled(processor.pipeline.config)
+        diagnostic = os.environ.get("NOESIS_XC3D_REID_PROVENANCE_DIAGNOSTIC") == "1"
+        if candidate or diagnostic:
+            producer = getattr(getattr(processor.pipeline, "world_service", None), "producer", None)
+            run_id = getattr(producer, "run_id", None)
+            path = getattr(processor.pipeline, "yaml_path", None)
+            if not run_id or path is None:
+                raise RuntimeError("XC3D source provenance requires actual run/graph ownership")
+            graph_id = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            if not callable(getattr(noesis_analytics_meta_ext, "extract_source_acquisition", None)):
+                raise RuntimeError("XC3D requires isolated native source acquisition extraction")
+            processor.pipeline.xc3d_source_acquisition = SourceAcquisitionState(
+                run_id, graph_id, "host_receive" if processor.pipeline.config.get("streammux", {}).get("attach-sys-ts", True) else "source_sr")
+            processor.pipeline.xc3d_private_owner_state = SourceAcquisitionState(run_id, graph_id)
+            processor.pipeline.xc3d_private_owner_diagnostics = deque(maxlen=64)
+            if candidate and not xc3d_world_quality_enabled(processor.pipeline.config):
+                from noesis.identity_association_service import ProducerAdmission
+                if getattr(processor.pipeline, "xc3d_ordered_identity_producer", None) is None:
+                    processor.pipeline.xc3d_ordered_identity_producer = OrderedIdentityProducer(run_id,
+                        ProducerAdmission("unavailable", graph_id,
+                            "native_metric_clock_camera_epoch_original_swin_unavailable"))
+            if getattr(processor.pipeline, "ds_pipeline", None) is not None:
+                component = processor.pipeline.components.get("reid_sgie")
+                if component is None:
+                    raise RuntimeError("selected synchronous Swin component unavailable")
+                # Service Maker BufferProbe supports OUTPUT pads only. The
+                # built component graph and direct _link use the same edge;
+                # analytics.src is therefore the exact selected SGIE input.
+                predecessors = [item for item in processor.pipeline.components.values()
+                    if component.name in getattr(item, "downstream", ())]
+                before = predecessors[0] if len(predecessors) == 1 else None
+                if (before is not processor.pipeline.components.get("analytics")
+                        or before is None or before.element != "nvdsanalytics"
+                        or before.downstream != [component.name] or component.element != "nvinfer"
+                        or any(str(error).startswith("link:" + before.name + "->" + component.name + ":")
+                            for error in getattr(processor.pipeline, "errors", ()))):
+                    raise AcquisitionUnavailable("selected_swin_exact_adjacent_output_required")
+                ini = Path(component.config["config-file-path"])
+                if not ini.is_absolute(): ini = Path(__file__).resolve().parents[3] / ini
+                source_payload = yaml.safe_load(Path(path).read_text())
+                source_ini = Path(source_payload["models"]["reid"]["config-file-path"])
+                if not source_ini.is_absolute(): source_ini = Path(__file__).resolve().parents[3] / source_ini
+                effective_model = processor.pipeline.config["models"]["reid"]
+                profile = selected_swin_profile(ini, source_ini=source_ini,
+                    engine_path=Path(effective_model["engine"]), model_config=effective_model,
+                    runtime_properties=component.config, pipeline_config=processor.pipeline.config)
+                for api in ("count_reid_tensor_records", "extract_reid_ingress"):
+                    if not callable(getattr(noesis_reid_meta_ext, api, None)):
+                        raise RuntimeError("changed normal-origin ReID ingress API unavailable: " + api)
+                budget = (256 if getattr(processor.pipeline, "identity_v2_service", None) is not None
+                          else int(processor._reid_embeds_per_frame_max))
+                ingress = SelectedSwinIngress(run_id, graph_id, profile, noesis_analytics_meta_ext,
+                    noesis_reid_meta_ext, timestamp_origin=processor.pipeline.xc3d_source_acquisition.origin,
+                    budget=budget, coverage_diagnostics=diagnostic)
+                processor.pipeline.xc3d_swin_ingress = ingress
+                def operator(boundary):
+                    class Ingress(_BatchMetadataOperatorBase):
+                        def handle_metadata(self, batch):
+                            try: boundary(batch)
+                            except Exception: ingress.counters["boundary_unavailable"] += 1
+                    return Ingress()
+                processor.pipeline.ds_pipeline.attach(before.name,
+                    Probe("xc3d_swin_input", operator(ingress.enter)), tips="src")
+                processor.pipeline.ds_pipeline.attach(component.name,
+                    Probe("xc3d_original_swin_output", operator(ingress.leave)), tips="src")
 
     def handle_metadata(self, batch_meta: Any) -> None:
         if batch_meta is None:
@@ -25476,7 +28076,17 @@ class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cov
 
         extract_start_ns = time.perf_counter_ns()
         try:
-            tracker_lifecycles = noesis_analytics_meta_ext.extract_tracker_lifecycle(batch_meta)
+            tracker_lifecycles = ScopedFrameReceipts(
+                batch_meta, noesis_analytics_meta_ext.extract_tracker_lifecycle(batch_meta),
+                frame_key=noesis_analytics_meta_ext.extract_frame_identity)
+            frame_keys = ordered_current_frames(getattr(batch_meta, "frame_items", ()),
+                frame_key=noesis_analytics_meta_ext.extract_frame_identity)
+            # Validate ALL canonical rows before processing any frame. Private
+            # evidence cannot turn canonical corruption into catch-and-empty.
+            canonical_rows = {key: tracker_lifecycles.lookup_key(batch_meta, key) for key in frame_keys}
+            for lifecycle in canonical_rows.values():
+                _tracker_lifecycle_ids_for_frame(lifecycle, source_id=lifecycle["source_id"],
+                    frame_id=lifecycle["post_tracker_frame"], media_pts_ns=lifecycle["post_tracker_pts_ns"], record_counters=False)
         except Exception as exc:
             _increment_core_counter("tracking.native_lifecycle_extract_failed_total")
             logger.exception("Failed to extract canonical tracker lifecycle metadata")
@@ -25486,14 +28096,36 @@ class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cov
             return
         finally:
             _record_core_stage_timing("analytics.tracker_lifecycle_extract", extract_start_ns)
-        frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is None:
-            return
-        for frame_meta in frame_items:
+        acquisition = getattr(self._processor.pipeline, "xc3d_source_acquisition", None)
+        source_receipts = _xc3d_private_batch_receipts(batch_meta) if acquisition is not None else None
+        def consume(frame_meta, key):
+            lifecycle = canonical_rows[key]
             try:
+                source = lifecycle["source_id"]
+                private_evidence = None
+                if acquisition is not None:
+                    row = _xc3d_private_frame_receipt(source_receipts, batch_meta, frame_meta)
+                    original, denial = None, None
+                    if row is None:
+                        denial = "exact_frame_private_receipt_unavailable"
+                        acquisition.reset(source, denial)
+                    else:
+                        try:
+                            original = acquisition.observe_native(row)
+                        except Exception as exc:
+                            denial = str(exc) if isinstance(exc, AcquisitionUnavailable) else "private_frame_validation_failed"
+                            if not isinstance(exc, AcquisitionUnavailable):
+                                acquisition.reset(source, denial)
+                            _increment_core_counter("xc3d.association_unavailable_total")
+                    _shadow, terminated = _tracker_lifecycle_ids_for_frame(lifecycle,
+                        source_id=source, frame_id=lifecycle["post_tracker_frame"], media_pts_ns=lifecycle["post_tracker_pts_ns"], record_counters=False)
+                    private_evidence = PrivateAssociationWork(source, lifecycle["post_tracker_frame"],
+                        lifecycle["post_tracker_pts_ns"], acquisition.epochs[source], original, denial, terminated)
                 self._processor.handle_servicemaker_frame(
                     frame_meta,
-                    tracker_lifecycle=tracker_lifecycles.get(int(getattr(frame_meta, "pad_index", -1))),
+                    tracker_lifecycle=lifecycle,
+                    **({"xc3d_private_evidence": private_evidence,
+                        "native_frame_context": (private_evidence,row,key)} if acquisition is not None else {}),
                 )
             except Exception as exc:
                 logger.exception("Failed to process analytics telemetry within batch metadata")
@@ -25502,6 +28134,15 @@ class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cov
                     report(exc)
                 else:
                     raise
+        try:
+            consume_ordered_current_frames(batch_meta, frame_keys, consume,
+                                           frame_key=noesis_analytics_meta_ext.extract_frame_identity)
+        except Exception as exc:
+            _increment_core_counter("tracking.native_lifecycle_extract_failed_total")
+            logger.exception("Current canonical frame changed during callback-local consumption")
+            report = getattr(self._processor.tracking_pub, "_report_failure", None)
+            if callable(report): report(exc)
+            else: raise
 
 
 class _TrailOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
@@ -25677,9 +28318,15 @@ class _PoseFeatureOperator(_BatchMetadataOperatorBase):  # pragma: no cover - re
         frame_items = getattr(batch_meta, "frame_items", None)
         if frame_items is None:
             return
+        exact = self._processor._early_anchor_enabled()
+        receipts = _xc3d_private_batch_receipts(batch_meta) if exact else None
         for frame_meta in frame_items:
             try:
-                self._processor.handle_servicemaker_frame(batch_meta, frame_meta)
+                if exact:
+                    receipt = _xc3d_private_frame_receipt(receipts, batch_meta, frame_meta)
+                    self._processor.handle_servicemaker_frame(batch_meta, frame_meta, source_receipt=receipt)
+                else:
+                    self._processor.handle_servicemaker_frame(batch_meta, frame_meta)
             except Exception:
                 logger.exception(
                     "Failed to compute pose features within batch metadata"

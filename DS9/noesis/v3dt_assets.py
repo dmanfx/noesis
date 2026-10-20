@@ -6,9 +6,12 @@ import hashlib
 import math
 import os
 import stat
+import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import numpy as np
 import yaml
@@ -72,6 +75,146 @@ DS9_MODEL_ROOT = _artifact_dir("NOESIS_MODEL_DIR", "models", DS9_ROOT / "models"
 DS9_ONNX_ROOT = _subdir("NOESIS_ONNX_DIR", DS9_MODEL_ROOT / "onnx")
 DS9_ENGINE_ROOT = _subdir("NOESIS_ENGINE_DIR", DS9_MODEL_ROOT / "engines")
 V3DT_CAMERAS_CONFIG = DS9_CONFIG_ROOT / "cameras_v3dt.yaml"
+
+
+class CandidateArtifactUnavailable(RuntimeError):
+    """Explicit candidate origin denial; never a legacy-directory fallback."""
+
+
+@dataclass(frozen=True)
+class CandidateAnalyticsPin:
+    receipt_path: Path
+    receipt_sha256: str
+    binary: Path
+    binary_sha256: str
+    cpp: Path
+    cpp_sha256: str
+    python: Path
+    extension_suffix: str
+    sdk_root: Path
+
+
+def _candidate_regular_hash(path: Path, *, maximum: int) -> str:
+    if not path.is_absolute() or path.resolve(strict=True) != path or not path.is_file():
+        raise CandidateArtifactUnavailable("candidate_artifact_path_or_symlink")
+    before = path.stat()
+    if not 0 < before.st_size <= maximum:
+        raise CandidateArtifactUnavailable("candidate_artifact_size")
+    value = hashlib.sha256(path.read_bytes()).hexdigest()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise CandidateArtifactUnavailable("candidate_artifact_path_drift")
+    return value
+
+
+def candidate_analytics_pin(code_root, receipt_path, receipt_sha256, *,
+                            selected_python=None, extension_suffix=None) -> CandidateAnalyticsPin:
+    """Pure bounded source preflight of an EXPLICIT root-issued ABI receipt.
+
+    Typed fields are not authentication. The operation owner supplies the trusted
+    receipt SHA; neither config nor incoming env may nominate a binary authority.
+    This receipt alone NEVER bypasses the existing full-runtime attester.
+    """
+    if receipt_path is None or not isinstance(receipt_sha256, str) or len(receipt_sha256) != 64:
+        raise CandidateArtifactUnavailable("candidate_analytics_receipt_unavailable")
+    root, receipt = Path(code_root).resolve(strict=True), Path(receipt_path)
+    if _candidate_regular_hash(receipt, maximum=65536) != receipt_sha256:
+        raise CandidateArtifactUnavailable("candidate_analytics_receipt_hash")
+    payload = strict_json_loads(receipt.read_text(), label="candidate analytics root receipt")
+    if _candidate_regular_hash(receipt, maximum=65536) != receipt_sha256:
+        raise CandidateArtifactUnavailable("candidate_analytics_receipt_drift")
+    if (payload.get("writer") != "project-coordinator" or
+            payload.get("status") != "passed_private_build_and_abi_import" or
+            Path(payload.get("code_root", "")) != root):
+        raise CandidateArtifactUnavailable("candidate_analytics_receipt_authority")
+    selected = payload.get("selected_python", {})
+    python = Path(selected.get("path", ""))
+    suffix = selected.get("extension_suffix")
+    if (python != Path(selected_python or sys.executable).absolute() or
+            suffix != (extension_suffix or sysconfig.get_config_var("EXT_SUFFIX")) or
+            selected.get("version", "").split(".")[:2] != ["3", "12"]):
+        raise CandidateArtifactUnavailable("candidate_python_abi_identity")
+    abi = payload.get("sdk_abi", {})
+    sdk = Path(abi.get("deepstream_root", ""))
+    if (abi.get("deepstream") != "9.1" or abi.get("gstreamer") != "1.24.2" or
+            sdk != Path("/opt/nvidia/deepstream/deepstream-9.1")):
+        raise CandidateArtifactUnavailable("candidate_sdk_abi_identity")
+    record = payload.get("analytics_binary", {})
+    cpp = root / "DS9/native/noesis_analytics_meta_ext.cpp"
+    binary = Path(record.get("path", ""))
+    if (record.get("source_path") != "DS9/native/noesis_analytics_meta_ext.cpp" or
+            binary.name != "noesis_analytics_meta_ext" + str(suffix)):
+        raise CandidateArtifactUnavailable("candidate_analytics_binary_identity")
+    for path, expected, maximum in ((cpp, record.get("source_sha256"), 1024*1024),
+                                    (binary, record.get("sha256"), 32*1024*1024)):
+        if _candidate_regular_hash(path, maximum=maximum) != expected:
+            raise CandidateArtifactUnavailable("candidate_analytics_source_or_binary_hash")
+    return CandidateAnalyticsPin(receipt, receipt_sha256, binary, record["sha256"],
+        cpp, record["source_sha256"], python, suffix, sdk)
+
+
+def candidate_native_environment(pin: CandidateAnalyticsPin, merged: Mapping[str, str]) -> dict[str, str]:
+    """Apply explicit selection AFTER baseline/supervisor merges, no secret logging."""
+    env = dict(merged)
+    configured_sdk = env.get("NOESIS_DEEPSTREAM_HOME")
+    if configured_sdk and Path(configured_sdk) != pin.sdk_root:
+        raise CandidateArtifactUnavailable("candidate_selected_sdk_environment_mismatch")
+    env["NOESIS_NATIVE_EXT_DIR"] = str(pin.binary.parent)
+    env["NOESIS_DEEPSTREAM_HOME"] = str(pin.sdk_root)
+    return env
+
+
+def preflight_candidate_analytics(pin: CandidateAnalyticsPin, code_root, *, load=False):
+    """Root-only execution entry: exact spec/import/API AND unchanged attestation.
+
+    Plan-only must not call this importer. The current private ABI directory is
+    rejected by public attestation BEFORE any SDK/native import or side effect.
+    """
+    from noesis.runtime_paths import (require_ds9_native_extension_origins, load_ds9_native_extensions,
+                                     configure_ds9_runtime_import_paths)
+    from noesis.native_artifact_provenance import attest_ds9_native_artifacts
+    # Recheck fixed receipt/file identity at the actual consumption boundary.
+    current = candidate_analytics_pin(code_root, pin.receipt_path, pin.receipt_sha256)
+    if current != pin:
+        raise CandidateArtifactUnavailable("candidate_analytics_selection_drift")
+    names = ("noesis_analytics_meta_ext",)
+    selected = require_ds9_native_extension_origins(pin.binary.parent, module_names=names,
+                                                   search_path=[str(pin.binary.parent)])
+    if selected[names[0]] != pin.binary:
+        raise CandidateArtifactUnavailable("candidate_analytics_selected_spec_mismatch")
+    # No catch/continue, manifest relabel, alternate directory, or helper bypass.
+    attest_ds9_native_artifacts(ds9_root=Path(code_root)/"DS9", native_dir=pin.binary.parent,
+                              module_names=names)
+    if not load:
+        return {"binary": str(pin.binary), "sha256": pin.binary_sha256, "attested": True}
+    os.environ["NOESIS_NATIVE_EXT_DIR"] = str(pin.binary.parent)
+    configure_ds9_runtime_import_paths(ds9_root=Path(code_root)/"DS9", repo_root=Path(code_root))
+    # Existing loader verifies both actual selected spec and cached/imported file.
+    load_ds9_native_extensions(pin.binary.parent, module_names=names)
+    module = sys.modules[names[0]]
+    if Path(module.__file__).resolve(strict=True) != pin.binary:
+        raise CandidateArtifactUnavailable("candidate_analytics_imported_origin_mismatch")
+    required = ("stamp_source_acquisition", "extract_source_acquisition", "extract_frame_identity",
+                "extract_tracker_lifecycle", "SenderReportObserver", "SourceStopObserver")
+    if any(not callable(getattr(module, name, None)) for name in required):
+        raise CandidateArtifactUnavailable("candidate_analytics_scoped_api_unavailable")
+    candidate_analytics_pin(code_root, pin.receipt_path, pin.receipt_sha256)
+    return module
+
+
+def candidate_artifact_plan(code_root, receipt_path=None, receipt_sha256=None):
+    """No SDK/native import, search-path mutation, stores, or process operations."""
+    try:
+        pin = candidate_analytics_pin(code_root, receipt_path, receipt_sha256)
+    except (CandidateArtifactUnavailable, OSError, ValueError, TypeError) as exc:
+        return {"status": "unavailable", "reason": str(exc), "sdk_imported": False}
+    required = Path(code_root).resolve()/"DS9/native_extensions"
+    return {"status": "selection_verified_attestation_pending" if pin.binary.parent == required else "unavailable",
+            "reason": "runtime_attestation_required" if pin.binary.parent == required else "candidate_native_attestation_path_unavailable",
+            "binary": str(pin.binary), "sha256": pin.binary_sha256,
+            "cpp_sha256": pin.cpp_sha256, "required_native_directory": str(required),
+            "sdk_imported": False, "private_abi_receipt_is_runtime_admission": False}
 
 TRACKER_REID_SOURCE = DS9_MODEL_ROOT / "tracker_reid" / "resnet50_market1501.etlt"
 TRACKER_REID_SOURCE_SHA256 = (
@@ -149,6 +292,189 @@ class V3DTAssetError(ValueError):
     """Raised when the DS9 V3DT profile is incomplete or crosses ownership roots."""
 
 
+XC3D_CANDIDATE_CONTRACT = "noesis.xc3d.m960.candidate.v1"
+
+
+def registered_body_column_enabled(config: Mapping[str, Any]) -> bool:
+    value = config.get("registered_body_column", False)
+    if type(value) is not bool:
+        raise V3DTAssetError("registered_body_column must be boolean")
+    if value and not xc3d_world_quality_enabled(config):
+        raise V3DTAssetError("registered_body_column requires explicit task world-quality mode")
+    return value
+
+
+def xc3d_world_quality_enabled(config: Mapping[str, Any]) -> bool:
+    """Explicit baseline-NvDCF task mode; no metric/time/identity admission."""
+    mode = config.get("xc3d_world_quality")
+    if mode is None:
+        return False
+    if (not isinstance(mode, Mapping) or mode.get("contract") != "noesis.xc3d.world_quality.v1"
+            or type(mode.get("enabled")) is not bool or set(mode) != {"contract", "enabled"}):
+        raise V3DTAssetError("invalid explicit XC3D world-quality contract")
+    if mode["enabled"] and config.get("xc3d_candidate") is not None:
+        raise V3DTAssetError("world-quality baseline mode cannot use the MV3DT candidate")
+    return mode["enabled"]
+
+
+def xc3d_candidate_enabled(config: Mapping[str, Any]) -> bool:
+    if xc3d_world_quality_enabled(config):
+        return True  # Reuse existing exact compact acquisition/native graph boundaries.
+    candidate = config.get("xc3d_candidate")
+    if candidate is None:
+        return False
+    if not isinstance(candidate, Mapping) or candidate.get("contract") != XC3D_CANDIDATE_CONTRACT:
+        raise V3DTAssetError("invalid explicit XC3D candidate contract")
+    return True
+
+
+def validate_xc3d_capabilities(config: Mapping[str, Any], baseline: Mapping[str, Any]) -> None:
+    registered_body_column_enabled(config)
+    from noesis.reid_swin_profile import reid_swin_replay_every_frame, validate_reid_swin_source_config
+    try:
+        swin_every_frame = reid_swin_replay_every_frame(config)
+    except ValueError as exc:
+        raise V3DTAssetError(str(exc)) from exc
+    """Source capability parity only; this cannot admit geometry or a clock."""
+    if not xc3d_candidate_enabled(config):
+        raise V3DTAssetError("explicit XC3D candidate contract required")
+    world_quality = xc3d_world_quality_enabled(config)
+    def comparable_models(node, *, task_context):
+        if not isinstance(node, Mapping) or not isinstance(node.get("pose"), Mapping):
+            return node
+        pose = node["pose"]
+        if "xc3d_small_roi_context" not in pose:
+            return node
+        enabled = pose["xc3d_small_roi_context"]
+        if type(enabled) is not bool:
+            raise V3DTAssetError("models.pose.xc3d_small_roi_context must be boolean")
+        if enabled and not task_context:
+            raise V3DTAssetError("xc3d_small_roi_context requires explicit task world-quality mode")
+        # Application semantic opt-in, NOT an engine/profile/cadence capability
+        # exemption. Do not mutate either input or normalize any other pose key.
+        result = dict(node)
+        result["pose"] = dict(pose)
+        result["pose"].pop("xc3d_small_roi_context")
+        return result
+    candidate_models = comparable_models(config.get("models"), task_context=world_quality)
+    baseline_models = comparable_models(baseline.get("models"), task_context=False)
+    if swin_every_frame:
+        if not world_quality or not isinstance(candidate_models, Mapping):
+            raise V3DTAssetError("Swin replay requires selected world-quality models")
+        try:
+            raw = candidate_models["reid"]["config-file-path"]
+            source_ini = Path(raw)
+            if not source_ini.is_absolute(): source_ini = DS9_ROOT.parent / source_ini
+            validate_reid_swin_source_config(source_ini, pipeline_config=config)
+            candidate_models = dict(candidate_models)
+            candidate_models["reid"] = dict(candidate_models["reid"])
+            candidate_models["reid"]["config-file-path"] = baseline_models["reid"]["config-file-path"]
+        except (KeyError, TypeError, OSError, ValueError) as exc:
+            raise V3DTAssetError("Swin replay exact source derivation unavailable: " + str(exc)) from exc
+    replay = False
+    if "recorded_replay" in config:
+        metadata = config["recorded_replay"]
+        if (not isinstance(metadata, Mapping) or set(metadata) != {"realtime", "preserve_frames"}
+                or metadata["realtime"] is not True or metadata["preserve_frames"] is not True):
+            raise V3DTAssetError("invalid finite recorded replay metadata")
+        replay = True
+    original_root = os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT", "")
+    def normalized(node):
+        if isinstance(node, Mapping):
+            return {key: normalized(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [normalized(value) for value in node]
+        if isinstance(node, str):
+            if original_root and node.startswith(original_root.rstrip("/") + "/"):
+                node = node[len(original_root.rstrip("/")) + 1:]
+            if node.startswith("../../data/"):
+                node = node[6:]
+            if node.startswith(("config/", "pipelines/")):
+                node = "DS9/" + node
+        return node
+    for section in ("models", "preprocess", "analytics", "canonical_world", "support_surfaces",
+                    "depth_registration", "scene_priors", "scene_fusions", "mosaic_output", "visualization"):
+        candidate_value = candidate_models if section == "models" else config.get(section)
+        baseline_value = baseline_models if section == "models" else baseline.get(section)
+        if normalized(candidate_value) != normalized(baseline_value):
+            raise V3DTAssetError(f"XC3D candidate capability changed: {section}")
+    sources = [dict(value) for value in config.get("sources", [])]
+    original_sources = [dict(value) for value in baseline.get("sources", [])]
+    if len(sources) != 3 or len(original_sources) != 3:
+        raise V3DTAssetError("XC3D requires exactly the three selected sources")
+    if replay:
+        for index, value in enumerate(sources):
+            expected_camera = EXPECTED_CAMERA_ORDER[index]
+            declared_camera = value.get('camera_id')
+            # Renderer-only application metadata is not a changed SDK source
+            # capability. Consume it ONLY after exact registered-camera check.
+            if (value.pop('camera_id', expected_camera) != expected_camera
+                    or value.get('uri_secret', expected_camera) != expected_camera):
+                raise V3DTAssetError('XC3D replay camera identity changed')
+            uri = str(value.pop("uri", ""))
+            if not uri.startswith("file://"):
+                raise V3DTAssetError("XC3D replay requires explicit retained file sources")
+            if "file-loop" in value:
+                # Only the finite renderer's literal false is operationally
+                # normalized; every other source capability still compares.
+                try:
+                    parsed = urlsplit(uri)
+                except ValueError as exc:
+                    raise V3DTAssetError("XC3D finite replay file-loop binding changed") from exc
+                if (value["file-loop"] is not False or declared_camera != expected_camera
+                        or parsed.scheme != "file" or parsed.netloc or not parsed.path.startswith("/")
+                        or parsed.query or parsed.fragment):
+                    raise V3DTAssetError("XC3D finite replay file-loop binding changed")
+                if "file-loop" in original_sources[index]:
+                    value["file-loop"] = original_sources[index]["file-loop"]
+                else:
+                    value.pop("file-loop")
+            value["uri_secret"] = expected_camera
+    if normalized(sources) != normalized(original_sources):
+        raise V3DTAssetError("XC3D source/dewarper/latency capability changed")
+    mux = dict(config.get("streammux", {}))
+    if replay:
+        if type(mux.get("live-source")) is not int or mux["live-source"] != 0:
+            raise V3DTAssetError("XC3D finite replay requires live-source zero")
+        mux["live-source"] = baseline.get("streammux", {}).get("live-source")
+    if mux != baseline.get("streammux"):
+        raise V3DTAssetError("XC3D finite baseline mux capability changed")
+    if world_quality:
+        if normalized(config.get("tracker")) != normalized(baseline.get("tracker")):
+            raise V3DTAssetError("world-quality requires unchanged baseline NvDCF tracker")
+        for section in ("version", "batch_size", "sinks", "bev", "osd", "dewarper_validity_masks"):
+            if normalized(config.get(section)) != normalized(baseline.get(section)):
+                raise V3DTAssetError(f"world-quality baseline capability changed: {section}")
+        return
+    if (config.get("tracker", {}).get("tracker-width"), config.get("tracker", {}).get("tracker-height")) != (960, 544):
+        raise V3DTAssetError("XC3D candidate requires explicit baseline tracker raster 960x544")
+    if config.get("v3dt", {}).get("caminfo_pixel_space") != "tracker":
+        raise V3DTAssetError("XC3D candidate requires source-bound tracker-space projection")
+
+
+def xc3d_admission_refusal(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Operational denial, not an Identity/World DTO or synthetic admission."""
+    if xc3d_world_quality_enabled(config):
+        from noesis.pipelines.world_quality_adapter import require_world_quality_api
+        try:
+            require_world_quality_api()
+        except (ImportError, ValueError) as exc:
+            return {"status": "unavailable", "comparable": False, "reasons": [str(exc)]}
+        # Implemented SOURCE-LOCAL API is not common-metric physical admission.
+        # Runtime still validates actual guarded source bindings BEFORE start.
+        return {"status": "source_local_spatial", "physical_admission": "unavailable",
+                "comparable": False, "covariance_intersection": False,
+                "reasons": ["metric_frame_unavailable", "independent_geometry_unavailable",
+                            "acquisition_clock_unqualified"]}
+    if not xc3d_candidate_enabled(config):
+        return {"status": "not_candidate", "reasons": []}
+    # Physical config labels and a numeric projection cannot replace CURRENT
+    # revocable receipts. The old MV3DT/common-metric route remains denied.
+    return {"status": "unavailable", "comparable": False,
+            "reasons": ["metric_frame_unavailable", "independent_geometry_unavailable",
+                        "acquisition_clock_unqualified", "accepted_identity_dto_unavailable"]}
+
+
 def derive_nvmot_tracker_engine_path(
     staged_etlt: Path,
     *,
@@ -202,20 +528,68 @@ def validate_sv3dt_calibration_binding(
     ``world_snapshot`` already applies the revision-bound calibration-to-world
     transform. Comparing against the raw snapshot would accept camera models
     whose output is silently labelled as a different world frame downstream.
-    The accepted MV3DT profile has its own geometry contract and is not handled
-    here. No calibration or projection is changed by this check.
+    No calibration or projection is changed by this check.
     """
 
     if bundle.profile != "sv3dt":
         raise V3DTAssetError("SV3DT calibration binding requires the sv3dt profile")
+    _validate_v3dt_calibration_binding(
+        bundle,
+        pipeline_config=pipeline_config,
+        calibration_provider=calibration_provider,
+        camera_labels=camera_labels,
+        label="SV3DT",
+    )
+
+
+def validate_mv3dt_calibration_binding(
+    bundle: V3DTAssetBundle,
+    *,
+    pipeline_config: Mapping[str, Any],
+    calibration_provider: Any,
+    camera_labels: Mapping[int, str],
+) -> None:
+    """Bind native projections to active metric targets before MV3DT starts.
+
+    Only Kitchen/Family are peers. Their target frame/revision must agree;
+    source-to-target transform hashes may differ. Living's local target revision
+    need not equal theirs. Geometry acceptance cannot substitute for this check.
+    """
+
+    if bundle.profile != "mv3dt":
+        raise V3DTAssetError("MV3DT calibration binding requires the mv3dt profile")
+    _validate_v3dt_calibration_binding(
+        bundle,
+        pipeline_config=pipeline_config,
+        calibration_provider=calibration_provider,
+        camera_labels=camera_labels,
+        label="MV3DT",
+    )
+
+
+def _validate_v3dt_calibration_binding(
+    bundle: V3DTAssetBundle,
+    *,
+    pipeline_config: Mapping[str, Any],
+    calibration_provider: Any,
+    camera_labels: Mapping[int, str],
+    label: str,
+) -> None:
+    """Compare source-bound camInfo to the canonical target K/E, never raw E."""
+
+    multi_view = bundle.profile == "mv3dt"
     profile = pipeline_config.get("v3dt", {})
     try:
         axes = V3DTAxisMap.parse(profile.get("caminfo_world_axes"))
     except (AttributeError, V3DTAxisMapError) as exc:
-        raise V3DTAssetError(f"SV3DT calibration axis binding is invalid: {exc}") from exc
+        raise V3DTAssetError(f"{label} calibration axis binding is invalid: {exc}") from exc
     # The current native bbox contract uses tracker Z-up with its floor at Z=0.
     if axes.columns[2] != (1, 1):
-        raise V3DTAssetError("SV3DT tracker Z must map to canonical positive Y")
+        raise V3DTAssetError(f"{label} tracker Z must map to canonical positive Y")
+    if multi_view and axes.spec != "xzy":
+        raise V3DTAssetError("MV3DT calibration requires the locked xzy axis map")
+    if multi_view and profile.get("world_frame") != "backend_world_m":
+        raise V3DTAssetError("MV3DT calibration requires the canonical meter frame backend_world_m")
     axis_transform = np.eye(4, dtype=np.float64)
     axis_transform[:3, :3] = 0.0
     for tracker_axis, (world_axis, sign) in enumerate(axes.columns):
@@ -229,17 +603,30 @@ def validate_sv3dt_calibration_binding(
             (tracker["tracker-width"], tracker["tracker-height"]), label="tracker"
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise V3DTAssetError("SV3DT calibration requires explicit mux/tracker raster") from exc
+        raise V3DTAssetError(f"{label} calibration requires explicit mux/tracker raster") from exc
     pixel_space = profile.get("caminfo_pixel_space", "mux")
     if pixel_space not in ("mux", "tracker"):
-        raise V3DTAssetError("SV3DT caminfo_pixel_space must be mux or tracker")
+        raise V3DTAssetError(f"{label} caminfo_pixel_space must be mux or tracker")
+    candidate = multi_view and xc3d_candidate_enabled(pipeline_config)
+    if multi_view and pixel_space != "mux" and not candidate:
+        raise V3DTAssetError("MV3DT calibration requires mux-space camInfo projections")
     if pixel_space == "mux" and tracker_raster != raster:
-        raise V3DTAssetError("SV3DT calibration mux and tracker raster must match")
-    order = tuple(profile.get("camera_order", ()))
+        raise V3DTAssetError(f"{label} calibration mux and tracker raster must match")
+    try:
+        order = tuple(profile.get("camera_order", ()))
+    except TypeError as exc:
+        raise V3DTAssetError(f"{label} calibration camera order is invalid") from exc
     if len(order) != len(bundle.camera_models) or not order:
-        raise V3DTAssetError("SV3DT calibration camera order does not match camInfo files")
+        raise V3DTAssetError(f"{label} calibration camera order does not match camInfo files")
+    if multi_view and (
+        order != EXPECTED_CAMERA_ORDER or len(camera_labels) != len(order)
+    ):
+        raise V3DTAssetError("MV3DT calibration requires exact Living/Kitchen/Family source order")
+    if candidate and (pixel_space != "tracker" or tracker_raster != (960, 544)):
+        raise V3DTAssetError("XC3D projection requires explicit tracker-space 960x544 binding")
 
     errors: list[str] = []
+    peer_targets: dict[str, tuple[str, str]] = {}
     for source_id, (camera_id, path) in enumerate(zip(order, bundle.camera_models)):
         try:
             if camera_labels.get(source_id) != camera_id:
@@ -258,19 +645,36 @@ def validate_sv3dt_calibration_binding(
             if not math.isclose(float(snapshot.floor_plane_offset_m), 0.0, abs_tol=1e-8):
                 raise ValueError("active target floor plane must pass through Y=0")
             if snapshot.world_frame_id != profile.get("world_frame"):
-                raise ValueError("active world frame does not match the SV3DT output frame")
+                raise ValueError(f"active world frame does not match the {label} output frame")
 
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             binding = payload.get("noesis_frame_binding")
             if not isinstance(binding, Mapping):
                 raise ValueError("camInfo lacks noesis_frame_binding provenance")
+            if multi_view:
+                # K/E and the provider's target floor are metric. In addition to
+                # rejecting centimeter-scaled P below, retain the asset contract
+                # for the native cylinder so sample centimeter models cannot pass.
+                model = payload.get("modelInfo")
+                if not isinstance(model, Mapping):
+                    raise ValueError("camInfo requires meter-valued modelInfo")
+                for field, expected in (
+                    ("height", MV3DT_KITCHEN_FAMILY_OBJECT_MODEL_HEIGHT_M),
+                    ("radius", EXPECTED_OBJECT_MODEL_RADIUS_M),
+                ):
+                    if not math.isclose(float(model.get(field, math.nan)), expected, abs_tol=1e-9):
+                        raise ValueError(f"camInfo modelInfo.{field} must be {expected} meters")
             for field in (
                 "world_frame_id", "world_frame_revision", "frame_transform_sha256",
                 "camera_calibration_sha256",
             ):
                 expected = getattr(snapshot, field)
-                if not isinstance(expected, str) or not expected or binding.get(field) != expected:
+                if not isinstance(expected, str) or not expected.strip() or binding.get(field) != expected:
                     raise ValueError(f"camInfo {field} differs from active calibration")
+                if multi_view and field.endswith("sha256") and (
+                    len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected)
+                ):
+                    raise ValueError(f"active calibration {field} must be a lowercase SHA-256 digest")
             if binding.get("image_size") != list(raster):
                 raise ValueError("camInfo provenance raster differs from active calibration")
             if not math.isclose(float(binding.get("floor_y", math.nan)), float(snapshot.floor_y), abs_tol=1e-8):
@@ -280,6 +684,8 @@ def validate_sv3dt_calibration_binding(
 
             k = np.asarray(snapshot.intrinsics, dtype=np.float64).reshape(3, 3)
             e = np.asarray(snapshot.extrinsics_col_major, dtype=np.float64).reshape(4, 4, order="F")
+            if not np.isfinite(k).all() or not np.isfinite(e).all():
+                raise ValueError("active calibration projection K/E must be finite")
             expected_projection = k @ (e @ axis_transform)[:3, :]
             actual_projection = np.asarray(payload["projectionMatrix_3x4_w2p"], dtype=np.float64).reshape(3, 4)
             if binding.get("projection_pixel_space", "mux") != pixel_space:
@@ -294,17 +700,25 @@ def validate_sv3dt_calibration_binding(
                 raise ValueError("camInfo and calibration projections must be finite")
             expected_norm = float(np.linalg.norm(expected_projection))
             actual_norm = float(np.linalg.norm(actual_projection))
-            if min(expected_norm, actual_norm) <= 0.0 or not np.allclose(
+            if (
+                not math.isfinite(expected_norm)
+                or not math.isfinite(actual_norm)
+                or min(expected_norm, actual_norm) <= 0.0
+            ) or not np.allclose(
                 actual_projection / actual_norm,
                 expected_projection / expected_norm,
                 atol=1e-9,
                 rtol=1e-7,
             ):
                 raise ValueError("camInfo projection differs from active target-frame K @ E @ axes")
-        except (AttributeError, KeyError, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+            if multi_view and camera_id in {"kitchen", "family-room"}:
+                peer_targets[camera_id] = (snapshot.world_frame_id, snapshot.world_frame_revision)
+        except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError, yaml.YAMLError) as exc:
             errors.append(f"{camera_id}: {exc}")
+    if len(peer_targets) == 2 and peer_targets["kitchen"] != peer_targets["family-room"]:
+        errors.append("Kitchen/Family active target world frame and revision must match")
     if errors:
-        raise V3DTAssetError("SV3DT calibration binding failed: " + "; ".join(errors))
+        raise V3DTAssetError(f"{label} calibration binding failed: " + "; ".join(errors))
 
 
 def _sha256(path: Path) -> str:
@@ -466,10 +880,11 @@ def _validate_pipeline_paths(
             require_file=False,
         )
 
+    candidate = profile == "mv3dt" and xc3d_candidate_enabled(pipeline)
     depth_tracking = models.get("depth_tracking")
     if (
         not isinstance(depth_tracking, Mapping)
-        or depth_tracking.get("enable") is not False
+        or depth_tracking.get("enable") is not candidate
     ):
         errors.append(
             "models.depth_tracking.enable must be false for the V3DT profile"
@@ -484,16 +899,16 @@ def _validate_pipeline_paths(
         errors.append(
             f"streammux width/height must be {EXPECTED_STREAM_SIZE[0]}x{EXPECTED_STREAM_SIZE[1]}"
         )
-    if streammux.get("enable-padding") != 0:
+    if streammux.get("enable-padding") != (1 if candidate else 0):
         errors.append(
             "streammux.enable-padding must be 0 for the locked V3DT projection"
         )
-    if streammux.get("num-surfaces-per-frame") != 1:
+    if streammux.get("num-surfaces-per-frame", 1 if candidate else None) != 1:
         errors.append("streammux.num-surfaces-per-frame must be 1")
     if profile == "mv3dt":
         sync_inputs = streammux.get("sync-inputs")
         batched_push_timeout = streammux.get("batched-push-timeout")
-        if batched_push_timeout != -1:
+        if batched_push_timeout != (40000 if candidate else -1):
             errors.append(
                 "MV3DT streammux.batched-push-timeout must be -1 so the "
                 "ordered peer-message synchronizer receives complete batches"
@@ -996,7 +1411,7 @@ def validate_v3dt_assets(
         )
     pixel_space = profile_config.get("caminfo_pixel_space", "mux")
     if pixel_space not in ("mux", "tracker") or (
-        profile != "sv3dt" and pixel_space != "mux"
+        profile != "sv3dt" and pixel_space != "mux" and not xc3d_candidate_enabled(pipeline)
     ):
         errors.append("tracker camInfo pixel space is an SV3DT-only opt-in")
     try:

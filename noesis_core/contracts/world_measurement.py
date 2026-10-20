@@ -197,6 +197,8 @@ class WorldMeasurementHypothesis(ContractModel):
     candidate_id: str = Field(min_length=1, max_length=120)
     cohort: WorldMeasurementCohort
     kind: MeasurementKind
+    # Internal resolver method, not a new public position quantity or foot claim.
+    method: Literal["registered_body_column"] | None = None
     position: Vector3
     covariance: Matrix3
     anchor: str = Field(min_length=1, max_length=80)
@@ -218,6 +220,16 @@ class WorldMeasurementHypothesis(ContractModel):
     pcf: WorldPriorEvidence | None = None
     valid: bool = True
     rejection_reason: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _column_semantics(self) -> "WorldMeasurementHypothesis":
+        if self.method == "registered_body_column" and not (
+            self.kind == "registered_depth" and self.anchor == "registered_body_column"
+            and self.support_state == "unknown"
+            and self.support_surface is None
+        ):
+            raise ValueError("registered body column has unknown support and no foot/surface claim")
+        return self
 
     @field_validator("position")
     @classmethod

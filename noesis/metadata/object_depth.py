@@ -91,6 +91,52 @@ class PoseDepthSample:
 
 
 @dataclass(frozen=True, slots=True)
+class NativePosePatchSupport:
+    """Private scalar copy of an actually sampled patch, never a pixel sigma.
+
+    Native metadata transport only. Public object-depth serialization omits it.
+    Original measurement/raster fields are deliberately not renewed by caching.
+    """
+
+    anchor_source: str
+    anchor_uv: Sequence[float]
+    capsules: Sequence[Sequence[float]]
+    image_size: Sequence[int]
+    measurement_frame_id: int
+    measurement_ts_us: int
+
+    def __post_init__(self) -> None:
+        if self.anchor_source not in {"pose_ankle_support", "pose_torso_support", "pose_shoulder_support"}:
+            raise ValueError("body patch anatomy required")
+        uv = _coerce_point2(self.anchor_uv)
+        size = tuple(self.image_size)
+        capsules = tuple(tuple(float(v) for v in c) for c in self.capsules)
+        if (len(size) != 2 or any(type(v) is not int or not 8 < v <= 32768 for v in size)
+                or not 1 <= len(capsules) <= (2 if self.anchor_source == "pose_ankle_support" else 1)
+                or any(len(c) != 6 or not all(math.isfinite(v) for v in c)
+                    or min(c[4:]) <= 0 for c in capsules)
+                or not all(math.isfinite(v) and 0 <= v <= limit for v, limit in zip(uv, size))
+                or type(self.measurement_frame_id) is not int or self.measurement_frame_id < 0
+                or type(self.measurement_ts_us) is not int or self.measurement_ts_us < 0):
+            raise ValueError("invalid original body patch support")
+        object.__setattr__(self, "anchor_uv", uv)
+        object.__setattr__(self, "image_size", size)
+        object.__setattr__(self, "capsules", capsules)
+
+    def to_dict(self) -> JsonDict:
+        return {"anchor_source": self.anchor_source, "anchor_uv": list(self.anchor_uv),
+                "capsules": [list(c) for c in self.capsules], "image_size": list(self.image_size),
+                "measurement_frame_id": self.measurement_frame_id,
+                "measurement_ts_us": self.measurement_ts_us}
+
+    def enclosing_radius_px(self) -> float:
+        """Enclose endpoints AND their sampled radii about the exact anchor."""
+        u, v = self.anchor_uv
+        return max(math.hypot(x-u, y-v) + r for c in self.capsules
+                   for x, y, r in ((c[0], c[1], c[4]), (c[2], c[3], max(c[4:]))))
+
+
+@dataclass(frozen=True, slots=True)
 class ObjectDepthResult:
     source_id: int
     frame_id: int
@@ -142,8 +188,14 @@ class ObjectDepthResult:
     model: str = "depth-anything"
     version: int = 2
     ts_us: Optional[int] = None
+    native_pose_support: Sequence[NativePosePatchSupport | Mapping[str, Any]] = ()
 
     def __post_init__(self) -> None:
+        if len(self.native_pose_support) > 2:
+            raise ValueError("private body patch budget exceeded")
+        object.__setattr__(self, "native_pose_support", tuple(
+            p if isinstance(p, NativePosePatchSupport) else NativePosePatchSupport(**p)
+            for p in self.native_pose_support))
         if len(self.pose_depth_samples) > 3:
             raise ValueError("pose depth attempts exceed bounded anatomy budget")
         object.__setattr__(self, "pose_depth_samples", tuple(
@@ -303,6 +355,13 @@ class ObjectDepthResult:
         if indent is None:
             return json.dumps(self.to_dict(), separators=(",", ":"))
         return json.dumps(self.to_dict(), indent=indent)
+
+    def to_native_dict(self) -> JsonDict:
+        """Opaque native attachment/cache only; NOT the public depth contract."""
+        payload = self.to_dict()
+        if self.native_pose_support:
+            payload["native_pose_support"] = [p.to_dict() for p in self.native_pose_support]
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ObjectDepthResult":

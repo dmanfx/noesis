@@ -121,6 +121,65 @@ def _attest(ds9_root: Path, native_dir: Path, module_name: str) -> dict[str, Pat
     )
 
 
+@pytest.mark.parametrize('fault', ['none', 'source', 'output', 'symlink', 'hardlink', 'missing_record',
+                                  'arbitrary_id', 'missing_hash', 'contract', 'base', 'race'])
+def test_p52_shm_exact_bound_supplement(tmp_path, monkeypatch, fault):
+    ds9, native, _sources, _output = _fixture(tmp_path, 'noesis_analytics_meta_ext')
+    contract = provenance._SHM_CONTRACT
+    payloads = {}
+    for label in contract.sources:
+        path = ds9.parent / label
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payloads[label] = (label + '\n').encode()
+        path.write_bytes(payloads[label])
+    output = ds9.parent / contract.output
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b'reviewed-private-shm')
+    record = {'id': contract.artifact_id, 'kind': 'gstreamer_plugin', 'role': 'test-only SHM',
+              'output': contract.output, 'sources': list(contract.sources), 'builder': contract.builder,
+              'required_profiles': list(contract.required_profiles), 'state': 'staged_unverified',
+              'compatibility': {'deepstream_major': 9, 'cuda': '13.2', 'tensorrt': None, 'gstreamer': '1.24.2'},
+              'provenance': {'source_sha256': _source_digest(payloads),
+                             'output_sha256': hashlib.sha256(output.read_bytes()).hexdigest(),
+                             'built_at_utc': '2026-10-16T00:00:00Z', 'build_host': 'synthetic-test',
+                             'command': 'synthetic-test'}}
+    path = ds9 / provenance._SUPPLEMENTAL_NATIVE_MANIFEST
+    manifest = yaml.safe_load(path.read_text())
+    if fault != 'missing_record':
+        manifest['artifacts'].append(record)
+    if fault == 'arbitrary_id':
+        record['id'] = 'plugin.arbitrary'
+    elif fault == 'missing_hash':
+        del record['provenance']['output_sha256']
+    elif fault == 'contract':
+        record['output'] = 'DS9/gst-plugins/foreign.so'
+    path.write_text(yaml.safe_dump(manifest, sort_keys=False))
+    if fault == 'source':
+        (ds9.parent / contract.sources[0]).write_bytes(b'tampered')
+    elif fault == 'output':
+        output.write_bytes(b'tampered')
+    elif fault == 'symlink':
+        actual = output.with_suffix('.actual'); output.rename(actual); output.symlink_to(actual)
+    elif fault == 'hardlink':
+        os.link(output, output.with_suffix('.linked'))
+    elif fault == 'base':
+        base = ds9 / 'asset_manifest.yaml'; base.write_bytes(base.read_bytes() + b'\n')
+    elif fault == 'race':
+        original = provenance._assert_identity
+        def race(candidate, identity, *, label):
+            if candidate == output:
+                candidate.write_bytes(b'changed-after-read')
+            return original(candidate, identity, label=label)
+        monkeypatch.setattr(provenance, '_assert_identity', race)
+    if fault == 'none':
+        assert provenance.attest_ds9_shm_plugin(ds9_root=ds9, plugin_dir=output.parent) == output
+        # Existing analytics import still accepts ONLY the exact two-record set.
+        assert _attest(ds9, native, 'noesis_analytics_meta_ext')
+    else:
+        with pytest.raises(provenance.DS9NativeArtifactProvenanceError):
+            provenance.attest_ds9_shm_plugin(ds9_root=ds9, plugin_dir=output.parent)
+
+
 def test_exact_content_passes_when_binary_mtime_is_older_than_source(
     tmp_path: Path,
 ) -> None:

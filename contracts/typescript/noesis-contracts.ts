@@ -984,9 +984,46 @@ export type WebSocketDeploymentHealth = {
   readonly ready: true;
 };
 
+export type WorldAttributionClaim = {
+  readonly run_id: string;
+  readonly physical_serial: number;
+  readonly camera_id: string;
+  readonly source_id: number;
+  readonly source_epoch: number;
+  readonly raw_id: number;
+  readonly lifecycle_generation: number;
+  readonly lifecycle_started_frame: number;
+  readonly frame_id: number;
+  readonly observation_id: string;
+  readonly acquired_at_s: number;
+  readonly clock_domain: string;
+  readonly media_time_s: number | null;
+  readonly clock_basis: string;
+  readonly household_state: "unknown" | "provisional" | "resident" | "visitor" | "handoff";
+  readonly household_identity_key: string | null;
+  readonly household_stable_id: number | null;
+  readonly household_visitor_generation: number | null;
+  readonly household_constraint: "eligible" | "unresolved" | "rejected";
+};
+
+export type WorldAttributionQuarantine = {
+  readonly status?: "quarantined";
+  readonly purpose?: "physical_only_quarantine";
+  readonly reason?: "settled_household_claim_conflict";
+  readonly conflict_id: string;
+  readonly run_id: string;
+  readonly association_revision: number;
+  readonly subject_ids: ReadonlyArray<string>;
+  readonly stable_ids: ReadonlyArray<number>;
+  readonly owners: ReadonlyArray<WorldAttributionClaim>;
+  readonly retained_owners?: ReadonlyArray<WorldAttributionClaim>;
+  readonly component_entity_ids: ReadonlyArray<string>;
+};
+
 export type WorldEntity = {
   readonly entity_id: string;
   readonly subject: SubjectRef;
+  readonly attribution_quarantine?: WorldAttributionQuarantine | null;
   readonly lifecycle: EntityLifecycle;
   readonly position?: Vector3 | null;
   readonly covariance?: Matrix3 | null;
@@ -1018,6 +1055,7 @@ export type WorldEvent = {
   readonly event_type: "appeared" | "held" | "resumed" | "lost" | "conflict_started" | "conflict_cleared";
   readonly entity_id: string;
   readonly subject: SubjectRef;
+  readonly attribution_quarantine?: WorldAttributionQuarantine | null;
   readonly observed_at_us: number;
   readonly published_at_us: number;
   readonly frame: "backend_world_m";

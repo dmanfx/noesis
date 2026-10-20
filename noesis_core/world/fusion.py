@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Iterable
+
+from reid.mv3dt_person_association import MemberKey, PhysicalPersonKey, ObservationStamp, SpatialClockContext
 
 from noesis_core.contracts.base import Matrix3, ProducerRef, Vector3
 from noesis_core.contracts.identity import SubjectRef
@@ -15,12 +17,184 @@ from noesis_core.contracts.world import (
     WorldEntity,
     WorldSnapshot,
     WorldSourceEvidence,
+    WorldAttributionClaim,
+    WorldAttributionQuarantine,
+    validate_world_identity_uniqueness,
 )
 from noesis_core.world.support_surfaces import contains_xz, constrained_plane_covariance
 
 
 class ObservationOrderError(ValueError):
     pass
+
+
+def position_quality_sort_key(
+    envelope: ObservationEnvelope,
+    *,
+    resolver_confidence: float | None = None,
+    comparable_clock: bool = True,
+) -> tuple[int, float, float, int, str]:
+    """Existing quality order; time breaks ties only for comparable clocks.
+
+    This is selection math, not frame/time or current-person admission. The
+    spatial caller must supply the ORIGINAL resolver confidence, not a legacy
+    quality bucket or a tracker-confidence replacement.
+    """
+    world = envelope.payload.world
+    if world is None:
+        raise ValueError("position quality requires an original world observation")
+    return (
+        0 if GlobalWorldFusion._has_canonical_identity(world) else 1,
+        GlobalWorldFusion._variance_sum(world.covariance),
+        -float(world.confidence if resolver_confidence is None else resolver_confidence),
+        -int(envelope.observed_at_us) if comparable_clock else 0,
+        envelope.payload.tracklet.camera_id,
+    )
+
+
+SPATIAL_NO_VOTE_REASONS = frozenset({
+    "producer_no_position", "non_current_measurement", "native_active_required",
+    "stale_spatial_member", "world_support_unavailable",
+    "resolver_covariance_absent", "resolver_confidence_absent",
+    "projective_current_support_required", "current_visual_stale_member_delivery",
+    "anatomical_current_support_required",
+    "image_region_current_support_required",
+    "image_region_rejoin_proof_required",
+    "image_region_ambiguous_member",
+    "image_region_contradictory_cue_member",
+})
+SPATIAL_INTEGRITY_REASONS = frozenset({
+    "resolver_covariance_invalid", "resolver_confidence_invalid", "world_position_invalid",
+    "world_registration_unavailable", "world_covariance_or_position_invalid",
+    "world_position_unavailable", "accepted_world_position_unavailable", "producer_state_invalid",
+    "producer_state_conflict", "measurement_state_unavailable", "world_quantity_invalid",
+    "world_support_invalid", "spatial_original_media_binding", "spatial_original_member_context",
+    "spatial_member_ineligible", "source_clock_unavailable", "original_acquisition_interval",
+    "current_rejoin_proof_required", "noncurrent_spatial_member",
+    "spatial_original_frame_binding", "spatial_original_source_binding",
+    "camera_calibration_sha256_missing", "camera_calibration_sha256_invalid",
+    "camera_calibration_sha256_mismatch", "unexpected_spatial_rejection_reason",
+})
+
+
+def spatial_rejection_category(reason: str | None) -> str:
+    """Closed no-vote vocabulary; unknown/unexpected states fail closed."""
+    if reason is None:
+        return "vote"
+    return "no_vote" if reason in SPATIAL_NO_VOTE_REASONS else "integrity"
+
+
+@dataclass(frozen=True)
+class PreparedUprightFootprintSupport:
+    """Private same-preparation support, not a floor/depth or person grant.
+
+    The historical name also covers the explicit registered-body-column
+    method (truthful posture, UNKNOWN support, no observed foot or seat claim).
+    Only World normalization creates this from the compact typed resolver
+    descriptor of a producer-accepted current original. The exact immutable
+    envelope and native stamp prevent borrowing support from another row.
+    """
+
+    original: ObservationEnvelope
+    stamp: ObservationStamp
+    selected_id: str
+    contact_basis: str
+
+    def matches(self, original: ObservationEnvelope) -> bool:
+        world, track = original.payload.world, original.payload.tracklet
+        return (self.original is original and type(self.stamp) is ObservationStamp
+            and self.stamp.observation_id == original.observation_id
+            and self.stamp.member.run_id == original.producer.run_id
+            and original.media_pts_ns is not None and self.stamp.media_time_s is not None
+            and math.isclose(self.stamp.media_time_s, original.media_pts_ns / 1e9,
+                             abs_tol=1e-9, rel_tol=0.)
+            and (self.stamp.member.camera_id, self.stamp.member.source_id,
+                 self.stamp.member.raw_id, self.stamp.frame_id) ==
+                (track.camera_id, track.source_id, track.tracker_id, track.frame_id)
+            and world is not None and world.quantity == "ground_footprint"
+            and world.support_state == "unknown" and (
+                self.selected_id == "upright_pose_projection"
+                and self.contact_basis == "pose:upright_body_planes" and world.posture == "standing"
+                or self.selected_id == "registered_body_column"
+                and self.contact_basis == "depth:registered_body_column"
+                and world.source == "registered_body_column"
+                and world.posture in {"standing", "sitting", "lying", "unknown"}
+                and world.quality == "estimated"))
+
+
+def select_source_local_observation(
+    candidates: tuple[tuple[ObservationEnvelope, float | None, str | None], ...],
+    *,
+    comparable_clock: bool = False,
+    upright_support: tuple[PreparedUprightFootprintSupport, ...] = (),
+) -> tuple[ObservationEnvelope | None, tuple[tuple[ObservationEnvelope, str | None], ...]]:
+    """Choose one exact measured original; retain nonvoting alternatives.
+
+    At most two ALREADY owner-associated members are supplied by the future
+    spatial transaction. Each tuple carries original resolver confidence and
+    the private raw-quality rejection recorded during World.prepare(). This
+    helper neither associates people nor issues grants, checks freshness, or
+    authorizes CI; coincident frame labels never cause averaging here.
+    """
+    if (type(candidates) is not tuple or not 1 <= len(candidates) <= 2
+            or type(comparable_clock) is not bool
+            or any(type(row) is not tuple or len(row) != 3 for row in candidates)):
+        raise ValueError("one or two exact source-local candidates required")
+    if any(type(row[0]) is not ObservationEnvelope for row in candidates):
+        raise TypeError("original World observations required")
+    if len({row[0].observation_id for row in candidates}) != len(candidates):
+        raise ValueError("duplicate source-local observation identity")
+    if (type(upright_support) is not tuple or len(upright_support) > 2
+            or any(type(proof) is not PreparedUprightFootprintSupport
+                or not any(proof.matches(row[0]) for row in candidates) for proof in upright_support)):
+        raise ValueError("exact prepared upright support required")
+    eligible: list[tuple[ObservationEnvelope, float]] = []
+    diagnostics: list[tuple[ObservationEnvelope, str | None]] = []
+    for original, confidence, reason in candidates:
+        world = original.payload.world
+        if reason is not None and (type(reason) is not str or not 1 <= len(reason) <= 200):
+            raise ValueError("bounded original quality rejection required")
+        # Raw integrity cannot be erased by an inactive member or a usable
+        # peer. Conversely a missing quality field isn't a malformed value.
+        if spatial_rejection_category(reason) != "integrity":
+            if world is None:
+                reason = reason or "world_position_unavailable"
+            elif not (GlobalWorldFusion._has_canonical_identity(world) and world.calibration_revision):
+                reason = "world_registration_unavailable"
+            else:
+                # Revalidate without replacing the original. model_copy() can
+                # bypass public validators; no malformed covariance may win.
+                try:
+                    type(world).model_validate(world.model_dump(mode="python"))
+                    if (not all(math.isfinite(v) for v in (world.position.x, world.position.y, world.position.z))
+                            or any(world.covariance.values[i] <= 0.0 for i in (0, 4, 8))):
+                        raise ValueError("finite position and positive covariance diagonal required")
+                except (TypeError, ValueError):
+                    reason = "world_covariance_or_position_invalid"
+                if spatial_rejection_category(reason) != "integrity":
+                    if world.quantity != "ground_footprint":
+                        reason = "world_quantity_invalid"
+                    elif confidence is not None and (type(confidence) not in {int, float}
+                            or not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0):
+                        reason = "resolver_confidence_invalid"
+                    elif reason is None:
+                        if world.source in {"cv_prediction", "image_motion_prediction", "anchor_hold"} or world.quality == "held":
+                            reason = "non_current_measurement"
+                        elif world.support_state == "unknown" and not any(
+                                proof.matches(original) for proof in upright_support):
+                            reason = "world_support_unavailable"
+                        elif confidence is None:
+                            reason = "resolver_confidence_absent"
+        diagnostics.append((original, reason))
+        if reason is None:
+            eligible.append((original, float(confidence)))
+    selected = min(eligible, key=lambda row: position_quality_sort_key(
+        row[0], resolver_confidence=row[1], comparable_clock=comparable_clock,
+    ))[0] if eligible else None
+    return selected, tuple(
+        (original, reason if reason is not None or original is selected else "source_local_alternative")
+        for original, reason in diagnostics
+    )
 
 
 @dataclass(frozen=True)
@@ -55,6 +229,13 @@ class _ResolvedObservation:
     trail_break_required: bool = False
     tracker_lifecycle_generation: int | None = None
     source_epoch: int | None = None
+    physical_member: MemberKey | None = None
+    spatial_stamp: ObservationStamp | None = None
+    spatial_selected: bool = False
+    spatial_rejection: str | None = None
+    attribution_claims: tuple[WorldAttributionClaim, ...] = ()
+    spatial_resolver_confidence: float | None = None
+    spatial_committed_held: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,7 +244,7 @@ class _FusedState:
     media_pts_ns: int | None
     position_source: tuple[str, int, str, int | None] | None
     position: Vector3
-    continuity_identity: tuple[str, str, str | None] | None
+    continuity_identity: tuple[object, ...] | None
     last_trail_reset_tokens: tuple[
         tuple[str, int, str, int, int | None, int], ...
     ]
@@ -71,6 +252,21 @@ class _FusedState:
         tuple[str, int, str, int, int | None, int], ...
     ]
     entity: WorldEntity
+
+
+@dataclass(frozen=True)
+class _SplitCustodyOriginal:
+    """One previously committed ORIGINAL, never a current tracklet or vote."""
+
+    episode_id: str
+    origin_key: PhysicalPersonKey
+    successor_keys: tuple[PhysicalPersonKey, ...]
+    row: _ResolvedObservation
+    entity: WorldEntity
+    continuity: _ContinuityState | None
+    destination_key: PhysicalPersonKey | None = None
+    # Diagnostic provenance only: excluded from custody equality/authority.
+    owner_diagnostic_view: object | None = field(default=None,compare=False,repr=False)
 
 
 @dataclass(frozen=True)
@@ -84,6 +280,7 @@ class _ContinuityState:
     source_tokens: tuple[
         tuple[str, int, str, int, int | None, int | None, int | None], ...
     ]
+    spatial_identity: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,10 +310,22 @@ class GlobalWorldFusion:
         self._source_runs: dict[tuple[str, int], str] = {}
         self._last_sequence: dict[tuple[str, int, str], int] = {}
         self._by_entity: OrderedDict[str, dict[str, _ResolvedObservation]] = OrderedDict()
-        self._entity_by_tracklet: dict[tuple[str, int, str, int], str] = {}
+        self._entity_by_tracklet: dict[tuple[object, ...], str] = {}
         self._last_fused: dict[str, _FusedState] = {}
         self._continuity_by_entity: dict[str, _ContinuityState] = {}
         self._snapshot_sequence = 0
+        self._spatial_context: SpatialClockContext | None = None
+        self._attribution_quarantines: dict[str, WorldAttributionQuarantine] = {}
+        self._split_custody: dict[str, _SplitCustodyOriginal] = {}
+        self._consumed_split_episodes: dict[str, object] = {}
+        self._omission_diagnostics = {}
+
+    def _note_omission(self, entity_id, reason, age=None):
+        try:
+            if entity_id in self._omission_diagnostics or len(self._omission_diagnostics)<64:
+                self._omission_diagnostics[entity_id]=(reason,age)
+        except Exception:
+            pass  # Private observation cannot change fusion.
 
     def fork(self) -> GlobalWorldFusion:
         """Return an isolated copy-on-write candidate of the fusion state.
@@ -139,6 +348,11 @@ class GlobalWorldFusion:
         candidate._last_fused = dict(self._last_fused)
         candidate._continuity_by_entity = dict(self._continuity_by_entity)
         candidate._snapshot_sequence = int(self._snapshot_sequence)
+        candidate._spatial_context = self._spatial_context
+        candidate._attribution_quarantines = dict(self._attribution_quarantines)
+        candidate._split_custody = dict(self._split_custody)
+        candidate._consumed_split_episodes = dict(self._consumed_split_episodes)
+        candidate._omission_diagnostics = {}
         return candidate
 
     def ingest(
@@ -150,9 +364,25 @@ class GlobalWorldFusion:
         trail_break_required: bool = False,
         tracker_lifecycle_generation: int | None = None,
         source_epoch: int | None = None,
+        physical_key: PhysicalPersonKey | None = None,
+        physical_member: MemberKey | None = None,
+        spatial_stamp: ObservationStamp | None = None,
+        spatial_selected: bool = False,
+        spatial_rejection: str | None = None,
+        attribution_claims: tuple[WorldAttributionClaim, ...] = (),
+        spatial_resolver_confidence: float | None = None,
     ) -> None:
         if envelope.payload.world is None:
             return
+        if spatial_resolver_confidence is not None and (
+                type(spatial_resolver_confidence) not in (int,float)
+                or not math.isfinite(spatial_resolver_confidence) or not 0 <= spatial_resolver_confidence <= 1):
+            raise ValueError("original spatial resolver confidence required")
+        if spatial_stamp is not None and (
+            type(spatial_stamp) is not ObservationStamp or spatial_stamp.member != physical_member
+            or spatial_stamp.observation_id != envelope.observation_id
+        ):
+            raise ValueError("exact original spatial stamp/member required")
         try:
             normalized_trail_segment_id = (
                 int(trail_segment_id)
@@ -178,6 +408,19 @@ class GlobalWorldFusion:
             )
         except (TypeError, ValueError, OverflowError):
             normalized_source_epoch = None
+        entity_id = subject.subject_id
+        if physical_key is not None or physical_member is not None:
+            if (type(physical_key) is not PhysicalPersonKey
+                    or type(physical_member) is not MemberKey
+                    or physical_key.run_id != envelope.producer.run_id
+                    or physical_member.run_id != physical_key.run_id
+                    or (physical_member.camera_id, physical_member.source_id, physical_member.raw_id)
+                    != (envelope.payload.tracklet.camera_id, envelope.payload.tracklet.source_id,
+                        envelope.payload.tracklet.tracker_id)
+                    or physical_member.source_epoch != normalized_source_epoch
+                    or physical_member.lifecycle_generation != normalized_lifecycle_generation):
+                raise ValueError("exact physical member and run-owned key required")
+            entity_id = self.physical_entity_id(physical_key)
         source_base = (envelope.payload.tracklet.camera_id, envelope.payload.tracklet.source_id)
         previous_run = self._source_runs.get(source_base)
         if previous_run is not None and previous_run != envelope.producer.run_id:
@@ -194,17 +437,19 @@ class GlobalWorldFusion:
         self._last_sequence[sequence_key] = envelope.sequence
 
         camera_id = envelope.payload.tracklet.camera_id
-        tracklet_key = (
+        tracklet_key: tuple[object, ...] = (
             camera_id,
             envelope.payload.tracklet.source_id,
             envelope.producer.run_id,
             envelope.payload.tracklet.tracker_id,
         )
+        if physical_member is not None:
+            tracklet_key += (physical_member.source_epoch, physical_member.lifecycle_generation)
         prior_entity_id = self._entity_by_tracklet.get(tracklet_key)
-        if prior_entity_id is not None and prior_entity_id != subject.subject_id:
+        if prior_entity_id is not None and prior_entity_id != entity_id:
             self._remove_tracklet_observation(prior_entity_id, tracklet_key)
 
-        entity_observations = self._by_entity.setdefault(subject.subject_id, {})
+        entity_observations = self._by_entity.setdefault(entity_id, {})
         replaced = entity_observations.get(camera_id)
         if replaced is not None:
             replaced_world = replaced.envelope.payload.world
@@ -220,13 +465,8 @@ class GlobalWorldFusion:
                 # The per-camera slot is the replacement/reset boundary.  Do
                 # not carry velocity across a registration change, even when
                 # other cameras continue contributing to the same subject.
-                self._last_fused.pop(subject.subject_id, None)
-            replaced_key = (
-                camera_id,
-                replaced.envelope.payload.tracklet.source_id,
-                replaced.envelope.producer.run_id,
-                replaced.envelope.payload.tracklet.tracker_id,
-            )
+                self._last_fused.pop(entity_id, None)
+            replaced_key = self._tracklet_key(replaced)
             if replaced_key != tracklet_key:
                 self._entity_by_tracklet.pop(replaced_key, None)
         entity_observations[camera_id] = _ResolvedObservation(
@@ -239,16 +479,316 @@ class GlobalWorldFusion:
             ),
             tracker_lifecycle_generation=normalized_lifecycle_generation,
             source_epoch=normalized_source_epoch,
+            physical_member=physical_member,
+            spatial_stamp=spatial_stamp,
+            spatial_selected=spatial_selected,
+            spatial_rejection=spatial_rejection,
+            attribution_claims=attribution_claims,
+            spatial_resolver_confidence=spatial_resolver_confidence,
         )
-        self._entity_by_tracklet[tracklet_key] = subject.subject_id
-        self._by_entity.move_to_end(subject.subject_id)
+        self._entity_by_tracklet[tracklet_key] = entity_id
+        self._by_entity.move_to_end(entity_id)
         while len(self._by_entity) > self.config.max_entities:
             entity_id, _ = self._by_entity.popitem(last=False)
             self._last_fused.pop(entity_id, None)
             self._continuity_by_entity.pop(entity_id, None)
+
             self._drop_entity_tracklets(entity_id)
         if len(self._continuity_by_entity) > self.config.max_entities:
             self._prune_absent_continuity()
+
+    def selected_spatial_original(self, key: PhysicalPersonKey):
+        """One already granted immutable original; NOT an alternative/new vote.
+
+        The service must additionally validate current owner eligibility and
+        literal active frame bindings. No normalized confidence reconstruction.
+        """
+        rows = self._by_entity.get(self.physical_entity_id(key),{})
+        selected = [r for r in rows.values() if r.spatial_selected and r.spatial_stamp is not None]
+        if len(selected) != 1:
+            return None
+        row, = selected
+        if row.spatial_resolver_confidence is None or self._spatial_age_us(row) > 350_000:
+            return None
+        return row.envelope,row.spatial_stamp,row.spatial_resolver_confidence,row.subject
+
+    def select_spatial(self, key: PhysicalPersonKey, observation_id: str) -> None:
+        """Mark ONE publicly granted original; older peers stay nonvoting."""
+        rows = self._by_entity.get(f"physical:{key.run_id}:{key.serial}", {})
+        for camera, row in tuple(rows.items()):
+            if row.spatial_stamp is not None:
+                chosen = row.envelope.observation_id == observation_id
+                rows[camera] = replace(row, spatial_selected=chosen, spatial_committed_held=False,
+                                       spatial_rejection=None if chosen else row.spatial_rejection or "source_local_alternative")
+
+    def committed_spatial_original(self, key: PhysicalPersonKey, *, published_at_us: int):
+        """Only the selected committed custody, not a current measurement grant."""
+        rows = self._by_entity.get(self.physical_entity_id(key), {})
+        selected = [r for r in rows.values() if r.spatial_selected and r.spatial_stamp is not None]
+        if len(selected) == 1:
+            row, = selected
+        else:
+            custody = next((c for c in self._split_custody.values()
+                if c.origin_key == key or c.destination_key == key), None)
+            if custody is None:
+                return None
+            row = custody.row
+        if (row.spatial_resolver_confidence is None
+                or self._spatial_age_us(row) > self.config.lost_ttl_us
+                or row.envelope.observed_at_us + self.config.lost_ttl_us <= published_at_us):
+            return None
+        return row.envelope, row.spatial_stamp, row.spatial_resolver_confidence, row.subject
+
+    def capture_split_custody(self, episode_id, origin_key, successor_keys, *, published_at_us):
+        """Read ONLY selected committed custody, before ordinary withdrawal."""
+        if episode_id in self._consumed_split_episodes:
+            return None  # Its authorized successor is NEVER a pre-split original.
+        original = self.committed_spatial_original(origin_key, published_at_us=published_at_us)
+        if original is None:
+            return None
+        prior = self._split_custody.get(episode_id)
+        if prior is not None:
+            if (prior.origin_key, prior.successor_keys) != (origin_key, successor_keys):
+                raise ValueError("split_custody_episode_changed")
+            return prior
+        entity_id = self.physical_entity_id(origin_key)
+        rows = self._by_entity.get(entity_id, {})
+        selected = [r for r in rows.values() if r.spatial_selected and r.spatial_stamp == original[1]]
+        previous = self._last_fused.get(entity_id)
+        if len(selected) != 1 or previous is None:
+            return None
+        entity = previous.entity
+        # A rejected/filter-retained newer sample is not the committed point.
+        if entity.observed_at_us != selected[0].envelope.observed_at_us:
+            return None
+        return _SplitCustodyOriginal(episode_id, origin_key, successor_keys, selected[0], entity,
+                                     self._continuity_by_entity.get(entity_id))
+
+    def replace_split_custody(self, originals):
+        """Complete owner-certified view; omission revokes, never refreshes."""
+        if len(originals) > self.config.max_entities:
+            raise ValueError("split_custody_capacity")
+        keys = [k for c in originals for k in c.successor_keys]
+        if len(keys) != len(set(keys)):
+            raise ValueError("split_custody_overlap")
+        incoming={c.episode_id: c for c in originals}
+        for episode,custody in self._split_custody.items():
+            if episode not in incoming:
+                self._note_omission(self.physical_entity_id(custody.destination_key or custody.origin_key),'split_custody_omitted')
+        self._split_custody = incoming
+        for custody in originals:
+            if custody.continuity is not None:
+                self._continuity_by_entity[self.physical_entity_id(custody.origin_key)] = custody.continuity
+
+    def enforce_split_exclusivity(self, keys, selected=None):
+        """Owner-certified scope: diagnostics never become a second head."""
+        for key in keys:
+            entity_id = self.physical_entity_id(key)
+            for camera, row in tuple(self._by_entity.get(entity_id, {}).items()):
+                if row.spatial_stamp is not None and (selected is None or
+                        (key, row.envelope.observation_id) != selected):
+                    self._by_entity[entity_id][camera] = replace(row, spatial_selected=False)
+
+    def split_custody_originals(self):
+        return tuple(self._split_custody.values())
+
+    def synchronize_split_episodes(self, views):
+        """Bound consumption to COMPLETE live owner views, not tombstone history."""
+        current = {view.episode_id: view for view in views}
+        if len(current) > self.config.max_entities:
+            raise ValueError("split_custody_capacity")
+        for episode, view in current.items():
+            if episode in self._consumed_split_episodes and self._consumed_split_episodes[episode] is not view:
+                prior=self._consumed_split_episodes[episode]
+                # A certified reunion must never make an already replaced
+                # original eligible again. Carry its consumed marker forward.
+                if (view.rejoined_key!=prior.origin_key or replace(view,rejoined_key=None,
+                        rejoined_stamps=(),rejoin_revision=None)!=replace(prior,rejoined_key=None,
+                        rejoined_stamps=(),rejoin_revision=None)):
+                    raise ValueError("split_custody_episode_changed")
+                self._consumed_split_episodes[episode]=view
+        self._consumed_split_episodes = {episode: view for episode, view
+            in self._consumed_split_episodes.items() if episode in current}
+
+    def consume_split_episode(self, view):
+        """Candidate-only bookkeeping; only the atomic World commit installs it."""
+        if len(self._consumed_split_episodes) >= self.config.max_entities and view.episode_id not in self._consumed_split_episodes:
+            raise ValueError("split_custody_capacity")
+        self._consumed_split_episodes[view.episode_id] = view
+        self._split_custody.pop(view.episode_id, None)
+
+    def hold_committed_spatial(self, key: PhysicalPersonKey, stamp: ObservationStamp) -> None:
+        rows = self._by_entity.get(self.physical_entity_id(key), {})
+        selected = [r for r in rows.values() if r.spatial_selected]
+        if len(selected) != 1 or selected[0].spatial_stamp != stamp:
+            raise ValueError("committed_spatial_hold_custody_changed")
+        row, = selected
+        rows[row.envelope.payload.tracklet.camera_id] = replace(row, spatial_committed_held=True)
+
+    def reindex_committed_spatial(self, prior, origin, destination, stamp, *, published_at_us):
+        """Move ONE exact committed observation; caller owns current DTO proof.
+
+        No new original, claim, position vote, clock or split episode is made.
+        This runs after ordinary removals on a transaction-local fusion fork.
+        """
+        original = prior.committed_spatial_original(origin, published_at_us=published_at_us)
+        old_id, new_id = self.physical_entity_id(origin), self.physical_entity_id(destination)
+        rows = prior._by_entity.get(old_id, {})
+        selected = [r for r in rows.values() if r.spatial_selected and r.spatial_stamp == stamp]
+        previous = prior._last_fused.get(old_id)
+        continuity = prior._continuity_by_entity.get(old_id)
+        if (origin == destination or origin.run_id != destination.run_id or original is None
+                or original[1] != stamp or len(selected) != 1 or previous is None or continuity is None
+                or previous.entity.observed_at_us != original[0].observed_at_us
+                or not any(s.accepted and s.observation_id == original[0].observation_id
+                           for s in previous.entity.sources)
+                or any(r.spatial_selected for r in self._by_entity.get(new_id, {}).values())):
+            raise ValueError("ordinary_join_original_changed")
+        row, = selected
+        self._by_entity.setdefault(new_id, {})[row.envelope.payload.tracklet.camera_id] = replace(
+            row, spatial_committed_held=True)
+        self._entity_by_tracklet[self._tracklet_key(row)] = new_id
+        self._last_fused[new_id] = replace(previous,
+            entity=previous.entity.model_copy(update={"entity_id": new_id}))
+        self._continuity_by_entity[new_id] = continuity
+
+    def has_spatial_original_slot(self, key):
+        """An expired selected slot still competes until normal snapshot pruning."""
+        return any(row.spatial_selected for row in self._by_entity.get(self.physical_entity_id(key), {}).values())
+
+    def prune_expired_spatial_original(self, key, *, published_at_us):
+        """Only positive original source/wire expiry, on a transaction fork."""
+        entity = self.physical_entity_id(key)
+        selected = [row for row in self._by_entity.get(entity, {}).values() if row.spatial_selected]
+        if len(selected) != 1 or selected[0].spatial_stamp is None:
+            return
+        row, = selected
+        age = self._spatial_age_us(row)  # Unknown/foreign binding is NOT expiry.
+        if (age <= self.config.lost_ttl_us
+                and row.envelope.observed_at_us + self.config.lost_ttl_us > published_at_us):
+            return
+        self._note_omission(entity, 'source_age_expired' if age > self.config.lost_ttl_us
+                            else 'original_wire_expired', age)
+        self._by_entity.pop(entity, None)
+        self._last_fused.pop(entity, None)
+        self._continuity_by_entity.pop(entity, None)
+        self._drop_entity_tracklets(entity)
+
+    def set_spatial_context(self, context: SpatialClockContext) -> None:
+        """Use the public owner-validated context, never publication arrival."""
+        if type(context) is not SpatialClockContext:
+            raise ValueError("actual spatial source-clock context required")
+        self._spatial_context = context
+
+    def spatial_attribution_claims(self) -> dict[str, tuple[WorldAttributionClaim, ...]]:
+        """Original claim evidence owned by still-live position samples, not new leases."""
+        result = {}
+        for entity_id, rows in self._by_entity.items():
+            selected = next((row for row in rows.values() if row.spatial_selected), None)
+            if selected is None or self._spatial_age_us(selected) > self.config.lost_ttl_us:
+                continue
+            claims = {}
+            for row in rows.values():
+                for claim in row.attribution_claims:
+                    key = (claim.camera_id, claim.source_id, claim.source_epoch, claim.raw_id,
+                           claim.lifecycle_generation)
+                    if key not in claims or claim.frame_id > claims[key].frame_id:
+                        claims[key] = claim
+            if not claims:
+                raise ValueError("retained_attribution_provenance_unavailable")
+            result[entity_id] = tuple(claims.values())
+        for custody in self._split_custody.values():
+            if self._spatial_age_us(custody.row) <= self.config.lost_ttl_us:
+                entity = self.physical_entity_id(custody.destination_key or custody.origin_key)
+                result[entity] = tuple(dict.fromkeys((*result.get(entity, ()), *custody.row.attribution_claims)))
+        if sum(map(len, result.values())) > 128:
+            raise ValueError("attribution_claim_capacity")
+        return result
+
+    def spatial_original_attribution_claims(self) -> dict[str, tuple[WorldAttributionClaim, ...]]:
+        """ALL originals attached to live samples, separate from latest arbitration.
+
+        A newer peer slot can hide an older claim until a rekey removes that
+        slot. Preserve that genuine custody without growing a history ledger.
+        Original selected-position TTL and the existing bounded rows apply.
+        """
+        result = {}
+        total = 0
+        for entity_id, rows in self._by_entity.items():
+            selected = next((row for row in rows.values() if row.spatial_selected), None)
+            if selected is None or self._spatial_age_us(selected) > self.config.lost_ttl_us:
+                continue
+            claims = tuple(dict.fromkeys(c for row in rows.values() for c in row.attribution_claims))
+            if not claims:
+                raise ValueError("retained_attribution_provenance_unavailable")
+            total += len(claims)
+            if total > 128:
+                raise ValueError("attribution_claim_capacity")
+            result[entity_id] = claims
+        for custody in self._split_custody.values():
+            if self._spatial_age_us(custody.row) <= self.config.lost_ttl_us:
+                entity = self.physical_entity_id(custody.destination_key or custody.origin_key)
+                result[entity] = tuple(dict.fromkeys((*result.get(entity, ()), *custody.row.attribution_claims)))
+        if sum(map(len, result.values())) > 128:
+            raise ValueError("attribution_claim_capacity")
+        return result
+
+    def attribution_quarantines(self) -> dict[str, WorldAttributionQuarantine]:
+        return dict(self._attribution_quarantines)
+
+    def set_attribution_quarantines(self, records: dict[str, WorldAttributionQuarantine]) -> None:
+        if len(records) > self.config.max_entities or any(type(v) is not WorldAttributionQuarantine for v in records.values()):
+            raise ValueError("attribution_quarantine_capacity")
+        self._attribution_quarantines = dict(records)
+
+    def _spatial_age_us(self, row: _ResolvedObservation) -> int:
+        stamp = row.spatial_stamp
+        context = self._spatial_context
+        interval = next((i for i in context.intervals if i.binding.source_id == stamp.member.source_id), None) if context and stamp else None
+        world = row.envelope.payload.world
+        if (interval is None or world is None
+                or (interval.binding.camera_id, interval.binding.source_epoch,
+                    interval.binding.clock_domain, interval.binding.clock_basis)
+                != (stamp.member.camera_id, stamp.member.source_epoch, stamp.clock_domain, stamp.clock_basis)
+                or interval.binding.calibration_revision != world.calibration_revision
+                or interval.binding.transform_id != world.world_transform_sha256):
+            raise ValueError("retained_spatial_clock_or_binding_unavailable")
+        return max(0, round((interval.evaluation_max_s - stamp.acquired_at_s) * 1_000_000))
+
+    @staticmethod
+    def physical_entity_id(key: PhysicalPersonKey) -> str:
+        if (type(key) is not PhysicalPersonKey or not key.run_id
+                or type(key.serial) is not int or key.serial < 1):
+            raise ValueError("run-owned physical person key required")
+        return f"physical:{key.run_id}:{key.serial}"
+
+    @staticmethod
+    def _tracklet_key(item: _ResolvedObservation) -> tuple[object, ...]:
+        t = item.envelope.payload.tracklet
+        key: tuple[object, ...] = (t.camera_id, t.source_id, item.envelope.producer.run_id, t.tracker_id)
+        if item.physical_member is not None:
+            key += (item.physical_member.source_epoch, item.physical_member.lifecycle_generation)
+        return key
+
+    def withdraw_physical_member(self, member: MemberKey) -> None:
+        """Remove exactly an old contributor, never a reused numeric raw ID."""
+        if type(member) is not MemberKey:
+            raise TypeError("exact association MemberKey required")
+        key = (member.camera_id, member.source_id, member.run_id, member.raw_id,
+               member.source_epoch, member.lifecycle_generation)
+        entity_id = self._entity_by_tracklet.get(key)
+        if entity_id is not None:
+            self._note_omission(entity_id,'withdrawn_physical_member')
+            self._remove_tracklet_observation(entity_id, key)
+            self._prune_absent_continuity()
+
+    def retire_physical_key(self, key: PhysicalPersonKey) -> None:
+        entity_id = self.physical_entity_id(key)
+        self._note_omission(entity_id,'retired_physical_key')
+        self._by_entity.pop(entity_id, None)
+        self._last_fused.pop(entity_id, None)
+        self._continuity_by_entity.pop(entity_id, None)
+        self._drop_entity_tracklets(entity_id)
 
     def _retain_admitted_tracker_origin(
         self, envelope: ObservationEnvelope, subject: SubjectRef, *,
@@ -337,12 +877,7 @@ class GlobalWorldFusion:
                     tracker, current.tracker_lifecycle_generation, current.source_epoch
                 ) in retained_lifecycles:
                     continue
-            tracklet_key = (
-                camera_key,
-                source_key,
-                run_key,
-                int(tracklet.tracker_id),
-            )
+            tracklet_key = self._tracklet_key(current)
             observations.pop(camera_key, None)
             self._entity_by_tracklet.pop(tracklet_key, None)
             removed += 1
@@ -353,11 +888,36 @@ class GlobalWorldFusion:
         return removed
 
     def _prune_absent_continuity(self) -> None:
+        # Saved continuity belongs to the origin; a certified transfer's
+        # visible attribution belongs to its destination. Both are already
+        # bounded members of this SAME finite two-key custody scope.
+        held = {self.physical_entity_id(key) for c in self._split_custody.values()
+                for key in (c.origin_key, c.destination_key or c.origin_key)}
         for entity_id in tuple(self._continuity_by_entity):
-            if entity_id not in self._by_entity:
+            if entity_id not in self._by_entity and entity_id not in held:
                 self._continuity_by_entity.pop(entity_id, None)
+        for entity_id in tuple(self._attribution_quarantines):
+            if entity_id not in self._by_entity and entity_id not in held:
+                self._attribution_quarantines.pop(entity_id, None)
 
     def snapshot(self, *, published_at_us: int) -> WorldSnapshot:
+        # The public fusion boundary must not consume a sequence, expire an
+        # index or update velocity/continuity on a refused whole snapshot.
+        candidate = self.fork()
+        candidate._omission_diagnostics = dict(self._omission_diagnostics)
+        snapshot = candidate._snapshot_candidate(published_at_us=published_at_us)
+        self._by_entity = candidate._by_entity
+        self._entity_by_tracklet = candidate._entity_by_tracklet
+        self._last_fused = candidate._last_fused
+        self._continuity_by_entity = candidate._continuity_by_entity
+        self._snapshot_sequence = candidate._snapshot_sequence
+        self._attribution_quarantines = candidate._attribution_quarantines
+        self._split_custody = candidate._split_custody
+        self._consumed_split_episodes = candidate._consumed_split_episodes
+        self._omission_diagnostics = candidate._omission_diagnostics
+        return snapshot
+
+    def _snapshot_candidate(self, *, published_at_us: int) -> WorldSnapshot:
         if published_at_us <= 0:
             raise ValueError("published_at_us must be positive")
         self._snapshot_sequence += 1
@@ -366,9 +926,21 @@ class GlobalWorldFusion:
         expired: list[str] = []
         for entity_id, observations in list(self._by_entity.items()):
             entity = self._fuse_entity(entity_id, observations.values(), published_at_us)
-            if entity is None:
+            # Source-clock eligibility and the immutable wire deadline are
+            # independent bounds (e.g. a paced/queued replay). Intersect them;
+            # never publish a head that the canonical consumer must expire at
+            # this very snapshot's published_at_us. No original is restamped.
+            if entity is None or entity.stale_after_us <= published_at_us:
+                if entity is not None:
+                    self._note_omission(entity_id,'original_wire_expired')
                 expired.append(entity_id)
                 continue
+            quarantine = self._attribution_quarantines.get(entity_id)
+            if quarantine is not None:
+                serial = entity_id.rsplit(":", 1)[-1]
+                entity = WorldEntity.model_validate({**entity.model_dump(mode="python"),
+                    "subject": SubjectRef(subject_id=f"quarantine:{quarantine.run_id}:{serial}", kind="provisional"),
+                    "attribution_quarantine": quarantine})
             entities.append(entity)
             observation_times.append(entity.observed_at_us)
         for entity_id in expired:
@@ -376,10 +948,39 @@ class GlobalWorldFusion:
             self._last_fused.pop(entity_id, None)
             self._continuity_by_entity.pop(entity_id, None)
             self._drop_entity_tracklets(entity_id)
+        for episode, custody in tuple(self._split_custody.items()):
+            scope = {self.physical_entity_id(k) for k in custody.successor_keys}
+            # A genuinely admitted current successor consumes the OLD hold.
+            if any(e.entity_id in scope for e in entities):
+                del self._split_custody[episode]
+                continue
+            old = custody.entity
+            custody_age = self._spatial_age_us(custody.row)
+            if (custody_age > self.config.lost_ttl_us
+                    or old.stale_after_us <= published_at_us):
+                self._note_omission(old.entity_id,'split_source_age_expired' if custody_age>self.config.lost_ttl_us
+                    else 'split_original_wire_expired',custody_age)
+                del self._split_custody[episode]
+                continue
+            destination=custody.destination_key or custody.origin_key
+            destination_id=self.physical_entity_id(destination)
+            quarantine = self._attribution_quarantines.get(destination_id)
+            subject_id = (f"quarantine:{quarantine.run_id}:{destination.serial}"
+                          if quarantine is not None else f"split-custody:{episode}")
+            entity = old.model_copy(update={
+                "entity_id": destination_id,
+                "subject": SubjectRef(subject_id=subject_id, kind="provisional"),
+                "lifecycle": EntityLifecycle.HELD, "position_state": PositionState.HELD,
+                "velocity_mps": None,
+                "attribution_quarantine": quarantine,
+            })
+            entities.append(entity)
+            observation_times.append(entity.observed_at_us)
         self._prune_absent_continuity()
 
         observed_end = max(observation_times, default=published_at_us)
         observed_start = min(observation_times, default=published_at_us)
+        validate_world_identity_uniqueness(entities)
         return WorldSnapshot(
             contract="noesis.world.snapshot",
             contract_version=1,
@@ -411,7 +1012,7 @@ class GlobalWorldFusion:
     def _remove_tracklet_observation(
         self,
         entity_id: str,
-        tracklet_key: tuple[str, int, str, int],
+        tracklet_key: tuple[object, ...],
     ) -> None:
         observations = self._by_entity.get(entity_id)
         if observations is None:
@@ -420,12 +1021,7 @@ class GlobalWorldFusion:
         camera_id = tracklet_key[0]
         current = observations.get(camera_id)
         if current is not None:
-            current_key = (
-                camera_id,
-                current.envelope.payload.tracklet.source_id,
-                current.envelope.producer.run_id,
-                current.envelope.payload.tracklet.tracker_id,
-            )
+            current_key = self._tracklet_key(current)
             if current_key == tracklet_key:
                 observations.pop(camera_id, None)
         self._entity_by_tracklet.pop(tracklet_key, None)
@@ -446,6 +1042,7 @@ class GlobalWorldFusion:
     ) -> WorldEntity | None:
         usable = [item for item in observations if item.envelope.payload.world is not None]
         if not usable:
+            self._note_omission(entity_id,'no_usable_world_original')
             return None
         usable.sort(
             key=lambda item: (
@@ -463,18 +1060,25 @@ class GlobalWorldFusion:
             ))
         ]
         if not bounded_usable:
+            self._note_omission(entity_id,'position_outside_support_extent')
             return None
         # An out-of-extent named observation cannot refresh entity time or
         # shorten the cohort window for an older valid measurement.
-        latest_at = bounded_usable[0].envelope.observed_at_us
-        age_us = max(0, now_us - latest_at)
+        spatial = any(item.spatial_stamp is not None for item in usable)
+        selected = next((item for item in bounded_usable if item.spatial_selected), None) if spatial else None
+        if spatial and selected is None:
+            self._note_omission(entity_id,'no_selected_spatial_original')
+            return None  # A diagnostic peer is never an implicit position grant.
+        latest_at = (selected or bounded_usable[0]).envelope.observed_at_us
+        age_us = self._spatial_age_us(selected) if spatial else max(0, now_us - latest_at)
         if age_us > self.config.lost_ttl_us:
+            self._note_omission(entity_id,'source_age_expired',age_us)
             return None
         lifecycle = EntityLifecycle.PRESENT if age_us <= self.config.present_ttl_us else EntityLifecycle.HELD
         contemporaneous = [
             item
             for item in usable
-            if abs(latest_at - item.envelope.observed_at_us) <= self.config.simultaneous_window_us
+            if spatial or abs(latest_at - item.envelope.observed_at_us) <= self.config.simultaneous_window_us
         ]
         bounded_ids = {id(item) for item in bounded_usable}
         bounded_contemporaneous = [
@@ -489,6 +1093,7 @@ class GlobalWorldFusion:
             for item in bounded_contemporaneous
             if item.envelope.payload.world is not None
             and self._position_state(item) == PositionState.MEASURED
+            and (not spatial or item is selected)
         ]
         ignored_held: list[tuple[_ResolvedObservation, str]] = []
         if authoritative:
@@ -506,7 +1111,7 @@ class GlobalWorldFusion:
             # exactly.  Never average two process-model continuations: their
             # errors can be correlated and the resulting point would exist in
             # neither tracking cohort.
-            selected_held = min(
+            selected_held = selected if spatial else min(
                 bounded_contemporaneous,
                 key=self._held_continuation_sort_key,
             )
@@ -517,7 +1122,7 @@ class GlobalWorldFusion:
                 if item is not selected_held
             ]
 
-        anchor = min(fusion_candidates, key=self._anchor_sort_key)
+        anchor = selected if spatial else min(fusion_candidates, key=self._anchor_sort_key)
         anchor_world = anchor.envelope.payload.world
         assert anchor_world is not None
         anchor_target_identity = self._target_frame_identity(anchor_world)
@@ -558,7 +1163,23 @@ class GlobalWorldFusion:
             # On named finite geometry the best-supported measurement is the
             # fallback if matrix CI leaves the observed support extent.
             accepted = [anchor] + [item for item in accepted if item is not anchor]
-        position, covariance, accepted, extent_rejected = self._weighted_position(accepted)
+        if spatial:
+            # Source-local capability grants exactly one original, NOT CI.
+            position, covariance, accepted, extent_rejected = anchor_world.position, anchor_world.covariance, [anchor], []
+            for item in contemporaneous:
+                world = item.envelope.payload.world
+                if item is anchor or item.spatial_rejection not in {None, "source_local_alternative"}:
+                    continue
+                reason = (
+                    "registration_identity_conflict" if self._target_frame_identity(world) != anchor_target_identity
+                    else "support_surface_conflict" if world.support_surface != anchor_world.support_surface
+                    else "position_conflict" if self._distance(world.position, position) > self.config.conflict_distance_m
+                    else None
+                )
+                if reason:
+                    rejected.append((item, reason))
+        else:
+            position, covariance, accepted, extent_rejected = self._weighted_position(accepted)
         rejected.extend(extent_rejected)
         source_evidence: list[WorldSourceEvidence] = []
         rejected_ids = {id(item): reason for item, reason in rejected}
@@ -567,6 +1188,8 @@ class GlobalWorldFusion:
             world = item.envelope.payload.world
             assert world is not None
             reason = rejected_ids.get(id(item)) or ignored_held_ids.get(id(item))
+            if spatial and item is not anchor:
+                reason = rejected_ids.get(id(item)) or item.spatial_rejection or "source_local_alternative"
             source_evidence.append(
                 WorldSourceEvidence(
                     observation_id=item.envelope.observation_id,
@@ -600,7 +1223,7 @@ class GlobalWorldFusion:
         room_id = next(iter(accepted_zones)) if len(accepted_zones) == 1 else None
         room_conflict = len(accepted_zones) > 1
         position_observed_at: int | None = None
-        continuity_identity: tuple[str, str, str | None] | None = None
+        continuity_identity: tuple[object, ...] | None = None
         accepted_trail_reset_tokens: tuple[
             tuple[str, int, str, int, int | None, int], ...
         ] = ()
@@ -618,6 +1241,9 @@ class GlobalWorldFusion:
             )
             position_media_pts_ns, position_source = self._position_clock(accepted)
             continuity_identity = self._fusion_continuity_identity(accepted)
+            if spatial:
+                continuity_identity = (*continuity_identity, anchor.physical_member,
+                                       anchor_world.world_transform_sha256, anchor_world.calibration_revision)
             accepted_trail_reset_tokens = (
                 self._accepted_trail_tokens(
                     accepted,
@@ -722,13 +1348,19 @@ class GlobalWorldFusion:
             if len(accepted_target_identities) == 1
             else None
         )
-        continuity = self._next_continuity_state(
-            entity_id,
-            accepted,
-            frame_identity=common_target_identity or ("backend_world_m", None),
-            support_state=anchor_world.support_state,
-            support_surface=anchor_world.support_surface,
-        )
+        if spatial and anchor.spatial_committed_held:
+            continuity = self._continuity_by_entity.get(entity_id)
+            if continuity is None:
+                raise ValueError("committed_spatial_hold_continuity_missing")
+        else:
+            continuity = self._next_continuity_state(
+                entity_id,
+                accepted,
+                frame_identity=common_target_identity or ("backend_world_m", None),
+                support_state=anchor_world.support_state,
+                support_surface=anchor_world.support_surface,
+                spatial_identity=continuity_identity if spatial else None,
+            )
         position_state = (
             PositionState.HELD
             if age_us > self.config.present_ttl_us
@@ -903,6 +1535,8 @@ class GlobalWorldFusion:
     def _position_state(item: _ResolvedObservation) -> PositionState:
         world = item.envelope.payload.world
         assert world is not None
+        if item.spatial_committed_held:
+            return PositionState.HELD
         # The strict service already verified process provenance before
         # ingestion. Source and quality, rather than entity age or confidence,
         # distinguish a current metric point from its continuation.
@@ -920,6 +1554,7 @@ class GlobalWorldFusion:
         frame_identity: tuple[str, str | None],
         support_state: str,
         support_surface: SupportSurfaceReference | None,
+        spatial_identity: tuple[object, ...] | None = None,
     ) -> _ContinuityState:
         current_tokens = tuple(sorted((
             (
@@ -954,6 +1589,7 @@ class GlobalWorldFusion:
                 or previous.support_state != support_state
                 or previous.support_surface != support_surface
                 or source_reset
+                or previous.spatial_identity != spatial_identity
             )
             segment_id = previous.segment_id + int(reset)
         # Remember a bounded token for a temporarily absent accepted source.
@@ -970,19 +1606,11 @@ class GlobalWorldFusion:
             support_state=support_state,
             support_surface=support_surface,
             source_tokens=tokens[:self.MAX_TRAIL_SOURCE_TOKENS],
+            spatial_identity=spatial_identity,
         )
 
     def _anchor_sort_key(self, item: _ResolvedObservation) -> tuple[int, float, float, int, str]:
-        world = item.envelope.payload.world
-        assert world is not None
-        variance = self._variance_sum(world.covariance)
-        return (
-            0 if self._has_canonical_identity(world) else 1,
-            variance,
-            -float(world.confidence),
-            -int(item.envelope.observed_at_us),
-            item.envelope.payload.tracklet.camera_id,
-        )
+        return position_quality_sort_key(item.envelope)
 
     def _held_continuation_sort_key(
         self,

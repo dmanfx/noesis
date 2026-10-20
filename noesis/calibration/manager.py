@@ -453,6 +453,7 @@ class CalibrationManager:
         camera_labels: Mapping[int, str] | None = None,
         scene_presentation_registration_path: Path | None = None,
         presentation_authored_obj_path: Path | None = None,
+        presentation_evidence_root: Path | None = None,
     ) -> None:
         self._cameras_yaml_path = Path(cameras_yaml_path)
         self._camera_calibration_path = Path(camera_calibration_json_path)
@@ -512,6 +513,8 @@ class CalibrationManager:
                 self._scene_presentation_registration = load_scene_presentation_registration(
                     scene_presentation_registration_path,
                     authored_obj_path=presentation_authored_obj_path,
+                    **({"evidence_root": presentation_evidence_root}
+                       if presentation_evidence_root is not None else {}),
                 )
                 # Validate against every live camera/frame/scale before the
                 # first bundle may be published.
@@ -717,79 +720,86 @@ class CalibrationManager:
     def snapshot(self, source_id: int, camera_id: str) -> Optional[CalibrationSnapshot]:
         """Get calibration snapshot for a camera, with K scaled to streammux resolution."""
         with self._lock:
-            cache_key = (int(source_id), str(camera_id))
             intr = self._intrinsics_loader.get(source_id)
-            cached = self._snapshot_cache.get(cache_key)
-            if cached is not None and self._snapshot_intrinsics.get(cache_key) == intr:
-                return cached
-            if cached is not None:
-                # CameraConfigLoader hot-reloads by mtime.  Do not let a
-                # changed intrinsics entry leave any other snapshot stale.
+            return self._snapshot_locked(source_id, camera_id, intr)
+
+    def snapshots(self, camera_labels: Mapping[int, str]) -> Dict[int, Optional[CalibrationSnapshot]]:
+        """Read up to three cameras from ONE current intrinsics generation.
+
+        Every call independently polls the loader; prepare and commit cannot
+        share a stale cross-transaction authority cache. Reload/setter methods
+        use this same manager lock. Missing cameras remain unavailable.
+        """
+        labels = dict(camera_labels)
+        if (not 1 <= len(labels) <= 3 or any(type(source) is not int or source < 0
+                or type(camera) is not str or not camera for source,camera in labels.items())):
+            raise ValueError("calibration_snapshot_source_bounds")
+        with self._lock:
+            intrinsics = self._intrinsics_loader.all()
+            # Invalidate BEFORE returning any camera, including unchanged ones,
+            # so a batch never spans old/new cached calibration generations.
+            if any(intrinsics.get(source) != prior
+                   for (source,_camera),prior in self._snapshot_intrinsics.items()):
                 self._invalidate_snapshot_cache()
-            if intr is None:
-                _LOGGER.warning("snapshot: no intrinsics for source_id=%d camera_id=%s", source_id, camera_id)
-                return None
+            return {source: self._snapshot_locked(source,camera,intrinsics.get(source))
+                    for source,camera in sorted(labels.items())}
 
-            K = self._build_scaled_K(intr, camera_id)
-            if K is None:
-                return None
+    def _snapshot_locked(self, source_id, camera_id, intr) -> Optional[CalibrationSnapshot]:
+        """Existing single-camera builder; caller owns lock and current inputs."""
+        cache_key = (int(source_id), str(camera_id))
+        cached = self._snapshot_cache.get(cache_key)
+        if cached is not None and self._snapshot_intrinsics.get(cache_key) == intr:
+            return cached
+        if cached is not None:
+            self._invalidate_snapshot_cache()
+        if intr is None:
+            _LOGGER.warning("snapshot: no intrinsics for source_id=%d camera_id=%s", source_id, camera_id)
+            return None
 
-            # Validate K
-            try:
-                _validate_K(K, camera_id)
-            except CalibrationValidationError as exc:
-                _LOGGER.error("snapshot validation failed: %s", exc)
-                return None
-            # Cached snapshots are shared across all consumers.  Keep the
-            # matrix read-only so a caller cannot corrupt the cached value.
-            K.setflags(write=False)
+        K = self._build_scaled_K(intr, camera_id)
+        if K is None:
+            return None
+        try:
+            _validate_K(K, camera_id)
+        except CalibrationValidationError as exc:
+            _LOGGER.error("snapshot validation failed: %s", exc)
+            return None
+        K.setflags(write=False)
 
-            # Get extrinsics
-            E = self._get_E(camera_id)
-            if E is None:
-                _LOGGER.warning("snapshot: no extrinsics for camera_id=%s", camera_id)
-                return None
+        E = self._get_E(camera_id)
+        if E is None:
+            _LOGGER.warning("snapshot: no extrinsics for camera_id=%s", camera_id)
+            return None
+        try:
+            _validate_E(E, camera_id)
+        except CalibrationValidationError as exc:
+            _LOGGER.error("snapshot validation failed: %s", exc)
+            return None
 
-            # Validate E
-            try:
-                _validate_E(E, camera_id)
-            except CalibrationValidationError as exc:
-                _LOGGER.error("snapshot validation failed: %s", exc)
-                return None
-
-            floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
-            unit_scale = 1.0
-            frame_contract = self._frame_contract_for_camera(camera_id)
-            frame_binding = self._scene_prior_frame_bindings.get(camera_id)
-
-            snapshot = CalibrationSnapshot(
-                camera_id=camera_id,
-                intrinsics=K,
-                extrinsics_col_major=tuple(float(value) for value in E),
-                floor_y=floor_y,
-                image_size=self._streammux_size,
-                unit_scale=unit_scale,
-                frame_contract=frame_contract,
-                camera_calibration_sha256=self._camera_calibration_sha256,
-                world_alignment_sha256=self._world_alignment_sha256,
-                scene_prior_id=(
-                    (
-                        frame_binding.artifact_revision_id
-                        or frame_binding.target_frame.revision
-                    )
-                    if frame_binding is not None
-                    else None
-                ),
-                target_revision_id=(
-                    frame_binding.target_revision_id
-                    if frame_binding is not None
-                    else None
-                ),
-                support_surfaces=self._support_surfaces.get(camera_id),
-            )
-            self._snapshot_cache[cache_key] = snapshot
-            self._snapshot_intrinsics[cache_key] = intr
-            return snapshot
+        floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
+        unit_scale = 1.0
+        frame_contract = self._frame_contract_for_camera(camera_id)
+        frame_binding = self._scene_prior_frame_bindings.get(camera_id)
+        snapshot = CalibrationSnapshot(
+            camera_id=camera_id,
+            intrinsics=K,
+            extrinsics_col_major=tuple(float(value) for value in E),
+            floor_y=floor_y,
+            image_size=self._streammux_size,
+            unit_scale=unit_scale,
+            frame_contract=frame_contract,
+            camera_calibration_sha256=self._camera_calibration_sha256,
+            world_alignment_sha256=self._world_alignment_sha256,
+            scene_prior_id=(
+                (frame_binding.artifact_revision_id or frame_binding.target_frame.revision)
+                if frame_binding is not None else None
+            ),
+            target_revision_id=(frame_binding.target_revision_id if frame_binding is not None else None),
+            support_surfaces=self._support_surfaces.get(camera_id),
+        )
+        self._snapshot_cache[cache_key] = snapshot
+        self._snapshot_intrinsics[cache_key] = intr
+        return snapshot
 
     def _invalidate_snapshot_cache(self) -> None:
         """Drop raw/active snapshots as one atomic calibration generation."""
@@ -1782,10 +1792,14 @@ def create_calibration_manager(
     scene_prior_frame_bindings: Mapping[
         str, ScenePriorFrameBinding
     ] | None = None,
+    presentation_evidence_root: Path | None = None,
 ) -> CalibrationManager:
     """Construct the one calibration authority used by live and offline paths."""
 
     cameras_path = Path(cameras_yaml_path)
+    if presentation_evidence_root is not None and (
+            not presentation_evidence_root.is_absolute() or not presentation_evidence_root.is_dir()):
+        raise CalibrationValidationError("presentation evidence root must be an explicit existing absolute directory")
     extrinsics_path = Path(camera_calibration_json_path)
     alignment_path = Path(ply_alignment_json_path)
     for label, path in (
@@ -1856,6 +1870,7 @@ def create_calibration_manager(
         presentation_authored_obj_path=(
             Path(authored_path_raw) if authored_path_raw else None
         ),
+        presentation_evidence_root=presentation_evidence_root,
     )
     manager.set_camera_labels(labels)
     return manager

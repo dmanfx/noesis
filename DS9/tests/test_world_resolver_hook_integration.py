@@ -44,6 +44,567 @@ def _processor(config: dict[str, object] | None = None):
     )
 
 
+@pytest.mark.parametrize('mode',['negative','anchor_negative','geometry_negative','current','budget','off'])
+def test_r141_same_original_native_diagnostics_and_rendezvous(monkeypatch,mode):
+    hooks.reset_core_path_instrumentation()
+    monkeypatch.setenv('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S','6')
+    if mode!='off':monkeypatch.setenv('NOESIS_XC3D_POSE_DIAGNOSTIC_RANGE','1:6:420:470')
+    else:monkeypatch.delenv('NOESIS_XC3D_POSE_DIAGNOSTIC_RANGE',raising=False)
+    negative=mode in ('negative','anchor_negative','geometry_negative')
+    monkeypatch.setenv('NOESIS_POSE_FEATURES_PER_FRAME_MAX','0' if mode in ('budget','anchor_negative') else '1')
+    monkeypatch.setenv('NOESIS_POSE_ANCHOR_NATIVE_EXTRACTS_PER_FRAME_MAX','1' if mode=='anchor_negative' else '0')
+    calls=[]
+    def extract(obj,gie,w,h,score,letterbox,*optional):
+        calls.append(len(optional))
+        if optional:
+            optional[0].update(tensor_count=1,context_present=True,context_valid=True,
+                shape_valid=True,rows=300,cols=57,qualifying_rows_seen=0 if negative else 1,
+                result='no_qualifying_row' if negative else 'decoded')
+            if mode=='geometry_negative':
+                optional[0].update(_i156_geometry())
+                optional[0]['result']='context_no_matching_row'
+        if negative:return None
+        joints=[[float(i),float(i),.9] for i in range(17)]
+        return dict(score=.9,keypoints_roi=joints,keypoints_abs=joints)
+    monkeypatch.setattr(hooks,'noesis_pose_meta_ext',SimpleNamespace(
+        extract_pose_keypoints=extract,attach_pose_features=lambda *args:True))
+    pipeline=SimpleNamespace(config={
+        'xc3d_world_quality':{'contract':'noesis.xc3d.world_quality.v1','enabled':True},
+        'xc3d_image_regions':{'enabled':True}},stable_id_mgr=SimpleNamespace(active_tracks={}))
+    producer=hooks.PoseFeatureProcessor(pipeline=pipeline,gie_id=4)
+    obj=SimpleNamespace(object_id=6,class_id=0,rect_params=SimpleNamespace(
+        left=30.,top=40.,width=100.,height=200.))
+    frame=420;pts=frame*33_333_333+777
+    receipt=dict(source_id=1,original_source_id=1,receipt_valid=True,
+        sdk_source_id=1,original_sdk_source_id=1,slot=0,original_batch_id=0,
+        original_buffer_scope=421,original_ntp_ns=0,post_tracker_ntp_ns=0,
+        original_frame=frame,original_pts_ns=pts,post_tracker_pts_ns=pts)
+    producer.handle_servicemaker_frame(object(),SimpleNamespace(source_id=1,
+        frame_number=1320,buf_pts=pts,object_items=iter([obj])),source_receipt=receipt)
+    found,value=producer._owned_pose_result((1,6,frame,pts),[30.,40.,100.,200.],(4,(640,640),.25,True))
+    assert calls==([] if mode=='budget' else [0 if mode=='off' else 1])
+    assert found==(mode!='budget')
+    assert (value is not None)==(mode in ('current','off'))
+    summary=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']
+    if mode=='off':
+        assert not summary['records'];return
+    row=summary['records'][0]
+    assert row['frame']==420 and row['pts_ns']==pts and row['generation'] is None
+    assert row['lifecycle_available'] is False
+    assert row['rendezvous_status']==('owned_negative' if negative else
+        'object_or_bbox_missing' if mode=='budget' else 'owned_current')
+    if negative:
+        assert row['result']==('context_no_matching_row' if mode=='geometry_negative' else 'no_qualifying_row')
+        assert row['tensor_count']==1
+        assert row['first_pose_failure_frame']==420
+        if mode=='geometry_negative':
+            assert row['first_pre_iou_rejection']['frame']==420
+            assert row['first_pre_iou_rejection']['pts_ns']==pts
+            assert row['pre_iou_candidates'][0]['torso_unclipped'][0][0]==31.
+    producer._owned_pose_result((1,6,421,pts+1),[30.,40.,100.,200.],(4,(640,640),.25,True))
+    later=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records'][0]
+    assert later['frame']==420 and later['rendezvous_frame']==421
+    if negative:assert later['first_pose_failure_frame']==420
+    assert len(calls)==(0 if mode=='budget' else 1)
+
+
+def test_r141_pose_probe_shares_final_record_and_byte_bounds():
+    import json
+    observer=hooks._CorePathInstrumentation()
+    for raw in range(10):
+        observer.record_pose_probe(dict(source=1,raw=raw,frame=420,pts_ns=1,
+            producer_status='anchor_attempt',native_returned=False,result='x'*80))
+    result=observer.snapshot()['registered_ankle_priority']
+    assert len(result['records'])==8 and result['omitted_records']==2
+    assert len(json.dumps(result,sort_keys=True,allow_nan=False,separators=(',',':')).encode())<=8192
+    observer.record_pose_probe(dict(source=1,raw=0,frame=421,pts_ns=2,producer_status='budget_denied'))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert row['frame']==421 and 'result' not in row and 'native_returned' not in row
+    assert row['first_pose_failure_frame']==420
+
+
+@pytest.mark.parametrize('native_current',[True,False])
+def test_r142_actual_projective_call_forwards_current_original_binding(monkeypatch,native_current):
+    import ast
+    p,t,proof=_r138_factory(monkeypatch)
+    state=hooks._WorldAnchorState()
+    point=np.array([proof.position_xz[0],0.,proof.position_xz[1]])
+    p._update_track_world_state(t,state,measurement=point,floor_y=0.,now_ts=proof.sample_ts,
+        alpha=.3,beta=.15,quality='good',contact_basis='depth:pose_ankle_support',
+        registered_ankle_original=proof,registered_ankle_binding=proof.binding[:-2],
+        selected_geometry_kind='registered_depth',media_pts_ns=proof.media_pts_ns)
+    _,current,selected,_=_r131_ankle_original(frame=75)
+    current['_xc3d_native_pose_measured']=native_current
+    selected=selected.model_copy(update={'kind':'floor_ray'})
+    hooks.mark_world_measurement_unavailable(state,reason='depth_measurement_not_current',
+        now_ts=proof.sample_ts+1/30,config=p._human_ground_cfg)
+    assert state.accepted_ankle_original is proof
+    calls=[n for n in ast.walk(ast.parse(Path(hooks.__file__).read_text()))
+        if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)
+        and n.func.id=='integrate_projective_ground_observation']
+    assert len(calls)==1
+    namespace=dict(integrate_projective_ground_observation=hooks.integrate_projective_ground_observation,
+        state=state,projective_point=point+np.array([.01,0.,.01]),calib=SimpleNamespace(floor_y=0.),
+        now_ts=proof.sample_ts+1/30,self=p,track=current,selected_resolver_candidate=selected,
+        kinematic_output_reference_at_entry=(point[0],point[2],proof.media_pts_ns,proof.sample_ts,0),
+        output_reference_at_entry=None,display_recovery_reference_at_entry=None,filter_transition={})
+    result=eval(compile(ast.Expression(calls[0]),'<actual projective caller>','eval'),namespace)
+    assert result is not None and not state.measurement_accepted
+    assert (state.accepted_ankle_original is proof)==native_current
+    assert proof.sample_ts==proof.media_pts_ns/1e9 and state.ankle_original_cursor is proof
+
+
+def test_r143_same_pass_native_subpredicate_scalars_are_bounded_and_not_grafted():
+    observer=hooks._CorePathInstrumentation()
+    observer.record_pose_probe(dict(source=1,raw=6,frame=420,pts_ns=1,producer_status='feature_attempt',
+        native_returned=False,result='context_no_matching_row',finite_rows_seen=300,padding_rows_seen=298,
+        score_pass_rows=2,class_pass_rows=2,bbox_pass_rows=2,center_pass_rows=0,iou_pass_rows=0,
+        max_score=.9,max_iou=None))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert row['score_pass_rows']==2 and row['max_score']==.9 and row['max_iou'] is None
+    observer.record_pose_probe(dict(source=1,raw=6,frame=421,pts_ns=2,producer_status='budget_denied'))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert 'score_pass_rows' not in row and 'max_score' not in row
+    observer.record_pose_probe(dict(source=1,raw=6,frame=422,pts_ns=3,max_iou=float('nan')))
+    assert observer.snapshot()['registered_ankle_priority']['records'][0]['frame']==421
+
+
+def _i156_geometry():
+    return dict(pre_iou_parent_bbox_xywh=[30.,40.,100.,200.],pre_iou_candidates_seen=3,
+        pre_iou_scan_complete=True,pre_iou_invalid_row_index=None,
+        pre_iou_candidates=[dict(row_index=i,score=.8,class_id=0.,iou=.49,
+            bbox_xyxy=[20.,30.,140.,250.],torso_unclipped=[[31.,60.,.9],[80.,60.,.9],
+                [31.,180.,.9],[80.,180.,.9]]) for i in range(2)])
+
+
+def test_i156_first_geometry_rejection_is_detached_and_keeps_its_own_original():
+    observer=hooks._CorePathInstrumentation()
+    observer.record_pose_probe(dict(source=1,raw=6,frame=420,pts_ns=4200,
+        native_returned=False,result='tensor_missing'))
+    geometry=_i156_geometry()
+    observer.record_pose_probe(dict(source=1,raw=6,frame=431,pts_ns=4310,
+        native_returned=False,result='context_no_matching_row',**geometry))
+    geometry['pre_iou_candidates'][0]['torso_unclipped'][0][0]=999.
+    first=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert first['first_pose_failure_frame']==420
+    pinned=first['first_pre_iou_rejection']
+    assert (pinned['frame'],pinned['pts_ns'])==(431,4310)
+    assert pinned['pre_iou_candidates_seen']==3 and len(pinned['pre_iou_candidates'])==2
+    assert pinned['pre_iou_candidates'][0]['torso_unclipped'][0][0]==31.
+    pinned['pre_iou_candidates'][0]['iou']=999.
+    # Later success/no-context and denied-original records cannot erase or
+    # restamp the first real geometry failure, nor graft latest coordinates.
+    observer.record_pose_probe(dict(source=1,raw=6,frame=432,pts_ns=4320,
+        native_returned=True,result='decoded'))
+    observer.record_pose_probe(dict(source=1,raw=6,frame=433,pts_ns=4330,producer_status='budget_denied'))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert row['frame']==433 and 'pre_iou_candidates' not in row and 'result' not in row
+    assert row['first_pre_iou_rejection']['pre_iou_candidates'][0]['iou']==.49
+    assert (row['first_pre_iou_rejection']['frame'],row['first_pre_iou_rejection']['pts_ns'])==(431,4310)
+
+
+@pytest.mark.parametrize('fault',['rows','torso','nan','bool-coordinate','unknown-key','bool-count','partial','invalid-index'])
+def test_i156_nested_geometry_rejects_unbounded_or_malformed_values(fault):
+    g=_i156_geometry()
+    if fault=='rows':g['pre_iou_candidates'].append(g['pre_iou_candidates'][0].copy())
+    elif fault=='torso':g['pre_iou_candidates'][0]['torso_unclipped'].append(None)
+    elif fault=='nan':g['pre_iou_candidates'][0]['torso_unclipped'][0][0]=float('nan')
+    elif fault=='bool-coordinate':g['pre_iou_parent_bbox_xywh'][0]=True
+    elif fault=='unknown-key':g['pre_iou_candidates'][0]['unbounded_tensor']=[]
+    elif fault=='bool-count':g['pre_iou_candidates_seen']=True
+    elif fault=='partial':g.pop('pre_iou_scan_complete')
+    elif fault=='invalid-index':g['pre_iou_invalid_row_index']=300
+    observer=hooks._CorePathInstrumentation()
+    observer.record_pose_probe(dict(source=1,raw=6,frame=431,pts_ns=4310,**g))
+    assert observer.snapshot()['registered_ankle_priority']['records']==[]
+
+
+def test_i156_geometry_keeps_existing_shared_record_and_byte_caps_with_honest_omissions():
+    import json
+    observer=hooks._CorePathInstrumentation()
+    for raw in range(10):
+        observer.record_pose_probe(dict(source=1,raw=raw,frame=431,pts_ns=4310,
+            native_returned=False,result='context_no_matching_row',**_i156_geometry()))
+    result=observer.snapshot()['registered_ankle_priority']
+    assert result['record_limit']==8 and result['byte_limit']==8192
+    assert len(result['records'])<=8 and result['omitted_records']==10-len(result['records'])
+    assert len(json.dumps(result,allow_nan=False,sort_keys=True,separators=(',',':')).encode())<=8192
+    # Explicit unavailable point/IoU from a malformed mapping remains JSON None.
+    g=_i156_geometry();g['pre_iou_candidates'][0]['torso_unclipped'][0]=None
+    g['pre_iou_candidates'][0]['iou']=None
+    observer=hooks._CorePathInstrumentation()
+    observer.record_pose_probe(dict(source=1,raw=6,frame=431,pts_ns=4310,**g))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert row['pre_iou_candidates'][0]['torso_unclipped'][0] is None
+    assert row['pre_iou_candidates'][0]['iou'] is None
+
+
+def test_r146_pending_weak_floor_cannot_suppress_current_column():
+    import copy
+    from DS9.tests.test_registered_body_column import _r75_current_column,_r75_apply
+    from noesis_core.world.resolver import UniversalWorldMeasurementResolver,WorldMeasurementResolverConfig
+    state=hooks._WorldAnchorState(world_x=11.5604794722,world_z=5.7414193952,
+        filtered_ts=4.4,last_good_world=(11.5604794722,0.,5.7414193952),last_good_ts=4.4,
+        last_output_world_x=11.5604794722,last_output_world_z=5.7414193952,
+        accepted_metric_contact_basis='pose_ankle_floor',posture='standing')
+    for i in range(1):
+        p,t,column,depth=_r75_current_column(134+i*6,4_466_666_666+i*200_000_000)
+        p._min_unposed_detection_confidence=.55
+        p._world_resolver=UniversalWorldMeasurementResolver(config=WorldMeasurementResolverConfig(registered_body_column=True))
+        floor=column.model_copy(update=dict(candidate_id='floor_ray',method=None,kind='floor_ray',
+            anchor='pose_ankle_floor',support_state='floor',confidence=.99,support_score=.99,
+            source_reliability=1.,ray_incidence_sin=.3,
+            position=Vector3(x=12.3412776064,y=0.,z=6.5337807356)))
+        rows=WorldMeasurementSet(cohort=column.cohort,hypotheses=(floor,column))
+        trial=copy.deepcopy(state)
+        floor_result=p._world_resolver.resolve(rows.model_copy(update={'hypotheses':(floor,)}))
+        assert floor_result.quality=='weak'
+        hooks.update_human_cv_filter(trial,measurement=np.array([floor.position.x,0.,floor.position.z]),
+            floor_y=0.,now_ts=t['media_pts_ns']/1e9,quality='weak',config=p._human_ground_cfg,
+            contact_basis='pose_ankle_floor',selected_geometry_kind='floor_ray')
+        assert not trial.measurement_accepted  # Actual temporal/physical admission, not just support.
+        before=copy.deepcopy(state.__dict__)
+        kwargs=dict(contact_basis={'floor_ray':'pose_ankle_floor','registered_body_column':'depth:registered_body_column'},
+            track=t,state=state,detector_confidence=.9,now_ts=t['media_pts_ns']/1e9)
+        chosen=p._body_column_fallback_set(rows,**kwargs)
+        assert state.__dict__==before
+        assert next(h for h in chosen.hypotheses if h.method=='registered_body_column').valid
+        assert p._world_resolver.resolve(chosen).selected_candidate_id=='registered_body_column'
+        _r75_apply(p,t,column,depth,state)
+        assert not state.measurement_accepted and state.reacquire_count==1
+    assert not state.reacquired  # Selection is not a one-sample measurement grant.
+
+
+@pytest.mark.parametrize('mode',['near-weak','third-floor-vote','good-floor','cold-floor','no-column'])
+def test_r146_actual_admitted_ordinary_retains_priority_without_state_mutation(mode):
+    import copy
+    from DS9.tests.test_registered_body_column import _r75_current_column
+    from noesis_core.world.resolver import UniversalWorldMeasurementResolver,WorldMeasurementResolverConfig
+    p,t,column,_=_r75_current_column(146,4_866_666_666)
+    p._min_unposed_detection_confidence=.55
+    p._world_resolver=UniversalWorldMeasurementResolver(config=WorldMeasurementResolverConfig(registered_body_column=True))
+    state=hooks._WorldAnchorState(world_x=11.56,world_z=5.74,filtered_ts=4.8,
+        last_good_world=(11.56,0.,5.74),last_good_ts=4.8,last_output_world_x=11.56,
+        last_output_world_z=5.74,accepted_metric_contact_basis='pose_ankle_floor')
+    far=mode=='third-floor-vote'
+    point=Vector3(x=12.34 if far else 11.57,y=0.,z=6.53 if far else 5.75)
+    floor=column.model_copy(update=dict(candidate_id='floor_ray',method=None,kind='floor_ray',
+        anchor='pose_ankle_floor',support_state='floor',confidence=.99,support_score=.99,
+        source_reliability=1.,ray_incidence_sin=.3,position=point,
+        pcf=None if mode in ('good-floor','cold-floor') else column.pcf))
+    if far:
+        state.reacquire_candidate_x=12.34;state.reacquire_candidate_z=6.53
+        state.reacquire_candidate_ts=4.8;state.reacquire_candidate_basis='pose_floor'
+        state.reacquire_candidate_exact_basis='pose_ankle_floor';state.reacquire_count=2
+    if mode=='cold-floor':state=hooks._WorldAnchorState()
+    if mode=='no-column':column=column.model_copy(update={'valid':False,'rejection_reason':'no_current_registered_original'})
+    before=copy.deepcopy(state.__dict__)
+    rows=WorldMeasurementSet(cohort=column.cohort,hypotheses=(floor,column))
+    chosen=p._body_column_fallback_set(rows,contact_basis={'floor_ray':'pose_ankle_floor'},
+        track=t,state=state,detector_confidence=.9,now_ts=t['media_pts_ns']/1e9)
+    assert p._world_resolver.resolve(chosen).selected_candidate_id=='floor_ray'
+    assert state.__dict__==before
+
+
+def _r131_ankle_original(frame=62):
+    from noesis.metadata.object_depth import NativePosePatchSupport, PoseDepthSample
+    from noesis.pipelines.source_acquisition import OriginalCohort
+    p = _processor()
+    p.pipeline.config['xc3d_image_regions'] = {'enabled': True}
+    pts = frame*1_000_000_000//30
+    c = _cohort().model_copy(update={'frame_id': frame, 'observed_at_us': pts//1000,
+        'world_transform_sha256': 'a'*64})
+    selected = _hypothesis(c, candidate_id='registered_depth', kind='registered_depth',
+        x=10.6101953969).model_copy(update={'anchor':'person_mask_floor',
+            'position':Vector3(x=10.6101953969,y=0.,z=5.5591718368)})
+    patch = NativePosePatchSupport('pose_ankle_support',(400.,500.),
+        ((390.,500.,410.,500.,5.,5.),),(1920,1080),frame,pts//1000)
+    sample = PoseDepthSample('pose_ankle_support',(400.,500.),32,1.,32,12.,11.9,12.1,'good')
+    depth = ObjectDepthResult(5,frame,17,0,(350.,300.,100.,220.),.9,'pose_capsule_native','ok','m',True,32,1.,
+        anchor_source='pose_ankle_support',anchor_uv=(400.,500.),anchor_depth_m=12.,
+        anchor_sample_count=32,anchor_valid_fraction=1.,pose_depth_samples=(sample,),native_pose_support=(patch,),
+        ts_us=pts//1000,measurement_frame_id=frame,measurement_ts_us=pts//1000,measurement_cached=False,
+        depth_tensor_frame_id=frame,depth_tensor_ts_us=pts//1000,depth_tensor_age_frames=0,depth_tensor_age_us=0)
+    track=dict(source_id=5,tracker_id=17,frame_id=frame,observed_at_us=pts//1000,
+        tracker_lifecycle_generation=3,media_pts_ns=pts,image_size=(1920,1080),
+        _xc3d_native_pose_measured=True,
+        _xc3d_original_frame_id=frame,
+        _xc3d_current_original=OriginalCohort('run','graph','camera-0',5,0,frame,pts,0,'source_sr'))
+    return p,track,selected,depth
+
+
+def _r138_factory(monkeypatch, defect=None, *, enabled=True):
+    from dataclasses import replace
+    monkeypatch.setenv('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S','5.333333')
+    _,t,c,d=_r131_ankle_original(frame=74)
+    p=_processor({'xc3d_image_regions':{'enabled':enabled}})
+    if defect=='binding':t['_xc3d_native_pose_measured']=False
+    if defect=='patch':d=replace(d,native_pose_support=())
+    if defect=='patch-frame':d=replace(d,native_pose_support=(replace(d.native_pose_support[0],measurement_frame_id=73),))
+    point=np.array([c.position.x,0.,c.position.z])
+    resolved=point.copy()
+    if defect=='xz':resolved[0]+=.001
+    proof=p._registered_ankle_original(track=t,selected=c,depth_result=d,
+        depth_observation=hooks._DepthObservationResult(point,.9,'ok',raw_depth_m=12.,
+            registered_depth_m=7.2,registration_status='ok',registration_id='reg'),
+        person_anchor=p._resolve_person_depth_anchor(d),measurement=resolved,
+        now_ts=t['media_pts_ns']/1e9,calib=SimpleNamespace(image_size=(1280,720) if defect=='raster' else (1920,1080)),
+        pose_is_current=defect!='pose')
+    return p,t,proof
+
+
+@pytest.mark.parametrize('defect,stage',[(None,'ready'),('binding','binding'),('pose','pose_not_current'),
+    ('patch','private_patch_count'),('patch-frame','private_patch_original'),('raster','private_patch_raster'),
+    ('xz','resolved_xz_mismatch')])
+def test_r138_exact_factory_failure_stage_outside_fixed_targets(monkeypatch,defect,stage):
+    hooks.reset_core_path_instrumentation()
+    _,_,proof=_r138_factory(monkeypatch,defect)
+    rows=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records']
+    assert len(rows)==1 and rows[0]['factory_stage']==stage and rows[0]['frame']==74
+    assert (proof is not None)==(defect is None)
+    assert rows[0]['pts_ns']==74*1_000_000_000//30  # Not the configured 5.333s target.
+
+
+def test_r138_diagnostic_default_disabled_and_observer_failure_parity(monkeypatch):
+    hooks.reset_core_path_instrumentation()
+    _r138_factory(monkeypatch,'pose',enabled=False)
+    assert not hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records']
+    monkeypatch.delenv('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S')
+    p=_processor({'xc3d_image_regions':{'enabled':True}})
+    assert p._ankle_priority_diagnostic_enabled is False
+    def broken(*a,**kw):raise RuntimeError('optional diagnostic unavailable')
+    monkeypatch.setattr(hooks._CORE_PATH_INSTRUMENTATION,'record_ankle_priority',broken)
+    assert _r138_factory(monkeypatch)[2] is not None
+    assert _r138_factory(monkeypatch,'pose')[2] is None
+
+
+def test_r138_first_failure_latest_proof_and_final_byte_bound():
+    import json
+    observer=hooks._CorePathInstrumentation()
+    for raw in range(40):
+        observer.record_ankle_priority({'source':2,'raw':raw,'generation':2,'frame':74,
+            'factory_stage':'pose_not_current','pose_current':False,
+            'factory_geometry':'registered_depth','factory_relevant':True})
+    observer.record_ankle_priority({'source':2,'raw':0,'generation':2,'frame':80,
+        'factory_stage':'ready','proof_present':True,'proof_frame':80,
+        'factory_geometry':'registered_depth','factory_relevant':True})
+    view=observer.snapshot()['registered_ankle_priority']
+    assert len(view['records'])==8 and view['omitted_records']==32
+    first=view['records'][0]
+    assert first['first_failure']=='pose_not_current' and first['first_failure_frame']==74
+    assert first['factory_stage']=='ready' and first['proof_frame']==80
+    first['factory_stage']='foreign'
+    assert observer.snapshot()['registered_ankle_priority']['records'][0]['factory_stage']=='ready'
+    # All accepted scalar fields may be long; FINAL encoded bytes still bound.
+    for raw in range(8):
+        observer.record_ankle_priority(dict(source=2,raw=raw,generation=2,
+            **{k:'x'*80 for k in ('frame','pts_ns','factory_stage','pose_current','native_measured','original_frame',
+            'depth_frame','patch_frame','patch_pts_us','patch_raster_match','depth_current','filter_frame',
+            'local_accepted','cursor_frame','proof_frame','proof_sample_ts','proof_age_s','proof_present',
+            'proof_expired','binding_present','geometry','proof_transition')},factory_relevant=True))
+    encoded=json.dumps(observer.snapshot()['registered_ankle_priority'],sort_keys=True,allow_nan=False,separators=(',',':')).encode()
+    assert len(encoded)<=8192 and json.loads(encoded)['omitted_records']>32
+
+
+def test_r138_floor_support_skip_never_hides_real_registered_factory_failure():
+    observer=hooks._CorePathInstrumentation()
+    key={'source':2,'raw':3,'generation':2}
+    for frame in (66,68):
+        observer.record_ankle_priority(dict(key,frame=frame,factory_stage='not_invoked_quality',
+            factory_geometry='floor_ray',factory_relevant=False))
+    assert not observer.snapshot()['registered_ankle_priority']['records']
+    observer.record_ankle_priority(dict(key,frame=74,factory_stage='private_patch_original',
+        factory_geometry='registered_depth',factory_relevant=True))
+    observer.record_ankle_priority(dict(key,frame=76,factory_stage='selected_anatomy_or_support',
+        factory_geometry='floor_ray',factory_relevant=False))
+    observer.record_ankle_priority(dict(key,filter_frame=76,geometry='floor_ray',proof_present=False))
+    row=observer.snapshot()['registered_ankle_priority']['records'][0]
+    assert row['first_failure']=='private_patch_original' and row['first_failure_frame']==74
+    assert row['factory_stage']=='private_patch_original' and row['frame']==74
+    assert row['factory_geometry']=='registered_depth' and row['factory_relevant'] is True
+    assert row['filter_frame']==76 and row['geometry']=='floor_ray'
+    clean=hooks._CorePathInstrumentation()
+    clean.record_ankle_priority(dict(key,frame=74,factory_stage='ready',factory_geometry='registered_depth',factory_relevant=True))
+    clean.record_ankle_priority(dict(key,frame=76,factory_stage='not_invoked_quality',factory_geometry='floor_ray',factory_relevant=False))
+    assert 'first_failure' not in clean.snapshot()['registered_ankle_priority']['records'][0]
+
+
+def test_r138_actual_filter_proof_harvest_and_expiry_scalars(monkeypatch):
+    hooks.reset_core_path_instrumentation()
+    p,t,proof=_r138_factory(monkeypatch)
+    state=hooks._WorldAnchorState()
+    for frame,quality,basis,geometry in ((74,'good','depth:pose_ankle_support','registered_depth'),
+            (76,'weak','pose_ankle_floor','floor_ray'),(100,'weak','pose_ankle_floor','floor_ray')):
+        t['frame_id']=frame
+        p._update_track_world_state(t,state,measurement=np.array([*proof.position_xz[:1],0.,proof.position_xz[1]]),
+            floor_y=0.,now_ts=proof.sample_ts if frame==74 else frame/30.,alpha=.3,beta=.15,quality=quality,
+            contact_basis=basis,selected_geometry_kind=geometry,registered_ankle_binding=proof.binding[:-2],
+            registered_ankle_original=proof if frame==74 else None,media_pts_ns=proof.media_pts_ns if frame==74 else None)
+        row=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records'][0]
+        assert row['filter_frame']==frame and row['cursor_frame']==74
+        if frame==76:assert row['proof_transition']=='harvested' and row['proof_frame']==74
+        if frame==100:assert row['proof_transition']=='cleared' and row['proof_expired'] is True
+    assert row['first_clear_frame']==100 and row['first_clear_proof_frame']==74
+    assert row['first_clear_quality']=='weak' and row['first_clear_contact']=='pose_ankle_floor'
+    assert row['first_clear_geometry']=='floor_ray' and row['first_clear_binding_equal'] is True
+    assert row['first_clear_age_s']>.75 and row['first_clear_native_measured'] is True
+    # Another actual clear must not replace the first; ordinary latest state can advance.
+    p._record_ankle_filter_state(t,state,proof,proof.sample_ts+.1,None,'floor_ray','weak','pose_ankle_floor')
+    latest=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records'][0]
+    assert latest['first_clear_binding_equal'] is True and latest['first_clear_age_s']==row['first_clear_age_s']
+
+
+def test_r140_actual_filter_pins_native_binding_clear_before_later_updates(monkeypatch):
+    hooks.reset_core_path_instrumentation()
+    p,t,proof=_r138_factory(monkeypatch)
+    state=hooks._WorldAnchorState()
+    point=np.array([proof.position_xz[0],0.,proof.position_xz[1]])
+    for frame in (74,76,78,80):
+        t['frame_id']=frame;t['_xc3d_native_pose_measured']=frame!=78
+        p._update_track_world_state(t,state,measurement=point,floor_y=0.,
+            now_ts=proof.sample_ts if frame==74 else frame/30.,alpha=.3,beta=.15,
+            quality='good' if frame==74 else 'weak',
+            contact_basis='depth:pose_ankle_support' if frame==74 else 'pose_ankle_floor',
+            selected_geometry_kind='registered_depth' if frame==74 else 'floor_ray',
+            registered_ankle_original=proof if frame==74 else None,
+            registered_ankle_binding=None if frame==78 else proof.binding[:-2],
+            media_pts_ns=proof.media_pts_ns if frame==74 else None)
+    row=hooks.get_core_path_instrumentation_snapshot()['registered_ankle_priority']['records'][0]
+    assert row['first_clear_frame']==78 and row['first_clear_proof_frame']==74
+    assert row['first_clear_binding_present'] is False and row['first_clear_binding_equal'] is False
+    assert row['first_clear_native_measured'] is False and 0<row['first_clear_age_s']<.75
+    assert row['filter_frame']==80 and row['binding_present'] is True
+
+
+def test_r138_actual_runtime_stats_payload_forwards_only_opted_in_collected_probe(monkeypatch):
+    import ast
+    import copy
+    import json
+    import os
+    root=ast.parse((REPO_ROOT/'DS9/noesis/ds9_runtime_core.py').read_text())
+    stats=next(n for n in ast.walk(root) if isinstance(n,ast.FunctionDef) and n.name=='_stats')
+    assignment=next(n for n in ast.walk(stats) if isinstance(n,ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='stats_payload' for t in n.targets))
+    def field(node,name):
+        return next(v for k,v in zip(node.keys,node.values) if isinstance(k,ast.Constant) and k.value==name)
+    # Execute the ACTUAL producer payload expression, without importing SDK/runtime.
+    node=copy.deepcopy(field(field(assignment.value,'pipeline'),'zero_copy_core'))
+    expression=compile(ast.fix_missing_locations(ast.Expression(node)),'actual_stats_zero_copy_core','eval')
+    hooks.reset_core_path_instrumentation()
+    _r138_factory(monkeypatch,'pose')
+    snapshot=hooks.get_core_path_instrumentation_snapshot()
+    namespace=dict(core_instr=snapshot,core_counters={'existing':1},core_stage_timings={'existing':{}},
+        ws_boundary_metrics={'ws':1},rest_boundary_metrics={'rest':1},os=os,
+        pipeline=SimpleNamespace(config={'xc3d_image_regions':{'enabled':True}}))
+    payload=eval(expression,namespace)
+    assert payload['registered_ankle_priority']==snapshot['registered_ankle_priority']
+    assert payload['registered_ankle_priority']['records'][0]['factory_stage']=='pose_not_current'
+    assert len(json.dumps(payload['registered_ankle_priority'],sort_keys=True,separators=(',',':')).encode())<=8192
+    expected={'counters':{'existing':1},'stage_timings':{'existing':{}},
+        'boundary_serialization_metrics':{'ws':{'ws':1},'rest':{'rest':1}}}
+    assert {k:v for k,v in payload.items() if k!='registered_ankle_priority'}==expected
+    monkeypatch.delenv('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S')
+    assert eval(expression,namespace)==expected
+    monkeypatch.setenv('NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S','5.333333')
+    namespace['pipeline'].config={}
+    assert eval(expression,namespace)==expected
+    namespace['pipeline'].config={'xc3d_image_regions':{'enabled':True}}
+    namespace['core_instr']={'registered_ankle_priority':{'records':[],'omitted_records':0}}
+    assert eval(expression,namespace)==expected
+    namespace['core_instr']={'registered_ankle_priority':{'records':[],'omitted_records':1}}
+    assert eval(expression,namespace)['registered_ankle_priority']['omitted_records']==1
+
+
+@pytest.mark.parametrize('defect',['cached','old','future','birth','pts','missing-patch','not-current-pose','shadow','disabled','wrong-anatomy'])
+def test_r131_registered_ankle_proof_requires_actual_current_original(defect):
+    from dataclasses import replace
+    p,t,c,d=_r131_ankle_original()
+    if defect=='cached': d=replace(d,measurement_cached=True)
+    elif defect=='old': d=replace(d,measurement_frame_id=61)
+    elif defect=='future': d=replace(d,measurement_frame_id=63)
+    elif defect=='birth': t['tracker_lifecycle_generation']=4
+    elif defect=='pts': t['_xc3d_current_original']=replace(t['_xc3d_current_original'],pts_ns=1)
+    elif defect=='missing-patch': d=replace(d,native_pose_support=())
+    elif defect=='shadow': t['_xc3d_native_pose_measured']=False
+    elif defect=='disabled': p.pipeline.config['xc3d_image_regions']['enabled']=False
+    elif defect=='wrong-anatomy': d=replace(d,anchor_source='pose_torso_support')
+    point=np.array([c.position.x,0.,c.position.z])
+    proof=p._registered_ankle_original(track=t,selected=c,depth_result=d,
+        depth_observation=hooks._DepthObservationResult(point,.9,'ok',raw_depth_m=12.,
+            registered_depth_m=7.2,registration_status='ok',registration_id='reg'),
+        person_anchor=p._resolve_person_depth_anchor(d),measurement=point,
+        now_ts=t['media_pts_ns']/1e9,calib=SimpleNamespace(image_size=(1920,1080)),
+        pose_is_current=defect!='not-current-pose')
+    assert proof is None
+
+
+@pytest.mark.parametrize('generic_pixel_motion',[False,True])
+def test_r131_current_registered_ankle_cannot_be_reanchored_by_weak_floor_cadence(generic_pixel_motion):
+    p,track,selected,depth = _r131_ankle_original()
+    point = np.array([selected.position.x,0.,selected.position.z])
+    proof = p._registered_ankle_original(track=track,selected=selected,depth_result=depth,
+        depth_observation=hooks._DepthObservationResult(point,.9,'ok',raw_depth_m=12.,
+            registered_depth_m=7.2,registration_status='ok',registration_id='reg'),
+        person_anchor=p._resolve_person_depth_anchor(depth),measurement=point,
+        now_ts=track['media_pts_ns']/1e9,calib=SimpleNamespace(image_size=(1920,1080)),pose_is_current=True)
+    assert type(proof) is hooks.RegisteredAnkleOriginal
+    state = hooks._WorldAnchorState()
+    p._update_track_world_state({}, state,
+        measurement=point, floor_y=0.,
+        now_ts=proof.sample_ts, alpha=.3, beta=.15, quality='good',
+        registered_ankle_original=proof,registered_ankle_binding=proof.binding[:-2],media_pts_ns=proof.media_pts_ns,
+        contact_basis='depth:pose_ankle_support', verified_reacquire_support=True)
+    assert state.measurement_accepted
+    for frame in (63, 64, 65):
+        p._update_track_world_state({}, state,
+            measurement=np.array([11.3454876512, 0., 6.5970391003]), floor_y=0.,
+            now_ts=frame/30., alpha=.3, beta=.15, quality='weak',
+            registered_ankle_binding=proof.binding[:-2],
+            image_motion_supported=generic_pixel_motion,
+            contact_basis='pose_ankle_floor', verified_reacquire_support=True)
+        assert not state.measurement_accepted and not state.reacquired
+        assert state.accepted_ankle_original is proof
+        assert state.accepted_ankle_original.sample_ts == proof.sample_ts
+
+
+@pytest.mark.parametrize('unavailable', [False, True])
+@pytest.mark.parametrize('generic_pixel_motion', [False, True])
+def test_r136_floor_ray_geometry_keeps_true_depth_uv_basis_but_cannot_reanchor(unavailable, generic_pixel_motion):
+    p, track, selected, depth = _r131_ankle_original(frame=64)
+    point = np.array([selected.position.x, 0., selected.position.z])
+    proof = p._registered_ankle_original(track=track, selected=selected, depth_result=depth,
+        depth_observation=hooks._DepthObservationResult(point, .9, 'ok', raw_depth_m=12.,
+            registered_depth_m=7.2, registration_status='ok', registration_id='reg'),
+        person_anchor=p._resolve_person_depth_anchor(depth), measurement=point,
+        now_ts=track['media_pts_ns']/1e9, calib=SimpleNamespace(image_size=(1920,1080)), pose_is_current=True)
+    assert type(proof) is hooks.RegisteredAnkleOriginal
+    state = hooks._WorldAnchorState()
+    p._update_track_world_state({}, state, measurement=point, floor_y=0.,
+        now_ts=proof.sample_ts, alpha=.3, beta=.15, quality='good',
+        registered_ankle_original=proof, registered_ankle_binding=proof.binding[:-2],
+        media_pts_ns=proof.media_pts_ns, contact_basis='depth:pose_ankle_support',
+        selected_geometry_kind=selected.kind, verified_reacquire_support=True)
+    if unavailable:
+        hooks.mark_world_measurement_unavailable(state, reason='depth_measurement_not_current',
+            now_ts=65/30., config=p._human_ground_cfg)
+    floor = selected.model_copy(update={'candidate_id':'floor_ray', 'kind':'floor_ray',
+        'position':Vector3(x=11.3454876512, y=0., z=6.5970391003)})
+    original_ts = proof.sample_ts
+    for frame in (66, 68, 70):
+        row = {'world_resolver_selected_id':floor.candidate_id,
+            'world_resolver_contact_basis':'depth:pose_ankle_support'}
+        p._update_track_world_state(row, state,
+            measurement=np.array([floor.position.x, 0., floor.position.z]), floor_y=0.,
+            now_ts=frame/30., alpha=.3, beta=.15, quality='weak',
+            registered_ankle_binding=proof.binding[:-2], selected_geometry_kind=floor.kind,
+            contact_basis=row['world_resolver_contact_basis'],
+            image_motion_supported=generic_pixel_motion, verified_reacquire_support=True)
+        assert row['world_resolver_contact_basis'] == 'depth:pose_ankle_support'
+        assert not state.measurement_accepted and not state.reacquired
+        assert state.measurement_rejection_reason == 'weak_floor_reanchor_requires_independent_support'
+        assert state.accepted_ankle_original is proof and proof.sample_ts == original_ts
+
+
 def _upright_projection_calibration() -> SimpleNamespace:
     intrinsics = np.array(
         [
@@ -119,6 +680,163 @@ def _cohort(*, pcf_revision: str | None = None) -> WorldMeasurementCohort:
         calibration_revision="calibration-revision",
         pcf_revision=pcf_revision,
     )
+
+
+def _r123_contact_candidates(source: str, *, floor=True):
+    """Literal R58 K29 ray/ROI; synthetic scalar covariance, no SDK receipt."""
+    processor = _processor()
+    processor.scene_priors = None
+    processor._floor_candidate_covariance = lambda *_a, **_k: Matrix3(
+        values=(.007293833248229415, 0., 0., 0., .03765852363999861, 0.,
+                0., 0., .023378484592169384))
+    anchor = processor._resolve_bbox_floor_anchor((657., 406.5, 85.5, 133.))
+    if source != 'bbox_bottom':
+        anchor = hooks._PoseAnchorCandidate(u=anchor.u, v=anchor.v, source=source,
+            contact_basis='pose:ankle_pair', quality='good', height_lock_eligible=True)
+    candidates = []
+    processor._append_universal_world_candidates(candidates, sensor_id=1,
+        track={'tracker_id':0,'world_floor_incidence_sin':.308536909}, camera_id='kitchen',
+        calib=SimpleNamespace(), floor_candidate=np.array([17.0351691164,0.,6.4587978178]) if floor else None,
+        floor_ray_admitted=True, anchor_candidate=anchor, pose_uv=(anchor.u,anchor.v),
+        contact_basis=anchor.contact_basis, posture='unknown', occlusion_fraction=0.,
+        image_motion_supported=True, depth_obs=None, depth_weight=0.,
+        depth_observation=hooks._DepthObservationResult(None,0.,'depth_anchor_unavailable'),
+        depth_result=None, person_anchor=None, reject_current_geometry=False, flip_u=False, flip_v=False)
+    return processor, anchor, candidates
+
+
+def test_r123_literal_counter_bbox_is_diagnostic_not_verified_floor():
+    processor, anchor, candidates = _r123_contact_candidates('bbox_bottom')
+    assert (anchor.u,anchor.v)==(699.75,539.5)  # Preserve image diagnostic ROI.
+    assert not processor._anchor_is_verified_ground_contact(anchor)
+    assert candidates == []
+    assert processor._accepted_image_foot_for_recording(
+        {'image_base':[701.,540.], '_world_current_image_foot_calib':[699.75,539.5]},
+        world_source='person_anchor_floor_only', anchor=anchor)==(701.,540.)
+
+
+@pytest.mark.parametrize('source',['pose_ankle_floor','pose_single_ankle_floor',
+    'pose_ankle_support','pose_leg_floor'])
+def test_r123_qualified_contact_paths_remain_current_floor_candidates(source):
+    processor,anchor,candidates=_r123_contact_candidates(source)
+    assert processor._anchor_is_verified_ground_contact(anchor)
+    assert len(candidates)==1 and candidates[0]['kind']=='floor_ray'
+    assert candidates[0]['anchor']==source
+
+
+@pytest.mark.parametrize('basis,expected',[('depth:lower_body_band',True),
+    ('depth:pose_ankle_support',True),('depth:torso_core',False),('depth:pose_torso_support',False)])
+def test_r123_mask_contact_still_requires_actual_lower_body_band(basis,expected):
+    anchor=hooks._PoseAnchorCandidate(100.,200.,'person_mask_floor',contact_basis=basis)
+    assert hooks._AnalyticsTelemetryProcessor._anchor_is_verified_ground_contact(anchor) is expected
+
+
+def test_r123_bbox_reference_does_not_suppress_exact_registered_body_column():
+    from DS9.tests.test_registered_body_column import _r75_current_column
+    from noesis_core.world.resolver import UniversalWorldMeasurementResolver,WorldMeasurementResolverConfig
+    processor,track,column,depth=_r75_current_column()
+    processor.scene_priors=None;processor.depth_registration=SimpleNamespace()
+    processor._depth_candidate_covariance=lambda *_a,**_k:column.covariance
+    processor._world_resolver_diag_max_candidates=4;processor._min_unposed_detection_confidence=.55
+    processor._world_resolver=UniversalWorldMeasurementResolver(config=WorldMeasurementResolverConfig(registered_body_column=True))
+    bbox=processor._resolve_bbox_floor_anchor(depth.bbox)
+    torso=processor._resolve_person_depth_anchor(depth)
+    candidates=[]
+    processor._append_universal_world_candidates(candidates,sensor_id=2,track=track,camera_id='family-room',
+        calib=SimpleNamespace(floor_y=0.),floor_candidate=np.array([20.,0.,20.]),
+        floor_ray_admitted=True,anchor_candidate=bbox,pose_uv=(bbox.u,bbox.v),contact_basis=bbox.contact_basis,
+        posture='unknown',observed_posture='unknown',occlusion_fraction=0.,image_motion_supported=False,
+        depth_obs=np.array([column.position.x,.414,column.position.z]),depth_weight=.9,
+        depth_observation=hooks._DepthObservationResult(np.array([column.position.x,.414,column.position.z]),
+            .9,'ok',registered_depth_m=7.2,registration_status='ok',registration_id='reg'),
+        depth_result=depth,person_anchor=torso,reject_current_geometry=False,flip_u=False,flip_v=False)
+    assert all(c['kind']!='floor_ray' for c in candidates)
+    typed=processor._build_world_measurement_set(cohort=column.cohort,candidates=candidates)
+    typed=processor._body_column_fallback_set(typed,contact_basis={c['candidate_id']:c['contact_basis']for c in candidates},
+        track=track,state=None,detector_confidence=.9)
+    result=processor._world_resolver.resolve(typed)
+    assert result.selected_candidate_id=='registered_body_column'
+    assert result.support_state=='unknown' and result.posture=='unknown'
+
+
+@pytest.mark.parametrize('resolver_enabled',[False,True])
+def test_r123_actual_default_caller_cannot_seed_floor_from_bbox(resolver_enabled):
+    processor,calibration=_r123_actual_contact_processor(resolver_enabled)
+    for frame in range(1,5):
+        track=_r123_actual_contact_row(processor,calibration,frame=frame,contact=False)
+        assert track.get('world_valid') is not True
+        assert track.get('world_measurement_accepted') is not True
+        assert track.get('world_estimator_evaluated') is True
+        assert track['bbox']==[657.,406.5,85.5,133.]
+
+
+def _r123_actual_contact_processor(resolver_enabled=True, *, source=0, camera='cam0', binding=None):
+    from noesis.calibration.world_fusion_policy import CameraWorldFusionProfile,WorldFusionPolicy
+    calibration=_upright_projection_calibration()
+    extrinsics=np.asarray(calibration.extrinsics_col_major).reshape((4,4),order='F').copy()
+    extrinsics[:3,3]=-extrinsics[:3,:3]@np.array([0.,2.2,-3.])
+    calibration.extrinsics_col_major=list(extrinsics.flatten(order='F'))
+    calibration.camera_id=camera
+    calibration.camera_calibration_sha256=binding.source_camera_calibration_sha256 if binding else 'b'*64
+    calibration.world_frame_id='backend_world_m'
+    calibration.world_frame_revision=binding.target_frame.revision if binding else 'r123'
+    calibration.frame_transform_sha256=binding.target_from_source_sha256 if binding else 'a'*64
+    provider=SimpleNamespace(snapshot=lambda *_:calibration,world_snapshot=lambda *_:calibration)
+    policy=WorldFusionPolicy(policy_id='r123-synthetic',evidence={},cameras={camera:CameraWorldFusionProfile(
+        camera_id=camera,calibration_fingerprint_sha256='a'*64,registration_id='reg-test',
+        floor_weight_scale=1.,depth_weight_scale=1.,floor_only_allowed=True,floor_ray_max_range_m=20.)})
+    processor=hooks._AnalyticsTelemetryProcessor(pipeline=SimpleNamespace(config={
+        'models':{'pose':{'kpt_threshold':.35}},'canonical_world':{'measurement_resolver':{
+            'enabled':resolver_enabled,'max_range_m':22.,'max_disagreement_m':1.25,
+            'max_candidates':4}}}),tracking_pub=SimpleNamespace(),camera_labels={source:camera},
+        sensor_id_map={source:source},bev_calibration=provider,world_fusion_policy=policy)
+    return processor,calibration
+
+
+def _r123_actual_contact_row(processor,calibration,*,frame,contact,source=0,camera='cam0',raw=0):
+    pose=None;bbox=[657.,406.5,85.5,133.]
+    if contact:
+        pose,_=_occluded_upright_pose(calibration)
+        for name,world in [('left_knee',(-.1,.5,6.)),('right_knee',(.1,.5,6.)),
+                           ('left_ankle',(-.1,0.,6.)),('right_ankle',(.1,0.,6.))]:
+            u,v=project_world_to_image(world,calibration.intrinsics,calibration.extrinsics_col_major,
+                calibration.image_size,unit_scale=1.)
+            pose[hooks._POSE_KPT_INDEX[name]]=[u,v,.99]
+        visible=pose[pose[:,2]>.9]
+        bbox=[float(visible[:,0].min()-15),float(visible[:,1].min()-10),
+            float(np.ptp(visible[:,0])+30),float(np.ptp(visible[:,1])+20)]
+    track=dict(source_id=source,camera_id=camera,tracker_id=raw,tracker_lifecycle_generation=1,
+        lifecycle_started_frame=1,frame_id=frame,bbox=bbox,confidence=.95,tracker_confidence=.93,
+        image_size=[1280,720],media_pts_ns=frame*100_000_000,observed_at_us=10_000_000+frame*100_000)
+    processor._augment_track_with_world(source,camera,track,pose_kpts_abs=pose,
+        pose_is_current=contact,world_now_ts=frame*.1)
+    return track
+
+
+def test_r136_actual_resolver_caller_forwards_selected_geometry_not_anatomy(monkeypatch):
+    processor, calibration = _r123_actual_contact_processor()
+    calls = []
+    actual = processor._update_track_world_state
+    def record(track, state, **kwargs):
+        calls.append((kwargs.get('selected_geometry_kind'), kwargs.get('contact_basis')))
+        return actual(track, state, **kwargs)
+    monkeypatch.setattr(processor, '_update_track_world_state', record)
+    rows = [_r123_actual_contact_row(processor, calibration, frame=f, contact=True) for f in range(1, 5)]
+    assert rows[-1]['world_resolver_selected_id'] == 'floor_ray'
+    assert rows[-1]['world_resolver_contact_basis'] == 'pose:ankle_pair'
+    assert calls and all(kind == 'floor_ray' and basis == 'pose_ankle_floor' for kind, basis in calls)
+
+
+@pytest.mark.parametrize('resolver_enabled',[False,True])
+def test_r123_actual_qualified_ankles_upgrade_bbox_first_without_first_view_lock(resolver_enabled):
+    processor,calibration=_r123_actual_contact_processor(resolver_enabled)
+    for frame in range(1,4):
+        assert _r123_actual_contact_row(processor,calibration,frame=frame,contact=False).get('world_valid') is not True
+    rows=[_r123_actual_contact_row(processor,calibration,frame=f,contact=True) for f in range(4,8)]
+    assert any(r.get('world_measurement_accepted') is True for r in rows)
+    assert rows[-1]['world_valid'] is True and rows[-1]['world_source']=='pose_floor_only'
+    if resolver_enabled:
+        assert rows[-1]['world_resolver_contact_basis']=='pose:ankle_pair'
 
 
 def _hypothesis(

@@ -3,7 +3,7 @@ import asyncio
 import concurrent.futures
 import hmac
 from http import HTTPStatus
-from websockets.legacy.server import serve
+from websockets.legacy.server import WebSocketServerProtocol, serve
 import websockets
 import inspect
 import json
@@ -421,6 +421,27 @@ class WebSocketStartupError(RuntimeError):
             f"thread_stopped={receipt.thread_stopped}, "
             f"event_loop_closed={receipt.event_loop_closed})"
         )
+
+
+class _SerializedWebSocketServerProtocol(WebSocketServerProtocol):
+    """One connection owns application sends and the legacy drain waiter.
+
+    The locks are distinct: send enters drain, never the reverse. Protocol
+    ping/pong/close frames also drain and must not race the legacy single waiter.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._noesis_send_lock = asyncio.Lock()
+        self._noesis_drain_lock = asyncio.Lock()
+
+    async def send(self, message):
+        async with self._noesis_send_lock:
+            return await super().send(message)
+
+    async def drain(self):
+        async with self._noesis_drain_lock:
+            return await super().drain()
 
 
 class WebSocketServer:
@@ -2320,11 +2341,11 @@ class WebSocketServer:
             raise
         except Exception as exc:
             client_ip = websocket.remote_address if hasattr(websocket, 'remote_address') else "Unknown"
-            self.logger.debug("Failed to send message to %s: %s", client_ip, exc)
-            try:
-                self._discard_connected_client(websocket)
-            except Exception:
-                pass
+            if isinstance(exc, websockets.exceptions.ConnectionClosed):
+                self.logger.debug("Closed client %s before direct delivery: %s", client_ip, exc)
+            else:
+                self.logger.error("Failed to send message to %s: %s %r", client_ip, type(exc).__name__, exc)
+            await self._retire_failed_client(websocket)
 
     async def _send_to_client_from_sync_submission(
         self,
@@ -2701,6 +2722,55 @@ class WebSocketServer:
         self.connected_clients.discard(websocket)
         return self._remove_localization_details_client(websocket)
 
+    async def _retire_failed_client(self, websocket: Any) -> bool:
+        """Never leave a failed sender OPEN but absent from publications."""
+        changed = self._discard_connected_client(websocket)
+        close = getattr(websocket, "close", None)
+        if getattr(websocket, "closed", False) or not callable(close):
+            return changed
+        task = getattr(websocket, "_noesis_failed_close_task", None)
+        if task is None:
+            task = asyncio.create_task(close(code=1011, reason="delivery_failed"),
+                                       name="WebSocketFailedDeliveryClose")
+            # A resistant close is still connection-owned, never silently lost.
+            websocket._noesis_failed_close_task = task
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        def abort():
+            try:
+                transport_abort = getattr(getattr(websocket, "transport", None), "abort", None)
+                fail_connection = getattr(websocket, "fail_connection", None)
+                if callable(transport_abort):transport_abort()
+                elif callable(fail_connection):fail_connection()
+            except Exception as exc:
+                # Preserve the original close failure or caller cancellation.
+                self.logger.error("Failed delivery transport abort: %s %r", type(exc).__name__, exc)
+        deadline = time.monotonic() + self.CLIENT_CLOSE_GRACE_S + self.CLIENT_ABORT_DRAIN_S
+        try:
+            _, pending = await asyncio.wait((task,), timeout=self.CLIENT_CLOSE_GRACE_S)
+            if pending:
+                abort()
+                _, pending = await asyncio.wait((task,), timeout=self.CLIENT_ABORT_DRAIN_S)
+            if pending:
+                raise RuntimeError("failed WebSocket delivery close did not quiesce")
+            await task
+        except BaseException as original:
+            abort()
+            if not task.done():task.cancel()
+            try:
+                _, pending = await asyncio.wait((task,), timeout=min(self.CLIENT_ABORT_DRAIN_S,
+                    max(0.0,deadline-time.monotonic())))
+            except asyncio.CancelledError:
+                pending = () if task.done() else (task,)
+            if pending:
+                message = "failed WebSocket delivery close remained active after bounded abort"
+                self.logger.error(message)
+                if isinstance(original, asyncio.CancelledError):
+                    original.add_note(message)
+                else:
+                    raise RuntimeError(message) from original
+            raise
+        return changed
+
     def _localization_details_message(self) -> Dict[str, Any]:
         return {
             "type": "toggle_update",
@@ -3026,6 +3096,7 @@ class WebSocketServer:
                 self.handle_client,
                 self.host,
                 self.port,
+                create_protocol=_SerializedWebSocketServerProtocol,
                 process_request=self._process_request,
                 max_size=None,       # allow large binary frames
                 max_queue=1,         # minimize buffering to reduce latency
@@ -4332,6 +4403,11 @@ class WebSocketServer:
                                     ).duration_ms
                                 ),
                             )
+                        except websockets.exceptions.ConnectionClosed:
+                            # A completed floorplan can outlive its requesting
+                            # client. Let the existing connection lifecycle own
+                            # cleanup; do not retry an error on the dead socket.
+                            raise
                         except Exception as exc:
                             completion_started_ns = time.perf_counter_ns()
                             result['error'] = str(exc)
@@ -4769,7 +4845,7 @@ class WebSocketServer:
                     elif "keepalive ping timeout" in str(result):
                         self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")
                     else:
-                        self.logger.error(f"Failed to send message to {client_ip}: {result}")
+                        self.logger.error("Failed to send message to %s: %s %r", client_ip, type(result).__name__, result)
 
         except Exception as e:
             self.logger.error(f"Broadcast error: {e}")
@@ -4780,7 +4856,7 @@ class WebSocketServer:
                 localization_details_changed = False
                 for client in disconnected_clients:
                     localization_details_changed = (
-                        self._discard_connected_client(client)
+                        await self._retire_failed_client(client)
                         or localization_details_changed
                     )
                     client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
@@ -4873,6 +4949,20 @@ class WebSocketServer:
                 canonical_outbound_token=self._canonical_outbound_token,
             )
             return None
+
+    async def _broadcast_bev_from_sync_submission(
+        self, message: Any, submitted_ns: int,
+        response_model_timing: Optional[BoundaryResponseModelTiming] = None,
+    ) -> None:
+        """Share canonical delivery order, including every awaited client send."""
+        lock = self._canonical_outbound_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._canonical_outbound_lock = lock
+        async with lock:
+            await self._broadcast_from_sync_submission(message, submitted_ns,
+                response_model_timing=response_model_timing,
+                canonical_outbound_token=self._canonical_outbound_token)
 
     def _freeze_outbound_message(
         self,
@@ -5286,11 +5376,10 @@ class WebSocketServer:
         frozen_message, payload_bytes = self._freeze_outbound_message(message)
         submitted_ns = time.perf_counter_ns()
         return self._submit_outbound_coroutine(
-            lambda: self._broadcast_from_sync_submission(
+            lambda: self._broadcast_bev_from_sync_submission(
                 frozen_message,
                 submitted_ns,
                 response_model_timing=response_model_timing,
-                canonical_outbound_token=self._canonical_outbound_token,
             ),
             message_count=1,
             payload_bytes=payload_bytes,
@@ -5383,7 +5472,7 @@ class WebSocketServer:
             localization_details_changed = False
             for client in disconnected_clients:
                 localization_details_changed = (
-                    self._discard_connected_client(client)
+                    await self._retire_failed_client(client)
                     or localization_details_changed
                 )
                 client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"

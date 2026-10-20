@@ -2,7 +2,7 @@ schema_version: 1
 contract: noesis.ds9.native_artifact_manifest
 base_manifest:
   path: DS9/asset_manifest.yaml
-  sha256: c7179f7800880ed49d48949f3ee5abdc563d0904e13bc5dad5d84bd7304ec3dd
+  sha256: 2d91b210b58dda8e591320a2d7f49deb53a3cc02b886baa7651de512b1d9e38f
 artifacts:
   - id: native.analytics_meta
     kind: native_extension
@@ -14,8 +14,37 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: 60abaf4a102f507c32fb79e705b7f8745779ba38bdf6e957c9c4fa33700e6e20
-      output_sha256: 664cbe732a74ca2f6e8a0ec67a96d1de39a0b4c1a6577d9453ee9c570e757f79
-      built_at_utc: "2026-10-05T04:17:21Z"
-      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
+      source_sha256: 678472dffa49005671be5810c36e640d257b8fdb184d8d1d9b58fbcc404139b5
+      output_sha256: 69da4521129ba69392715b6d0b1b5c98cabad8c987299ba60169de81cd84e71e
+      built_at_utc: "2026-10-16T16:55:12.219750+00:00"
+      build_host: "native-host:TauntonMainframe (DS9.1/CUDA13.2, Python3.12)"
       command: bash DS9/scripts/build_noesis_analytics_meta_ext.sh
+  - id: plugin.shm_stop_fix
+    kind: gstreamer_plugin
+    role: Same-protocol GStreamer SHM stop/poll correction
+    output: DS9/gst-plugins/libgstshm.so
+    sources:
+      - DS9/native/gst_shm_stop_fix/COPYING
+      - DS9/native/gst_shm_stop_fix/README.md
+      - DS9/native/gst_shm_stop_fix/gstshm.c
+      - DS9/native/gst_shm_stop_fix/gstshmsink.c
+      - DS9/native/gst_shm_stop_fix/gstshmsink.h
+      - DS9/native/gst_shm_stop_fix/gstshmsrc.c
+      - DS9/native/gst_shm_stop_fix/gstshmsrc.h
+      - DS9/native/gst_shm_stop_fix/meson.build
+      - DS9/native/gst_shm_stop_fix/provenance.json
+      - DS9/native/gst_shm_stop_fix/shmalloc.c
+      - DS9/native/gst_shm_stop_fix/shmalloc.h
+      - DS9/native/gst_shm_stop_fix/shmpipe.c
+      - DS9/native/gst_shm_stop_fix/shmpipe.h
+      - DS9/scripts/build_shm_stop_fix_host.sh
+    builder: DS9/scripts/build_shm_stop_fix_host.sh
+    required_profiles: [runtime_common, full]
+    state: validated
+    compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null, gstreamer: "1.24.2"}
+    provenance:
+      source_sha256: 4fa7896ef4077400afeb2b0d02048b8393e02488df1bb48bfd595cc2d306e6af
+      output_sha256: c12a6ae9655bc0fdafe25caf8894b0ddef913a748045c6d1d7d19d94c945f11d
+      built_at_utc: "2026-10-16T18:32:08.253698243+00:00"
+      build_host: "native-host:TauntonMainframe (GStreamer1.24.2, DS9.1/CUDA13.2)"
+      command: bash DS9/scripts/build_shm_stop_fix_host.sh DS9/gst-plugins

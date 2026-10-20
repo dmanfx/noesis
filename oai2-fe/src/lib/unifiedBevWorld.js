@@ -236,6 +236,80 @@ function cohortOf(message) {
   return { ...c };
 }
 const runKey = (p) => `${p.runtime}:${p.instance_id}:${p.run_id}`;
+function validateAttribution(e) {
+  const q = e.attribution_quarantine;
+  if (q == null) {
+    requireValue(!e.subject.subject_id.startsWith('quarantine:'), 'attribution_quarantine_missing');
+    return;
+  }
+  const prefix = `physical:${q.run_id}:`;
+  const serial = e.entity_id.startsWith(prefix) ? e.entity_id.slice(prefix.length) : '';
+  requireValue(/^[1-9][0-9]*$/.test(serial) && BigInt(serial) < 2n ** 64n
+    && q.component_entity_ids.includes(e.entity_id)
+    && new Set(q.component_entity_ids).size === q.component_entity_ids.length
+    && e.subject.subject_id === `quarantine:${q.run_id}:${serial}`
+    && e.subject.kind === 'provisional' && e.subject.generation === 0
+    && e.subject.stable_id == null && e.subject.resident_uuid == null && e.subject.display_name == null
+    && [...q.owners, ...q.retained_owners].every((c) => c.run_id === q.run_id), 'attribution_quarantine_invalid');
+  const claims = [...q.owners, ...q.retained_owners];
+  const claimId = (c) => `physical:${c.run_id}:${c.physical_serial}`;
+  const claimSubject = (c) => c.household_state === 'resident' ? `resident:${c.household_identity_key}`
+    : c.household_state === 'visitor' ? `visitor:${c.run_id}:${c.household_stable_id}:g${c.household_visitor_generation}` : null;
+  requireValue(claims.every((c) => c.lifecycle_started_frame <= c.frame_id
+    && (!['unknown', 'provisional'].includes(c.household_state) || (c.household_identity_key == null
+      && c.household_stable_id == null && c.household_visitor_generation == null))
+    && (!['resident', 'visitor', 'handoff'].includes(c.household_state) || text(c.household_identity_key))
+    && ((c.household_state === 'visitor') === (c.household_visitor_generation != null))), 'attribution_claim_invalid');
+  const subjects = new Map(); const stable = new Map(); const latest = new Map();
+  for (const c of q.owners) {
+    for (const [map, key] of [[subjects, claimSubject(c)], [stable, c.household_stable_id]]) {
+      if (key == null) continue;
+      if (!map.has(key)) map.set(key, new Set());
+      map.get(key).add(claimId(c));
+    }
+    const member = JSON.stringify([claimId(c), c.camera_id, c.source_id, c.source_epoch,
+      c.raw_id, c.lifecycle_generation]);
+    if (!latest.has(member) || c.frame_id >= latest.get(member).frame_id) latest.set(member, c);
+  }
+  const duplicate = (map) => [...map.entries()].filter(([, ids]) => ids.size > 1).map(([key]) => key);
+  const contestedSubjects = new Set(duplicate(subjects)); const contestedStable = new Set(duplicate(stable));
+  const groups = new Map(); const divergent = new Set();
+  for (const c of latest.values()) {
+    if (!['resident', 'visitor', 'handoff'].includes(c.household_state) || c.household_constraint !== 'eligible') continue;
+    if (!groups.has(claimId(c))) groups.set(claimId(c), []);
+    groups.get(claimId(c)).push(c);
+  }
+  for (const [id, rows] of groups) {
+    const signatures = new Set(rows.map((c) => JSON.stringify([c.household_state,
+      c.household_identity_key, c.household_stable_id, c.household_visitor_generation])));
+    if (signatures.size < 2) continue;
+    divergent.add(id);
+    for (const c of rows) {
+      if (claimSubject(c) !== null) contestedSubjects.add(claimSubject(c));
+      if (c.household_stable_id !== null) contestedStable.add(c.household_stable_id);
+    }
+  }
+  const uniqueClaims = (rows) => new Set(rows.map((c) => JSON.stringify(Object.entries(c).sort()))).size === rows.length;
+  requireValue(equal(q.subject_ids, [...contestedSubjects].sort())
+    && equal(q.stable_ids, [...contestedStable].sort((a, b) => a - b))
+    && uniqueClaims(q.owners) && uniqueClaims(q.retained_owners), 'attribution_claims_incomplete');
+  if (q.component_entity_ids.length === 1) {
+    requireValue(divergent.has(q.component_entity_ids[0])
+      && claims.every((c) => claimId(c) === q.component_entity_ids[0]), 'attribution_singleton_invalid');
+  }
+  requireValue(q.component_entity_ids.every((id) => claims.some((c) => claimId(c) === id)), 'attribution_component_incomplete');
+  const remaining = new Set(q.component_entity_ids);
+  const reached = new Set([remaining.values().next().value]);
+  remaining.delete([...reached][0]);
+  while (remaining.size) {
+    const known = claims.filter((c) => reached.has(claimId(c)));
+    const added = claims.filter((c) => remaining.has(claimId(c)) && known.some((k) =>
+      (claimSubject(c) !== null && claimSubject(c) === claimSubject(k))
+      || (c.household_stable_id !== null && c.household_stable_id === k.household_stable_id)));
+    requireValue(added.length > 0, 'attribution_component_disconnected');
+    for (const c of added) { reached.add(claimId(c)); remaining.delete(claimId(c)); }
+  }
+}
 function validateSnapshot(s) {
   schemaValue(s, snapshotSchema, snapshotSchema);
   requireValue(['ds9', 'replay', 'test'].includes(s.producer.runtime), 'runtime_unsupported');
@@ -243,6 +317,7 @@ function validateSnapshot(s) {
     && s.observed_start_us <= s.observed_end_us && s.observed_end_us <= s.published_at_us, 'snapshot_time_invalid');
   const ids = new Set(); const subjects = new Set(); const stableIds = new Set();
   for (const e of s.entities) {
+    validateAttribution(e);
     requireValue(!ids.has(e.entity_id) && !subjects.has(e.subject.subject_id)
       && (e.subject.stable_id == null || !stableIds.has(e.subject.stable_id)), 'canonical_identity_duplicate');
     ids.add(e.entity_id); subjects.add(e.subject.subject_id);
@@ -263,6 +338,12 @@ function validateSnapshot(s) {
     requireValue(e.subject.kind !== 'resident' || text(e.subject.resident_uuid), 'subject_invalid');
     requireValue(e.subject.kind === 'resident' || e.subject.resident_uuid == null, 'subject_invalid');
     requireValue(!['unknown', 'provisional'].includes(e.subject.kind) || e.subject.display_name == null, 'subject_invalid');
+  }
+  for (const e of s.entities) {
+    if (e.attribution_quarantine == null) continue;
+    for (const peer of s.entities.filter((p) => e.attribution_quarantine.component_entity_ids.includes(p.entity_id))) {
+      requireValue(equal(peer.attribution_quarantine, e.attribution_quarantine), 'attribution_component_partial');
+    }
   }
   return s;
 }
@@ -319,7 +400,9 @@ function projectPerson(bindings, entity) {
   return { entityId: entity.entity_id, subjectId: entity.subject.subject_id,
     stableId: entity.subject.stable_id ?? null, identityKind: entity.subject.kind,
     generation: entity.subject.generation ?? 0,
-    label: entity.subject.display_name || (entity.subject.stable_id ? `Person ${entity.subject.stable_id}` : 'Person'),
+    label: entity.attribution_quarantine ? 'Person (attribution quarantined)'
+      : entity.subject.display_name || (entity.subject.stable_id ? `Person ${entity.subject.stable_id}` : 'Person'),
+    attributionQuarantine: entity.attribution_quarantine ? copy(entity.attribution_quarantine) : null,
     worldPosition, position, worldCovariance, sceneCovariance, worldVelocity, sceneVelocity,
     supportState: entity.support_state ?? 'unknown', posture: entity.posture ?? 'unknown',
     supportSurface: entity.support_surface ? copy(entity.support_surface) : null,
@@ -374,7 +457,14 @@ function acceptSnapshot(state, message, receivedAtMs) {
     try {
       const projected = projectPerson(state.bindings, e);
       const old = !changedRun && !sourceReset && !sequenceGap && state.people.find((p) => p.entityId === e.entity_id);
-      const trailKey = JSON.stringify([nextRun, e.entity_id, projected.generation, e.continuity_segment_id,
+      // GlobalWorldFusion.physical_entity_id emits exactly physical:<run>:<serial>.
+      // Its independent, run-owned key + explicit backend segment survives an
+      // honest household promotion. Legacy/subject-key IDs still bind generation.
+      const prefix = `physical:${s.producer.run_id}:`;
+      const serial = e.entity_id.startsWith(prefix) ? e.entity_id.slice(prefix.length) : '';
+      const physical = integer(Number(serial), 1) && String(Number(serial)) === serial
+        && integer(e.continuity_segment_id);
+      const trailKey = JSON.stringify([nextRun, e.entity_id, physical ? null : projected.generation, e.continuity_segment_id,
         e.world_frame_revision, e.world_transform_sha256, e.calibration_revision, projected.sceneMappingSha256]);
       const continuous = old && e.continuity_segment_id != null && old.trailKey === trailKey
         && old.observedAtUs <= e.observed_at_us;
@@ -433,7 +523,10 @@ export function reduceUnifiedBev(state, message, { receivedAtMs } = {}) {
       if (snapshot) validateSnapshot(snapshot);
       requireValue(Array.isArray(message.world_events) && message.world_events.length <= UNIFIED_BEV_LIMITS.eventsPerCohort
         && (snapshot !== null || message.world_events.length === 0), 'embedded_events_invalid');
-      for (const event of message.world_events) schemaValue(event, eventSchema, eventSchema);
+      for (const event of message.world_events) {
+        schemaValue(event, eventSchema, eventSchema);
+        validateAttribution(event);
+      }
       const epoch = message.source_epoch;
       requireValue(integer(epoch), 'source_epoch_invalid');
       const nextRun = snapshot ? runKey(snapshot.producer) : (next.cursor?.run ?? 'unbound');
@@ -460,6 +553,7 @@ export function reduceUnifiedBev(state, message, { receivedAtMs } = {}) {
       const cohort = cohortOf(message);
       const event = message.payload;
       schemaValue(event, eventSchema, eventSchema);
+      validateAttribution(event);
       const p = next.pending.find((item) => item.cohort.source_id === cohort.source_id);
       requireValue(p?.accepted && equal(p.cohort, cohort), 'event_without_exact_snapshot');
       requireValue(equal(event.producer, p.snapshot.producer) && event.published_at_us === p.snapshot.published_at_us

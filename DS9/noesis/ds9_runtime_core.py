@@ -10,6 +10,7 @@ import ctypes
 import copy
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -113,6 +114,7 @@ from noesis.reid_swin_profile import (
     load_reid_swin_nvinfer_properties as _load_reid_swin_nvinfer_properties,
     validate_reid_swin_model_config as _validate_reid_swin_model_config,
     validate_reid_swin_nvinfer_properties as _validate_reid_swin_nvinfer_properties,
+    validate_reid_swin_source_config as _validate_reid_swin_source_config,
 )
 from noesis.capture_event_controller import (
     CanonicalCameraAliases,
@@ -180,8 +182,13 @@ from noesis.v3dt_assets import (
     V3DTAssetBundle,
     V3DTAssetError,
     materialize_v3dt_tracker_config,
+    validate_mv3dt_calibration_binding,
     validate_sv3dt_calibration_binding,
     validate_v3dt_assets,
+    xc3d_candidate_enabled,
+    xc3d_world_quality_enabled,
+    xc3d_admission_refusal,
+    validate_xc3d_capabilities,
 )
 from noesis.server.websocket import (
     WebSocketServer,
@@ -949,8 +956,7 @@ def _preflight_reid_profile(
     if not config_path.is_file():
         raise SystemExit(f"[FATAL] DS9 ReID SGIE config missing: {config_path}")
     try:
-        props = _load_reid_swin_nvinfer_properties(config_path)
-        _validate_reid_swin_nvinfer_properties(props)
+        props = _validate_reid_swin_source_config(config_path, pipeline_config=pipeline_cfg)
     except ValueError as exc:
         raise SystemExit(f"[FATAL] {exc}") from exc
 
@@ -1454,6 +1460,14 @@ def _materialize_effective_pipeline_yaml(
         raise SystemExit(f"[FATAL] Unable to read DS9 pipeline YAML: {base_yaml_path} ({exc})") from exc
     if not isinstance(base_cfg, dict):
         raise SystemExit(f"[FATAL] DS9 pipeline YAML must be a mapping (got {type(base_cfg).__name__}): {base_yaml_path}")
+    if xc3d_candidate_enabled(base_cfg):
+        required_mode = "baseline" if xc3d_world_quality_enabled(base_cfg) else "mv3dt"
+        if str(tracking_mode).strip().lower() != required_mode or profile != "yolo26" or pgie_size != "m":
+            if required_mode == "baseline":
+                raise V3DTAssetError("XC3D world-quality requires explicit baseline/M960/yolo26 selection")
+            raise V3DTAssetError("XC3D candidate requires explicit mv3dt/M960/yolo26 selection")
+        baseline = load_runtime_pipeline_config(REPO_ROOT / "DS9/config/infer_yolo26_960_test.yaml", materialize_secrets=False)
+        validate_xc3d_capabilities(base_cfg, baseline)
 
     overlay: Dict[str, Any] = {}
     if profile in ("yolo11", "yolo26", "yolo26-watch"):
@@ -1604,7 +1618,8 @@ def _materialize_effective_pipeline_yaml(
         }
         logger.info("Wholebody49 PGIE size: %s (%s)", size_norm, assets.get("mode"))
 
-    if str(tracking_mode).strip().lower() == "baseline":
+    candidate_depth = str(tracking_mode).strip().lower() == "mv3dt" and xc3d_candidate_enabled(base_cfg)
+    if str(tracking_mode).strip().lower() == "baseline" or candidate_depth:
         models_cfg = base_cfg.get("models") if isinstance(base_cfg, dict) else None
         depth_cfg = (models_cfg or {}).get("depth_tracking") if isinstance(models_cfg, dict) else None
         ds9_runtime = str(os.environ.get("NOESIS_DEEPSTREAM_MAJOR", "")).strip() == "9"
@@ -3791,6 +3806,12 @@ def _build_stats_callback(
                 "zero_copy_core": {
                     "counters": core_counters,
                     "stage_timings": core_stage_timings,
+                    **({"registered_ankle_priority": core_instr["registered_ankle_priority"]}
+                       if (getattr(pipeline,"config",{}) or {}).get("xc3d_image_regions",{}).get("enabled") is True
+                       and os.environ.get("NOESIS_XC3D_BODY_DIAGNOSTIC_TARGETS_S","")
+                       and isinstance(core_instr.get("registered_ankle_priority"),dict)
+                       and (core_instr["registered_ankle_priority"].get("records")
+                            or core_instr["registered_ankle_priority"].get("omitted_records")) else {}),
                     "boundary_serialization_metrics": {
                         "ws": ws_boundary_metrics,
                         "rest": rest_boundary_metrics,
@@ -4529,6 +4550,74 @@ def _install_encode_latency_suppression(logger: logging.Logger) -> None:
         logger.info("Suppressed encoder KPI prints (NOESIS_SUPPRESS_ENCODE_LATENCY=0 to disable)")
 
 
+def _finalize_pose_roi_context(pipeline, *, eos_accepted, eos_seen, wait_completed,
+                               wait_failed, runtime_state, logger):
+    """Release paired SGIE probes only after actual native pipeline quiescence.
+
+    Publication/World shutdown cannot supply this proof. On unresolved media
+    ownership leave the controller attached; a failed close is a run failure.
+    """
+    controller = getattr(pipeline, 'pose_roi_context_controller', None)
+    receipt = {'present': controller is not None, 'quiesced': False}
+    runtime_state['pose_roi_context_shutdown_receipt'] = receipt
+    if not (eos_accepted is True and eos_seen is True
+            and wait_completed is True and wait_failed is False):
+        runtime_state['pipeline_failed'] = True
+        return False
+    try:
+        if controller is not None:
+            controller.close()
+            logger.info('Pose ROI context native summary: %s',
+                        json.dumps(dict(controller.snapshot()), sort_keys=True))
+    except Exception:
+        runtime_state['pipeline_failed'] = True
+        logger.exception('Pose ROI context shutdown did not quiesce')
+        return False
+    receipt['quiesced'] = True
+    return True
+
+
+def _drain_runtime_publications(gate, processor, *, timeout_s=5.0):
+    """Stop new callbacks, await admitted callbacks, then drain FIFO with WS alive."""
+    publication = gate.close_and_wait(timeout_s=timeout_s)
+    close = processor.shutdown(wait=True, timeout_s=timeout_s) if processor is not None else None
+    return publication, close
+
+
+def _prime_bound_bev_floorplans(camera_labels, scene_priors, provider, bounds_provider):
+    """Register already-bound static floorplans before the first spatial cohort.
+
+    Use the normal revision/calibration-checked provider, outside frame callbacks.
+    This is presentation registration only, never a live position authority.
+    """
+    if scene_priors is None:
+        return ()
+    primed = []
+    for camera in sorted(set(str(label) for label in camera_labels.values())):
+        binding = scene_priors.binding(camera)
+        if binding is None or not binding.include_floorplan_layers:
+            continue
+        payload = provider(camera=camera, cache_only=True, scene_prior_only=True)
+        if not isinstance(payload, Mapping) or payload.get("error"):
+            raise RuntimeError(f"bound BEV floorplan startup failed for {camera}")
+        if bounds_provider(camera) is None:
+            raise RuntimeError(f"bound BEV floorplan registration unavailable for {camera}")
+        primed.append(camera)
+    return tuple(primed)
+
+
+def _finalize_canonical_world(world_service, quality_ingress, close_receipt):
+    if quality_ingress is None:
+        world_service.close()
+        return False
+    if (quality_ingress.world is not world_service or close_receipt is None
+            or close_receipt.target is not world_service or close_receipt.completed is not True
+            or close_receipt.error is not None or type(close_receipt.thread_id) is not int
+            or close_receipt.thread_id <= 0):
+        raise RuntimeError("canonical World original actor close acknowledgement unavailable")
+    return True  # Public close ALREADY returned on its sole publication actor.
+
+
 def _run_main(startup_main_guard: StartupMainGuard) -> int:
     os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
@@ -4800,6 +4889,18 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     if not pipeline_path.exists():
         logger.error("Pipeline configuration not found: %s", pipeline_path)
         return 1
+    source_candidate_cfg = _load_pipeline_config(pipeline_path, logger)
+    if source_candidate_cfg is not None and xc3d_world_quality_enabled(source_candidate_cfg):
+        try:
+            from noesis.pipelines.world_quality_adapter import require_world_quality_api
+            require_world_quality_api()
+        except (ImportError, ValueError) as exc:
+            logger.error("XC3D world-quality source admission refused: %s", exc)
+            return _abort_startup("xc3d_world_quality_public_api_unavailable")
+    elif source_candidate_cfg is not None and xc3d_candidate_enabled(source_candidate_cfg):
+        logger.error("XC3D source admission refused before native initialization: %s",
+                     xc3d_admission_refusal(source_candidate_cfg))
+        return _abort_startup("xc3d_physical_admission_unavailable")
     v3dt_bundle: Optional[V3DTAssetBundle] = None
     if tracking_mode in {"v3dt", "mv3dt"}:
         if not _ensure_v3dt_meta_extension(logger):
@@ -5527,22 +5628,35 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             if scene_prior_set is not None
             else None
         ),
+        # Existing isolated runner supplies explicit ORIGINAL input authority.
+        # Forward it to the existing guarded structural loader, not a new
+        # catalog/root selector or a change to geometry/calibration values.
+        presentation_evidence_root=(
+            Path(os.environ["NOESIS_XC3D_ORIGINAL_ROOT"])
+            if os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT") else None
+        ),
     )
     setattr(pipeline, "bev_calibration", calibration_provider)
-    if tracking_mode == "v3dt":
+    if tracking_mode in {"v3dt", "mv3dt"}:
+        binding_label = "MV3DT" if tracking_mode == "mv3dt" else "SV3DT"
         try:
             if v3dt_bundle is None:
-                raise V3DTAssetError("SV3DT asset bundle is unavailable")
-            validate_sv3dt_calibration_binding(
+                raise V3DTAssetError(f"{binding_label} asset bundle is unavailable")
+            binding_validator = (
+                validate_mv3dt_calibration_binding
+                if tracking_mode == "mv3dt"
+                else validate_sv3dt_calibration_binding
+            )
+            binding_validator(
                 v3dt_bundle,
                 pipeline_config=pipeline.config,
                 calibration_provider=calibration_provider,
                 camera_labels=camera_labels,
             )
         except Exception as exc:
-            logger.error("SV3DT active calibration binding failed: %s", exc)
-            return _abort_startup("sv3dt_calibration_binding_invalid")
-        logger.info("SV3DT camInfo matches the active canonical world calibration")
+            logger.error("%s active calibration binding failed: %s", binding_label, exc)
+            return _abort_startup(f"{binding_label.lower()}_calibration_binding_invalid")
+        logger.info("%s camInfo matches the active canonical world calibration", binding_label)
     if calibration_provider.pose_only_enabled():
         pose_errors = calibration_provider.validate_pose_coverage()
         if pose_errors:
@@ -5560,7 +5674,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     world_fusion_policy: WorldFusionPolicy | None = None
     legacy_world_fusion_policy: WorldFusionPolicy | None = None
     depthless_reid_smoke = _allow_depthless_reid_smoke(pipeline.config)
-    if tracking_mode == "baseline" and not depthless_reid_smoke:
+    if (tracking_mode == "baseline" or xc3d_candidate_enabled(pipeline.config)) and not depthless_reid_smoke:
         try:
             depth_registration_manager = _load_depth_registration_manager(
                 path=depth_registration_path,
@@ -6163,6 +6277,68 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         failure_callback=_ws_boundary_failed,
         publication_gate=runtime_publication_gate,
     )
+    native_association = None
+    quality_identity = None
+    quality_bindings = ()
+    quality_frames = {}
+    quality_projective_policy = None
+    from noesis.pipelines.projective_continuity import projective_continuity_enabled, image_regions_enabled
+    try:
+        projective_requested = projective_continuity_enabled(pipeline.config)
+        image_regions_requested = image_regions_enabled(pipeline.config)
+    except ValueError:
+        logger.exception("Explicit projective-continuity mode is invalid")
+        return _abort_startup("xc3d_projective_continuity_configuration_invalid")
+    if xc3d_world_quality_enabled(pipeline.config):
+        import uuid
+        from noesis.identity_association_service import IdentityAssociationService
+        from reid.mv3dt_person_association import SpatialAssociationPolicy
+        from noesis.pipelines.world_quality_adapter import runtime_spatial_bindings
+        from noesis.pipelines.source_acquisition import selected_swin_profile, AcquisitionUnavailable
+        native_run_id = os.environ.get("NOESIS_RUNTIME_RUN_ID") or str(uuid.uuid4())
+        try:
+            quality_bindings, quality_frames = runtime_spatial_bindings(
+                native_run_id, camera_labels, calibration_provider, scene_prior_set)
+            component = pipeline.components["reid_sgie"]
+            ini = Path(component.config["config-file-path"])
+            if not ini.is_absolute(): ini = REPO_ROOT / ini
+            source_payload = _load_pipeline_config(Path(pipeline.yaml_path), logger)
+            source_ini = Path(source_payload["models"]["reid"]["config-file-path"])
+            if not source_ini.is_absolute(): source_ini = REPO_ROOT / source_ini
+            effective_model = pipeline.config["models"]["reid"]
+            profile = selected_swin_profile(ini, source_ini=source_ini,
+                engine_path=Path(effective_model["engine"]), model_config=effective_model,
+                runtime_properties=component.config, pipeline_config=pipeline.config)
+            from noesis.pipelines.projective_continuity import projective_continuity_enabled, runtime_projective_policy
+            quality_policy = SpatialAssociationPolicy(quality_bindings, profile, (("kitchen", "family-room"),))
+            if image_regions_requested:
+                from noesis.pipelines.projective_continuity import runtime_image_region_policy
+                quality_projective_policy = runtime_image_region_policy(
+                    pipeline.config,quality_bindings,calibration_provider,REPO_ROOT)
+                quality_identity = IdentityAssociationService.for_estimated_image_regions(
+                    native_run_id,quality_policy,quality_projective_policy,
+                    live_track_continuity=pipeline.config['xc3d_image_regions'].get('live_track_continuity',False),
+                    contradictory_cue_quarantine=pipeline.config['xc3d_image_regions'].get('contradictory_cue_quarantine',False),
+                    unresolved_birth_quarantine=pipeline.config['xc3d_image_regions'].get('unresolved_birth_quarantine',False),
+                    semantic_joint_max_mean_px=pipeline.config['xc3d_image_regions'].get('semantic_joint_max_mean_px'))
+            elif projective_requested:
+                quality_projective_policy = runtime_projective_policy(quality_bindings,calibration_provider)
+                quality_identity = IdentityAssociationService.for_projective_continuity(
+                    native_run_id,quality_policy,quality_projective_policy)
+            else:
+                quality_identity = IdentityAssociationService.for_spatial(native_run_id,quality_policy)
+        except (KeyError, TypeError, ValueError, OSError, AcquisitionUnavailable) as exc:
+            logger.error("XC3D world-quality actual capability unavailable: %s", exc)
+            return _abort_startup("xc3d_world_quality_actual_capability_unavailable")
+    elif xc3d_candidate_enabled(pipeline.config):
+        import uuid
+        from noesis.identity_association_service import ProducerAdmission
+        from noesis.pipelines.source_acquisition import OrderedIdentityProducer
+        native_run_id = os.environ.get("NOESIS_RUNTIME_RUN_ID") or str(uuid.uuid4())
+        native_association = OrderedIdentityProducer(native_run_id,
+            ProducerAdmission("unavailable", "native-current-inputs",
+                "native_metric_clock_camera_epoch_original_swin_unavailable"))
+        pipeline.xc3d_ordered_identity_producer = native_association
     world_service = startup_transaction.acquire(
         "canonical_world",
         lambda: create_runtime_world_service(
@@ -6176,6 +6352,19 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                 if appliance_binding is not None
                 else None
             ),
+            **({"run_id": native_association.run_id,
+                # Current native World/time inputs are unavailable. Preserve
+                # the honest default local World owner; installing a denied
+                # physical consumer would forbid its normal local commit.
+                "association_service": (native_association.service
+                    if native_association.admission.status == "admitted" else None),
+                "physical_admission": (lambda: native_association.admission)
+                    if native_association.admission.status == "admitted" else None}
+               if native_association is not None else {}),
+            **({"run_id": native_run_id, "association_service": quality_identity,
+                "spatial_bindings": lambda: runtime_spatial_bindings(native_run_id,
+                    camera_labels, calibration_provider, scene_prior_set)[1]}
+               if quality_identity is not None else {}),
         ),
         lambda service: service.close(),
     )
@@ -6294,10 +6483,26 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             identity_v2_service.runtime.scoring_calibration_status,
         )
 
+    tracking_world_ingress = world_service
+    if quality_identity is not None:
+        from noesis.pipelines.world_quality_adapter import OrderedQualityWorldIngress, snapshot_swin_lineage
+        from noesis.pipelines.projective_continuity import ProjectiveQualityBridge, ImageRegionQualityBridge
+        bridge_type = ImageRegionQualityBridge if image_regions_requested else ProjectiveQualityBridge
+        projective_bridge = (bridge_type(quality_projective_policy,
+            lambda: pipeline.xc3d_swin_ingress.cache,
+            joint_threshold=float(pipeline.config["models"]["pose"]["kpt_threshold"]))
+            if quality_projective_policy is not None else None)
+        tracking_world_ingress = OrderedQualityWorldIngress(world_service, quality_identity, quality_bindings,
+            origin_bindings=lambda: snapshot_swin_lineage(pipeline),projective_bridge=projective_bridge)
+        pipeline.xc3d_world_quality_ingress = tracking_world_ingress
+    elif native_association is not None:
+        from noesis.pipelines.source_acquisition import Xc3dWorldIngress
+        tracking_world_ingress = Xc3dWorldIngress(world_service)
+        pipeline.xc3d_world_ingress = tracking_world_ingress
     tracking_pub = TrackingTelemetryPublisher(
         ws_server,
         metadata_getter=_tracking_contract_metadata,
-        world_service=world_service,
+        world_service=tracking_world_ingress,
         health_monitor=capability_monitor,
         failure_callback=_canonical_publication_failed,
     )
@@ -6391,7 +6596,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     except Exception:
         logger.exception("Error while attaching pose feature hook")
         return _abort_startup("pose_feature_hook_failed")
-    if tracking_mode == "baseline" and not depthless_reid_smoke:
+    if (tracking_mode == "baseline" or xc3d_candidate_enabled(pipeline.config)) and not depthless_reid_smoke:
         try:
             hooks.attach_object_depth_fusion_hook(
                 pipeline,
@@ -6418,6 +6623,13 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         diagnostics_logger=diagnostics_logger,
         publication_gate=runtime_publication_gate,
     )
+    if xc3d_world_quality_enabled(pipeline.config):
+        from noesis.pipelines.world_quality_adapter import require_world_quality_attachment
+        try:
+            require_world_quality_attachment(pipeline)
+        except ValueError as exc:
+            logger.error("XC3D world-quality required source ingress failed: %s", exc)
+            return _abort_startup("xc3d_world_quality_analytics_attachment_unavailable")
     hooks.attach_analytics_reload_bridge(pipeline)
 
     # Wire pyservicemaker Pipeline messages into our logger + shutdown handling.
@@ -6433,6 +6645,12 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         except Exception:
             logger.exception("Error in pyservicemaker message callback")
 
+    try:
+        _prime_bound_bev_floorplans(camera_labels, scene_prior_set,
+            _floorplan_provider, _bev_active_floorplan_bounds_provider)
+    except Exception:
+        logger.exception("Bound BEV floorplan startup registration failed")
+        return _abort_startup("bound_bev_floorplan_startup_failed")
     if shutdown_event.is_set():
         return _abort_startup("shutdown_requested_before_prepare")
     logger.info("Preparing DS9 pipeline")
@@ -6617,6 +6835,8 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                     mosaic_h264_shm_socket,
                     request_keyframe=keyframe_requester,
                     on_fatal_error=_mosaic_transport_failed,
+                    is_expected_eos=lambda: runtime_state.get("pipeline_eos_seen") is True
+                        and runtime_state.get("pipeline_eos_reason") == "finite_source",
                 )
                 mosaic_h264_feeder.start()
                 logger.info(
@@ -6929,26 +7149,20 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         while True:
             signal.pause()
 
+    world_actor_close_receipt = None
     try:
-        analytics_processor = getattr(
-            pipeline,
-            "analytics_telemetry_processor",
-            None,
-        )
-        shutdown_tracking = getattr(analytics_processor, "shutdown", None)
-        if callable(shutdown_tracking):
-            shutdown_tracking(wait=True, timeout_s=5.0)
-            logger.info("Canonical tracking/BEV publication worker quiesced")
-    except Exception:
-        runtime_state["pipeline_failed"] = True
-        logger.exception("Canonical tracking/BEV publication worker shutdown failed")
-        while True:
-            signal.pause()
-
-    try:
-        publication_receipt = runtime_publication_gate.close_and_wait(
-            timeout_s=5.0
-        )
+        analytics_processor = getattr(pipeline, "analytics_telemetry_processor", None)
+        publication_receipt, world_actor_close_receipt = _drain_runtime_publications(
+            runtime_publication_gate, analytics_processor, timeout_s=5.0)
+        if world_actor_close_receipt is not None:
+            runtime_state["world_actor_close_receipt"] = {
+                "completed": world_actor_close_receipt.completed,
+                "error_type": None if world_actor_close_receipt.error is None else type(world_actor_close_receipt.error).__name__,
+                "target_id": id(world_actor_close_receipt.target), "thread_id": world_actor_close_receipt.thread_id}
+        worker = getattr(analytics_processor, "_tracking_publication_worker", None)
+        if worker is not None and worker.terminal_failure is not None:
+            runtime_state["pipeline_failed"] = True
+        logger.info("Canonical tracking/BEV publication worker quiesced")
         runtime_state["runtime_publication_shutdown_receipt"] = (
             publication_receipt.to_dict()
         )
@@ -7039,6 +7253,9 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             wait_failed,
         )
     else:
+        _finalize_pose_roi_context(pipeline, eos_accepted=eos_accepted,
+            eos_seen=eos_seen, wait_completed=wait_completed, wait_failed=wait_failed,
+            runtime_state=runtime_state, logger=logger)
         capture_controller = getattr(pipeline, "capture_event_controller", None)
         capture_event_quiesced = capture_controller is None
         if capture_controller is not None:
@@ -7181,7 +7398,15 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             _record_finalization_failure("identity_v2", exc)
 
         try:
-            world_service.close()
+            actor_closed = _finalize_canonical_world(world_service,
+                getattr(pipeline, "xc3d_world_quality_ingress", None),
+                world_actor_close_receipt)
+            if actor_closed:
+                logger.info("Canonical World actor close acknowledged: completed=1 target=%d thread=%d",
+                    id(world_service), world_actor_close_receipt.thread_id)
+                bridge = getattr(getattr(pipeline,"xc3d_world_quality_ingress",None),"projective_bridge",None)
+                if bridge is not None:
+                    logger.info("Projective continuity evidence summary: %s", json.dumps(bridge.diagnostics(),sort_keys=True))
         except BaseException as exc:
             logger.exception("Failed to flush canonical world journal")
             _record_finalization_failure("canonical_world", exc)

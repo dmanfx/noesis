@@ -352,6 +352,172 @@ class _HostOnlyDepthDevice:
         return depth
 
 
+def _no_work_cadence_caller(monkeypatch, *, rendezvous=True, device=None):
+    """Actual caller/owned-pose path, with CPU-only native statistic stand-in."""
+    bbox = (400., 300., 100., 260.)
+    profile = (4, (640, 640), .25, True)
+    producer = object.__new__(hooks.PoseFeatureProcessor)
+    producer.tensor_source = 'object_sgie'
+    producer.gie_id, producer.model_size, producer.score_threshold, producer.letterbox = profile
+    fusion = hooks._ObjectDepthFusionProcessor(hooks._AlignedDepthFrameStore(),
+        (1920, 1080), 'synthetic', 'm', True, 2)
+    fusion.pose_feature_processor = producer
+    fusion.pose_profile = profile
+    fusion.xc3d_exact_acquisition = True
+    fusion.original_depth_rendezvous_enabled = rendezvous
+    device = device or _MaskedStatsDevice()
+    depth = SimpleNamespace(frame_w=1920, frame_h=1080, depth_device_frame=device)
+    obj = SimpleNamespace(object_id=3, class_id=0, confidence=.9,
+        rect_params=SimpleNamespace(left=400., top=300., width=100., height=260.))
+    attached = []
+    monkeypatch.setattr(hooks, 'noesis_pose_meta_ext',
+        SimpleNamespace(extract_pose_features=lambda _: None))
+    monkeypatch.setattr(fusion, '_extract_instance_mask_payload', lambda _: None)
+    monkeypatch.setattr(fusion.depth_store, 'resolve', lambda **_: (depth, 0, 0))
+    monkeypatch.setattr(fusion, '_attach_object_depth_payload',
+        lambda _batch, _obj, payload: attached.append(payload) or True)
+
+    def run(frame_id, pts_ns, *, degenerate=False, object_count=1):
+        points = np.zeros((17, 3), dtype=np.float32)
+        for i, x, y in ((5, 425, 330), (6, 475, 330), (11, 435, 420),
+                        (12, 465, 420), (13, 435, 475), (14, 465, 475),
+                        (15, 435, 550), (16, 465, 550)):
+            points[i] = (x, y, .9)
+        if degenerate:
+            points[:] = 0
+            for i in (5, 6, 11, 12, 13, 14):
+                points[i] = (450, 350, .9)
+        objects = [SimpleNamespace(**{**vars(obj), 'object_id': 3 + i})
+                   for i in range(object_count)]
+        producer._current_pose_results = {2: (frame_id, pts_ns, {
+            (o.object_id, bbox): dict(source_id=2, object_id=o.object_id,
+                frame_id=frame_id, ts_us=pts_ns // 1000, bbox=list(bbox),
+                keypoints_abs=points.tolist(), score=.9) for o in objects})}
+        depth.frame_id, depth.pts_us = frame_id, pts_ns // 1000
+        frame = SimpleNamespace(source_id=2, frame_number=frame_id, buf_pts=pts_ns,
+            object_items=objects)
+        receipt = dict(source_id=2, original_source_id=2, receipt_valid=True,
+            sdk_source_id=2, original_sdk_source_id=2, slot=0, original_batch_id=0,
+            original_buffer_scope=frame_id, original_ntp_ns=0, post_tracker_ntp_ns=0,
+            original_frame=frame_id, original_pts_ns=pts_ns, post_tracker_pts_ns=pts_ns)
+        fusion.handle_servicemaker_frame(object(), frame, source_receipt=receipt)
+        return attached[-1] if attached else None
+    return fusion, device, run
+
+
+def test_zero_plan_full_caller_does_not_charge_real_native_cadence(monkeypatch):
+    fusion, device, run = _no_work_cadence_caller(monkeypatch)
+    negative = run(160, 5_333_333_333, degenerate=True)
+    assert negative['status'] == 'no_ground_contact'
+    assert not device.capsule_calls and not device.calls
+    assert (2, 3) not in fusion._actual_depth_attempts
+    assert fusion._sample_service_sequence == 1  # CPU/fairness remains charged.
+    positive = run(162, 5_400_000_000)
+    assert positive['status'] == 'ok' and positive['measurement_frame_id'] == 162
+    assert not positive['measurement_cached'] and device.capsule_calls
+    calls = len(device.capsule_calls)
+    run(164, 5_466_666_666)
+    assert len(device.capsule_calls) == calls  # Last REAL attempt still fences 5 Hz.
+
+
+def test_zero_plan_preserves_previous_real_fence_and_replay_barrier(monkeypatch):
+    fusion, device, run = _no_work_cadence_caller(monkeypatch)
+    run(150, 5_000_000_000)
+    previous = fusion._actual_depth_attempts[(2, 3)]
+    count = len(device.capsule_calls)
+    run(160, 5_333_333_333, degenerate=True)
+    assert fusion._actual_depth_attempts[(2, 3)] == previous
+    service = fusion._sample_service_sequence
+    run(160, 5_333_333_333, degenerate=True)
+    run(159, 5_300_000_000, degenerate=True)
+    assert fusion._sample_service_sequence == service and len(device.capsule_calls) == count
+    run(162, 5_400_000_000)
+    assert len(device.capsule_calls) > count
+    assert fusion._actual_depth_attempts[(2, 3)][1] == 162
+    assert not fusion._result_cache[(2, 3)].get('_no_native_pose_work', False)
+    assert (2, 3) not in fusion._depth_retry_tracks
+
+
+def test_zero_plan_keeps_callback_cap_and_rotates_fairness(monkeypatch):
+    monkeypatch.setenv('NOESIS_OBJECT_DEPTH_MAX_OBJECTS_PER_FRAME', '2')
+    fusion, device, run = _no_work_cadence_caller(monkeypatch)
+    run(160, 5_333_333_333, degenerate=True, object_count=3)
+    assert fusion._sample_service_sequence == 2
+    assert set(fusion._result_cache) == {(2, 3), (2, 4)}
+    assert not device.capsule_calls and not device.calls
+    run(162, 5_400_000_000, object_count=3)
+    assert fusion._sample_service_sequence == 4
+    assert fusion._actual_depth_attempts[(2, 5)][1] == 162
+    assert len(fusion._actual_depth_attempts) == 2
+
+
+@pytest.mark.parametrize('route', ['failed-pose', 'bbox', 'mask'])
+def test_zero_plan_does_not_refund_real_native_attempts(monkeypatch, route):
+    fusion, device, run = _no_work_cadence_caller(monkeypatch)
+    calls = []
+    if route == 'failed-pose':
+        def fail(*_):
+            calls.append('pose')
+            raise RuntimeError('native statistic attempted but failed')
+        monkeypatch.setattr(device, 'sample_pose_capsule_stats', fail)
+    elif route == 'bbox':
+        monkeypatch.setattr(fusion, '_attached_pose_keypoints', lambda *_args, **_kwargs: None)
+    else:
+        monkeypatch.setattr(fusion, '_extract_instance_mask_payload',
+            lambda _: {'mask': np.ones((260, 100), dtype=np.float32)})
+        # Exact native mask implementation is exercised by existing tests; this
+        # stand-in records a failed attempt, which must still consume cadence.
+        def mask_attempt(*_args, **_kwargs):
+            calls.append('mask')
+            return fusion._build_result(_args[0], _args[1], bbox=(400.,300.,100.,260.),
+                status='no_ground_contact')
+        monkeypatch.setattr(fusion, '_sample_instance_mask_result_native', mask_attempt)
+    run(160, 5_333_333_333)
+    assert calls or device.calls
+    assert fusion._actual_depth_attempts[(2, 3)][1] == 160
+    assert (2, 3) not in fusion._depth_retry_tracks
+    before = (len(calls), len(device.calls))
+    run(162, 5_400_000_000)
+    assert (len(calls), len(device.calls)) == before
+
+
+def test_zero_plan_disabled_keeps_existing_cache_cadence(monkeypatch):
+    fusion, device, run = _no_work_cadence_caller(monkeypatch, rendezvous=False)
+    run(160, 5_333_333_333, degenerate=True)
+    run(162, 5_400_000_000)
+    assert not device.capsule_calls and not device.calls
+    assert not fusion._actual_depth_attempts and not fusion._depth_retry_tracks
+
+
+def test_zero_plan_retry_never_exceeds_real_five_hz_or_exports_marker(monkeypatch):
+    fusion, device, run = _no_work_cadence_caller(monkeypatch)
+    attempts = []
+    for frame in range(160, 191):
+        old = fusion._actual_depth_attempts.get((2, 3))
+        payload = run(frame, frame * 100_000_000 // 3, degenerate=frame % 2 == 0)
+        current = fusion._actual_depth_attempts.get((2, 3))
+        if current != old:
+            attempts.append(current[0])
+        assert not any(str(key).startswith('_') for key in payload)
+    assert len(attempts) >= 3
+    assert all(b - a >= 200_000 for a, b in zip(attempts, attempts[1:]))
+    assert device.capsule_calls and not device.calls
+
+
+@pytest.mark.parametrize('later', ['newer-attempt', 'sealed-birth'])
+def test_zero_plan_rollback_cannot_replace_newer_or_lifecycle_bound_claim(monkeypatch, later):
+    fusion, _device, _run = _no_work_cadence_caller(monkeypatch)
+    work = hooks._DepthSamplingWork()
+    assert fusion._claim_actual_depth_attempt((2, 3), 5_333_333, 160,
+        pts_ns=5_333_333_333, _work=work)
+    current = (5_600_000, 168, ('new-birth', 2), 5_600_000_000) if later == 'newer-attempt' else (
+        5_333_333, 160, ('epoch', 'birth'), 5_333_333_333)
+    fusion._actual_depth_attempts[(2, 3)] = current
+    work.no_native_pose_work = True
+    fusion._release_no_work_attempt((2, 3), work)
+    assert fusion._actual_depth_attempts[(2, 3)] == current
+
+
 def _run_pose_depth_sample(
     monkeypatch: Any,
     *,

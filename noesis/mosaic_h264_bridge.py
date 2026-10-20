@@ -67,11 +67,13 @@ class MosaicH264ShmFeeder:
         *,
         request_keyframe: Optional[Callable[[str], None]] = None,
         on_fatal_error: Optional[Callable[[BaseException], None]] = None,
+        is_expected_eos: Optional[Callable[[], bool]] = None,
         startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> None:
         self.socket_path = str(socket_path or DEFAULT_SHM_SOCKET)
         self._request_keyframe = request_keyframe
         self._on_fatal_error = on_fatal_error
+        self._is_expected_eos = is_expected_eos
         self._startup_timeout_s = max(1.0, min(30.0, float(startup_timeout_s)))
         self.pipeline: Optional[Gst.Pipeline] = None
         self.appsink: Optional[Gst.Element] = None
@@ -85,6 +87,7 @@ class MosaicH264ShmFeeder:
         self._context_acquired = False
         self._fatal_error: Optional[BaseException] = None
         self._fatal_error_notified = False
+        self._finite_source_read_closed = False
         self._frame_count = 0
         self._drop_count = 0
         self._last_keyframe_request = 0.0
@@ -359,8 +362,30 @@ class MosaicH264ShmFeeder:
             except Exception:
                 logger.exception("Mosaic H.264 SHM fatal-error callback failed")
 
+    def _producer_confirmed_finite_eos(self) -> bool:
+        if self._is_expected_eos is None:
+            return False
+        try:
+            return self._is_expected_eos() is True
+        except Exception:
+            logger.warning("Mosaic finite-source EOS receipt unavailable")
+            return False
+
     def _on_bus_error(self, _bus: Gst.Bus, message: Gst.Message) -> None:
         error, debug = message.parse_error()
+        source = message.src.get_name() if message.src is not None else None
+        # shmsrc reports a closed producer as READ, then a derivative basesrc
+        # stream error. Only those exact teardown messages AFTER the canonical
+        # producer confirmed finite EOS are normal closure. Other/live faults
+        # remain fatal; this cannot clear an already recorded failure.
+        if source == "mosaic_h264_shmsrc" and self._producer_confirmed_finite_eos():
+            read_closed = error.domain == "gst-resource-error-quark" and error.code == 9
+            derivative = (self._finite_source_read_closed
+                          and error.domain == "gst-stream-error-quark" and error.code == 1)
+            if read_closed or derivative:
+                self._finite_source_read_closed = True
+                logger.info("Mosaic H.264 SHM reader closed after producer-confirmed finite-source EOS")
+                return
         failure = RuntimeError(f"{error}; debug={debug or 'unavailable'}")
         logger.critical("Mosaic H.264 SHM feeder pipeline failed: %s", failure)
         self._record_fatal_error(failure)
@@ -368,7 +393,10 @@ class MosaicH264ShmFeeder:
     def _on_bus_eos(self, _bus: Gst.Bus, _message: Gst.Message) -> None:
         with self._state_lock:
             stopping = self._stopping
-        if not stopping:
+        expected = not stopping and self._producer_confirmed_finite_eos()
+        if expected:
+            logger.info("Mosaic H.264 SHM feeder received producer-confirmed finite-source EOS")
+        elif not stopping:
             failure = RuntimeError("Mosaic H.264 SHM feeder received unexpected EOS")
             logger.critical("%s", failure)
             self._record_fatal_error(failure)

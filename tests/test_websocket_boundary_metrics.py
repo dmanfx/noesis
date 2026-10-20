@@ -27,10 +27,220 @@ from noesis.server.websocket import (
     ProviderCapacityExceeded,
     ProviderQuiescenceTimeout,
     WebSocketServer,
+    _SerializedWebSocketServerProtocol,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _r117_protocol(protocol_type=_SerializedWebSocketServerProtocol):
+    from types import SimpleNamespace
+    from websockets.protocol import State
+    class Transport:
+        def __init__(self):self.frames=[]
+        def write(self,data):self.frames.append(data)
+        def is_closing(self):return False
+        def get_extra_info(self,name,default=None):return ('127.0.0.1',51912) if name=='peername' else default
+    protocol=protocol_type(lambda *args:None,SimpleNamespace(),ping_interval=None)
+    protocol.state=State.OPEN
+    protocol.transfer_data_task=asyncio.get_running_loop().create_future()
+    protocol.transport=Transport()
+    return protocol
+
+
+def _r117_messages(protocol):
+    result=[]
+    for frame in protocol.transport.frames:
+        if frame[0]&15!=1:continue
+        size=frame[1]&127;offset=2
+        if size==126:size=int.from_bytes(frame[2:4],'big');offset=4
+        elif size==127:size=int.from_bytes(frame[2:10],'big');offset=10
+        result.append(frame[offset:offset+size].decode())
+    return result
+
+
+def test_r117_installed_legacy_paused_drain_red_and_all_send_green():
+    from websockets.legacy.server import WebSocketServerProtocol
+    async def run():
+        old=_r117_protocol(WebSocketServerProtocol);old.pause_writing()
+        first=asyncio.create_task(old.send('first'));await asyncio.sleep(0)
+        with pytest.raises(AssertionError) as error:await old.send('second')
+        assert str(error.value)==''
+        old.resume_writing();await first;old.transfer_data_task.cancel()
+        new=_r117_protocol();new.pause_writing()
+        sends=[asyncio.create_task(new.send(str(i))) for i in range(3)]
+        await asyncio.sleep(0)
+        # Control frames bypass send(), but share the distinct drain lock.
+        ping=asyncio.create_task(new.ping(b'actual-control'))
+        await asyncio.sleep(0)
+        assert all(not task.done() for task in sends) and not ping.done()
+        new.resume_writing();await asyncio.gather(*sends)
+        pong=await ping;pong.cancel();new.transfer_data_task.cancel()
+        assert _r117_messages(new)==['0','1','2']
+    asyncio.run(run())
+
+
+def test_r117_shared_connection_floorplan_stats_ice_and_canonical_order():
+    async def run():
+        ws=WebSocketServer(stats_callback=None);ws.event_loop=asyncio.get_running_loop()
+        client=_r117_protocol();ws.connected_clients.add(client);client.pause_writing()
+        first=ws.admit_broadcast_batch_sync(_canonical_tracking_batch(ws,sequence=1))
+        first.commit_then_release(lambda:None);await asyncio.sleep(0)
+        floor=asyncio.create_task(ws._send_json_with_boundary_metrics(client,
+            {'type':'floorplan_response'},route='get_floorplan',message_type='floorplan_response',
+            response_model_timing=ws.response_model_timing_since(time.perf_counter_ns())))
+        stats=asyncio.create_task(ws.broadcast(_timed_payload(ws,lambda:{'type':'stats'})))
+        ice=asyncio.create_task(ws._send_to_client(client,_timed_payload(ws,lambda:{'type':'webrtc_ice_candidate'})))
+        second=ws.admit_broadcast_batch_sync(_canonical_tracking_batch(ws,sequence=2));second.commit_then_release(lambda:None)
+        await asyncio.sleep(0);client.resume_writing()
+        await asyncio.gather(floor,stats,ice)
+        await ws.quiesce_outbound_submissions(timeout_s=1.)
+        messages=[json.loads(s) for s in _r117_messages(client)]
+        canonical=[(m['type'],m['cohort']['tracking_publication_sequence']) for m in messages if 'cohort' in m]
+        assert canonical==[(kind,seq) for seq in (1,2) for kind in ('tracking','world_snapshot','world_event')]
+        assert {'floorplan_response','stats','webrtc_ice_candidate'}<={m['type'] for m in messages}
+        assert client in ws.connected_clients
+        client.transfer_data_task.cancel()
+    asyncio.run(run())
+
+
+def test_r117_connection_isolation_and_cancelled_waiter_release_locks():
+    async def run():
+        blocked=_r117_protocol();other=_r117_protocol();blocked.pause_writing()
+        first=asyncio.create_task(blocked.send('first'));await asyncio.sleep(0)
+        waiting=asyncio.create_task(blocked.send('cancelled'));await asyncio.sleep(0)
+        await other.send('independent')
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):await waiting
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):await first
+        blocked.resume_writing();await blocked.send('after-cancel')
+        assert _r117_messages(blocked)==['first','after-cancel']
+        assert _r117_messages(other)==['independent']
+        assert not blocked._noesis_send_lock.locked() and not blocked._noesis_drain_lock.locked()
+        blocked.transfer_data_task.cancel();other.transfer_data_task.cancel()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('route',['broadcast','direct','binary'])
+def test_r117_delivery_failure_closes_orphan_and_preserves_error(caplog,route):
+    class Broken(_FakeSocket):
+        def __init__(self):super().__init__();self.close_calls=[]
+        async def send(self,payload):raise RuntimeError('actual delivery failure')
+        async def close(self,**kwargs):self.close_calls.append(kwargs)
+    async def run():
+        ws=WebSocketServer(stats_callback=None);client=Broken();ws.connected_clients.add(client)
+        if route=='broadcast':await ws.broadcast('message')
+        elif route=='binary':await ws._broadcast_binary_immediate(b'message')
+        else:await ws._send_to_client(client,'message')
+        assert client not in ws.connected_clients
+        assert client.close_calls==[{'code':1011,'reason':'delivery_failed'}]
+    with caplog.at_level(logging.ERROR):asyncio.run(run())
+    assert 'actual delivery failure' in caplog.text
+
+
+@pytest.mark.parametrize('cancel',[False,True])
+def test_r117_failed_close_timeout_or_cancellation_aborts_and_joins(cancel):
+    class Client(_FakeSocket):
+        def __init__(self):
+            super().__init__();self.entered=asyncio.Event();self.aborted=asyncio.Event();self.finished=False
+            self.transport=type('Transport',(),{'abort':lambda _:self.aborted.set()})()
+        async def close(self,**kwargs):
+            self.entered.set()
+            try:await self.aborted.wait()
+            finally:self.finished=True
+    async def run():
+        ws=WebSocketServer(stats_callback=None);ws.CLIENT_CLOSE_GRACE_S=.01;ws.CLIENT_ABORT_DRAIN_S=.1
+        client=Client();ws.connected_clients.add(client)
+        task=asyncio.create_task(ws._retire_failed_client(client))
+        await client.entered.wait()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):await task
+        else:await task
+        assert client.aborted.is_set() and client.finished
+        assert client not in ws.connected_clients
+        assert not any(t.get_name()=='WebSocketFailedDeliveryClose' and not t.done() for t in asyncio.all_tasks())
+    asyncio.run(run())
+
+
+def test_r117_actual_start_selects_serialized_protocol_without_binding(monkeypatch):
+    import noesis.server.websocket as module
+    captured={}
+    async def serve(*args,**kwargs):
+        captured.update(kwargs)
+        raise OSError('fixture stops before any network binding')
+    async def prewarm():pass
+    ws=WebSocketServer(stats_callback=None)
+    monkeypatch.setattr(module,'serve',serve)
+    monkeypatch.setattr(ws,'_prewarm_serializer_executor',prewarm)
+    with pytest.raises(OSError,match='before any network binding'):asyncio.run(ws.start())
+    assert captured['create_protocol'] is _SerializedWebSocketServerProtocol
+    assert captured['max_queue']==1 and captured['ping_interval']==60 and captured['ping_timeout']==30
+    assert captured['close_timeout']==ws.CLOSE_HANDSHAKE_TIMEOUT_S
+
+
+def test_r117_close_failure_is_not_silenced_and_still_aborts():
+    class Client(_FakeSocket):
+        def __init__(self):
+            super().__init__();self.aborted=False
+            self.transport=type('Transport',(),{'abort':lambda _:setattr(self,'aborted',True)})()
+        async def send(self,payload):raise RuntimeError('delivery failed')
+        async def close(self,**kwargs):raise RuntimeError('close failed')
+    async def run():
+        ws=WebSocketServer(stats_callback=None);client=Client();ws.connected_clients.add(client)
+        with pytest.raises(RuntimeError,match='close failed'):await ws.broadcast('payload')
+        assert client.aborted and client not in ws.connected_clients
+        assert not any(t.get_name()=='WebSocketFailedDeliveryClose' and not t.done() for t in asyncio.all_tasks())
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('cancel',[False,True])
+def test_r117a_cancellation_resistant_close_is_bounded_explicit_and_owned(cancel,caplog):
+    class Client(_FakeSocket):
+        def __init__(self):super().__init__();self.entered=asyncio.Event();self.release=asyncio.Event()
+        async def close(self,**kwargs):
+            self.entered.set()
+            while not self.release.is_set():
+                try:await self.release.wait()
+                except asyncio.CancelledError:pass
+    async def run():
+        ws=WebSocketServer(stats_callback=None);ws.CLIENT_CLOSE_GRACE_S=.01;ws.CLIENT_ABORT_DRAIN_S=.01
+        client=Client();ws.connected_clients.add(client)
+        started=time.monotonic();task=asyncio.create_task(ws._retire_failed_client(client))
+        await client.entered.wait()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:await task
+            assert any('remained active' in n for n in caught.value.__notes__)
+        else:
+            with pytest.raises(RuntimeError,match='remained active'):await task
+        assert time.monotonic()-started<.5
+        assert client not in ws.connected_clients and not client._noesis_failed_close_task.done()
+        client.release.set();await client._noesis_failed_close_task
+    with caplog.at_level(logging.ERROR):asyncio.run(run())
+    assert 'remained active after bounded abort' in caplog.text
+
+
+def test_r117a_actual_installed_close_aborts_after_caller_cancel():
+    async def run():
+        protocol=_r117_protocol();protocol.close_timeout=.01
+        transport=protocol.transport
+        transport.can_write_eof=lambda:False
+        def ended():
+            if not protocol.connection_lost_waiter.done():protocol.connection_lost(None)
+        transport.close=ended;transport.abort=ended
+        protocol.close_connection_task=asyncio.create_task(protocol.close_connection())
+        ws=WebSocketServer(stats_callback=None);ws.CLIENT_CLOSE_GRACE_S=.02;ws.CLIENT_ABORT_DRAIN_S=.1
+        ws.connected_clients.add(protocol)
+        task=asyncio.create_task(ws._retire_failed_client(protocol));await asyncio.sleep(0);await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        assert protocol.closed and protocol.connection_lost_waiter.done()
+        assert protocol._noesis_failed_close_task.done() and protocol.close_connection_task.done()
+        assert protocol not in ws.connected_clients
+    asyncio.run(run())
 
 
 class _FakeSocket:
@@ -371,6 +581,44 @@ def test_get_floorplan_forwards_exact_snapshot_identity_to_provider() -> None:
         and json.loads(str(payload)).get("type") == "floorplan_response"
     )
     assert response["snapshot_id"] == "fused-1"
+
+
+@pytest.mark.parametrize("closed", [True, False])
+def test_r115_floorplan_closed_send_is_not_generation_failure(caplog, closed) -> None:
+    attempts = []
+
+    class Socket(_InboundSocket):
+        async def send(self, payload):
+            message = json.loads(payload)
+            if message.get("type") == "floorplan_response":
+                attempts.append(message)
+                if closed:
+                    from websockets.exceptions import ConnectionClosedError
+                    raise ConnectionClosedError(None, None, None)
+            await super().send(payload)
+
+    def provider(*args, **kwargs):
+        if not closed:
+            raise ValueError("genuine generation failure")
+        return {"ok": True}
+
+    async def run():
+        ws = WebSocketServer(stats_callback=None)
+        ws.floorplan_provider = provider
+        socket = Socket([{"type": "get_floorplan", "camera": "family-room"}])
+        await ws.handle_client(socket)
+        return ws, socket
+
+    caplog.set_level(logging.ERROR)
+    ws, socket = asyncio.run(run())
+    assert ws.quiesce_blocking_providers(timeout_s=1.).quiesced
+    assert len(attempts) == 1
+    assert socket not in ws.connected_clients
+    stages = ws.get_boundary_serialization_metrics()["stages"]
+    assert stages["ws|get_floorplan|floorplan_response|total|ok"]["count"] == 1
+    assert ("Floorplan generation error:" in caplog.text) is not closed
+    if not closed:
+        assert attempts[0]["error"] == "genuine generation failure"
 
 
 def test_get_floorplan_forwards_explicit_scene_prior_only_mode() -> None:
@@ -2152,19 +2400,22 @@ def test_authority_gated_batch_rejects_mixed_or_drifted_cohorts() -> None:
 def test_authority_gated_api_has_only_publisher_production_call_sites() -> None:
     hits: set[str] = set()
     bev_hits: set[str] = set()
-    for path in ROOT.rglob("*.py"):
+    # Audit executable application sources, not captured/generated review data.
+    # In particular data/mapanything_phone_scans is not a production caller.
+    source_roots = (
+        "noesis", "noesis_core", "reid", "DS9/noesis", "DS9/scripts", "scripts",
+    )
+    paths = list(ROOT.glob("*.py"))
+    for source_root in source_roots:
+        paths.extend((ROOT / source_root).rglob("*.py"))
+    for path in paths:
         relative = path.relative_to(ROOT)
         if any(part in {"tests", "archive", ".git"} for part in relative.parts):
             continue
-        if "admit_broadcast_batch_sync" in path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        ):
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if "admit_broadcast_batch_sync" in source:
             hits.add(relative.as_posix())
-        if "broadcast_bev_sync" in path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        ):
+        if "broadcast_bev_sync" in source:
             bev_hits.add(relative.as_posix())
     assert hits == {
         "noesis/server/websocket.py",
@@ -2746,3 +2997,160 @@ def test_failed_webrtc_peer_reset_removes_unsafe_slot() -> None:
 
     assert gateway not in ws.webrtc_gateways
     assert ws.webrtc_gateway is None
+
+
+def _t9_real_wire_publisher(ws):
+    from noesis.telemetry.publishers import TrackingTelemetryPublisher
+    from noesis_core.contracts.base import ProducerRef, ArtifactFingerprint
+    from noesis_core.world_service import CanonicalWorldService, WorldArtifacts
+    world=CanonicalWorldService(producer=ProducerRef(runtime="ds9",instance_id="synthetic-wire",
+        run_id="synthetic-wire-run",software_revision="synthetic"),artifacts=WorldArtifacts(
+            calibration=ArtifactFingerprint(role="camera_calibration",sha256="a"*64),
+            model=ArtifactFingerprint(role="tracking_models",sha256="b"*64),
+            config=ArtifactFingerprint(role="runtime_config",sha256="c"*64)))
+    return TrackingTelemetryPublisher(ws,world_service=world),world
+
+
+def _t9_publish_real(publisher,source,frame,*,occupied=True):
+    camera=("living-room","kitchen","family-room")[source]
+    observed=time.time_ns()//1000  # Host-receive fixture time, NOT qualified capture time.
+    tracks=[{"source_id":source,"camera_id":camera,"tracker_id":9,"tracker_lifecycle_generation":1,
+        "frame_id":frame,"observed_at_us":observed,"media_pts_ns":frame*33_333_333,"capture_time_status":"estimated",
+        "bbox":[10.,20.,30.,60.],"image_size":[1920,1080],"confidence":.9,"tracker_confidence":.9,
+        "stable_id":source+1,"identity_kind":"resident","resident_uuid":f"synthetic-resident-{source}",
+        "world":[float(source+1),0.,2.],"world_valid":True,"world_frame":"backend_world_m",
+        "world_frame_revision":"synthetic-world-revision","world_transform_sha256":"d"*64,
+        "calibration_revision":"synthetic-calibration-revision","world_quality":"good","world_source":"pose_depth_fused"}] if occupied else []
+    return publisher.publish(source,tracks,frame_metadata={"camera_id":camera,"source_epoch":0,"frame_id":frame,
+        "observed_at_us":observed,"media_pts_ns":frame*33_333_333})
+
+
+def _t9_paired_bev(ws,receipt):
+    cohort={"source_id":receipt.source_id,"source_epoch":0,"frame_id":receipt.frame_id,
+        "observed_at_us":receipt.observed_at_us,"tracking_publication_sequence":receipt.tracking_publication_sequence,
+        "tracking_outbound_submission_id":receipt.outbound_submission_id}
+    return ws.broadcast_bev_sync(_timed_payload(ws,lambda:{"type":"bev-frame","cohort":cohort,
+        "sensorId":receipt.source_id,"frameId":receipt.frame_id,"sourceEpoch":0,
+        "trackingPublicationSequence":receipt.tracking_publication_sequence,"trackingOutboundSubmissionId":receipt.outbound_submission_id}))
+
+
+class _T9BlockedSocket(_FakeSocket):
+    def __init__(self,source,frame):
+        super().__init__()
+        self.source,self.frame=source,frame
+        self.entered,self.release=asyncio.Event(),asyncio.Event()
+
+    async def send(self,payload):
+        row=json.loads(payload)
+        if row.get("type")=="tracking" and row["cohort"]["source_id"]==self.source and row["cohort"]["frame_id"]==self.frame:
+            self.entered.set()
+            await self.release.wait()
+        self.sent.append(payload)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("source,frame,sequence",[(1,8,3),(0,16,1),(1,22,7)])
+def test_t9_wire_actual_publisher_world_batch_BEFORE_dedicated_BEV_awaited_clients(source,frame,sequence):
+    async def run():
+        ws=WebSocketServer(stats_callback=None)
+        ws.event_loop=asyncio.get_running_loop()
+        slow,fast=_T9BlockedSocket(source,frame),_FakeSocket()
+        ws.connected_clients.update((slow,fast))
+        publisher,world=_t9_real_wire_publisher(ws)
+        try:
+            for previous in range(sequence):_t9_publish_real(publisher,source,previous,occupied=False)
+            receipt=_t9_publish_real(publisher,source,frame)
+            assert receipt.tracking_publication_sequence==sequence
+            await asyncio.wait_for(slow.entered.wait(),1.)
+            _t9_paired_bev(ws,receipt)
+            next_receipt=_t9_publish_real(publisher,2,1)
+            _t9_paired_bev(ws,next_receipt)
+            for _ in range(5):await asyncio.sleep(0)
+            for client in (slow,fast):
+                assert not any(json.loads(row)["type"]=="bev-frame" for row in client.sent)
+            slow.release.set()
+            shutdown=await ws.quiesce_outbound_submissions(timeout_s=1.)
+            assert shutdown.quiesced and shutdown.inflight_bytes==0 and shutdown.failed_submissions==0
+            for client in (slow,fast):
+                sent=[json.loads(row) for row in client.sent]
+                target=[row for row in sent if row.get("cohort",{}).get("source_id")==source
+                    and row["cohort"]["frame_id"]==frame]
+                assert [row["type"] for row in target]==["tracking","world_snapshot","world_event","bev-frame"]
+                assert all(row["cohort"]["tracking_publication_sequence"]==sequence for row in target)
+                assert target[-1]["trackingOutboundSubmissionId"]==receipt.outbound_submission_id
+                assert target[-1]["cohort"]["tracking_outbound_submission_id"]==receipt.outbound_submission_id
+                next_index=next(i for i,row in enumerate(sent) if row["type"]=="tracking" and row["cohort"]["source_id"]==2)
+                assert sent.index(target[-1])<next_index
+        finally:
+            slow.release.set()
+            world.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("ending",["drain","cancel_waiting_bev","timeout_then_drain"])
+def test_t9_wire_real_locked_BEV_capacity_cancel_shutdown_has_no_byte_leak(ending):
+    async def run():
+        ws=WebSocketServer(stats_callback=None)
+        ws.event_loop=asyncio.get_running_loop()
+        ws._outbound_max_inflight=2
+        slow=_T9BlockedSocket(1,8)
+        ws.connected_clients.add(slow)
+        publisher,world=_t9_real_wire_publisher(ws)
+        try:
+            receipt=_t9_publish_real(publisher,1,8)
+            await asyncio.wait_for(slow.entered.wait(),1.)
+            bev=_t9_paired_bev(ws,receipt)
+            with pytest.raises(OutboundCapacityExceeded):_t9_paired_bev(ws,receipt)
+            if ending=="cancel_waiting_bev":
+                with ws._outbound_condition:
+                    future=next(f for f in ws._outbound_futures if ws._outbound_bytes_by_future[f]==bev.payload_bytes)
+                assert future.cancel()
+                for _ in range(3):await asyncio.sleep(0)
+            if ending=="timeout_then_drain":
+                with pytest.raises(OutboundQuiescenceTimeout):await ws.quiesce_outbound_submissions(timeout_s=.01)
+            else:
+                shutdown_task=asyncio.create_task(ws.quiesce_outbound_submissions(timeout_s=1.))
+                await asyncio.sleep(0)
+                assert not shutdown_task.done()
+            with pytest.raises(OutboundAdmissionClosed):_t9_paired_bev(ws,receipt)
+            slow.release.set()
+            shutdown=await ws.quiesce_outbound_submissions(timeout_s=1.) if ending=="timeout_then_drain" else await shutdown_task
+            assert shutdown.quiesced and shutdown.inflight_bytes==0 and shutdown.pending_futures==0
+            assert ws._outbound_bytes_by_future=={}
+            types=[json.loads(row)["type"] for row in slow.sent]
+            assert types==["tracking","world_snapshot","world_event"]+([] if ending=="cancel_waiting_bev" else ["bev-frame"])
+        finally:
+            slow.release.set()
+            world.close()
+    asyncio.run(run())
+
+
+def test_t9_wire_actual_publication_commit_failure_cannot_enqueue_paired_BEV(monkeypatch):
+    from types import SimpleNamespace
+    from noesis.pipelines import hooks
+    from noesis_core.runtime_publication import RuntimePublicationGate
+    from noesis_core.tracking_continuity import TrackingLifecycleRegistry
+    async def run():
+        ws=WebSocketServer(stats_callback=None)
+        ws.event_loop=asyncio.get_running_loop()
+        client=_FakeSocket()
+        ws.connected_clients.add(client)
+        publisher,world=_t9_real_wire_publisher(ws)
+        monkeypatch.setattr(world,"commit",lambda *_a,**_k:(_ for _ in ()).throw(RuntimeError("synthetic-actual-commit-failure")))
+        bev=[]
+        registry=TrackingLifecycleRegistry()
+        continuity=registry.update_frame(source_id=1,camera_id="kitchen",frame_id=8,observed_at_us=1_000_000,
+            media_pts_ns=266_666_664,tracks=[])
+        processor=SimpleNamespace(pipeline=SimpleNamespace(),publication_gate=RuntimePublicationGate(),
+            tracking_pub=publisher,_tracking_lifecycle=registry,_stamp_footpoint_lifecycles=lambda *_:None,
+            bev_renderer=object(),_publish_bev=lambda *_a,**_k:bev.append(1))
+        work=hooks._TrackingPublicationWork(1,"kitchen",8,1_000_000,time.time(),266666,[],[],
+            {"media_pts_ns":266_666_664},continuity=continuity)
+        try:
+            with pytest.raises(RuntimeError,match="synthetic-actual-commit-failure"):
+                hooks._AnalyticsTelemetryProcessor._publish_tracking_work(processor,work)
+            shutdown=await ws.quiesce_outbound_submissions(timeout_s=1.)
+            assert bev==[] and client.sent==[] and shutdown.aborted_submissions==1 and shutdown.inflight_bytes==0
+            assert world.current_snapshot() is None
+        finally:world.close()
+    asyncio.run(run())

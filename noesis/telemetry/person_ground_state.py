@@ -50,6 +50,42 @@ MotionMode = str  # walk | idle | sit | lie | unknown
 
 
 @dataclass(frozen=True)
+class RegisteredBodyColumnOriginal:
+    """Private current registered-torso evidence, never verified foot support.
+
+    Constructed only by the task producer after exact receipt/resolver binding.
+    One immutable scalar cursor per lifecycle prevents replay as new consensus.
+    """
+    binding: Tuple[object, ...]
+    frame_id: int
+    media_pts_ns: int
+    observed_at_us: int
+    sample_ts: float
+    position_xz: Tuple[float, float]
+    covariance_xz: Optional[Tuple[float, float, float, float]] = None
+
+
+@dataclass(frozen=True)
+class RegisteredAnkleOriginal:
+    """Exact current registered ankle, distinct from torso/column evidence."""
+    binding: Tuple[object, ...]
+    frame_id: int
+    media_pts_ns: int
+    observed_at_us: int
+    sample_ts: float
+    position_xz: Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class RegisteredTorsoUpgradeOriginal:
+    """Current qualified torso, not a generic support/force-accept flag."""
+    original: RegisteredBodyColumnOriginal
+    posture: str
+    support_state: str
+    agreement_mahalanobis_sq: float
+
+
+@dataclass(frozen=True)
 class HumanGroundConfig:
     """Tunable priors for human ground tracking."""
 
@@ -540,11 +576,15 @@ class PersonGroundState:
     # This distinguishes ankle-pair from single-ankle evidence and exact
     # four-plane body solves from generic partial-body rows.
     reacquire_candidate_exact_basis: Optional[str] = None
+    column_original_cursor: Optional[RegisteredBodyColumnOriginal] = None
+    accepted_column_original: Optional[RegisteredBodyColumnOriginal] = None
+    ankle_original_cursor: Optional[RegisteredAnkleOriginal] = None
+    accepted_ankle_original: Optional[RegisteredAnkleOriginal] = None
     reacquire_count: int = 0
     # One missing exact cohort may occur between otherwise consistent observed
-    # ankle-floor samples. Upright-body cold evidence may cross multiple
-    # non-measurement rows, but its original observation timestamp is never
-    # renewed and the next body sample must still satisfy
+    # ankle-floor samples. Typed body and registered-ankle evidence may cross
+    # multiple non-measurement rows, but the original observation timestamp is
+    # never renewed and the next sample must still satisfy
     # ``reacquire_max_gap_s``. Other bases fail closed immediately.
     reacquire_unavailable_rows: int = 0
     reacquired: bool = False
@@ -1312,6 +1352,14 @@ def world_frame_matches_calibration(
 
 
 def _begin_filter_measurement(state: PersonGroundState) -> None:
+    # Preserve only the last locally accepted ORIGINAL before replacing its
+    # per-callback diagnostics, including on an honest unavailable callback.
+    # This is finite filter evidence, not a canonical World commit receipt.
+    previous_ankle = state.ankle_original_cursor
+    if (type(previous_ankle) is RegisteredAnkleOriginal and state.measurement_accepted
+            and state.accepted_metric_contact_basis == "depth:pose_ankle_support"
+            and state.filtered_ts == previous_ankle.sample_ts):
+        state.accepted_ankle_original = previous_ankle
     state.measurement_accepted = True
     state.measurement_rejection_reason = None
     state.measurement_innovation_m = 0.0
@@ -1346,6 +1394,8 @@ def mark_world_measurement_unavailable(
             "pose:upright_body_planes",
             "non_upright_body_projection",
             "partial_shoulder_projection",
+            "depth:pose_ankle_support",
+            "depth:registered_body_column",
         }
         and int(state.reacquire_count) > 0
         and now_ts is not None
@@ -1366,7 +1416,8 @@ def mark_world_measurement_unavailable(
         state.reacquire_unavailable_rows = 1
     elif preserve_bounded_body_gap:
         # Pose and exact DAv2 cadence can be lower than detector cadence while
-        # furniture hides the lower body. Keep the last actual body solve as
+        # furniture hides the lower body. Registered ankle depth likewise
+        # arrives only on exact depth frames. Keep the last actual solve as
         # the non-renewing evidence root; elapsed media time, not callback
         # count, bounds this exception.
         state.reacquire_unavailable_rows = min(
@@ -1597,6 +1648,7 @@ def integrate_projective_ground_observation(
     ] = None,
     media_pts_ns: Optional[int] = None,
     transition_proof: Optional[Dict[str, Any]] = None,
+    registered_ankle_binding: Optional[Tuple[object, ...]] = None,
 ) -> Optional[np.ndarray]:
     """Integrate an admissible image-motion floor point into filter state.
 
@@ -1610,6 +1662,10 @@ def integrate_projective_ground_observation(
     it never clips the resulting coordinate.  A rejected projective point
     leaves the bounded process state as-is and returns ``None``; it is never
     clamped into a plausible-looking relocation.
+
+    The optional current lifecycle/frame binding lets this non-measurement
+    transition retain an already accepted finite ankle original. It supplies
+    no new ankle vote or time; ordinary binding/age invalidation still runs.
     """
 
     if transition_proof is not None:
@@ -1899,6 +1955,7 @@ def integrate_projective_ground_observation(
         config=config,
         force_accept=False,
         contact_basis=None,
+        registered_ankle_binding=registered_ankle_binding,
         image_motion_supported=False,
         # The first projective trial is deliberately allowed to expose a
         # posterior beyond the queue-visible prior disk.  It is evaluated on
@@ -1974,6 +2031,7 @@ def integrate_projective_ground_observation(
                     config=config,
                     force_accept=False,
                     contact_basis=None,
+                    registered_ankle_binding=registered_ankle_binding,
                     image_motion_supported=False,
                     position_gain_override=float(prior_gain),
                     transition_proof=filter_update_proof,
@@ -2074,6 +2132,7 @@ def integrate_projective_ground_observation(
                 config=config,
                 force_accept=False,
                 contact_basis=None,
+                registered_ankle_binding=registered_ankle_binding,
                 image_motion_supported=False,
                 position_gain_override=float(display_gain),
                 transition_proof=filter_update_proof,
@@ -2303,6 +2362,7 @@ def assess_lower_body_occlusion(
     posture: Posture,
     now_ts: float,
     evidence_ts: Optional[float] = None,
+    observed_posture: Optional[Posture] = None,
     config: HumanGroundConfig,
 ) -> LowerBodyOcclusionAssessment:
     """Classify standing-person occlusion from feet through waist/hips.
@@ -2402,11 +2462,20 @@ def assess_lower_body_occlusion(
                 / float(state.upright_bbox_shoulder_ratio)
             )
 
-    explicit_non_upright = bool(
-        str(posture or "unknown") in ("sitting", "lying")
+    # The adapter may retain seated/lying *policy* while a current pose is
+    # unknown. That safety state is not another observed non-upright sample:
+    # feeding it back into this clock would make its own memory immortal.
+    # Omitted observed_posture preserves existing callers' direct-pose API.
+    observed_non_upright = bool(
+        str(posture if observed_posture is None else observed_posture)
+        in ("sitting", "lying")
         or legs_are_bent(kpts_abs, config=config)
     )
-    if explicit_non_upright:
+    explicit_non_upright = bool(
+        str(posture or "unknown") in ("sitting", "lying")
+        or observed_non_upright
+    )
+    if observed_non_upright:
         state.last_non_upright_ts = now_ts
 
     visible_ankle_points = (
@@ -2744,6 +2813,23 @@ def classify_posture(
     return "unknown"
 
 
+def _observed_torso_span_px(
+    kpts_abs: np.ndarray, *, conf_threshold: float
+) -> Optional[float]:
+    shoulder = _mid_xy(
+        pose_point(kpts_abs, "left_shoulder", conf_threshold=conf_threshold),
+        pose_point(kpts_abs, "right_shoulder", conf_threshold=conf_threshold),
+    )
+    hip = _mid_xy(
+        pose_point(kpts_abs, "left_hip", conf_threshold=conf_threshold),
+        pose_point(kpts_abs, "right_hip", conf_threshold=conf_threshold),
+    )
+    if shoulder is None or hip is None:
+        return None
+    span = math.hypot(hip[0] - shoulder[0], hip[1] - shoulder[1])
+    return span if math.isfinite(span) and span > 1e-6 else None
+
+
 def legs_are_bent(
     kpts_abs: Optional[np.ndarray],
     *,
@@ -2757,6 +2843,12 @@ def legs_are_bent(
     if kpts_abs is None or not isinstance(kpts_abs, np.ndarray) or kpts_abs.shape[0] < 17:
         return False
     thr = float(config.kpt_conf_threshold)
+    torso_span = _observed_torso_span_px(kpts_abs, conf_threshold=thr)
+    compact_span = (
+        float(config.bent_leg_vertical_ratio) * torso_span
+        if torso_span is not None
+        else None
+    )
     bent_votes = 0
     extended_votes = 0
     for side in ("left", "right"):
@@ -2767,7 +2859,9 @@ def legs_are_bent(
             continue
         if ankle is None:
             hip_knee_v = abs(float(knee[1]) - float(hip[1]))
-            if hip_knee_v < 25.0:
+            # Pixel size alone is not a bent-leg observation. A distant
+            # straight leg can be shorter than either former 25/20px limit.
+            if compact_span is not None and hip_knee_v < compact_span:
                 bent_votes += 1
             continue
         hx, hy = float(hip[0]), float(hip[1])
@@ -2776,8 +2870,12 @@ def legs_are_bent(
         dx = ax - hx
         dy = ay - hy
         seg_len = math.hypot(dx, dy)
-        if seg_len < 20.0:
-            # Collapsed hip-ankle span → sitting / tucked legs.
+        if seg_len <= 1e-6:
+            # Coincident detections have no observable leg direction.
+            continue
+        if compact_span is not None and seg_len < compact_span:
+            # Compression is relative to this observed body, not its raster
+            # size or an assumed population/person height.
             bent_votes += 1
             continue
         # Project knee onto hip→ankle segment.
@@ -2877,7 +2975,11 @@ def resolve_pose_floor_anchor(
     # Bent/non-upright legs cannot be safely extended, and upper-body points do
     # not provide a ground contact. Fail closed until another contact-bearing
     # source (for example an instance mask) is available.
-    if bent or effective_posture in ("sitting", "lying"):
+    if bent or effective_posture in ("sitting", "lying", "unknown", ""):
+        # Removing scale-only bent votes must not turn missing feet with
+        # unresolved posture into a new extrapolated floor contact. Actual
+        # observed ankles have already returned above; explicit standing
+        # retains the existing, separately typed leg-extension path.
         return None
 
     estimates: List[Tuple[str, float, float]] = []
@@ -4249,6 +4351,9 @@ def _quarantine_or_reacquire_measurement(
     contact_basis: Optional[str],
     image_motion_supported: bool,
     verified_reacquire_support: bool,
+    current_registered_column: bool = False,
+    block_weak_floor_reanchor: bool = False,
+    preserve_pending_registered_on_rejection: bool = False,
 ) -> np.ndarray:
     """Quarantine one unreachable update or explicitly reanchor a track.
 
@@ -4265,6 +4370,17 @@ def _quarantine_or_reacquire_measurement(
     mz = float(measurement_z)
     admitted_basis = _reacquire_basis_family(contact_basis)
     pose_floor_candidate = admitted_basis == "pose_floor"
+    if block_weak_floor_reanchor or preserve_pending_registered_on_rejection:
+        # Repetition of a weaker projection is not independent evidence
+        # against a fresh accepted ankle/column or pending typed registered run.
+        # No floor vote or clock renewal; retain bounded non-measurement output.
+        if (not preserve_pending_registered_on_rejection
+                and (state.reacquire_candidate_basis != "depth:pose_ankle_support"
+                    or not 0.0 <= now_ts-state.reacquire_candidate_ts <= config.reacquire_max_gap_s)):
+            _clear_reacquire_candidate(state)
+        return _reject_with_cv_time_update(state, pred_x=pred_x, pred_z=pred_z,
+            now_ts=now_ts, floor_y=floor_y,
+            reason="weak_floor_reanchor_requires_independent_support", config=config)
     upright_body_candidate = admitted_basis == "pose:upright_body_planes"
     verified_reacquire_support = bool(
         verified_reacquire_support or pose_floor_candidate
@@ -4273,6 +4389,7 @@ def _quarantine_or_reacquire_measurement(
         state.post_occlusion_reacquire_support_required
         and not verified_reacquire_support
         and not upright_body_candidate
+        and not current_registered_column
     ):
         _clear_reacquire_candidate(state)
         return _reject_with_cv_time_update(
@@ -4289,6 +4406,7 @@ def _quarantine_or_reacquire_measurement(
         and not pose_floor_candidate
         and not verified_reacquire_support
         and not upright_body_candidate
+        and not current_registered_column
     ):
         _clear_reacquire_candidate(state)
         return _reject_with_cv_time_update(
@@ -4342,6 +4460,7 @@ def _quarantine_or_reacquire_measurement(
             bool(image_motion_supported)
             or pose_floor_candidate
             or verified_reacquire_support
+            or current_registered_column
         )
     )
     if reacquire_consensus_ready and reacquire_support_ready:
@@ -4355,6 +4474,7 @@ def _quarantine_or_reacquire_measurement(
         state.exit_motion_frames = 0
         state.reacquired = True
         state.accepted_metric_contact_basis = str(contact_basis or "") or None
+        state.accepted_column_original = state.column_original_cursor if current_registered_column else None
         state.trail_break_required = True
         state.trail_segment_id = int(state.trail_segment_id) + 1
         state.post_occlusion_reacquire_support_required = False
@@ -4385,6 +4505,11 @@ def update_human_cv_filter(
     contact_basis: Optional[str] = None,
     image_motion_supported: bool = False,
     verified_reacquire_support: bool = False,
+    registered_column_original: Optional[RegisteredBodyColumnOriginal] = None,
+    registered_torso_upgrade: Optional[RegisteredTorsoUpgradeOriginal] = None,
+    registered_ankle_original: Optional[RegisteredAnkleOriginal] = None,
+    registered_ankle_binding: Optional[Tuple[object, ...]] = None,
+    selected_geometry_kind: Optional[str] = None,
     verified_first_output_pose_floor_seed: bool = False,
     position_gain_override: Optional[float] = None,
     allow_physical_output_overrun: bool = False,
@@ -4422,6 +4547,8 @@ def update_human_cv_filter(
     except (TypeError, ValueError, IndexError, OverflowError):
         mx = mz = now_ts = floor_y = math.nan
     if not all(math.isfinite(value) for value in (mx, mz, now_ts, floor_y)):
+        state.accepted_ankle_original = None
+        state.accepted_column_original = None
         state.measurement_accepted = False
         state.measurement_rejection_reason = "nonfinite_measurement"
         state.measurement_innovation_m = math.nan
@@ -4429,6 +4556,183 @@ def update_human_cv_filter(
         state.trail_append_allowed = False
         _clear_reacquire_candidate(state)
         return np.array([math.nan, math.nan, math.nan], dtype=np.float64)
+
+    if (state.accepted_ankle_original is not None
+            and (type(registered_ankle_binding) is not tuple
+                or state.accepted_ankle_original.binding[:-2] != registered_ankle_binding
+                or now_ts-state.accepted_ankle_original.sample_ts > config.reacquire_max_gap_s
+                or (quality != "weak" and (selected_geometry_kind == "floor_ray"
+                    or contact_basis != "depth:pose_ankle_support")))):
+        state.accepted_ankle_original = None
+    # This is finite LOCAL filter evidence, not a World grant or foot-contact
+    # claim. A missing/currently foreign source binding cannot borrow it, and
+    # weak floor/CV callbacks never renew its immutable original sample time.
+    column_original = state.accepted_column_original
+    if (type(column_original) is RegisteredBodyColumnOriginal
+            and type(column_original.binding) is tuple and len(column_original.binding) == 16
+            and (type(registered_ankle_binding) is not tuple
+                or column_original.binding[:-2] != registered_ankle_binding
+                or not 0.0 <= now_ts-column_original.sample_ts <= config.reacquire_max_gap_s
+                or (quality != "weak" and (selected_geometry_kind == "floor_ray"
+                    or _reacquire_basis_family(contact_basis) == "pose_floor")))):
+        state.accepted_column_original = None
+    block_weak_column_floor_reanchor = bool(
+        type(state.accepted_column_original) is RegisteredBodyColumnOriginal
+        and type(state.accepted_column_original.binding) is tuple
+        and len(state.accepted_column_original.binding) == 16
+        and state.accepted_column_original.binding[:-2] == registered_ankle_binding
+        and 0.0 <= now_ts-state.accepted_column_original.sample_ts <= config.reacquire_max_gap_s
+        and quality == "weak" and (selected_geometry_kind == "floor_ray"
+            or _reacquire_basis_family(contact_basis) == "pose_floor")
+        and not force_accept)
+    if registered_ankle_original is not None:
+        ankle = registered_ankle_original
+        prior = state.ankle_original_cursor
+        valid = bool(type(ankle) is RegisteredAnkleOriginal
+            and type(ankle.binding) is tuple and len(ankle.binding) == 16
+            and all(type(v) in (str, int, type(None)) for v in ankle.binding)
+            and all(type(v) is str and 0 < len(v) <= 240 for v in ankle.binding[-2:])
+            and type(registered_ankle_binding) is tuple and len(registered_ankle_binding) == 14
+            and ankle.binding[:-2] == registered_ankle_binding
+            and contact_basis == "depth:pose_ankle_support"
+            and type(ankle.frame_id) is int and ankle.frame_id >= 0
+            and type(ankle.media_pts_ns) is int and ankle.media_pts_ns > 0
+            and type(ankle.observed_at_us) is int and ankle.observed_at_us > 0
+            and ankle.media_pts_ns == media_pts_ns and ankle.sample_ts == now_ts
+            and type(ankle.position_xz) is tuple and len(ankle.position_xz) == 2
+            and ankle.position_xz == (mx, mz)
+            and (prior is None or (ankle.binding == prior.binding
+                and ankle.frame_id > prior.frame_id and ankle.media_pts_ns > prior.media_pts_ns
+                and ankle.observed_at_us > prior.observed_at_us)))
+        if not valid:
+            state.measurement_accepted = False
+            state.measurement_rejection_reason = "registered_ankle_original_invalid"
+            state.trail_append_allowed = False
+            return np.array([float(state.world_x) if state.world_x is not None else mx,
+                floor_y, float(state.world_z) if state.world_z is not None else mz])
+        state.ankle_original_cursor = ankle
+    block_weak_floor_reanchor = bool(state.accepted_ankle_original is not None
+        and 0.0 <= now_ts-state.accepted_ankle_original.sample_ts <= config.reacquire_max_gap_s
+        and quality == "weak" and (selected_geometry_kind == "floor_ray"
+            or _reacquire_basis_family(contact_basis) == "pose_floor")
+        and not force_accept)
+    # Coherent pixel/bbox motion does not explain a metric coordinate jump.
+    # It remains useful to the ordinary motion gates, not this quality override.
+
+    current_registered_column = False
+    if registered_column_original is not None:
+        original = registered_column_original
+        previous = state.column_original_cursor
+        valid = bool(
+            type(original) is RegisteredBodyColumnOriginal
+            and str(contact_basis or "") == "depth:registered_body_column"
+            and len(original.binding) > 0
+            and type(original.frame_id) is int and original.frame_id >= 0
+            and type(original.media_pts_ns) is int and original.media_pts_ns > 0
+            and type(original.observed_at_us) is int and original.observed_at_us > 0
+            and original.media_pts_ns == media_pts_ns
+            and original.sample_ts == now_ts
+            and original.position_xz == (mx, mz)
+            and (previous is None or (
+                previous.binding == original.binding
+                and original.frame_id > previous.frame_id
+                and original.media_pts_ns > previous.media_pts_ns
+                and original.observed_at_us > previous.observed_at_us)))
+        if not valid:
+            if (type(original) is RegisteredBodyColumnOriginal and previous is not None
+                    and (original.frame_id <= previous.frame_id
+                         or original.media_pts_ns <= previous.media_pts_ns
+                         or original.observed_at_us <= previous.observed_at_us)):
+                # A stale/replayed token cannot erase a NEWER exact run.
+                state.measurement_accepted = False
+                state.measurement_rejection_reason = "registered_body_column_original_invalid"
+                state.trail_append_allowed = False
+                return np.array([float(state.world_x) if state.world_x is not None else mx,
+                    floor_y, float(state.world_z) if state.world_z is not None else mz])
+            if (type(original) is RegisteredBodyColumnOriginal and previous is not None
+                    and previous.binding != original.binding):
+                _clear_reacquire_candidate(state)
+            mark_world_measurement_unavailable(state, reason="registered_body_column_original_invalid",
+                now_ts=now_ts, config=config)
+            return np.array([float(state.world_x) if state.world_x is not None else mx,
+                floor_y, float(state.world_z) if state.world_z is not None else mz])
+        if (state.reacquire_candidate_basis == "depth:registered_body_column"
+                and state.reacquire_count > 0
+                and (previous is None or previous.sample_ts != state.reacquire_candidate_ts)):
+            # Legacy/string-only rows cannot become the first two votes of
+            # this NEW exact-original proof on arrival of one typed sample.
+            _clear_reacquire_candidate(state)
+        state.column_original_cursor = original
+        current_registered_column = True
+
+    if (not current_registered_column and str(contact_basis or "") == "depth:registered_body_column"
+            and state.reacquire_candidate_basis == "depth:registered_body_column"
+            and state.column_original_cursor is not None
+            and state.column_original_cursor.sample_ts == state.reacquire_candidate_ts
+            and state.reacquire_count > 0):
+        mark_world_measurement_unavailable(state, reason="registered_body_column_original_unavailable",
+            now_ts=now_ts, config=config)
+        return np.array([float(state.world_x) if state.world_x is not None else mx,
+            floor_y, float(state.world_z) if state.world_z is not None else mz])
+
+    # A weak floor can be anatomically supported yet physically rejected.
+    # Decide its admission normally before discarding a genuine pending column
+    # run. Missing current floor binding is not a contradictory registration;
+    # an explicit foreign binding, expired run, or bad time still clears it.
+    column_cursor = state.column_original_cursor
+    preserve_pending_column_on_rejection = bool(
+        not force_accept and str(quality) == "weak"
+        and (selected_geometry_kind == "floor_ray"
+            or _reacquire_basis_family(contact_basis) == "pose_floor")
+        and state.reacquire_candidate_basis == "depth:registered_body_column"
+        and type(column_cursor) is RegisteredBodyColumnOriginal
+        and type(column_cursor.binding) is tuple and len(column_cursor.binding) == 16
+        and column_cursor.sample_ts == state.reacquire_candidate_ts
+        and 0 < state.reacquire_count < config.reacquire_samples
+        and 0.0 < now_ts-column_cursor.sample_ts <= config.reacquire_max_gap_s
+        and now_ts > state.filtered_ts
+        and (registered_ankle_binding is None
+            or (type(registered_ankle_binding) is tuple
+                and registered_ankle_binding == column_cursor.binding[:-2]))
+        and (media_pts_ns is None
+            or (type(media_pts_ns) is int and media_pts_ns > column_cursor.media_pts_ns)))
+
+    ankle_cursor = state.ankle_original_cursor
+    preserve_pending_registered_on_rejection = preserve_pending_column_on_rejection or bool(
+        not force_accept and str(quality) == "weak"
+        and (selected_geometry_kind == "floor_ray"
+            or _reacquire_basis_family(contact_basis) == "pose_floor")
+        and state.reacquire_candidate_basis == "depth:pose_ankle_support"
+        and state.reacquire_candidate_exact_basis == "depth:pose_ankle_support"
+        and type(ankle_cursor) is RegisteredAnkleOriginal
+        and type(ankle_cursor.binding) is tuple and len(ankle_cursor.binding) == 16
+        and type(registered_ankle_binding) is tuple and len(registered_ankle_binding) == 14
+        and registered_ankle_binding == ankle_cursor.binding[:-2]
+        and ankle_cursor.sample_ts == state.reacquire_candidate_ts
+        and ankle_cursor.position_xz == (state.reacquire_candidate_x, state.reacquire_candidate_z)
+        and 0 < state.reacquire_count < config.reacquire_samples
+        and 0.0 < now_ts-ankle_cursor.sample_ts <= config.reacquire_max_gap_s
+        and now_ts > state.filtered_ts
+        and type(media_pts_ns) is int and media_pts_ns > ankle_cursor.media_pts_ns)
+    # This is pending evidence, not an accepted position lease. Only an actual
+    # rejection below uses this guard; admitted floors keep their existing rules.
+
+    if (state.reacquire_candidate_basis == "depth:registered_body_column"
+            and state.column_original_cursor is not None
+            and state.column_original_cursor.sample_ts == state.reacquire_candidate_ts
+            and state.reacquire_count > 0 and str(contact_basis or "") != "depth:registered_body_column"):
+        # A weak bbox/diagnostic callback is not a contradictory registered
+        # solve. Preserve ONLY the non-renewing bounded column run; genuine
+        # qualified floor/body support instead invalidates that pending run.
+        if (str(quality) == "weak" and not verified_reacquire_support
+                and _reacquire_basis_family(contact_basis) != "pose_floor"
+                and 0.0 <= now_ts-state.reacquire_candidate_ts <= config.reacquire_max_gap_s):
+            mark_world_measurement_unavailable(state, reason="registered_body_column_consensus_pending",
+                now_ts=now_ts, config=config)
+            return np.array([float(state.world_x) if state.world_x is not None else mx,
+                floor_y, float(state.world_z) if state.world_z is not None else mz])
+        if not preserve_pending_column_on_rejection:
+            _clear_reacquire_candidate(state)
 
     # The state is shared with the runtime's prediction/readout path.  A
     # state restored from an older runtime, or populated by a direct caller,
@@ -4466,6 +4770,7 @@ def update_human_cv_filter(
         state.vel_world_z = 0.0
         state.filtered_ts = now_ts
         state.accepted_metric_contact_basis = str(contact_basis or "") or None
+        state.accepted_column_original = None
         state.last_good_world = None
         state.last_good_ts = 0.0
         state.locked_world = None
@@ -4631,6 +4936,7 @@ def update_human_cv_filter(
         _clear_reacquire_candidate(state)
         _clear_rejection_anchor(state)
         state.accepted_metric_contact_basis = str(contact_basis or "") or None
+        state.accepted_column_original = state.column_original_cursor if current_registered_column else None
         return np.array([mx, floor_y, mz], dtype=np.float64)
 
     dt = now_ts - float(state.filtered_ts)
@@ -4638,6 +4944,8 @@ def update_human_cv_filter(
         state.measurement_accepted = False
         state.measurement_rejection_reason = "non_monotonic_timestamp"
         state.trail_append_allowed = False
+        if state.reacquire_candidate_basis == "depth:pose_ankle_support":
+            _clear_reacquire_candidate(state)
         return np.array([float(state.world_x), floor_y, float(state.world_z)], dtype=np.float64)
 
     # Predict with constant velocity.
@@ -4657,6 +4965,55 @@ def update_human_cv_filter(
     state.measurement_allowed_m = float(allowed)
     previous_basis = str(state.accepted_metric_contact_basis or "")
     current_basis = str(contact_basis or "")
+    torso_upgrade = False
+    if (previous_basis == "depth:registered_body_column"
+            and current_basis == "depth:pose_torso_support"
+            and type(registered_torso_upgrade) is RegisteredTorsoUpgradeOriginal
+            and type(state.accepted_column_original) is RegisteredBodyColumnOriginal):
+        prior = state.accepted_column_original
+        proof = registered_torso_upgrade
+        original = proof.original
+        try:
+            old_cov = np.asarray(prior.covariance_xz, dtype=np.float64).reshape(2, 2)
+            new_cov = np.asarray(original.covariance_xz, dtype=np.float64).reshape(2, 2)
+            delta = np.array([mx-prior.position_xz[0], mz-prior.position_xz[1]])
+            valid_cov = all(np.all(np.isfinite(c)) and np.allclose(c, c.T, rtol=0., atol=1e-12)
+                and float(np.linalg.eigvalsh(c).min()) > 0. for c in (old_cov, new_cov))
+            torso_upgrade = bool(
+                type(original) is RegisteredBodyColumnOriginal and prior.binding == original.binding
+                and bool(prior.binding) and type(original.frame_id) is int
+                and original.frame_id > prior.frame_id
+                and original.media_pts_ns > prior.media_pts_ns
+                and original.observed_at_us > prior.observed_at_us
+                and original.media_pts_ns == media_pts_ns and original.sample_ts == now_ts
+                and original.position_xz == (mx, mz)
+                and 0. < now_ts-prior.sample_ts <= config.reacquire_max_gap_s
+                and proof.posture == str(state.posture) and proof.posture in {'sitting', 'lying'}
+                and proof.support_state == ('seat' if proof.posture == 'sitting' else 'couch')
+                and str(quality) in {'good', 'estimated'} and verified_reacquire_support
+                and valid_cov and np.linalg.norm(delta) <= config.max_jump_m
+                and math.isfinite(proof.agreement_mahalanobis_sq)
+                and proof.agreement_mahalanobis_sq > 0.
+                and float(delta @ np.linalg.solve(old_cov+new_cov, delta)) <= proof.agreement_mahalanobis_sq
+                and innov_dist <= allowed)
+        except (TypeError, ValueError, AttributeError, OverflowError, np.linalg.LinAlgError):
+            torso_upgrade = False
+    if (not force_accept and previous_basis != current_basis
+            and "depth:registered_body_column" in (previous_basis, current_basis)
+            and not torso_upgrade):
+        return _quarantine_or_reacquire_measurement(
+            state, measurement_x=mx, measurement_z=mz, pred_x=pred_x, pred_z=pred_z,
+            now_ts=now_ts, floor_y=floor_y, reason="estimated_body_column_basis_changed",
+            config=config, contact_basis=contact_basis,
+            image_motion_supported=image_motion_supported,
+            verified_reacquire_support=verified_reacquire_support,
+            current_registered_column=current_registered_column,
+            # Repetition of a weaker floor does not replace a still-fresh
+            # registered column merely because it fits generic motion slack.
+            # This is a basis-selection rule, not a tighter physical gate;
+            # already-floor walking and qualified replacements are unchanged.
+            block_weak_floor_reanchor=block_weak_floor_reanchor or block_weak_column_floor_reanchor,
+            preserve_pending_registered_on_rejection=preserve_pending_registered_on_rejection)
     body_bases = {"depth:pose_shoulder_support", "depth:pose_torso_support",
                   "depth:torso_core", "pose:seated_torso_plane"}
     if (not force_accept and previous_basis != current_basis
@@ -4673,6 +5030,8 @@ def update_human_cv_filter(
             config=config, contact_basis=contact_basis,
             image_motion_supported=image_motion_supported,
             verified_reacquire_support=False,
+            block_weak_floor_reanchor=block_weak_floor_reanchor or block_weak_column_floor_reanchor,
+            preserve_pending_registered_on_rejection=preserve_pending_registered_on_rejection,
         )
     if (
         not force_accept
@@ -4693,6 +5052,9 @@ def update_human_cv_filter(
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
             verified_reacquire_support=bool(verified_reacquire_support),
+            current_registered_column=current_registered_column,
+            block_weak_floor_reanchor=block_weak_floor_reanchor or block_weak_column_floor_reanchor,
+            preserve_pending_registered_on_rejection=preserve_pending_registered_on_rejection,
         )
 
     posture = str(state.posture or "unknown")
@@ -4783,6 +5145,8 @@ def update_human_cv_filter(
                     contact_basis=contact_basis,
                     image_motion_supported=bool(image_motion_supported),
                     verified_reacquire_support=bool(verified_reacquire_support),
+                    block_weak_floor_reanchor=block_weak_floor_reanchor or block_weak_column_floor_reanchor,
+                    preserve_pending_registered_on_rejection=preserve_pending_registered_on_rejection,
                 )
             display_gain_reduced = bool(display_gain < float(alpha) - 1e-12)
             alpha = float(display_gain)
@@ -4797,7 +5161,28 @@ def update_human_cv_filter(
         # not preserve a visibly wrong foot-derived coordinate when a current
         # body projection repeatedly identifies the chair/sofa footprint.
         deadzone = min(deadzone, float(config.non_upright_body_deadzone_m))
-    if mode in ("idle", "sit", "lie") and (not force_accept) and innov_dist <= deadzone:
+    idle_hold = mode in ("idle", "sit", "lie") and not force_accept and innov_dist <= deadzone
+    # A physically admitted WEAK floor update near the entry accepted point is
+    # not another registered-ankle vote or a qualified contradiction. Preserve
+    # that finite independent cursor in WALK too, without changing the normal
+    # moving posterior below. An idle lock is authoritative only in its own
+    # hold branch; a leftover lock must not bias a moving-state comparison.
+    accepted_x, accepted_z = (state.locked_world if idle_hold and state.locked_world is not None
+                              else (state.world_x, state.world_z))
+    preserve_registered_ankle = bool(
+        (idle_hold or mode == "walk" and not force_accept)
+        and str(quality) == "weak"
+        and _reacquire_basis_family(contact_basis) == "pose_floor"
+        and state.reacquire_candidate_basis == "depth:pose_ankle_support"
+        and state.reacquire_candidate_exact_basis == "depth:pose_ankle_support"
+        and 0 < state.reacquire_count < int(config.reacquire_samples)
+        and state.reacquire_candidate_x is not None
+        and state.reacquire_candidate_z is not None
+        and all(math.isfinite(float(v)) for v in (state.reacquire_candidate_x,
+            state.reacquire_candidate_z, state.reacquire_candidate_ts))
+        and 0.0 < now_ts-state.reacquire_candidate_ts <= config.reacquire_max_gap_s
+        and math.hypot(mx-float(accepted_x), mz-float(accepted_z)) <= deadzone)
+    if idle_hold:
         # Hold position; gently decay velocity.
         state.vel_world_x *= 0.50
         state.vel_world_z *= 0.50
@@ -4806,7 +5191,14 @@ def update_human_cv_filter(
             state.world_x = float(state.locked_world[0])
             state.world_z = float(state.locked_world[1])
         state.accepted_metric_contact_basis = str(contact_basis or "") or None
-        _clear_reacquire_candidate(state)
+        state.accepted_column_original = state.column_original_cursor if current_registered_column else None
+        if torso_upgrade:
+            state.vel_world_x = state.vel_world_z = 0.0
+            state.trail_segment_id += 1
+            state.trail_break_required = True
+            state.trail_append_allowed = False
+        if not preserve_registered_ankle:
+            _clear_reacquire_candidate(state)
         _clear_rejection_anchor(state)
         if verified_reacquire_support or _reacquire_basis_family(contact_basis) == "pose_floor":
             state.post_occlusion_reacquire_support_required = False
@@ -4861,6 +5253,8 @@ def update_human_cv_filter(
             contact_basis=contact_basis,
             image_motion_supported=bool(image_motion_supported),
             verified_reacquire_support=bool(verified_reacquire_support),
+            block_weak_floor_reanchor=block_weak_floor_reanchor or block_weak_column_floor_reanchor,
+            preserve_pending_registered_on_rejection=preserve_pending_registered_on_rejection,
         )
 
     if transition_proof is not None:
@@ -4910,7 +5304,10 @@ def update_human_cv_filter(
                 }
             )
 
-    _clear_reacquire_candidate(state)
+    # Only this successful normal update may preserve the pending cursor.
+    # Rejected/contradictory updates above keep their existing reset paths.
+    if not preserve_registered_ankle:
+        _clear_reacquire_candidate(state)
 
     if dt >= float(config.min_dt_s):
         meas_vx = innov_x / dt
@@ -4940,6 +5337,12 @@ def update_human_cv_filter(
     state.vel_world_z = float(next_vz)
     state.filtered_ts = now_ts
     state.accepted_metric_contact_basis = str(contact_basis or "") or None
+    state.accepted_column_original = state.column_original_cursor if current_registered_column else None
+    if torso_upgrade:
+        state.vel_world_x = state.vel_world_z = 0.0
+        state.trail_segment_id += 1
+        state.trail_break_required = True
+        state.trail_append_allowed = False
     if verified_reacquire_support or _reacquire_basis_family(contact_basis) == "pose_floor":
         state.post_occlusion_reacquire_support_required = False
     _clear_rejection_anchor(state)

@@ -284,6 +284,48 @@ py::object extract_reid_embedding(
   return std::move(array);
 }
 
+unsigned int count_reid_tensor_records(const deepstream::ObjectMetadata& obj_meta, int gie_id) {
+  unsigned int matches = 0U;
+  obj_meta.iterate(
+      [&](const deepstream::UserMetadata& user_meta) {
+        deepstream::TensorOutputUserMetadata tensor_meta(user_meta);
+        if (tensor_meta && gie_id >= 0 &&
+            tensor_meta.uniqueId() == static_cast<unsigned int>(gie_id)) {
+          if (matches < 2U) ++matches;  // bounded zero/one/duplicate descriptor
+        }
+      }, NVDSINFER_TENSOR_OUTPUT_META);
+  return matches;
+}
+
+py::dict extract_reid_ingress(
+    const deepstream::ObjectMetadata& obj_meta,
+    int gie_id,
+    const std::string& layer_name,
+    int expected_dim) {
+  // ONLY the verified synchronous selected SGIE.src caller may interpret this
+  // current-buffer descriptor as fresh ingress. It is not a timestamp/cache API.
+  // SGIE.sink first proves no selected input tensor. Count before the sole
+  // compact copy: duplicate/copied tensor records deny.
+  const unsigned int matches = count_reid_tensor_records(obj_meta, gie_id);
+  py::dict descriptor;
+  descriptor["matching_metadata_count"] = matches;
+  descriptor["gie_id"] = gie_id;
+  descriptor["layer"] = layer_name;
+  descriptor["dimensions"] = expected_dim;
+  descriptor["embedding"] = py::none();
+  if (matches != 1U || expected_dim != 256 || layer_name != "fc_pred" || gie_id != 3) {
+    return descriptor;
+  }
+  // Existing implementation validates real FLOAT32/contiguous/shape/storage/
+  // finite nonzero data and owns getLayers observer wrappers for this call.
+  auto values = extract_reid_embedding_impl(obj_meta, gie_id, layer_name, expected_dim, true);
+  if (!values.has_value()) return descriptor;
+  py::array_t<float> owned(values->size());
+  std::memcpy(owned.mutable_data(), values->data(), values->size() * sizeof(float));
+  descriptor["embedding"] = std::move(owned);
+  return descriptor;
+}
+
 PYBIND11_MODULE(noesis_reid_meta_ext, m) {
   m.doc() =
       "Noesis DS9 public-Service-Maker helper for extracting ReID embeddings "
@@ -298,4 +340,12 @@ PYBIND11_MODULE(noesis_reid_meta_ext, m) {
       py::arg("normalize") = true,
       "Extract a ReID embedding through TensorOutputUserMetadata/Tensor. "
       "Returns a copied float32 numpy array or None.");
+  m.def("extract_reid_ingress", &extract_reid_ingress,
+        py::arg("obj_meta"), py::arg("gie_id") = 3,
+        py::arg("layer_name") = "fc_pred", py::arg("expected_dim") = 256,
+        "Current selected synchronous SGIE ingress only: bounded metadata count "
+        "plus one owned normalized embedding. No SDK timestamp or lifetime pointer.");
+  m.def("count_reid_tensor_records", &count_reid_tensor_records,
+        py::arg("obj_meta"), py::arg("gie_id") = 3,
+        "Bounded zero/one/duplicate count at SGIE.sink; no tensor copy.");
 }

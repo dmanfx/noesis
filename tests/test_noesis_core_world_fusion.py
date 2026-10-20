@@ -11,9 +11,108 @@ from noesis_core.contracts.observation import ObservationEnvelope, PersonObserva
 from noesis_core.contracts.world import EntityLifecycle, PositionState
 from noesis_core.contracts.support_surface import SupportSurfaceReference
 from noesis_core.world import GlobalWorldFusion, ObservationOrderError, WorldFusionConfig
+from noesis_core.world.fusion import position_quality_sort_key, select_source_local_observation, spatial_rejection_category
 
 
 SHA = "a" * 64
+
+
+def test_r113_fusion_source_age_omission_is_computed_and_candidate_local():
+    producer=_producer('r113-fusion')
+    fusion=GlobalWorldFusion(producer)
+    observation=_observation('camera',0,1,1_000_000,1.)
+    fusion.ingest(observation,SubjectRef(subject_id='synthetic',kind=IdentityKind.UNKNOWN))
+    snapshot=fusion.snapshot(published_at_us=1_000_000)
+    assert snapshot.entities
+    working=fusion.fork()
+    assert working._omission_diagnostics=={}
+    expired=working.snapshot(published_at_us=4_000_000)
+    assert not expired.entities
+    assert working._omission_diagnostics[snapshot.entities[0].entity_id]==('source_age_expired',3_000_000)
+    assert fusion._omission_diagnostics=={} and fusion._by_entity
+
+
+def _spatial_quality_original(camera, source_id, x, *, variance=.04, at=1_000_000, **changes):
+    original = _observation(camera, source_id, 1, at, x, variance=variance,
+                            world_frame_revision="synthetic-target", world_transform_sha256=SHA,
+                            calibration_revision="synthetic-source", **changes)
+    return original.model_copy(update={"payload": original.payload.model_copy(update={
+        "world": original.payload.world.model_copy(update={"support_state": "floor"}),
+    })})
+
+
+def test_spatial_quality_dynamic_selection_retains_exact_nonvoting_originals():
+    a = _spatial_quality_original("a", 0, 1., variance=.4)
+    b = _spatial_quality_original("b", 1, 8., variance=.04, at=1_050_000)
+    for rows in (((a, .9, None), (b, .2, None)), ((b, .2, None), (a, .9, None))):
+        chosen, alternatives = select_source_local_observation(rows)
+        assert chosen is b  # Disagreement/identical labels do not authorize CI.
+        assert chosen.payload.world.position.x == 8.
+        assert chosen.payload.world.covariance is b.payload.world.covariance
+        assert chosen.observed_at_us == 1_050_000
+        assert {id(original) for original, _ in alternatives} == {id(a), id(b)}
+        assert dict((original.observation_id, reason) for original, reason in alternatives) == {
+            a.observation_id: "source_local_alternative", b.observation_id: None,
+        }
+    stronger_a = _spatial_quality_original("a", 0, 1.1, variance=.01, at=1_100_000)
+    assert select_source_local_observation(((b, .9, None), (stronger_a, .2, None)))[0] is stronger_a
+    held_a = _spatial_quality_original("a", 0, 1.1, variance=.001, at=1_200_000, source="anchor_hold")
+    chosen, diagnostics = select_source_local_observation(((held_a, 1., None), (b, .2, None)))
+    assert chosen is b and chosen.observed_at_us == 1_050_000  # No peer-age renewal.
+    assert diagnostics[0] == (held_a, "non_current_measurement")
+
+
+def test_spatial_quality_resolver_confidence_and_comparable_time_only():
+    a = _spatial_quality_original("a", 0, 1., confidence=.99)
+    b = _spatial_quality_original("b", 1, 2., confidence=.1, at=2_000_000)
+    assert select_source_local_observation(((a, .2, None), (b, .8, None)))[0] is b
+    tied = ((a, .5, None), (b, .5, None))
+    assert select_source_local_observation(tied)[0] is a
+    assert select_source_local_observation(tuple(reversed(tied)))[0] is a
+    assert select_source_local_observation(tied, comparable_clock=True)[0] is b
+    assert position_quality_sort_key(a) == (0, .12, -.99, -1_000_000, "a")
+
+
+@pytest.mark.parametrize("confidence,raw_rejection,world_updates,reason", [
+    (None, None, {}, "resolver_confidence_absent"),
+    (float("nan"), None, {}, "resolver_confidence_invalid"),
+    (True, None, {}, "resolver_confidence_invalid"),
+    (.9, "resolver_covariance_absent", {}, "resolver_covariance_absent"),
+    (.9, None, {"source": "cv_prediction"}, "non_current_measurement"),
+    (.9, None, {"quality": "held"}, "non_current_measurement"),
+    (.9, None, {"calibration_revision": None}, "world_registration_unavailable"),
+    (.9, None, {"world_frame_revision": None, "world_transform_sha256": None}, "world_registration_unavailable"),
+    (.9, None, {"support_state": "unknown"}, "world_support_unavailable"),
+    (.9, None, {"covariance": Matrix3(values=(.1, 1., 0., 1., .1, 0., 0., 0., .1))}, "world_covariance_or_position_invalid"),
+    (.9, None, {"position": Vector3(x=float("nan"), y=0., z=2.)}, "world_covariance_or_position_invalid"),
+])
+def test_spatial_quality_refuses_nonmeasured_or_malformed_originals(confidence, raw_rejection, world_updates, reason):
+    original = _spatial_quality_original("a", 0, 1.)
+    original = original.model_copy(update={"payload": original.payload.model_copy(update={
+        "world": original.payload.world.model_copy(update=world_updates),
+    })})
+    chosen, diagnostics = select_source_local_observation(((original, confidence, raw_rejection),))
+    assert chosen is None and diagnostics == ((original, reason),)
+
+
+def test_spatial_quality_bounds_and_duplicate_originals():
+    original = _spatial_quality_original("a", 0, 1.)
+    with pytest.raises(ValueError, match="one or two"):
+        select_source_local_observation(((original, .9, None),) * 3)
+    with pytest.raises(ValueError, match="duplicate"):
+        select_source_local_observation(((original, .9, None),) * 2)
+
+
+def test_spatial_unavailable_r3_closed_classification_and_unknown_alternate():
+    good = _spatial_quality_original("a", 0, 1.)
+    bad = _spatial_quality_original("b", 1, 1.1)
+    assert spatial_rejection_category("resolver_covariance_absent") == "no_vote"
+    assert spatial_rejection_category("anatomical_current_support_required") == "no_vote"
+    assert spatial_rejection_category("anatomical_unexpected_reason") == "integrity"
+    assert spatial_rejection_category("resolver_covariance_invalid") == "integrity"
+    assert spatial_rejection_category("world_position_unavailable") == "integrity"
+    selected, diagnostics = select_source_local_observation(((good, .8, None), (bad, .9, "unrecognized_test_reason")))
+    assert selected is good and spatial_rejection_category(diagnostics[1][1]) == "integrity"
 
 
 def test_global_fusion_retains_surface_instead_of_averaging_levels():

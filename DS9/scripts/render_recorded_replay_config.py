@@ -46,6 +46,7 @@ def render_replay_config(
     videos: Mapping[str, Path],
     *,
     baseline_path: Path | None = None,
+    original_root: Path | None = None,
 ) -> dict[str, Any]:
     if set(videos) != set(CANONICAL_CAMERA_ORDER):
         missing = sorted(set(CANONICAL_CAMERA_ORDER) - set(videos))
@@ -65,8 +66,19 @@ def render_replay_config(
         source = sources[index]
         if not isinstance(source, dict):
             raise ReplayConfigError(f"source {index} must be a mapping")
+        # Preserve camera identity when replacing the secret-backed live URI.
+        # The recording filename is not a source/camera binding.
+        for field in ("camera_id", "uri_secret"):
+            if field in source and source[field] != camera_id:
+                raise ReplayConfigError(
+                    f"source {index} camera identity conflicts with canonical {camera_id}"
+                )
+        source["camera_id"] = camera_id
         source.pop("uri_secret", None)
         source["uri"] = videos[camera_id].resolve().as_uri()
+        # This generated replay is finite. Override inherited/automatic local
+        # file looping without changing the normal runtime source defaults.
+        source["file-loop"] = False
 
     streammux = payload.get("streammux")
     if not isinstance(streammux, dict):
@@ -78,6 +90,48 @@ def render_replay_config(
     }
     if baseline_path is not None:
         _preserve_baseline_path_scope(payload, baseline_path)
+    if original_root is not None:
+        original_root = original_root.resolve(strict=True)
+        code_root = baseline_path.resolve().parents[2]
+        task_prior_relative = Path("DS9/config/xc3d_image_regions_prior_r1.json")
+        task_prior = (code_root / task_prior_relative).resolve()
+
+        def pin(node, location=()):
+            if isinstance(node, dict):
+                return {key: pin(value, location + (key,)) for key, value in node.items()}
+            if isinstance(node, list):
+                return [pin(value, location + (index,)) for index, value in enumerate(node)]
+            # This one explicit task artifact belongs to candidate code, not
+            # the original asset/config authority. Do not exempt other fields
+            # or other DS9 paths, even when their basename happens to match.
+            if location == ("xc3d_image_regions", "prior_path"):
+                if not isinstance(node, str) or node not in (
+                    task_prior_relative.as_posix(), str(code_root / task_prior_relative)
+                ) or task_prior != code_root / task_prior_relative:
+                    raise ReplayConfigError("image-region task prior must be the exact code-owned task path")
+                return str(task_prior)
+            if not isinstance(node, str):
+                return node
+            # Model realization belongs to the configured native artifact root,
+            # not either source checkout. Keep its existing logical reference
+            # for the normal NOESIS_MODEL/ONNX/ENGINE_DIR resolvers.
+            if node.startswith("DS9/models/"):
+                return node
+            for checkout in (code_root, original_root):
+                if node.startswith(str(checkout / "DS9/models") + "/"):
+                    return "DS9/models/" + str(Path(node).relative_to(checkout / "DS9/models"))
+            # Candidate implementation/tracker stays isolated; existing assets,
+            # data, calibration/config inputs retain original authority.
+            if node.startswith("DS9/config/v3dt/xc3d_m960_candidate/"):
+                return str(code_root / node)
+            if node.startswith(str(code_root / "DS9/config/v3dt/xc3d_m960_candidate") + "/"):
+                return node
+            if node.startswith(("DS9/", "config/", "data/")):
+                return str(original_root / node)
+            if node.startswith((str(code_root / "data") + "/", str(code_root / "DS9") + "/")):
+                return str(original_root / Path(node).relative_to(code_root))
+            return node
+        payload = pin(payload)
     return payload
 
 
@@ -154,6 +208,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="canonical DS9.1 pipeline config to copy without quality changes",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--original-root", type=Path)
     parser.add_argument(
         "--source",
         action="append",
@@ -175,7 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if camera_id in videos:
             raise ReplayConfigError(f"duplicate replay source: {camera_id}")
         videos[camera_id] = video_path
-    payload = render_replay_config(baseline, videos, baseline_path=baseline_path)
+    payload = render_replay_config(baseline, videos, baseline_path=baseline_path, original_root=args.original_root)
     write_atomic_yaml(args.output, payload)
     print(args.output.expanduser().resolve(strict=False))
     return 0

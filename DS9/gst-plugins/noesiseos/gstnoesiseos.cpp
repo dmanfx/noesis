@@ -157,6 +157,25 @@ static gboolean resolve_upstream_sinks(GstNoesisEos *self, const gchar *paths,
   return ok;
 }
 
+// GstBaseTransform holds its SINK stream lock across transform_ip AND output
+// delivery. The atomic drop flag cannot protect an output already past that
+// callback. Fence its completion on this worker, never the property setter.
+static gboolean acquire_completed_output_fence(GstNoesisEos *self) {
+  GstPad *pad = GST_BASE_TRANSFORM_SINK_PAD(self);
+  const gint64 deadline = g_get_monotonic_time() + 1000000;  // one second
+  while (g_get_monotonic_time() < deadline) {
+    if (!gst_pad_is_active(pad)) return FALSE;  // teardown/cancellation
+    if (g_rec_mutex_trylock(GST_PAD_GET_STREAM_LOCK(pad))) {
+      if (gst_pad_is_active(pad)) return TRUE;
+      g_rec_mutex_unlock(GST_PAD_GET_STREAM_LOCK(pad));
+      return FALSE;
+    }
+    g_usleep(1000);
+  }
+  GST_WARNING_OBJECT(self, "completed-output fence timed out before EOS");
+  return FALSE;
+}
+
 static gpointer gst_noesis_eos_request_worker(gpointer data) {
   auto *request = static_cast<NoesisEosRequest *>(data);
   GstNoesisEos *self = request->self;
@@ -177,26 +196,32 @@ static gpointer gst_noesis_eos_request_worker(gpointer data) {
         drop_shutdown_buffer, nullptr, nullptr);
     targets_ready = sink.drop_probe != 0;
   }
-  GstEvent *event = targets_ready ? gst_event_new_eos() : nullptr;
+  const gboolean output_fenced =
+      targets_ready && acquire_completed_output_fence(self);
+  GstEvent *event = output_fenced ? gst_event_new_eos() : nullptr;
   if (event != nullptr) {
     // gst_pad_push_event() consumes the event regardless of the result. This
     // may block while asynchronous downstream elements drain, which is why it
     // must never run on the Service Maker/GObject property-setter thread.
     request_ok = gst_pad_push_event(GST_BASE_TRANSFORM_SRC_PAD(self), event);
     terminal_started = request_ok;
-    if (request_ok) {
-      for (auto &sink : sinks) {
-        // GstBaseSink's element-level send_event does not forward downstream
-        // EOS to its input pad. Use the normal serialized pad event handler;
-        // an element-level TRUE return alone would be a false acknowledgement.
-        GstPad *input = gst_element_get_static_pad(sink.element, "sink");
-        const gboolean accepted =
-            input != nullptr && gst_pad_send_event(input, gst_event_new_eos());
-        if (input != nullptr) gst_object_unref(input);
-        GST_INFO_OBJECT(self, "upstream sink EOS: sink=%s accepted=%d",
-                        GST_ELEMENT_NAME(sink.element), accepted);
-        request_ok = request_ok && accepted;
-      }
+  }
+  if (output_fenced)
+    g_rec_mutex_unlock(GST_PAD_GET_STREAM_LOCK(GST_BASE_TRANSFORM_SINK_PAD(self)));
+  // A source-side tee can feed both this chain and a hidden sink. Never hold
+  // the post-mux stream lock while injecting into that upstream side branch.
+  if (request_ok) {
+    for (auto &sink : sinks) {
+      // GstBaseSink's element-level send_event does not forward downstream
+      // EOS to its input pad. Use the normal serialized pad event handler;
+      // an element-level TRUE return alone would be a false acknowledgement.
+      GstPad *input = gst_element_get_static_pad(sink.element, "sink");
+      const gboolean accepted =
+          input != nullptr && gst_pad_send_event(input, gst_event_new_eos());
+      if (input != nullptr) gst_object_unref(input);
+      GST_INFO_OBJECT(self, "upstream sink EOS: sink=%s accepted=%d",
+                      GST_ELEMENT_NAME(sink.element), accepted);
+      request_ok = request_ok && accepted;
     }
   }
   // Successful probes are pad-owned and disappear with the pipeline. If EOS

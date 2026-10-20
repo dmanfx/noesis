@@ -5,7 +5,9 @@ import os
 import socket
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Callable
+from noesis.identity_association_service import IdentityAssociationService, ProducerAdmission
+from noesis_core.contracts.scene_prior import ScenePriorFrameBinding
 
 from noesis_core.contracts.base import ProducerRef
 from noesis_core.health import CapabilityMonitor, CapabilityPolicy
@@ -98,6 +100,11 @@ def create_runtime_world_service(
     instance_id: str | None = None,
     software_revision: str | None = None,
     journal_path: str | Path | None = None,
+    association_service: IdentityAssociationService | None = None,
+    physical_admission: Callable[[], ProducerAdmission] | None = None,
+    physical_bindings: Callable[[], Mapping[int, ScenePriorFrameBinding]] | None = None,
+    physical_rasters: Callable[[], Mapping[int, tuple[int, int]]] | None = None,
+    spatial_bindings: Callable[[], Mapping[int, ScenePriorFrameBinding]] | None = None,
 ) -> CanonicalWorldService:
     """Create the canonical world owner from runtime-owned, content-addressed inputs."""
 
@@ -203,7 +210,10 @@ def create_runtime_world_service(
             int(os.environ.get("NOESIS_WORLD_JOURNAL_TRANSACTION_BATCHES", "32")),
         ),
     )
-    return CanonicalWorldService(producer=producer, artifacts=artifacts, journal=journal)
+    return CanonicalWorldService(producer=producer, artifacts=artifacts, journal=journal,
+        association_service=association_service, physical_admission=physical_admission,
+        physical_bindings=physical_bindings, physical_rasters=physical_rasters,
+        spatial_bindings=spatial_bindings)
 
 
 __all__ = ["create_runtime_world_service"]

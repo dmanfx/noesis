@@ -65,6 +65,12 @@ class EosPluginSourceTests(unittest.TestCase):
         self.assertIn("g_object_ref(G_OBJECT(self))", source)
         self.assertIn("self->request_pending = TRUE", source)
         self.assertNotIn("GST_PAD_STREAM_LOCK", source)
+        self.assertIn("acquire_completed_output_fence", source)
+        self.assertIn("g_rec_mutex_trylock(GST_PAD_GET_STREAM_LOCK(pad))", source)
+        self.assertIn("g_get_monotonic_time() + 1000000", source)
+        self.assertIn("gst_pad_is_active(pad)", source)
+        self.assertLess(source.index("g_rec_mutex_unlock(GST_PAD_GET_STREAM_LOCK(GST_BASE_TRANSFORM_SINK_PAD(self)))"),
+                        source.index("gst_pad_send_event(input, gst_event_new_eos())"))
         self.assertLess(
             source.index("g_atomic_int_set(&self->eos_accepted, TRUE)"),
             source.index("g_thread_try_new"),
@@ -444,8 +450,18 @@ class EosPluginRuntimeTests(unittest.TestCase):
             late_pending = Gst.Buffer.new_allocate(None, 16 * 16 * 3 // 2, None)
             late_pending.pts = Gst.SECOND
             late_pending.duration = Gst.SECOND
-            late_pending_flow = quiesce.get_static_pad("sink").chain(late_pending)
-            eos_release.set()
+            late_pending_flows = []
+            late_thread = threading.Thread(target=lambda: late_pending_flows.append(
+                quiesce.get_static_pad("sink").chain(late_pending)), daemon=True)
+            try:
+                # The completed-output fence may serialize this late chain
+                # behind the EOS being deliberately held by this fixture.
+                late_thread.start()
+            finally:
+                eos_release.set()
+            late_thread.join(1.0)
+            assert not late_thread.is_alive() and len(late_pending_flows) == 1
+            late_pending_flow = late_pending_flows[0]
             message = pipeline.get_bus().timed_pop_filtered(
                 2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
             )
@@ -488,6 +504,260 @@ class EosPluginRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["request"], 7)
         self.assertEqual(payload["upstream_buffers"], [0, 1_000_000_000, 2_000_000_000])
         self.assertEqual(payload["downstream_buffers"], [0])
+
+    def test_pre_request_inflight_output_cannot_poison_upstream_flow(self) -> None:
+        """Characterize output already beyond transform_ip, not a new late buffer."""
+        program = textwrap.dedent(
+            """
+            import json
+            import threading
+            import time
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+
+            Gst.init(None)
+            pipeline = Gst.parse_launch(
+                "appsrc name=source is-live=true format=time "
+                "caps=video/x-raw,format=I420,width=16,height=16,framerate=1/1 "
+                "! noesiseos name=quiesce ! fakesink name=sink sync=false async=false"
+            )
+            bridge = pipeline.get_by_name("quiesce")
+            source = pipeline.get_by_name("source")
+            sink = pipeline.get_by_name("sink")
+            primed, parked, release, setter_done = (threading.Event() for _ in range(4))
+            eos_seen = threading.Event()
+            lock = threading.Lock()
+            events, failures, rendered = [], [], []
+            state = {}
+            chain_thread = control_thread = None
+
+            def record(kind, **values):
+                with lock:
+                    events.append(dict(kind=kind, monotonic_s=time.monotonic(), **values))
+
+            def buffer(pts):
+                value = Gst.Buffer.new_allocate(None, 16 * 16 * 3 // 2, None)
+                value.pts, value.duration = pts, Gst.SECOND
+                return value
+
+            def output_probe(_pad, info):
+                value = info.get_buffer()
+                if value is not None and value.pts == Gst.SECOND:
+                    state["request_at_park"] = bridge.get_property("request-sequence")
+                    state["park_started_s"] = time.monotonic()
+                    record("pre_request_output_parked")
+                    parked.set()
+                    # Self-releases even if the control thread fails. Never
+                    # leave a native streaming callback waiting indefinitely.
+                    if not release.wait(.9):
+                        failures.append("park_release_deadline")
+                    state["park_duration_s"] = time.monotonic() - state["park_started_s"]
+                    record("parked_output_released")
+                return Gst.PadProbeReturn.OK
+
+            def rendered_probe(_pad, info):
+                value = info.get_buffer()
+                if value is not None:
+                    rendered.append(int(value.pts))
+                    record("downstream_buffer", pts=int(value.pts), after_eos=eos_seen.is_set())
+                    if value.pts == 0:
+                        primed.set()
+                return Gst.PadProbeReturn.OK
+
+            def event_probe(_pad, info):
+                value = info.get_event()
+                if value is not None and value.type == Gst.EventType.EOS:
+                    record("downstream_eos")
+                    eos_seen.set()
+                return Gst.PadProbeReturn.OK
+
+            def push_inflight():
+                try:
+                    # This is the ACTUAL synchronous upstream chain result,
+                    # not appsrc's asynchronous enqueue acknowledgement.
+                    state["inflight_flow"] = int(bridge.get_static_pad("sink").chain(buffer(Gst.SECOND)))
+                    record("inflight_chain_returned", flow=state["inflight_flow"])
+                except BaseException as exc:
+                    failures.append("chain:" + type(exc).__name__)
+
+            def request_eos():
+                try:
+                    started = time.monotonic()
+                    record("request_eos")
+                    bridge.set_property("request-sequence", 91)
+                    state["setter_elapsed_s"] = time.monotonic() - started
+                    record("setter_returned")
+                except BaseException as exc:
+                    failures.append("setter:" + type(exc).__name__)
+                finally:
+                    setter_done.set()
+
+            try:
+                sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, rendered_probe)
+                sink.get_static_pad("sink").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, event_probe)
+                assert pipeline.set_state(Gst.State.PLAYING) != Gst.StateChangeReturn.FAILURE
+                assert source.emit("push-buffer", buffer(0)) == Gst.FlowReturn.OK
+                assert primed.wait(1.), "caps/segment prime failed"
+                bridge.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, output_probe)
+                chain_thread = threading.Thread(target=push_inflight, daemon=True)
+                chain_thread.start()
+                assert parked.wait(1.), "output never reached park"
+                control_thread = threading.Thread(target=request_eos, daemon=True)
+                control_thread.start()
+                try:
+                    if not setter_done.wait(.2):
+                        failures.append("setter_not_nonblocking")
+                    deadline = state["park_started_s"] + .55
+                    while time.monotonic() < deadline:
+                        if bridge.get_property("accepted-sequence") == 91:
+                            break
+                        time.sleep(.005)
+                    state["ack_while_parked"] = bridge.get_property("accepted-sequence")
+                    state["eos_while_parked"] = eos_seen.is_set()
+                    record("park_observation", accepted=state["ack_while_parked"], eos=state["eos_while_parked"])
+                finally:
+                    release.set()
+                chain_thread.join(1.)
+                control_thread.join(1.)
+                if chain_thread.is_alive() or control_thread.is_alive():
+                    failures.append("control_or_chain_thread_not_returned")
+                state["bus_messages"] = []
+                deadline = time.monotonic() + 1.
+                while len(state["bus_messages"]) < 4 and time.monotonic() < deadline:
+                    message = pipeline.get_bus().timed_pop_filtered(
+                        int(max(0., deadline - time.monotonic()) * Gst.SECOND),
+                        Gst.MessageType.EOS | Gst.MessageType.ERROR)
+                    if message is None:
+                        break
+                    state["bus_messages"].append("eos" if message.type == Gst.MessageType.EOS else "error")
+                state["bus_result"] = ("error" if "error" in state["bus_messages"] else
+                    "eos" if "eos" in state["bus_messages"] else "none")
+                deadline = time.monotonic() + .5
+                while bridge.get_property("accepted-sequence") != 91 and time.monotonic() < deadline:
+                    time.sleep(.005)
+                state["accepted"] = bridge.get_property("accepted-sequence")
+                state["ok"] = bridge.get_property("last-request-ok")
+                if not chain_thread.is_alive():
+                    state["late_flow"] = int(bridge.get_static_pad("sink").chain(buffer(2 * Gst.SECOND)))
+            except BaseException as exc:
+                failures.append("setup_or_observation:" + type(exc).__name__ + ":" + str(exc))
+            finally:
+                release.set()
+                for thread in (chain_thread, control_thread):
+                    if thread is not None:
+                        thread.join(1.)
+                pipeline.set_state(Gst.State.NULL)
+                state.update(events=events, failures=failures, rendered=rendered,
+                    buffer_after_eos=any(e["kind"] == "downstream_buffer" and e["after_eos"] for e in events))
+                print(json.dumps(state, sort_keys=True))
+            """
+        )
+        # Resolve this global at invocation so the operator can explicitly
+        # select the existing original plugin without copying/rebuilding it.
+        returncode, output, timed_out = self._run_bounded(program, timeout=10.0, plugin_root=PLUGIN_ROOT)
+        self.assertFalse(timed_out, _safe_output(output))
+        self.assertEqual(returncode, 0, _safe_output(output))
+        payload = self._json_lines(output)[-1]
+        print(json.dumps({"pre_request_inflight_output": payload}, sort_keys=True))
+        self.assertEqual(payload["failures"], [], _safe_output(output))
+        self.assertEqual(payload["request_at_park"], 0, _safe_output(output))
+        self.assertLessEqual(payload["park_duration_s"], 1., _safe_output(output))
+        self.assertEqual(payload["accepted"], 91, _safe_output(output))
+        self.assertTrue(payload["ok"], _safe_output(output))
+        self.assertEqual(payload["bus_result"], "eos", _safe_output(output))
+        self.assertEqual(payload["inflight_flow"], 0, _safe_output(output))
+        self.assertEqual(payload["late_flow"], 0, _safe_output(output))
+        self.assertFalse(payload["buffer_after_eos"], _safe_output(output))
+
+    def test_completed_output_fence_timeout_rolls_back_and_allows_retry(self) -> None:
+        program = textwrap.dedent(
+            """
+            import json, threading, time
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+            Gst.init(None)
+            pipeline = Gst.parse_launch(
+                "appsrc name=source is-live=true format=time "
+                "caps=video/x-raw,format=I420,width=16,height=16,framerate=1/1 "
+                "! noesiseos name=quiesce ! fakesink name=sink sync=false async=false")
+            bridge, source, sink = (pipeline.get_by_name(n) for n in ("quiesce", "source", "sink"))
+            primed, parked, release = (threading.Event() for _ in range(3))
+            state, rendered, eos, failures = {}, [], [], []
+            thread = None
+            def buffer(pts):
+                value = Gst.Buffer.new_allocate(None, 384, None)
+                value.pts, value.duration = pts, Gst.SECOND
+                return value
+            def output_probe(_pad, info):
+                value = info.get_buffer()
+                if value is not None and value.pts == Gst.SECOND:
+                    parked.set()
+                    if not release.wait(2.): failures.append("park_deadline")
+                return Gst.PadProbeReturn.OK
+            def rendered_probe(_pad, info):
+                value = info.get_buffer()
+                if value is not None:
+                    rendered.append(int(value.pts))
+                    if value.pts == 0: primed.set()
+                return Gst.PadProbeReturn.OK
+            def event_probe(_pad, info):
+                value = info.get_event()
+                if value is not None and value.type == Gst.EventType.EOS: eos.append("eos")
+                return Gst.PadProbeReturn.OK
+            def push():
+                try: state["inflight_flow"] = int(bridge.get_static_pad("sink").chain(buffer(Gst.SECOND)))
+                except BaseException as exc: failures.append("chain:" + type(exc).__name__)
+            try:
+                sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, rendered_probe)
+                sink.get_static_pad("sink").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, event_probe)
+                assert pipeline.set_state(Gst.State.PLAYING) != Gst.StateChangeReturn.FAILURE
+                assert source.emit("push-buffer", buffer(0)) == Gst.FlowReturn.OK
+                assert primed.wait(1.)
+                bridge.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, output_probe)
+                thread = threading.Thread(target=push, daemon=True); thread.start()
+                assert parked.wait(1.)
+                started = time.monotonic(); bridge.set_property("request-sequence", 41)
+                state["setter_elapsed_s"] = time.monotonic() - started
+                time.sleep(1.25)  # beyond worker's one-second fence, below park deadline
+                state["failed_ack"] = [bridge.get_property("accepted-sequence"), bridge.get_property("last-request-ok")]
+                state["eos_before_release"] = list(eos)
+                release.set(); thread.join(1.)
+                assert not thread.is_alive()
+                state["resumed_flow"] = int(bridge.get_static_pad("sink").chain(buffer(2 * Gst.SECOND)))
+                state["rendered_before_retry"] = list(rendered)
+                bridge.set_property("request-sequence", 42)
+                message = pipeline.get_bus().timed_pop_filtered(Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+                state["bus_result"] = "none" if message is None else "eos" if message.type == Gst.MessageType.EOS else "error"
+                deadline = time.monotonic() + .5
+                while bridge.get_property("accepted-sequence") != 42 and time.monotonic() < deadline: time.sleep(.005)
+                state["retry_ack"] = [bridge.get_property("accepted-sequence"), bridge.get_property("last-request-ok")]
+            except BaseException as exc:
+                failures.append("setup_or_observation:" + type(exc).__name__ + ":" + str(exc))
+            finally:
+                release.set()
+                if thread is not None: thread.join(1.)
+                pipeline.set_state(Gst.State.NULL)
+                state.update(failures=failures, rendered=rendered, eos=eos)
+                print(json.dumps(state, sort_keys=True))
+            """
+        )
+        returncode, output, timed_out = self._run_bounded(program, timeout=10.0, plugin_root=PLUGIN_ROOT)
+        self.assertFalse(timed_out, _safe_output(output))
+        self.assertEqual(returncode, 0, _safe_output(output))
+        payload = self._json_lines(output)[-1]
+        print(json.dumps({"completed_output_fence_retry": payload}, sort_keys=True))
+        self.assertEqual(payload["failures"], [], _safe_output(output))
+        self.assertLess(payload["setter_elapsed_s"], .2, _safe_output(output))
+        self.assertEqual(payload["failed_ack"], [0, False], _safe_output(output))
+        self.assertEqual(payload["eos_before_release"], [], _safe_output(output))
+        self.assertEqual(payload["inflight_flow"], 0, _safe_output(output))
+        self.assertEqual(payload["resumed_flow"], 0, _safe_output(output))
+        self.assertEqual(payload["rendered_before_retry"], [0, 1_000_000_000, 2_000_000_000], _safe_output(output))
+        self.assertEqual(payload["retry_ack"], [42, True], _safe_output(output))
+        self.assertEqual(payload["bus_result"], "eos", _safe_output(output))
+        self.assertEqual(payload["eos"], ["eos"], _safe_output(output))
 
     @staticmethod
     def _hidden_sink_program(mode: str, target_paths: str = "") -> str:
@@ -582,8 +852,14 @@ class EosPluginRuntimeTests(unittest.TestCase):
                 # The hidden sink's terminal guard must already be active while
                 # the main EOS is draining, before hidden EOS is delivered.
                 late_flows.append(int(hidden.get_static_pad("sink").get_peer().push(buffer(Gst.SECOND))))
-                late_flows.append(int(bridge.get_static_pad("sink").chain(buffer(Gst.SECOND))))
-                release_main_eos.set()
+                late_thread = threading.Thread(target=lambda: late_flows.append(
+                    int(bridge.get_static_pad("sink").chain(buffer(Gst.SECOND)))), daemon=True)
+                try:
+                    late_thread.start()  # may serialize behind the held EOS
+                finally:
+                    release_main_eos.set()
+                late_thread.join(1.0)
+                assert not late_thread.is_alive()
             if MODE == "invalid":
                 # A bad path must roll back before either branch gets EOS.
                 # Rendering proves the rejected request also removed the drop barrier.

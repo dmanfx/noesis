@@ -174,6 +174,67 @@ print(json.dumps({
 
 
 class PersonGroundContractTests(unittest.TestCase):
+    def test_registered_body_support_uses_observed_not_held_posture(self) -> None:
+        tree = ast.parse((DS9_ROOT / "noesis" / "pipelines" / "hooks.py").read_text())
+        operator = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "_AnalyticsTelemetryProcessor")
+        augment = next(node for node in operator.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_augment_track_with_world")
+        calls = [node for node in ast.walk(augment) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "_append_universal_world_candidates"]
+        self.assertEqual(len(calls), 1)
+        keywords = {item.arg: ast.unparse(item.value) for item in calls[0].keywords}
+        self.assertEqual(keywords["posture"], "str(posture)")
+        self.assertEqual(keywords["observed_posture"], "str(raw_classified_posture)")
+        # The independent exact-original torso branch also receives OBSERVED
+        # posture; it must not turn the held safety classification into evidence.
+        strong_call, = [node for node in ast.walk(augment) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "_append_strong_posed_column"]
+        self.assertEqual({k.arg: ast.unparse(k.value) for k in strong_call.keywords}["posture"],
+                         "raw_classified_posture")
+        strong = next(node for node in operator.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_append_strong_posed_column")
+        column_call, = [node for node in ast.walk(strong) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "_append_universal_world_candidates"]
+        column_keywords = {k.arg: ast.unparse(k.value) for k in column_call.keywords}
+        self.assertEqual(column_keywords["posture"], "posture")
+        self.assertEqual(column_keywords["observed_posture"], "posture")
+        self.assertEqual(column_keywords["registered_column_only"], "True")
+        self.assertEqual(column_keywords["depth_result"], "proof.depth")
+        assignments = {node.targets[0].id: ast.unparse(node.value)
+                       for node in ast.walk(augment) if isinstance(node, ast.Assign)
+                       and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id in {"exact_current_non_upright_torso",
+                                                  "torso_context_supported"}}
+        self.assertIn("raw_classified_posture", assignments["exact_current_non_upright_torso"])
+        self.assertIn("raw_classified_posture", assignments["torso_context_supported"])
+        self.assertIn("occlusion_assessment.active", assignments["torso_context_supported"])
+        self.assertIn("partial_body_without_floor_contact", assignments["torso_context_supported"])
+
+    def test_observed_posture_caller_is_separate_from_held_seat_policy(self) -> None:
+        """Check the executable caller, not a second posture implementation."""
+        path = DS9_ROOT / "noesis" / "pipelines" / "hooks.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name)
+                 and node.func.id == "assess_lower_body_occlusion"]
+        self.assertEqual(len(calls), 1)
+        keywords = {item.arg: ast.unparse(item.value) for item in calls[0].keywords}
+        self.assertEqual(keywords["posture"], "posture")
+        self.assertEqual(keywords["observed_posture"], "raw_classified_posture")
+        guards = [ast.unparse(node.test) for node in ast.walk(tree)
+                  if isinstance(node, ast.If)
+                  and any(isinstance(item, ast.Call)
+                          and isinstance(item.func, ast.Attribute)
+                          and item.func.attr == "_seated_torso_height_from_registered_depth"
+                          for item in ast.walk(node))
+                  and "posture == 'sitting'" in ast.unparse(node.test)]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("raw_classified_posture == 'sitting'", guards[0])
+
     def test_ds9_adapter_uses_shared_product_state_without_local_clone(self) -> None:
         path = DS9_ROOT / "noesis" / "pipelines" / "hooks.py"
         text = path.read_text(encoding="utf-8")

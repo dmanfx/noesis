@@ -34,6 +34,9 @@ DS9_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DS9_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(DS9_ROOT) in sys.path:
+    sys.path.remove(str(DS9_ROOT))
+sys.path.insert(0, str(DS9_ROOT))
 if str(DS9_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(DS9_ROOT / "scripts"))
 
@@ -297,6 +300,38 @@ def _runtime_lane(tracking_mode: str, pgie_profile: str | None = None) -> dict[s
     )
 
 
+def _candidate_selection(pipeline_config, tracking_mode, model_size, pgie_profile):
+    """Classify explicit source-local and physical modes before native effects."""
+    if pipeline_config is None:
+        return False, False, {}
+    import yaml
+    from noesis.v3dt_assets import xc3d_candidate_enabled, xc3d_world_quality_enabled
+    try:
+        payload = yaml.safe_load(Path(pipeline_config).read_text())
+        if not isinstance(payload, Mapping):
+            _fail("pipeline config must be a mapping")
+        world_quality = xc3d_world_quality_enabled(payload)
+        candidate = xc3d_candidate_enabled(payload)
+    except (OSError, ValueError) as exc:
+        _fail(f"invalid candidate config: {exc}")
+    if world_quality:
+        if tracking_mode != "baseline" or model_size != "m" or pgie_profile != "yolo26":
+            _fail("world-quality candidate requires explicit baseline/M960/yolo26")
+    elif candidate:
+        if tracking_mode != "mv3dt" or model_size != "m" or pgie_profile not in {None, "yolo26"}:
+            _fail("physical candidate requires M960/yolo26/mv3dt")
+    return candidate, world_quality, payload
+
+
+def _candidate_admission_allowed(world_quality, refusal):
+    if world_quality:
+        return (refusal.get("status") == "source_local_spatial" and
+                refusal.get("physical_admission") == "unavailable" and
+                refusal.get("comparable") is False and
+                refusal.get("covariance_intersection") is False)
+    return refusal.get("status") == "admitted"
+
+
 def canonical_runtime_arguments(
     *,
     storage_base: Path,
@@ -305,10 +340,22 @@ def canonical_runtime_arguments(
     model_size: str | None = None,
     pgie_profile: str | None = None,
 ) -> list[str]:
-    lane = _runtime_lane(tracking_mode, pgie_profile)
-    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+    if pipeline_config is not None and tracking_mode != CANONICAL_TRACKING_MODE and not Path(pipeline_config).is_file():
         _fail("a pipeline config override is supported only for the baseline lane")
-    if model_size is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+    candidate, _world_quality, _payload = _candidate_selection(
+        pipeline_config, tracking_mode, model_size, pgie_profile)
+    lane = _runtime_lane(tracking_mode, None if candidate else pgie_profile)
+    if candidate:
+        original_authority = os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT")
+        if not original_authority:
+            _fail("XC3D candidate requires explicit ORIGINAL input authority")
+        original_cameras = Path(original_authority) / "config/cameras.yaml"
+        if not original_cameras.is_file():
+            _fail("XC3D original camera inventory is unavailable")
+        lane["cameras_config"] = str(original_cameras.resolve())
+    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE and not candidate:
+        _fail("a pipeline config override is supported only for the baseline lane")
+    if model_size is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE and not candidate:
         _fail("a model size override is supported only for the baseline lane")
     selected_pipeline = os.fspath(pipeline_config or lane["pipeline_config"])
     selected_size = str(model_size or lane["model_size"]).strip().lower()
@@ -741,6 +788,41 @@ def port_occupancy() -> dict[str, Any]:
     }
 
 
+def candidate_asset_environment(
+    merged: Mapping[str, str], *, original_root: str | Path,
+    artifact_root: str | Path, sdk_root: Path,
+) -> dict[str, str]:
+    """Existing ORIGINAL native assets and selected models; no Python-path change."""
+    original = _absolute_path(os.fspath(original_root) if original_root else "",
+                              label="XC3D original input authority")
+    artifacts = _absolute_path(os.fspath(artifact_root) if artifact_root else "",
+                               label="XC3D selected artifact root")
+    paths = {
+        "NOESIS_GST_PLUGIN_DIR": original / "DS9/gst-plugins",
+        "NOESIS_PIPELINE_DIR": original / "DS9/pipelines",
+        "NOESIS_MODEL_DIR": artifacts / "models",
+        "NOESIS_ONNX_DIR": artifacts / "models/onnx",
+        "NOESIS_ENGINE_DIR": artifacts / "models/engines",
+    }
+    for name, path in paths.items():
+        if not path.is_dir():
+            _fail(f"{name} required selected directory is unavailable: {path}")
+    if not (original / "config/cameras.yaml").is_file():
+        _fail("XC3D original camera inventory is unavailable")
+    env = dict(merged)
+    env.update({name: str(path) for name, path in paths.items()})
+    env["NOESIS_XC3D_ORIGINAL_ROOT"] = str(original)
+    env["NOESIS_DS9_ARTIFACT_ROOT"] = str(artifacts)
+    gst_paths = [str(sdk_root / "lib/gst-plugins"), str(paths["NOESIS_GST_PLUGIN_DIR"])]
+    for value in env.get("GST_PLUGIN_PATH", "").split(os.pathsep):
+        if value and value not in gst_paths and Path(value).is_absolute() and Path(value).is_dir():
+            if _origin_is_forbidden(value) or _origin_is_forbidden(str(Path(value).resolve())):
+                _fail("inherited GStreamer plugin directory has a forbidden origin")
+            gst_paths.append(value)
+    env["GST_PLUGIN_PATH"] = os.pathsep.join(gst_paths)
+    return env
+
+
 def build_run_environment(
     config: NativeHostConfig,
     *,
@@ -750,6 +832,7 @@ def build_run_environment(
     build_root: Path,
     tracking_mode: str = CANONICAL_TRACKING_MODE,
     pgie_profile: str | None = None,
+    original_asset_root: Path | None = None,
 ) -> dict[str, str]:
     lane = _runtime_lane(tracking_mode, pgie_profile)
     env = {
@@ -829,6 +912,9 @@ def build_run_environment(
     if env["NOESIS_MANUAL_DEPTH_MODEL"] not in {"mapanything", "da3metric-large"}:
         _fail("NOESIS_MANUAL_DEPTH_MODEL must be mapanything or da3metric-large")
     env.update(build_health_context_env(env, tracking_mode=lane["tracking_mode"]))
+    if original_asset_root is not None:
+        env = candidate_asset_environment(env, original_root=original_asset_root,
+            artifact_root=config.artifacts, sdk_root=config.deepstream_home)
     return env
 
 
@@ -858,6 +944,43 @@ def prepare_session_directories(config: NativeHostConfig, session_id: str) -> di
     }
 
 
+def select_owned_shm_plugin(
+    config: NativeHostConfig, merged: Mapping[str, str], *, original_asset_root: Path | None = None,
+) -> dict[str, str]:
+    """Select/verify the same-factory stop fix AFTER every supervisor/env merge."""
+    owned = ((original_asset_root or config.repo_root) / "DS9/gst-plugins").resolve()
+    expected = owned / "libgstshm.so"
+    if expected.resolve() != expected or not expected.is_file() or expected.stat().st_size == 0:
+        _fail(f"owned SHM stop-fix plugin is missing: {expected}")
+    from noesis.native_artifact_provenance import attest_ds9_shm_plugin
+    if attest_ds9_shm_plugin(ds9_root=owned.parent, plugin_dir=owned) != expected:
+        _fail("owned SHM attestation returned a foreign output")
+    env = dict(merged)
+    parts = [str(owned)]
+    for key in ("GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0"):
+        for value in env.get(key, "").split(os.pathsep):
+            if value and value not in parts:
+                parts.append(value)
+    env["NOESIS_GST_PLUGIN_DIR"] = str(owned)
+    env["GST_PLUGIN_PATH"] = env["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(parts)
+    for factory in ("shmsink", "shmsrc"):
+        # Inspect the environment's NORMAL factory choice, as the application
+        # will; forcing a library here could hide a stale/system registry origin.
+        result = subprocess.run(["gst-inspect-1.0", factory],
+            env=env, capture_output=True, text=True, check=False, timeout=15)
+        fields = {}
+        for line in (result.stdout or "").splitlines():
+            values = line.strip().split(None, 1)
+            if len(values) == 2 and values[0] in {"Filename", "Version"}:
+                fields[values[0]] = values[1]
+        actual = Path(fields["Filename"]).resolve() if fields.get("Filename") else None
+        if result.returncode != 0 or actual != expected.resolve() or fields.get("Version") != "1.24.2":
+            _fail(f"{factory} must resolve to owned SHM 1.24.2 plugin: {expected}; got {actual}")
+    if attest_ds9_shm_plugin(ds9_root=owned.parent, plugin_dir=owned) != expected:
+        _fail("owned SHM attestation changed during factory verification")
+    return env
+
+
 def run_preflight(
     config: NativeHostConfig,
     env: Mapping[str, str],
@@ -866,8 +989,22 @@ def run_preflight(
     pipeline_config: Path | None = None,
 ) -> None:
     lane = _runtime_lane(tracking_mode)
-    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE:
+    candidate = False
+    if pipeline_config is not None:
+        import yaml
+        from noesis.v3dt_assets import xc3d_candidate_enabled, xc3d_world_quality_enabled
+        payload = yaml.safe_load(pipeline_config.read_text())
+        candidate = xc3d_candidate_enabled(payload)
+        if candidate and tracking_mode != ("baseline" if xc3d_world_quality_enabled(payload) else "mv3dt"):
+            _fail("candidate preflight tracking mode differs from its explicit contract")
+    if pipeline_config is not None and lane["tracking_mode"] != CANONICAL_TRACKING_MODE and not candidate:
         _fail("a pipeline config override is supported only for the baseline lane")
+    cameras = config.repo_root / lane["cameras_config"]
+    if candidate:
+        original = _absolute_path(env.get("NOESIS_XC3D_ORIGINAL_ROOT", ""), label="XC3D original input authority")
+        cameras = original / "config/cameras.yaml"
+        if not cameras.is_file():
+            _fail("XC3D original camera inventory is unavailable")
     script = DS9_ROOT / "scripts" / "ds9_preflight.py"
     result = subprocess.run(
         [
@@ -876,7 +1013,7 @@ def run_preflight(
             "--config",
             str(pipeline_config or (config.repo_root / lane["pipeline_config"])),
             "--cameras-config",
-            str(config.repo_root / lane["cameras_config"]),
+            str(cameras),
         ],
         check=False,
         cwd=str(config.repo_root),
@@ -894,11 +1031,29 @@ def check_native(
     pipeline_config: Path | None = None,
     model_size: str | None = None,
     pgie_profile: str | None = None,
+    native_artifact_receipt: Path | None = None,
+    native_artifact_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    lane = _runtime_lane(tracking_mode, pgie_profile)
+    candidate, world_quality, payload = _candidate_selection(
+        pipeline_config, tracking_mode, model_size, pgie_profile)
+    pin, original_asset_root = None, None
+    if candidate:
+        from noesis.v3dt_assets import (xc3d_admission_refusal, candidate_analytics_pin,
+            candidate_native_environment, preflight_candidate_analytics)
+        if not _candidate_admission_allowed(world_quality, xc3d_admission_refusal(payload)):
+            _fail("candidate source/physical admission is unavailable")
+        original_asset_root = _absolute_path(os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT", ""),
+                                             label="XC3D original input authority")
+        pin = candidate_analytics_pin(config.repo_root, native_artifact_receipt,
+            native_artifact_receipt_sha256, selected_python=config.venv_python)
+        if config.deepstream_home != pin.sdk_root:
+            _fail("candidate selected SDK origin differs from native config")
+        candidate_native_environment(pin, candidate_asset_environment(os.environ,
+            original_root=original_asset_root, artifact_root=config.artifacts, sdk_root=config.deepstream_home))
+    lane = _runtime_lane(tracking_mode, None if candidate else pgie_profile)
     canonical_runtime_arguments(storage_base=config.runtime, tracking_mode=tracking_mode,
-                                model_size=model_size, pgie_profile=pgie_profile)
+        pipeline_config=pipeline_config, model_size=model_size, pgie_profile=pgie_profile)
     if lane["pgie_profile"] == "yolo26-watch":
         engine = config.artifacts / "models/engines/watch-26m-v1-e44-b3-fp16.engine"
         if not engine.is_file() or engine.stat().st_size == 0:
@@ -918,8 +1073,13 @@ def check_native(
         evidence_root=config.runtime / "evidence" / "check" / "runtime",
         build_root=config.runtime / "build" / "check",
         tracking_mode=lane["tracking_mode"],
-        pgie_profile=pgie_profile,
+        pgie_profile=None if candidate else pgie_profile,
+        original_asset_root=original_asset_root,
     )
+    if pin is not None:
+        check_env = candidate_native_environment(pin, check_env)
+        preflight_candidate_analytics(pin, config.repo_root, load=False)
+    check_env = select_owned_shm_plugin(config, check_env, original_asset_root=original_asset_root)
     run_preflight(
         config,
         check_env,
@@ -977,8 +1137,30 @@ def run_native(
     pipeline_config: Path | None = None,
     model_size: str | None = None,
     pgie_profile: str | None = None,
+    native_artifact_receipt: Path | None = None,
+    native_artifact_receipt_sha256: str | None = None,
 ) -> NoReturn:
-    lane = _runtime_lane(tracking_mode, pgie_profile)
+    pin = None
+    original_asset_root = None
+    candidate, world_quality, payload = _candidate_selection(
+        pipeline_config, tracking_mode, model_size, pgie_profile)
+    if candidate:
+        from noesis.v3dt_assets import xc3d_admission_refusal, candidate_analytics_pin, preflight_candidate_analytics
+        if not _candidate_admission_allowed(world_quality, xc3d_admission_refusal(payload)):
+            _fail("candidate source/physical admission is unavailable")
+        canonical_runtime_arguments(storage_base=config.runtime, tracking_mode=tracking_mode,
+            pipeline_config=pipeline_config, model_size=model_size, pgie_profile=pgie_profile)
+        pin = candidate_analytics_pin(config.repo_root, native_artifact_receipt,
+                                      native_artifact_receipt_sha256, selected_python=config.venv_python)
+        if config.deepstream_home != pin.sdk_root:
+            _fail("candidate selected SDK origin differs from native config")
+        from noesis.v3dt_assets import candidate_native_environment
+        original_asset_root = _absolute_path(os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT", ""),
+                                             label="XC3D original input authority")
+        candidate_native_environment(pin, candidate_asset_environment(os.environ,
+            original_root=original_asset_root, artifact_root=config.artifacts, sdk_root=config.deepstream_home))
+        preflight_candidate_analytics(pin, config.repo_root, load=True)
+    lane = _runtime_lane(tracking_mode, None if candidate else pgie_profile)
     occupancy = port_occupancy()
     if occupancy["occupied"]:
         _fail(
@@ -994,8 +1176,14 @@ def run_native(
         evidence_root=directories["evidence_root"],
         build_root=directories["build_root"],
         tracking_mode=lane["tracking_mode"],
-        pgie_profile=pgie_profile,
+        pgie_profile=None if candidate else pgie_profile,
+        original_asset_root=original_asset_root,
     )
+    if pin is not None:
+        from noesis.v3dt_assets import candidate_native_environment
+        env = candidate_native_environment(pin, env)  # AFTER supervisor construction.
+        preflight_candidate_analytics(pin, config.repo_root, load=False)
+    env = select_owned_shm_plugin(config, env, original_asset_root=original_asset_root)
     command = build_run_command(
         config,
         session_id=session_id,
@@ -1010,7 +1198,12 @@ def run_native(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Canonical DS9.1 native-host supervisor")
-    parser.add_argument("mode", choices=("check", "run"))
+    parser.add_argument("mode", choices=("check", "run", "plan"))
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--code-root", type=Path)
+    parser.add_argument("--original-root", type=Path)
+    parser.add_argument("--native-artifact-receipt", type=Path)
+    parser.add_argument("--native-artifact-receipt-sha256")
     parser.add_argument(
         "--tracking-mode",
         choices=OPT_IN_TRACKING_MODES,
@@ -1043,6 +1236,34 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        if args.code_root is not None and args.code_root.resolve() != REPO_ROOT.resolve():
+            _fail("code root must match the executing isolated supervisor")
+        if args.original_root is not None and not args.original_root.is_dir():
+            _fail("original input authority must be an existing repository root")
+        candidate, world_quality, payload = _candidate_selection(
+            args.pipeline_config, args.tracking_mode, args.model_size, args.pgie_profile)
+        if args.plan_only or args.mode == "plan" or candidate:
+            from noesis.v3dt_assets import xc3d_admission_refusal, candidate_artifact_plan
+            refusal = xc3d_admission_refusal(payload)
+            plan = {"code_root": str(REPO_ROOT), "tracking_mode": args.tracking_mode,
+                    "physical_admission": refusal, "sdk_initialized": False,
+                    "service_operations": [], "stores_created": False}
+            if candidate:
+                plan["artifact_selection"] = candidate_artifact_plan(REPO_ROOT,
+                    args.native_artifact_receipt, args.native_artifact_receipt_sha256)
+            if args.plan_only or args.mode == "plan":
+                print(json.dumps(plan, indent=2))
+                return 0
+            if candidate and (not _candidate_admission_allowed(world_quality, refusal) or
+                    plan["artifact_selection"]["status"] == "unavailable"):
+                print(json.dumps(plan, indent=2))
+                return 78
+        if candidate and args.original_root is not None:
+            os.environ["NOESIS_XC3D_ORIGINAL_ROOT"] = str(args.original_root.resolve())
+        if candidate:
+            original = os.environ.get("NOESIS_XC3D_ORIGINAL_ROOT")
+            if not original or not (Path(original) / "config/cameras.yaml").is_file():
+                _fail("XC3D original camera inventory is unavailable")
         config = load_native_config()
         pipeline_config = None
         if args.pipeline_config is not None:
@@ -1060,6 +1281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pipeline_config=pipeline_config,
                 model_size=args.model_size,
                 pgie_profile=args.pgie_profile,
+                native_artifact_receipt=args.native_artifact_receipt,
+                native_artifact_receipt_sha256=args.native_artifact_receipt_sha256,
             )
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
@@ -1070,8 +1293,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             pipeline_config=pipeline_config,
             model_size=args.model_size,
             pgie_profile=args.pgie_profile,
+            native_artifact_receipt=args.native_artifact_receipt,
+            native_artifact_receipt_sha256=args.native_artifact_receipt_sha256,
         )
-    except NativeRuntimeError as exc:
+    except (NativeRuntimeError, RuntimeError, ValueError) as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
     return 0

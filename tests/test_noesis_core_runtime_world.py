@@ -132,3 +132,35 @@ def test_runtime_world_config_fingerprint_uses_public_camera_reference(tmp_path:
         service.close()
 
     assert publications[0].observations[0].config.sha256 == publications[1].observations[0].config.sha256
+
+
+def test_runtime_world_physical_and_spatial_options_pass_same_objects_and_default_none(tmp_path, monkeypatch):
+    """Only the existing constructor receives the optional actual owner inputs."""
+    import noesis_core.runtime_world as module
+    from noesis.identity_association_service import IdentityAssociationService, ProducerAdmission
+    captured = []
+    def construct(**kwargs):
+        captured.append(kwargs)
+        return kwargs
+    monkeypatch.setattr(module, "CanonicalWorldService", construct)
+    admission = ProducerAdmission("unavailable", "synthetic", "current_geometry_unavailable")
+    association = IdentityAssociationService("synthetic", admission)
+    callbacks = (lambda: admission, lambda: {}, lambda: {})
+    evaluated = []
+    def spatial_bindings():
+        evaluated.append(True)
+        return {}
+    common = dict(runtime="ds9", pipeline_config={}, camera_labels={}, calibration_provider=_CalibrationProvider(),
+                  repo_root=tmp_path, run_id="synthetic", software_revision="test")
+    try:
+        module.create_runtime_world_service(**common, journal_path=tmp_path / "default.sqlite3")
+        module.create_runtime_world_service(**common, journal_path=tmp_path / "physical.sqlite3",
+            association_service=association, physical_admission=callbacks[0],
+            physical_bindings=callbacks[1], physical_rasters=callbacks[2], spatial_bindings=spatial_bindings)
+        names = ("association_service", "physical_admission", "physical_bindings", "physical_rasters", "spatial_bindings")
+        assert all(captured[0][name] is None for name in names)
+        assert all(captured[1][name] is value for name, value in zip(names, (association, *callbacks, spatial_bindings)))
+        assert evaluated == []  # The factory forwards, never evaluates/copies the provider.
+        assert len(captured) == 2  # one existing owner per factory call
+    finally:
+        for kwargs in captured: kwargs["journal"].close()

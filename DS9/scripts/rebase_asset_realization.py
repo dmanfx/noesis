@@ -288,10 +288,17 @@ def _atomic_write(path: Path, raw: bytes, mode: int) -> None:
 def rebase(
     *,
     artifact_root: Path,
-    old_manifest_ref: str,
+    old_manifest_ref: str | None = None,
     expected_realization_sha256: str,
     apply: bool,
+    old_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
+    if old_manifest_ref is not None and old_manifest_path is not None:
+        raise RebaseError("old manifest ref and path are mutually exclusive")
+    if old_manifest_ref is not None and not isinstance(old_manifest_ref, str):
+        raise RebaseError("old manifest ref must be a Git revision string")
+    if old_manifest_path is not None and not isinstance(old_manifest_path, (str, os.PathLike)):
+        raise RebaseError("old manifest path must be a filesystem path")
     root = Path(os.path.abspath(artifact_root))
     if root.is_symlink() or not root.is_dir():
         raise RebaseError("artifact root must be a real directory")
@@ -299,7 +306,11 @@ def rebase(
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
         raise RebaseError("artifact root must be owned and not group/world writable")
 
-    old_raw = _git_manifest(old_manifest_ref)
+    old_raw = (
+        _read_regular(old_manifest_path, "old asset manifest")
+        if old_manifest_path is not None
+        else _git_manifest("HEAD" if old_manifest_ref is None else old_manifest_ref)
+    )
     new_raw = _read_regular(CURRENT_MANIFEST, "current asset manifest")
     old = _mapping_from_yaml(old_raw, "old asset manifest")
     new = _mapping_from_yaml(new_raw, "current asset manifest")
@@ -391,7 +402,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path(os.environ.get("NOESIS_DS9_ARTIFACT_ROOT", "")),
     )
-    parser.add_argument("--old-manifest-ref", default="HEAD")
+    old_source = parser.add_mutually_exclusive_group()
+    old_source.add_argument("--old-manifest-ref", help="old Git revision (default: HEAD)")
+    old_source.add_argument("--old-manifest-path", type=Path,
+                            help="byte-exact backed-up current manifest, instead of a Git ref")
     parser.add_argument("--expected-realization-sha256", required=True)
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args(argv)
@@ -405,6 +419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = rebase(
             artifact_root=args.artifact_root,
             old_manifest_ref=args.old_manifest_ref,
+            old_manifest_path=args.old_manifest_path,
             expected_realization_sha256=args.expected_realization_sha256,
             apply=args.apply,
         )

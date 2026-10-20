@@ -52,8 +52,11 @@ class WorldMeasurementResolverConfig:
     uncertainty_scale_m: float = 0.75
     good_score: float = 0.72
     estimated_score: float = 0.43
+    registered_body_column: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.registered_body_column) is not bool:
+            raise ValueError("registered_body_column must be boolean")
         object.__setattr__(self, "max_hypotheses", max(1, min(4, int(self.max_hypotheses))))
         object.__setattr__(
             self,
@@ -133,7 +136,7 @@ class UniversalWorldMeasurementResolver:
         scored = tuple(
             self._score(candidate, prediction.position if prediction is not None else None, prediction.covariance if prediction is not None else None)
             for candidate in candidates
-            if candidate.valid
+            if candidate.valid and (candidate.method is None or self.config.registered_body_column)
         )
         if not scored:
             return self._continuation_or_rejection(measurement_set)
@@ -146,11 +149,15 @@ class UniversalWorldMeasurementResolver:
         surface = selected.hypothesis.support_surface
         fused = False
         alternate: _ScoredHypothesis | None = None
+        semantic_floor_alternate: _ScoredHypothesis | None = None
         disagreement_m: float | None = None
         disagreement_mahalanobis_sq: float | None = None
         excluded_reasons: dict[str, str] = {}
 
         for candidate in ranked[1:]:
+            if candidate.hypothesis.method != selected.hypothesis.method:
+                excluded_reasons[candidate.hypothesis.candidate_id] = "estimated_method_not_equivalent"
+                continue
             # Nearby coordinates do not make different physical floors the
             # same measurement. Unknown geometry also cannot corroborate a
             # known surface. Preserve the alternate rather than averaging a
@@ -229,6 +236,27 @@ class UniversalWorldMeasurementResolver:
                 )
             )
             if not incompatible:
+                if (self.config.registered_body_column
+                        and selected.hypothesis.kind == "registered_depth"
+                        and selected.hypothesis.method is None
+                        and selected.hypothesis.anchor in {"person_mask_floor", "person_body_projection"}
+                        and not selected.pcf_strong_conflict
+                        and self._pcf_unobserved_room_nonmembership(selected.hypothesis.pcf)
+                        and candidate.hypothesis.kind == "floor_ray"
+                        and candidate.pcf_strong_conflict
+                        and self._pcf_unobserved_room_nonmembership(candidate.hypothesis.pcf)
+                        and candidate.hypothesis.pcf.prior_id == selected.hypothesis.pcf.prior_id
+                        and candidate.hypothesis.pcf.revision_id == selected.hypothesis.pcf.revision_id):
+                    # Its own floor policy remains strong, but this compatible
+                    # semantic room nonmembership is not independent physical
+                    # evidence against the admitted current registered range.
+                    # Preserve the floor score/strong diagnostic as an alternate,
+                    # without CI or spurious disagreement covariance inflation.
+                    excluded_reasons[candidate.hypothesis.candidate_id] = (
+                        "strong_pcf_boundary_conflict_semantic_room_noncontributor")
+                    if semantic_floor_alternate is None:
+                        semantic_floor_alternate = candidate
+                    continue
                 # Covariance intersection is safe when the relationship is
                 # unknown, but every contributor must be mutually compatible.
                 # Pairwise-to-primary admission is insufficient: two secondary
@@ -342,7 +370,7 @@ class UniversalWorldMeasurementResolver:
             ranked,
             selected=selected,
             contributors=contributors,
-            alternate=alternate,
+            alternate=alternate or semantic_floor_alternate,
             excluded_reasons=excluded_reasons,
         )
         if result_pcf_strong_conflict:
@@ -367,7 +395,8 @@ class UniversalWorldMeasurementResolver:
             support_state=selected.hypothesis.support_state,
             support_surface=selected.hypothesis.support_surface,
             contributor_ids=tuple(item.hypothesis.candidate_id for item in contributors),
-            alternate_candidate_id=alternate.hypothesis.candidate_id if alternate else None,
+            alternate_candidate_id=(alternate or semantic_floor_alternate).hypothesis.candidate_id
+            if (alternate or semantic_floor_alternate) else None,
             fused=fused,
             confidence=selected_score,
             quality=quality,
@@ -640,6 +669,18 @@ class UniversalWorldMeasurementResolver:
         candidate: WorldMeasurementHypothesis,
     ) -> bool:
         prior = candidate.pcf
+        if (self.config.registered_body_column and candidate.valid
+                and candidate.kind == "registered_depth"
+                and (candidate.method == "registered_body_column"
+                    or (candidate.method is None
+                        and candidate.anchor in {"person_mask_floor", "person_body_projection"}))
+                and self._pcf_unobserved_room_nonmembership(prior)):
+            # Preserve the SAME negative soft likelihood. In this explicit
+            # task, single-room nonmembership in an unobserved cell is not
+            # measured exclusion of an independently registered person range.
+            # Default policy, observed cells, extent violations, mixed reasons
+            # and floor/body-plane/inferred-height hypotheses stay strict.
+            return False
         outside_m = self._pcf_conflict_distance_m(prior)
         if outside_m is None:
             return False
@@ -651,6 +692,13 @@ class UniversalWorldMeasurementResolver:
             self.config.pcf_strong_conflict_margin_m,
             uncertainty_margin_m,
         )
+
+    @staticmethod
+    def _pcf_unobserved_room_nonmembership(prior: WorldPriorEvidence | None) -> bool:
+        return bool(prior is not None and prior.inside_extent is True
+            and prior.evidence_observed is False and prior.observed_confidence == 0.
+            and prior.inside_authored_space is False
+            and prior.reasons == ("outside_authored_space",))
 
     @staticmethod
     def _pcf_conflict_distance_m(

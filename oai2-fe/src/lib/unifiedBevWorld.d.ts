@@ -23,6 +23,7 @@ export type UnifiedBevTrailPoint = Readonly<{
   cohort: Cohort; worldFrameRevision: string; sceneMappingSha256: string;
 }>;
 export type UnifiedBevPerson = Readonly<{
+  attributionQuarantine: import('../../../contracts/typescript/noesis-contracts').WorldAttributionQuarantine | null;
   entityId: string; subjectId: string; stableId: number | null; identityKind: string; generation: number; label: string;
   worldPosition: Vec3; position: Vec3; coordinateFrame: 'menon_scene'; sceneTransformCount: 1;
   worldCovariance: readonly number[]; sceneCovariance: readonly number[];

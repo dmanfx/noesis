@@ -37,6 +37,296 @@ from noesis.telemetry.person_ground_state import (
 )
 
 
+def _r148_column_state():
+    state = PersonGroundState(world_x=11.5604794722, world_z=5.7414193952,
+        filtered_ts=4.4, last_good_world=(11.5604794722, 0., 5.7414193952),
+        last_good_ts=4.4, accepted_metric_contact_basis='pose_ankle_floor',
+        posture='standing')
+    return state, HumanGroundConfig()
+
+
+def _r148_column(state, cfg, frame, *, position=(11.6678, 5.1446)):
+    from noesis.telemetry.person_ground_state import RegisteredBodyColumnOriginal
+    pts = 4_466_666_666 + (frame-134)*1_000_000_000//30
+    binding = ('run', 'graph', 0, 'source_sr', '5:17:3', 3, 'cam', 5, 17,
+        'backend_world_m', 'world', 'calibration', 'transform', None, 'reg', 'model')
+    original = RegisteredBodyColumnOriginal(binding, frame, pts, pts//1000,
+        pts/1e9, position)
+    update_human_cv_filter(state, measurement=np.array([position[0], 0., position[1]]),
+        floor_y=0., now_ts=original.sample_ts, quality='estimated', config=cfg,
+        contact_basis='depth:registered_body_column', media_pts_ns=pts,
+        registered_column_original=original, registered_ankle_binding=binding[:-2])
+    return original
+
+
+def _r148_floor(state, cfg, original, *, admitted=False, binding=None, age=1/30):
+    point = (state.world_x, state.world_z) if admitted else (12.3412776064, 6.5337807356)
+    return update_human_cv_filter(state, measurement=np.array([point[0], 0., point[1]]),
+        floor_y=0., now_ts=original.sample_ts+age, quality='weak', config=cfg,
+        contact_basis='pose_ankle_floor', selected_geometry_kind='floor_ray',
+        verified_reacquire_support=True, registered_ankle_binding=binding,
+        media_pts_ns=original.media_pts_ns+int(age*1e9))
+
+
+def _r148_pending(state):
+    return (state.reacquire_candidate_x, state.reacquire_candidate_z,
+        state.reacquire_candidate_ts, state.reacquire_candidate_basis,
+        state.reacquire_candidate_exact_basis, state.reacquire_count,
+        state.reacquire_unavailable_rows)
+
+
+@pytest.mark.parametrize('binding_present', [False, True])
+def test_r148_three_current_columns_survive_only_rejected_weak_floor(binding_present):
+    state, cfg = _r148_column_state()
+    for i, frame in enumerate((134, 140, 146), 1):
+        original = _r148_column(state, cfg, frame)
+        if i == 3:
+            assert state.reacquired and state.trail_segment_id == 1
+            assert (state.world_x, state.world_z) == original.position_xz
+            assert state.accepted_column_original is original
+            # R151 adds finite accepted-original priority only for a bound,
+            # physically unreachable weak floor; it does not renew this row.
+            _r148_floor(state, cfg, original, binding=original.binding[:-2])
+            assert not state.measurement_accepted and not state.reacquired
+            assert state.reacquire_candidate_basis is None
+            assert state.reacquire_count == 0
+            assert state.accepted_column_original is original
+            assert state.accepted_column_original.sample_ts == original.sample_ts
+            break
+        assert state.reacquire_count == i
+        pending = _r148_pending(state)
+        for age in (1/30, 2/30):
+            _r148_floor(state, cfg, original,
+                binding=original.binding[:-2] if binding_present else None, age=age)
+            assert not state.measurement_accepted and not state.trail_append_allowed
+            assert _r148_pending(state) == pending
+            assert state.column_original_cursor is original
+
+
+def test_r148_admitted_floor_still_clears_pending_column():
+    from copy import deepcopy
+    from noesis.telemetry.person_ground_state import _clear_reacquire_candidate
+    state, cfg = _r148_column_state()
+    original = _r148_column(state, cfg, 134)
+    ordinary = deepcopy(state)
+    _clear_reacquire_candidate(ordinary)
+    np.testing.assert_array_equal(_r148_floor(state, cfg, original, admitted=True),
+        _r148_floor(ordinary, cfg, original, admitted=True))
+    assert state.measurement_accepted and state.reacquire_count == 0
+    assert state.reacquire_candidate_basis is None
+    for field in ('world_x', 'world_z', 'vel_world_x', 'vel_world_z', 'filtered_ts',
+            'trail_append_allowed', 'accepted_metric_contact_basis'):
+        assert getattr(state, field) == getattr(ordinary, field)
+    assert original.sample_ts == 4.466666666
+
+
+@pytest.mark.parametrize('release', ['expired', 'foreign', 'reset', 'untyped', 'no_column', 'nonmonotonic'])
+def test_r148_real_release_does_not_preserve_column_pending(release):
+    state, cfg = _r148_column_state()
+    original = _r148_column(state, cfg, 134)
+    if release == 'reset':
+        state, _ = _r148_column_state()
+    if release == 'untyped':
+        state.column_original_cursor = SimpleNamespace(**original.__dict__)
+    if release == 'no_column':
+        state.column_original_cursor = None
+    old = _r148_pending(state)
+    _r148_floor(state, cfg, original,
+        binding=('foreign',)+original.binding[1:-2] if release == 'foreign' else None,
+        age=cfg.reacquire_max_gap_s+.01 if release == 'expired' else 0. if release == 'nonmonotonic' else 1/30)
+    assert not (state.reacquire_candidate_basis == 'depth:registered_body_column'
+        and _r148_pending(state) == old)
+    assert not state.reacquired
+
+
+def test_r148_replayed_column_is_not_an_additional_vote():
+    state, cfg = _r148_column_state()
+    original = _r148_column(state, cfg, 134)
+    _r148_floor(state, cfg, original)
+    pending = _r148_pending(state)
+    _r148_column(state, cfg, 134)
+    assert not state.measurement_accepted and not state.reacquired
+    assert _r148_pending(state) == pending and state.reacquire_count == 1
+    assert state.column_original_cursor is original
+
+
+@pytest.mark.parametrize('quality', ['good', 'estimated'])
+def test_r148_qualified_floor_contradiction_clears_pending_column(quality):
+    state, cfg = _r148_column_state()
+    original = _r148_column(state, cfg, 134)
+    update_human_cv_filter(state, measurement=np.array([12.3412776064, 0., 6.5337807356]),
+        floor_y=0., now_ts=original.sample_ts+1/30, quality=quality, config=cfg,
+        contact_basis='pose_ankle_floor', selected_geometry_kind='floor_ray',
+        verified_reacquire_support=True)
+    assert state.reacquire_candidate_basis == 'pose_floor' and state.reacquire_count == 1
+    assert not state.measurement_accepted
+
+
+def _r151_accepted_column():
+    state, cfg = _r148_column_state()
+    for frame in (134, 140, 146):
+        original = _r148_column(state, cfg, frame)
+    assert state.measurement_accepted and state.accepted_column_original is original
+    return state, cfg, original
+
+
+def _r151_floor(state, cfg, original, i, *, motion=False, quality='weak',
+                binding=True, age=0., near=False):
+    point = (original.position_xz[0]+.01, original.position_xz[1]+.01) if near else (12.3490507108, 6.548397759)
+    return update_human_cv_filter(state, measurement=np.array([point[0], 0., point[1]]),
+        floor_y=0., now_ts=original.sample_ts+age+i/30, quality=quality, config=cfg,
+        contact_basis='pose_ankle_floor', selected_geometry_kind='floor_ray',
+        image_motion_supported=motion, verified_reacquire_support=True,
+        registered_ankle_binding=original.binding[:-2] if binding is True else binding,
+        media_pts_ns=original.media_pts_ns+int((age+i/30)*1e9))
+
+
+@pytest.mark.parametrize('motion', [False, True])
+def test_r151_fresh_accepted_column_blocks_three_unreachable_weak_floors(motion):
+    state, cfg, original = _r151_accepted_column()
+    segment = state.trail_segment_id
+    for i in (1, 2, 3):
+        _r151_floor(state, cfg, original, i, motion=motion)
+        assert not state.measurement_accepted and not state.reacquired
+        assert state.reacquire_count == 0 and not state.trail_append_allowed
+        assert state.accepted_column_original is original
+        assert state.trail_segment_id == segment
+    assert original.sample_ts == 4.866666666
+
+
+@pytest.mark.parametrize('release', ['good', 'estimated', 'foreign', 'missing', 'expired', 'reset'])
+def test_r151_real_floor_admission_and_release_remain_available(release):
+    state, cfg, original = _r151_accepted_column()
+    if release == 'reset':
+        state = PersonGroundState(world_x=original.position_xz[0],world_z=original.position_xz[1],
+            filtered_ts=original.sample_ts,accepted_metric_contact_basis='depth:registered_body_column')
+    binding = ('foreign',)+original.binding[1:-2] if release == 'foreign' else None if release == 'missing' else True
+    for i in (1, 2, 3):
+        _r151_floor(state,cfg,original,i,quality=release if release in ('good','estimated') else 'weak',
+            binding=binding,age=.8 if release=='expired' else 0.)
+    assert state.measurement_accepted and state.reacquired
+    assert state.accepted_column_original is None
+    assert original.sample_ts == 4.866666666
+
+
+def test_r151_unavailable_and_bound_projective_update_do_not_renew_column_original():
+    state, cfg, original = _r151_accepted_column()
+    mark_world_measurement_unavailable(state,reason='depth_measurement_not_current',
+        now_ts=original.sample_ts+.01,config=cfg)
+    assert state.accepted_column_original is original
+    result=integrate_projective_ground_observation(state,
+        measurement=np.array([original.position_xz[0]+.01,0.,original.position_xz[1]+.01]),
+        floor_y=0.,now_ts=original.sample_ts+1/30,config=cfg,
+        registered_ankle_binding=original.binding[:-2],media_pts_ns=original.media_pts_ns+33_333_333)
+    assert result is None and not state.measurement_accepted
+    assert state.accepted_column_original is original
+    for i in (2,3,4):
+        _r151_floor(state,cfg,original,i)
+        assert not state.measurement_accepted and state.accepted_column_original is original
+    assert original.sample_ts == 4.866666666
+
+
+def test_r151_only_genuine_accepted_current_column_refreshes_original():
+    state, cfg, original = _r151_accepted_column()
+    refreshed = _r148_column(state, cfg, 152)
+    assert state.measurement_accepted and state.accepted_column_original is refreshed
+    assert refreshed.sample_ts > original.sample_ts
+    for i in (1, 2, 3):
+        _r151_floor(state,cfg,refreshed,i)
+        assert not state.measurement_accepted and state.accepted_column_original is refreshed
+    _r148_column(state,cfg,152)  # Replay cannot count or renew the accepted row.
+    assert not state.measurement_accepted
+    assert state.accepted_column_original.sample_ts == refreshed.sample_ts
+
+
+def test_r151_genuine_current_ankles_keep_existing_three_original_reanchor():
+    from noesis.telemetry.person_ground_state import RegisteredAnkleOriginal
+    state, cfg, original = _r151_accepted_column()
+    for i in (1, 2, 3):
+        ts = original.sample_ts+i/15
+        pts = original.media_pts_ns+i*66_666_666
+        ankle = RegisteredAnkleOriginal(original.binding,146+i,pts,pts//1000,
+            ts,(12.3490507108,6.548397759))
+        update_human_cv_filter(state,measurement=np.array([*ankle.position_xz[:1],0.,ankle.position_xz[1]]),
+            floor_y=0.,now_ts=ts,quality='good',config=cfg,
+            contact_basis='depth:pose_ankle_support',selected_geometry_kind='registered_depth',
+            registered_ankle_original=ankle,registered_ankle_binding=original.binding[:-2],
+            verified_reacquire_support=True,media_pts_ns=pts)
+    assert state.measurement_accepted and state.reacquired
+    assert state.accepted_metric_contact_basis == 'depth:pose_ankle_support'
+    assert state.accepted_column_original is None
+
+
+@pytest.mark.parametrize('invalid', ['nonfinite', 'past', 'foreign-projective', 'missing-projective'])
+def test_r151_invalid_or_foreign_callback_cannot_keep_column_priority(invalid):
+    state, cfg, original = _r151_accepted_column()
+    binding = original.binding[:-2]
+    if invalid in ('foreign-projective','missing-projective'):
+        integrate_projective_ground_observation(state,
+            measurement=np.array([original.position_xz[0],0.,original.position_xz[1]]),
+            floor_y=0.,now_ts=original.sample_ts+1/30,config=cfg,
+            registered_ankle_binding=None if invalid=='missing-projective' else ('foreign',)+binding[1:])
+    else:
+        update_human_cv_filter(state,measurement=np.array([float('nan') if invalid=='nonfinite' else 1.,0.,2.]),
+            floor_y=0.,now_ts=original.sample_ts-1/30,quality='weak',config=cfg,
+            contact_basis='pose_ankle_floor',selected_geometry_kind='floor_ray',registered_ankle_binding=binding)
+    assert state.accepted_column_original is None
+    assert not state.measurement_accepted
+
+
+@pytest.mark.parametrize('motion', [False, True])
+def test_r153_r70_inside_motion_slack_weak_floor_cannot_replace_fresh_column(motion):
+    state, cfg = _r148_column_state()
+    # Actual R70 F147 column / F152 output coordinates; this is a public
+    # filter fixture, not a recreation of unrecorded native patch metadata.
+    column_point = (12.156940573567333, 5.606239462665208)
+    floor_point = (12.260904813059408, 6.308577765573183)
+    for frame in (134, 141, 147):
+        original = _r148_column(state,cfg,frame,position=column_point)
+    assert state.measurement_accepted and state.accepted_column_original is original
+    segment = state.trail_segment_id
+    accepted = []
+    for i in (1,2,3):
+        update_human_cv_filter(state,measurement=np.array([floor_point[0],0.,floor_point[1]]),
+            floor_y=0.,now_ts=original.sample_ts+i/30,quality='weak',config=cfg,
+            contact_basis='pose_ankle_floor',selected_geometry_kind='floor_ray',
+            verified_reacquire_support=True,image_motion_supported=motion,
+            registered_ankle_binding=original.binding[:-2],media_pts_ns=original.media_pts_ns+i*33_333_333)
+        assert state.measurement_innovation_m < state.measurement_allowed_m
+        accepted.append(state.measurement_accepted)
+    assert accepted == [False,False,False]
+    assert state.accepted_column_original is original and state.reacquire_count == 0
+    assert not state.reacquired and state.trail_segment_id == segment
+    assert original.sample_ts == 4.899999999
+
+
+def test_r153_near_column_floor_basis_waits_only_original_expiry():
+    state,cfg,original = _r151_accepted_column()
+    accepted=[]
+    for i in (1,2,3):
+        _r151_floor(state,cfg,original,i,near=True)
+        accepted.append(state.measurement_accepted)
+    assert accepted == [False,False,False]
+    assert state.accepted_column_original is original and state.reacquire_count == 0
+    assert original.sample_ts == 4.866666666
+    for i in (1,2,3):
+        _r151_floor(state,cfg,original,i,near=True,age=cfg.reacquire_max_gap_s+.01)
+    assert state.measurement_accepted and state.reacquired
+    assert state.accepted_column_original is None
+    assert state.accepted_metric_contact_basis == 'pose_ankle_floor'
+    assert original.sample_ts == 4.866666666
+
+
+def test_r153_already_floor_near_updates_remain_ordinary_current_measurements():
+    state,cfg,original = _r151_accepted_column()
+    state.accepted_column_original = None
+    state.accepted_metric_contact_basis = 'pose_ankle_floor'
+    for i in (1,2,3):
+        _r151_floor(state,cfg,original,i,near=True)
+        assert state.measurement_accepted and not state.reacquired
+        assert state.reacquire_count == 0 and state.accepted_column_original is None
+
+
 def _kpts_standing() -> np.ndarray:
     # COCO-17 style absolute keypoints: [x, y, conf]
     k = np.zeros((17, 3), dtype=np.float32)
@@ -3460,6 +3750,371 @@ def test_stationary_bbox_anchor_jump_cannot_unlock_or_reacquire() -> None:
     assert state.reacquire_count == 0
     assert state.reacquired is False
     assert state.trail_segment_id == 0
+
+
+def _r106_registered_ankle_pending():
+    cfg=HumanGroundConfig()
+    state=PersonGroundState(world_x=11.67586,world_z=6.59482,filtered_ts=86/30.,
+        posture='standing',motion_mode='idle',locked_world=(11.67586,6.59482))
+    update_human_cv_filter(state,measurement=np.array([11.13924261,0.,5.71949506]),
+        floor_y=0.,now_ts=87/30.,quality='good',config=cfg,
+        contact_basis='depth:pose_ankle_support',verified_reacquire_support=True)
+    assert state.reacquire_count==1 and not state.measurement_accepted
+    return state,cfg
+
+
+def _r129_ankle_cursor(state):
+    return tuple(getattr(state, name) for name in (
+        'reacquire_candidate_x', 'reacquire_candidate_z', 'reacquire_candidate_ts',
+        'reacquire_candidate_basis', 'reacquire_candidate_exact_basis',
+        'reacquire_count', 'reacquire_unavailable_rows'))
+
+
+def _r131_accepted_ankle():
+    from noesis.telemetry.person_ground_state import RegisteredAnkleOriginal
+    binding = ('run', 'graph', 0, 'source_sr', '5:17:3', 3, 'cam', 5, 17,
+        'backend_world_m', 'world', 'calibration', 'transform', None)
+    proof = RegisteredAnkleOriginal(binding+('reg', 'model'), 62, 2_000_000_000,
+        20_000_000, 2., (10.6101953969, 5.5591718368))
+    state, cfg = PersonGroundState(), HumanGroundConfig()
+    update_human_cv_filter(state, measurement=np.array([*proof.position_xz[:1],0.,proof.position_xz[1]]),
+        floor_y=0., now_ts=2., quality='good', config=cfg,
+        contact_basis='depth:pose_ankle_support', verified_reacquire_support=True,
+        registered_ankle_original=proof,registered_ankle_binding=binding,media_pts_ns=proof.media_pts_ns)
+    assert state.measurement_accepted
+    return state,cfg,proof
+
+
+@pytest.mark.parametrize('visible_reference',[False,True])
+def test_r142_projective_step_preserves_finite_actual_bound_ankle(visible_reference):
+    state,cfg,proof=_r131_accepted_ankle()
+    now=proof.sample_ts+1/30
+    mark_world_measurement_unavailable(state,reason='depth_measurement_not_current',now_ts=now,config=cfg)
+    assert state.accepted_ankle_original is proof
+    result=integrate_projective_ground_observation(state,
+        measurement=np.array([proof.position_xz[0]+.01,0.,proof.position_xz[1]+.01]),
+        floor_y=0.,now_ts=now,config=cfg,registered_ankle_binding=proof.binding[:-2],
+        prior_output=(proof.position_xz[0],proof.position_xz[1],proof.media_pts_ns,proof.sample_ts,0)
+            if visible_reference else None,media_pts_ns=proof.media_pts_ns+33_333_333)
+    assert result is not None and not state.measurement_accepted
+    assert state.measurement_rejection_reason=='projective_weak_observation'
+    assert state.accepted_ankle_original is proof and proof.sample_ts==2.
+    assert state.ankle_original_cursor is proof
+    for i in (2,3,4):
+        update_human_cv_filter(state,measurement=np.array([11.3454876512,0.,6.5970391003]),
+            floor_y=0.,now_ts=2.+i/30,quality='weak',config=cfg,
+            contact_basis='depth:pose_ankle_support',selected_geometry_kind='floor_ray',
+            registered_ankle_binding=proof.binding[:-2],image_motion_supported=True,
+            media_pts_ns=proof.media_pts_ns+i*33_333_333)
+        assert not state.measurement_accepted and not state.reacquired
+        assert state.accepted_ankle_original is proof
+
+
+@pytest.mark.parametrize('release',['missing','foreign','expired'])
+def test_r142_projective_step_does_not_waive_ankle_binding_or_original_expiry(release):
+    state,cfg,proof=_r131_accepted_ankle()
+    now=proof.sample_ts+(cfg.reacquire_max_gap_s+.01 if release=='expired' else 1/30)
+    binding=None if release=='missing' else ('foreign',)+proof.binding[1:-2] if release=='foreign' else proof.binding[:-2]
+    mark_world_measurement_unavailable(state,reason='depth_measurement_not_current',now_ts=now,config=cfg)
+    integrate_projective_ground_observation(state,measurement=np.array([proof.position_xz[0],0.,proof.position_xz[1]]),
+        floor_y=0.,now_ts=now,config=cfg,registered_ankle_binding=binding)
+    assert state.accepted_ankle_original is None
+    assert proof.sample_ts==2. and state.ankle_original_cursor is proof
+
+
+def test_r136_later_unavailable_keeps_only_accepted_local_ankle_original():
+    state, cfg, proof = _r131_accepted_ankle()
+    mark_world_measurement_unavailable(state, reason='depth_measurement_not_current',
+        now_ts=2. + 1/30., config=cfg)
+    for i in (2, 3, 4):
+        update_human_cv_filter(state, measurement=np.array([11.3454876512, 0., 6.5970391003]),
+            floor_y=0., now_ts=2. + i/30., quality='weak', config=cfg,
+            contact_basis='pose_ankle_floor', registered_ankle_binding=proof.binding[:-2],
+            image_motion_supported=True, verified_reacquire_support=True)
+        assert not state.measurement_accepted and not state.reacquired
+        assert state.accepted_ankle_original is proof
+        assert proof.sample_ts == 2.
+
+
+def test_r136_unavailable_does_not_promote_locally_rejected_ankle():
+    state, cfg, proof = _r131_accepted_ankle()
+    state = PersonGroundState(world_x=12., world_z=7., filtered_ts=1.99)
+    update_human_cv_filter(state, measurement=np.array([proof.position_xz[0], 0., proof.position_xz[1]]),
+        floor_y=0., now_ts=2., quality='good', config=cfg,
+        contact_basis='depth:pose_ankle_support', verified_reacquire_support=True,
+        registered_ankle_original=proof, registered_ankle_binding=proof.binding[:-2], media_pts_ns=proof.media_pts_ns)
+    assert not state.measurement_accepted and state.ankle_original_cursor is proof
+    mark_world_measurement_unavailable(state, reason='depth_measurement_not_current',
+        now_ts=2.1, config=cfg)
+    assert state.accepted_ankle_original is None
+
+
+@pytest.mark.parametrize('release', ['qualified', 'estimated', 'expired', 'binding'])
+def test_r136_geometry_does_not_override_real_release_guards(release):
+    state, cfg, proof = _r131_accepted_ankle()
+    mark_world_measurement_unavailable(state, reason='depth_measurement_not_current',
+        now_ts=2.01, config=cfg)
+    assert state.accepted_ankle_original is proof
+    for i in (1, 2, 3):
+        update_human_cv_filter(state, measurement=np.array([11.3454876512, 0., 6.5970391003]),
+            floor_y=0., now_ts=2. + (.8 if release=='expired' else 0.) + i/30.,
+            quality='good' if release=='qualified' else 'estimated' if release=='estimated' else 'weak',
+            config=cfg, contact_basis='depth:pose_ankle_support', selected_geometry_kind='floor_ray',
+            registered_ankle_binding=None if release=='binding' else proof.binding[:-2],
+            image_motion_supported=True, verified_reacquire_support=True)
+        assert state.measurement_rejection_reason != 'weak_floor_reanchor_requires_independent_support'
+        assert state.accepted_ankle_original is None
+    assert proof.sample_ts == 2.  # Unavailable and floor callbacks never renew it.
+
+
+def test_r136_admissible_walking_floor_geometry_keeps_ordinary_output_and_original_age():
+    from copy import deepcopy
+    state, cfg, proof = _r131_accepted_ankle()
+    ordinary = deepcopy(state)
+    ordinary.ankle_original_cursor = ordinary.accepted_ankle_original = None
+    for i in (1, 2):
+        kwargs = dict(measurement=np.array([10.62, 0., 5.57]), floor_y=0.,
+            now_ts=2. + i/30., quality='weak', config=cfg,
+            contact_basis='depth:pose_ankle_support', selected_geometry_kind='floor_ray',
+            registered_ankle_binding=proof.binding[:-2], image_motion_supported=True)
+        np.testing.assert_array_equal(update_human_cv_filter(state, **kwargs),
+            update_human_cv_filter(ordinary, **kwargs))
+        assert state.measurement_accepted and state.accepted_ankle_original is proof
+        assert proof.sample_ts == 2. and state.reacquire_count == 0
+
+
+@pytest.mark.parametrize('release', ['qualified', 'estimated', 'expired', 'binding', 'reset', 'untyped'])
+def test_r131_real_evidence_expiry_and_default_keep_existing_floor_reanchor(release):
+    from copy import deepcopy
+    state,cfg,proof = _r131_accepted_ankle()
+    binding=proof.binding[:-2]
+    if release=='reset': state=PersonGroundState(world_x=proof.position_xz[0],world_z=proof.position_xz[1],filtered_ts=2.)
+    if release=='untyped': state.ankle_original_cursor=None
+    ordinary=deepcopy(state)
+    ordinary.ankle_original_cursor=ordinary.accepted_ankle_original=None
+    for i in range(1,4):
+        kwargs=dict(measurement=np.array([11.3454876512,0.,6.5970391003]),
+            floor_y=0.,now_ts=2.+(.8 if release=='expired' else 0.)+i/30.,
+            quality='good' if release=='qualified' else 'estimated' if release=='estimated' else 'weak',
+            config=cfg,contact_basis='pose_ankle_floor',image_motion_supported=release=='motion',
+            registered_ankle_binding=('foreign',)+binding[1:] if release=='binding' else binding)
+        output=update_human_cv_filter(state,**kwargs)
+        if release=='expired':
+            np.testing.assert_array_equal(output,update_human_cv_filter(ordinary,**kwargs))
+    if release=='expired':
+        assert state.accepted_ankle_original is None
+        return  # Ordinary physical admission is unchanged, not forced successful.
+    assert state.measurement_accepted and (state.world_x,state.world_z)==pytest.approx((11.3454876512,6.5970391003))
+
+
+def test_r131_floor_normal_motion_does_not_renew_accepted_depth_and_replay_is_not_new_proof():
+    from dataclasses import replace
+    state,cfg,proof = _r131_accepted_ankle()
+    for i in (1,2):
+        update_human_cv_filter(state,measurement=np.array([10.62,0.,5.57]),floor_y=0.,
+            now_ts=2.+i/30.,quality='weak',config=cfg,contact_basis='pose_ankle_floor',
+            registered_ankle_binding=proof.binding[:-2])
+        assert state.measurement_accepted and state.accepted_ankle_original is proof
+        assert proof.sample_ts==2. and state.reacquire_count==0
+    update_human_cv_filter(state,measurement=np.array([*proof.position_xz[:1],0.,proof.position_xz[1]]),
+        floor_y=0.,now_ts=proof.sample_ts,quality='good',config=cfg,contact_basis='depth:pose_ankle_support',
+        registered_ankle_original=proof,registered_ankle_binding=proof.binding[:-2],media_pts_ns=proof.media_pts_ns)
+    assert not state.measurement_accepted and state.measurement_rejection_reason=='registered_ankle_original_invalid'
+    assert state.accepted_ankle_original is proof
+    assert replace(proof,frame_id=63).sample_ts==2.  # Copying cannot renew its original clock.
+
+
+def test_r129_walk_weak_floor_preserves_only_pending_depth_cursor():
+    from copy import deepcopy
+    from noesis.telemetry.person_ground_state import _clear_reacquire_candidate
+
+    state, cfg = _r106_registered_ankle_pending()
+    state.motion_mode = 'walk'
+    for floors, depth_frame, point, count in (
+        ((88, 89, 91, 92), 93, (11.14864642, 5.73664692), 2),
+        ((94, 95, 96, 97, 98, 100, 102, 104), 105, (11.29343128, 5.58107131), 0),
+    ):
+        for frame in floors:
+            cursor = _r129_ankle_cursor(state)
+            ordinary = deepcopy(state)
+            _clear_reacquire_candidate(ordinary)
+            kwargs = dict(measurement=np.array([11.70265972, 0., 6.61979054]),
+                floor_y=0., now_ts=frame/30., quality='weak', config=cfg,
+                contact_basis='pose_ankle_floor', verified_reacquire_support=True)
+            output = update_human_cv_filter(state, **kwargs)
+            ordinary_output = update_human_cv_filter(ordinary, **kwargs)
+            np.testing.assert_array_equal(output, ordinary_output)
+            for field in ('world_x', 'world_z', 'vel_world_x', 'vel_world_z',
+                    'filtered_ts', 'last_good_ts', 'last_output_media_pts_ns',
+                    'accepted_metric_contact_basis', 'trail_segment_id',
+                    'trail_append_allowed', 'measurement_accepted'):
+                assert getattr(state, field) == getattr(ordinary, field)
+            assert state.measurement_accepted and not state.reacquired
+            assert _r129_ankle_cursor(state) == cursor
+        update_human_cv_filter(state,
+            measurement=np.array([point[0], 0., point[1]]), floor_y=0.,
+            now_ts=depth_frame/30., quality='good', config=cfg,
+            contact_basis='depth:pose_ankle_support', verified_reacquire_support=True)
+        assert state.reacquire_count == count
+    assert state.reacquired and state.measurement_accepted
+    assert state.trail_break_required and state.trail_segment_id == 1
+    assert (state.world_x, state.world_z) == pytest.approx(point)
+
+
+@pytest.mark.parametrize('defect', ['qualified', 'estimated', 'contradictory',
+    'expired', 'nonmonotonic', 'invalid-time', 'other-basis', 'wrong-exact-basis',
+    'nonfinite-cursor', 'full-count', 'not-near-entry', 'unknown-mode', 'force'])
+def test_r129_walk_preservation_is_not_generic_authority(defect):
+    state, cfg = _r106_registered_ankle_pending()
+    state.motion_mode = 'walk'
+    kwargs = dict(measurement=np.array([11.70265972, 0., 6.61979054]),
+        floor_y=0., now_ts=88/30., quality='weak', config=cfg,
+        contact_basis='pose_ankle_floor', verified_reacquire_support=True)
+    if defect == 'qualified': kwargs['quality'] = 'good'
+    elif defect == 'estimated': kwargs['quality'] = 'estimated'
+    elif defect == 'contradictory': kwargs['measurement'] = np.array([30., 0., 30.])
+    elif defect == 'expired': kwargs['now_ts'] = 4.
+    elif defect == 'nonmonotonic': kwargs['now_ts'] = 87/30.
+    elif defect == 'invalid-time': kwargs['now_ts'] = float('nan')
+    elif defect == 'other-basis': kwargs['contact_basis'] = 'depth:pose_shoulder_support'
+    elif defect == 'wrong-exact-basis': state.reacquire_candidate_exact_basis = 'depth:pose_torso_support'
+    elif defect == 'nonfinite-cursor': state.reacquire_candidate_x = float('nan')
+    elif defect == 'full-count': state.reacquire_count = cfg.reacquire_samples
+    elif defect == 'not-near-entry':
+        kwargs['measurement'] = np.array([12., 0., 6.59482])
+        state.locked_world = (12., 6.59482)  # A stale lock is not WALK authority.
+    elif defect == 'unknown-mode': state.motion_mode = 'unknown'
+    else: kwargs['force_accept'] = True
+    update_human_cv_filter(state, **kwargs)
+    assert state.reacquire_candidate_basis != 'depth:pose_ankle_support'
+    assert not state.reacquired and state.trail_segment_id == 0
+
+
+def test_r129_walk_floor_cannot_renew_depth_deadline_or_vote():
+    state, cfg = _r106_registered_ankle_pending()
+    state.motion_mode = 'walk'
+    cursor = _r129_ankle_cursor(state)
+    for now in (3.1, 3.3, 3.5, cursor[2]+cfg.reacquire_max_gap_s):
+        update_human_cv_filter(state,
+            measurement=np.array([11.70265972, 0., 6.61979054]), floor_y=0.,
+            now_ts=now, quality='weak', config=cfg, contact_basis='pose_ankle_floor')
+        assert _r129_ankle_cursor(state) == cursor
+        assert state.measurement_accepted and not state.reacquired
+    update_human_cv_filter(state,
+        measurement=np.array([11.70265972, 0., 6.61979054]), floor_y=0.,
+        now_ts=cursor[2]+cfg.reacquire_max_gap_s+.001, quality='weak', config=cfg,
+        contact_basis='pose_ankle_floor')
+    assert state.reacquire_count == 0 and state.reacquire_candidate_ts == -1.
+    assert not state.reacquired and state.trail_segment_id == 0
+
+
+def test_r129_walk_uses_entry_coordinate_not_stale_idle_lock():
+    state, cfg = _r106_registered_ankle_pending()
+    state.motion_mode = 'walk'
+    state.locked_world = (0., 0.)
+    cursor = _r129_ankle_cursor(state)
+    output = update_human_cv_filter(state,
+        measurement=np.array([11.70265972, 0., 6.61979054]), floor_y=0.,
+        now_ts=88/30., quality='weak', config=cfg, contact_basis='pose_ankle_floor')
+    assert _r129_ankle_cursor(state) == cursor
+    assert state.measurement_accepted and not state.reacquired
+    assert not np.array_equal(output, [0., 0., 0.])
+    fresh = PersonGroundState()
+    update_human_cv_filter(fresh,
+        measurement=np.array([11.7, 0., 6.6]), floor_y=0., now_ts=1.,
+        quality='weak', config=cfg, contact_basis='pose_ankle_floor')
+    assert not fresh.measurement_accepted
+    assert fresh.reacquire_candidate_basis == 'pose_floor'  # No inherited ankle vote.
+
+
+def test_r106_actual_shaped_ankle_floor_interleaving_preserves_three_depth_votes():
+    state,cfg=_r106_registered_ankle_pending()
+    for floor_frames,depth_frame,point,count in (
+        ((88,89,91,92),93,(11.14864642,5.73664692),2),
+        ((94,95,96,97,98,100,102,104),105,(11.29343128,5.58107131),0),
+    ):
+        original=(state.reacquire_candidate_x,state.reacquire_candidate_z,
+            state.reacquire_candidate_ts,state.reacquire_count,state.reacquire_candidate_basis)
+        for frame in floor_frames:
+            update_human_cv_filter(state,measurement=np.array([11.70265972,0.,6.61979054]),
+                floor_y=0.,now_ts=frame/30.,quality='weak',config=cfg,
+                contact_basis='pose_ankle_floor',verified_reacquire_support=True)
+            assert (state.reacquire_candidate_x,state.reacquire_candidate_z,
+                state.reacquire_candidate_ts,state.reacquire_count,state.reacquire_candidate_basis)==original
+            assert state.measurement_accepted and not state.reacquired
+        update_human_cv_filter(state,measurement=np.array([point[0],0.,point[1]]),
+            floor_y=0.,now_ts=depth_frame/30.,quality='good',config=cfg,
+            contact_basis='depth:pose_ankle_support',verified_reacquire_support=True)
+        assert state.reacquire_count==count
+    assert state.reacquired and state.measurement_accepted
+    assert state.trail_break_required and state.trail_segment_id==1
+    assert (state.world_x,state.world_z)==pytest.approx((11.29343128,5.58107131))
+    # The weaker contradictory floor does not become part of the depth solve.
+    update_human_cv_filter(state,measurement=np.array([11.70265972,0.,6.61979054]),
+        floor_y=0.,now_ts=106/30.,quality='weak',config=cfg,contact_basis='pose_ankle_floor')
+    assert not state.measurement_accepted and state.reacquire_candidate_basis=='pose_floor'
+    update_human_cv_filter(state,measurement=np.array([11.39749559,0.,5.62677835]),
+        floor_y=0.,now_ts=111/30.,quality='good',config=cfg,
+        contact_basis='depth:pose_ankle_support',verified_reacquire_support=True)
+    assert state.measurement_accepted
+
+
+@pytest.mark.parametrize('defect',['qualified-floor','estimated-floor','contradictory-floor','expired','nonmonotonic',
+    'invalid-time','changed-depth-basis','sibling-anatomy','incoherent-depth'])
+def test_r106_pending_ankle_is_not_generic_cross_basis_authority(defect):
+    state,cfg=_r106_registered_ankle_pending()
+    kwargs=dict(measurement=np.array([11.70265972,0.,6.61979054]),floor_y=0.,now_ts=88/30.,
+        quality='weak',config=cfg,contact_basis='pose_ankle_floor')
+    if defect=='qualified-floor':kwargs['quality']='good'
+    elif defect=='estimated-floor':kwargs['quality']='estimated'
+    elif defect=='contradictory-floor':kwargs['measurement']=np.array([30.,0.,30.])
+    elif defect=='expired':kwargs['now_ts']=4.
+    elif defect=='nonmonotonic':kwargs['now_ts']=87/30.
+    elif defect=='invalid-time':kwargs['now_ts']=float('nan')
+    elif defect=='changed-depth-basis':kwargs.update(contact_basis='depth:pose_torso_support',quality='good')
+    elif defect=='sibling-anatomy':kwargs.update(contact_basis='depth:pose_shoulder_support')
+    else:kwargs.update(measurement=np.array([30.,0.,30.]),now_ts=93/30.,quality='good',
+        contact_basis='depth:pose_ankle_support',verified_reacquire_support=True)
+    update_human_cv_filter(state,**kwargs)
+    assert (state.reacquire_candidate_basis!='depth:pose_ankle_support'
+        or state.reacquire_count==1 and state.reacquire_candidate_x==30.)
+    assert not state.reacquired
+
+
+def test_r106_weak_floor_does_not_refresh_depth_evidence_or_cold_bootstrap():
+    state,cfg=_r106_registered_ankle_pending()
+    before=(state.reacquire_candidate_ts,state.last_good_ts,state.last_output_media_pts_ns)
+    update_human_cv_filter(state,measurement=np.array([11.70265972,0.,6.61979054]),floor_y=0.,
+        now_ts=88/30.,quality='weak',config=cfg,contact_basis='pose_ankle_floor')
+    assert (state.reacquire_candidate_ts,state.last_good_ts,state.last_output_media_pts_ns)==before
+    fresh=PersonGroundState()
+    update_human_cv_filter(fresh,measurement=np.array([11.7,0.,6.6]),floor_y=0.,now_ts=1.,
+        quality='weak',config=cfg,contact_basis='pose_ankle_floor')
+    assert not fresh.measurement_accepted and fresh.reacquire_candidate_basis=='pose_floor'
+    assert fresh.reacquire_count==1  # Ordinary cold-floor bootstrap, no ankle-depth seed.
+
+
+def test_r106_floor_callbacks_cannot_extend_original_depth_maxgap_or_vote():
+    state,cfg=_r106_registered_ankle_pending()
+    original_ts=state.reacquire_candidate_ts
+    for now in (3.1,3.3,3.5,original_ts+cfg.reacquire_max_gap_s):
+        update_human_cv_filter(state,measurement=np.array([11.70265972,0.,6.61979054]),
+            floor_y=0.,now_ts=now,quality='weak',config=cfg,contact_basis='pose_ankle_floor')
+        assert state.reacquire_candidate_ts==original_ts and state.reacquire_count==1
+        assert not state.reacquired
+    update_human_cv_filter(state,measurement=np.array([11.70265972,0.,6.61979054]),
+        floor_y=0.,now_ts=original_ts+cfg.reacquire_max_gap_s+.001,quality='weak',config=cfg,
+        contact_basis='pose_ankle_floor')
+    assert state.reacquire_count==0 and state.reacquire_candidate_ts==-1.
+
+
+def test_r106_depth_confirmation_still_needs_existing_current_support_gate():
+    state,cfg=_r106_registered_ankle_pending()
+    update_human_cv_filter(state,measurement=np.array([11.14864642,0.,5.73664692]),
+        floor_y=0.,now_ts=88/30.,quality='good',config=cfg,
+        contact_basis='depth:pose_ankle_support',verified_reacquire_support=False,
+        image_motion_supported=False)
+    assert not state.measurement_accepted and not state.reacquired and state.reacquire_count==0
 
 
 def test_reacquire_confirmation_cannot_cross_contact_basis() -> None:

@@ -42,6 +42,39 @@ class _NativeContract:
     required_profiles: tuple[str, ...]
 
 
+_SHM_CONTRACT = _NativeContract(
+    artifact_id="plugin.shm_stop_fix", output="DS9/gst-plugins/libgstshm.so",
+    sources=tuple("DS9/native/gst_shm_stop_fix/" + name for name in (
+        "COPYING", "README.md", "gstshm.c", "gstshmsink.c", "gstshmsink.h",
+        "gstshmsrc.c", "gstshmsrc.h", "meson.build", "provenance.json",
+        "shmalloc.c", "shmalloc.h", "shmpipe.c", "shmpipe.h"))
+        + ("DS9/scripts/build_shm_stop_fix_host.sh",),
+    builder="DS9/scripts/build_shm_stop_fix_host.sh",
+    required_profiles=("runtime_common", "full"),
+)
+
+
+def _validate_shm_record(artifact: Mapping[str, Any]) -> None:
+    expected_fields = {"id", "kind", "role", "output", "sources", "builder",
+                       "required_profiles", "state", "compatibility", "provenance"}
+    contract = _SHM_CONTRACT
+    if (set(artifact) != expected_fields or artifact.get("id") != contract.artifact_id
+        or artifact.get("kind") != "gstreamer_plugin" or artifact.get("output") != contract.output
+        or tuple(artifact.get("sources") or ()) != contract.sources
+        or artifact.get("builder") != contract.builder
+        or tuple(artifact.get("required_profiles") or ()) != contract.required_profiles
+        or artifact.get("state") not in {"staged_unverified", "validated"}
+        or artifact.get("compatibility") != {"deepstream_major": 9, "cuda": "13.2",
+                                             "tensorrt": None, "gstreamer": "1.24.2"}):
+        raise DS9NativeArtifactProvenanceError("SHM stop-fix contract drifted")
+    evidence = artifact.get("provenance")
+    fields = {"source_sha256", "output_sha256", "built_at_utc", "build_host", "command"}
+    if (not isinstance(evidence, Mapping) or set(evidence) != fields
+        or any(not isinstance(evidence.get(k), str) or not evidence[k].strip() for k in fields)
+        or any(not _SHA256_RE.fullmatch(evidence[k]) for k in ("source_sha256", "output_sha256"))):
+        raise DS9NativeArtifactProvenanceError("SHM stop-fix provenance is incomplete or malformed")
+
+
 _NATIVE_CONTRACTS: Mapping[str, _NativeContract] = {
     "noesis_analytics_meta_ext": _NativeContract(
         artifact_id="native.analytics_meta",
@@ -383,9 +416,9 @@ def _supplemental_native_records(
             "DS9 native artifact manifest authority does not match the base manifest"
         )
     records = _artifact_records(manifest)
-    if set(records) != {"native.analytics_meta"}:
+    if set(records) not in ({"native.analytics_meta"}, {"native.analytics_meta", "plugin.shm_stop_fix"}):
         raise DS9NativeArtifactProvenanceError(
-            "DS9 native artifact manifest must contain exactly native.analytics_meta"
+            "DS9 native artifact manifest must contain exactly native.analytics_meta, optionally with plugin.shm_stop_fix"
         )
     artifact = records["native.analytics_meta"]
     if set(artifact) != {
@@ -412,11 +445,59 @@ def _supplemental_native_records(
         raise DS9NativeArtifactProvenanceError(
             "DS9 native artifact manifest compatibility authority drifted"
         )
+    if "plugin.shm_stop_fix" in records:
+        _validate_shm_record(records["plugin.shm_stop_fix"])
     return records
 
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def attest_ds9_shm_plugin(*, ds9_root: Path, plugin_dir: Path) -> Path:
+    """Dedicated same-plugin attestation; no ABI-extension or manifest waiver."""
+    ds9_root = _absolute(ds9_root)
+    repo_root = ds9_root.parent
+    if _absolute(plugin_dir) != ds9_root / "gst-plugins":
+        raise DS9NativeArtifactProvenanceError("SHM must load directly from DS9/gst-plugins")
+    inspected = []
+    base_path = ds9_root / "asset_manifest.yaml"
+    base, base_identity = _read_stable_regular(base_path, root=repo_root,
+        label="DS9 asset manifest", maximum_bytes=_MAX_MANIFEST_BYTES)
+    _require_manifest_authority(_load_manifest(base))
+    supplemental_path = ds9_root / _SUPPLEMENTAL_NATIVE_MANIFEST
+    supplemental, supplemental_identity = _read_stable_regular(supplemental_path, root=repo_root,
+        label="DS9 native artifact manifest", maximum_bytes=_MAX_MANIFEST_BYTES)
+    records = _supplemental_native_records(_load_manifest(supplemental), base_manifest_payload=base)
+    artifact = records.get(_SHM_CONTRACT.artifact_id)
+    if artifact is None:
+        raise DS9NativeArtifactProvenanceError("SHM stop-fix artifact declaration is missing")
+    _validate_shm_record(artifact)
+    digest = hashlib.sha256()
+    for label in sorted(_SHM_CONTRACT.sources):
+        path = repo_root / label
+        payload, identity = _read_stable_regular(path, root=repo_root,
+            label="SHM stop-fix source", maximum_bytes=_MAX_SOURCE_BYTES)
+        digest.update(label.encode("utf-8") + b"\0" + payload + b"\0")
+        inspected.append((path, identity, "SHM stop-fix source"))
+    if digest.hexdigest() != artifact["provenance"]["source_sha256"]:
+        raise DS9NativeArtifactProvenanceError("SHM stop-fix source SHA-256 mismatch")
+    output = repo_root / _SHM_CONTRACT.output
+    payload, identity = _read_stable_regular(output, root=repo_root,
+        label="SHM stop-fix output", maximum_bytes=_MAX_EXTENSION_BYTES)
+    if _sha256(payload) != artifact["provenance"]["output_sha256"]:
+        raise DS9NativeArtifactProvenanceError("SHM stop-fix output SHA-256 mismatch")
+    inspected.append((output, identity, "SHM stop-fix output"))
+    for path, identity, label in inspected:
+        _assert_identity(path, identity, label=label)
+    for path, data, identity, label in (
+        (base_path, base, base_identity, "DS9 asset manifest"),
+        (supplemental_path, supplemental, supplemental_identity, "DS9 native artifact manifest")):
+        final, final_identity = _read_stable_regular(path, root=repo_root,
+            label=label, maximum_bytes=_MAX_MANIFEST_BYTES)
+        if final != data or final_identity != identity:
+            raise DS9NativeArtifactProvenanceError(f"{label} changed during SHM attestation")
+    return output
 
 
 def attest_ds9_native_artifacts(
@@ -630,4 +711,5 @@ def attest_ds9_native_artifacts(
 __all__ = [
     "DS9NativeArtifactProvenanceError",
     "attest_ds9_native_artifacts",
+    "attest_ds9_shm_plugin",
 ]

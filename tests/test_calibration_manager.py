@@ -258,6 +258,151 @@ def test_snapshot_and_world_snapshot_reuse_one_immutable_generation(
     assert isinstance(raw_first.extrinsics_col_major, tuple)
 
 
+def _configure_three_camera_batch(manager,directory):
+    import yaml
+    labels={0:'test-camera',1:'second-camera',2:'third-camera'}
+    path=directory/'cameras.yaml'
+    data=yaml.safe_load(path.read_text())
+    for source,camera in labels.items():
+        data['cameras'][source]={'name':camera,'model':'test_model','height_m':2.5}
+    path.write_text(yaml.safe_dump(data))
+    path=directory/'camera_calibration.json'
+    data=json.loads(path.read_text())
+    for camera in labels.values():data['cameras'][camera]=dict(data['cameras']['test-camera'])
+    path.write_text(json.dumps(data))
+    manager.set_camera_labels(labels);manager.reload_all()
+    return labels
+
+
+def test_batch_snapshot_polls_once_and_reuses_immutable_objects(manager,monkeypatch,temp_calibration_dir):
+    labels=_configure_three_camera_batch(manager,temp_calibration_dir)
+    loader=manager._intrinsics_loader
+    original_all=loader.all
+    original_get=loader.get
+    calls=[]
+    def all_once(): calls.append('all'); return original_all()
+    def get_one(source): calls.append('get'); return original_get(source)
+    monkeypatch.setattr(loader,'all',all_once)
+    monkeypatch.setattr(loader,'get',get_one)
+    old={s:manager.snapshot(s,c) for s,c in labels.items()}
+    assert calls == ['get']*3
+    calls.clear()
+    first=manager.snapshots(labels)
+    assert calls == ['all'] and all(first[s] is old[s] for s in labels)
+    second=manager.snapshots(labels)
+    assert calls == ['all','all'] and second[0] is first[0]
+    assert second[0].intrinsics.flags.writeable is False
+
+
+def test_batch_snapshot_does_not_mix_generation_during_file_change(manager,temp_calibration_dir,monkeypatch):
+    import threading
+    labels=_configure_three_camera_batch(manager,temp_calibration_dir)
+    entered,release=threading.Event(),threading.Event()
+    original=manager._snapshot_locked
+    first=[True]
+    def paused(source,camera,intr):
+        if first[0]:
+            first[0]=False;entered.set();assert release.wait(2)
+        return original(source,camera,intr)
+    monkeypatch.setattr(manager,'_snapshot_locked',paused)
+    result=[]
+    worker=threading.Thread(target=lambda:result.append(manager.snapshots(labels)))
+    worker.start();assert entered.wait(2)
+    path=temp_calibration_dir/'cameras.yaml'
+    path.write_text(path.read_text().replace('fx: 800.0','fx: 900.0'))
+    release.set();worker.join(2);assert not worker.is_alive()
+    assert {s.intrinsics[0,0] for s in result[0].values()} == {800.}
+    updated=manager.snapshots(labels)
+    assert {s.intrinsics[0,0] for s in updated.values()} == {900.}
+    assert all(updated[s] is not result[0][s] for s in labels)
+
+
+def test_batch_snapshot_invalidates_unchanged_cameras_before_return(manager,monkeypatch):
+    from dataclasses import replace
+    labels={0:'test-camera',1:'test-camera',2:'test-camera'}
+    intr=manager._intrinsics_loader.get(0)
+    values={s:intr for s in labels}
+    monkeypatch.setattr(manager._intrinsics_loader,'all',lambda:dict(values))
+    old=manager.snapshots(labels)
+    values[2]=replace(intr,fx=900.)
+    new=manager.snapshots(labels)
+    assert all(new[s] is not old[s] for s in labels)
+    assert [new[s].intrinsics[0,0] for s in labels] == [800.,800.,900.]
+
+
+@pytest.mark.parametrize('labels',[{},dict(enumerate(['test-camera']*4)),{True:'test-camera'},{0:''}])
+def test_batch_snapshot_refuses_bad_bounds(manager,labels):
+    with pytest.raises(ValueError,match='snapshot_source_bounds'):manager.snapshots(labels)
+
+
+def test_batch_snapshot_actual_runtime_binding_uses_same_calibration(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from noesis.pipelines.world_quality_adapter import runtime_spatial_bindings
+    root=Path(__file__).resolve().parents[1]
+    binding=_family_active_frame_binding(root)
+    manager=CalibrationManager(cameras_yaml_path=root/'config/cameras.yaml',
+        camera_calibration_json_path=root/'config/camera_calibration.json',
+        ply_alignment_json_path=root/'config/ply_alignment.json',streammux_size=(1920,1080),
+        scene_prior_frame_bindings={'family-room':binding},raw_audit_dir=tmp_path/'audit')
+    labels={2:'family-room'}
+    old=manager.snapshot(2,'family-room')
+    all_before=manager._intrinsics_loader.all
+    calls=[]
+    def one_read():calls.append('all');return all_before()
+    def no_single(*args):raise AssertionError('individual snapshot during batch')
+    monkeypatch.setattr(manager._intrinsics_loader,'all',one_read)
+    monkeypatch.setattr(manager,'snapshot',no_single)
+    scene=SimpleNamespace(frame_bindings=lambda:{'family-room':binding})
+    first=runtime_spatial_bindings('actual-calibration-fixture',labels,manager,scene)
+    second=runtime_spatial_bindings('actual-calibration-fixture',labels,manager,scene)
+    assert calls == ['all','all'] and first == second
+    assert first[1] == {2:binding}
+    assert manager.snapshots(labels)[2] is old
+
+
+def test_batch_snapshot_rechecks_ns_mtime_deletion_recreation(manager,temp_calibration_dir):
+    import os
+    path=temp_calibration_dir/'cameras.yaml'
+    labels={0:'test-camera'}
+    old=manager.snapshots(labels)[0]
+    stamp=path.stat()
+    raw=path.read_text().replace('fx: 800.0','fx: 900.0')
+    path.write_text(raw)
+    os.utime(path,ns=(stamp.st_atime_ns,stamp.st_mtime_ns+1))
+    updated=manager.snapshots(labels)[0]
+    assert updated is not old and updated.intrinsics[0,0] == 900.
+    path.unlink()
+    assert manager.snapshots(labels)[0] is None
+    path.write_text(raw)
+    recovered=manager.snapshots(labels)[0]
+    assert recovered is not None and recovered is not updated
+    assert manager.snapshot(0,'test-camera') is recovered
+
+
+def test_batch_snapshot_is_one_generation_across_concurrent_reload(manager,temp_calibration_dir,monkeypatch):
+    import threading
+    labels={0:'test-camera',1:'test-camera',2:'test-camera'}
+    loader=manager._intrinsics_loader
+    intrinsic=loader.get(0)
+    entered,release,reload_started,reload_done=(threading.Event() for _ in range(4))
+    def blocked_all():
+        entered.set(); assert release.wait(2)
+        return {i:intrinsic for i in labels}
+    monkeypatch.setattr(loader,'all',blocked_all)
+    result=[]
+    batch=threading.Thread(target=lambda:result.append(manager.snapshots(labels)))
+    batch.start(); assert entered.wait(2)
+    def reload():
+        reload_started.set(); manager.reload_all(); reload_done.set()
+    thread=threading.Thread(target=reload);thread.start();assert reload_started.wait(2)
+    assert not reload_done.wait(.03)
+    release.set();batch.join(2);thread.join(2)
+    assert not batch.is_alive() and not thread.is_alive() and reload_done.is_set()
+    assert set(result[0]) == set(labels)
+    assert all(snapshot is not None for snapshot in result[0].values())
+    assert len({v.camera_calibration_sha256 for v in result[0].values()}) == 1
+
+
 def test_snapshot_cache_is_invalidated_by_every_public_calibration_reload_or_setter(
     manager: CalibrationManager,
     temp_calibration_dir: Path,

@@ -28,6 +28,7 @@ from noesis_core.source_progress import (
     SourceProgressPolicy,
 )
 from noesis.telemetry.latency_metrics import LatencyCollector
+from noesis.v3dt_assets import xc3d_candidate_enabled
 
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -131,6 +132,20 @@ def _parse_recorded_replay_policy(
             raise ValueError(f"recorded_replay.{key} must be a boolean")
         values.append(value)
     return values[0], values[1]
+
+
+def _source_camera_id(source: Mapping[str, Any], index: int) -> str:
+    """Application metadata only; never a GStreamer source property."""
+    explicit = source.get("camera_id")
+    secret = str(source.get("uri_secret") or "").strip()
+    if "camera_id" in source:
+        if (not isinstance(explicit, str) or not explicit
+                or explicit != explicit.strip() or len(explicit) > 128):
+            raise ValueError(f"source {index} camera identity must be a nonempty bounded string")
+        if secret and explicit != secret:
+            raise ValueError(f"source {index} camera identity conflicts with uri_secret")
+        return explicit
+    return secret or f"source-{index}"
 
 
 try:  # DS9 runtime provides this; tests can still run without it.
@@ -1149,7 +1164,9 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
 
     # Track source output nodes when linking into nvstreammux.
     source_nodes: List[Tuple[str, int]] = []
-    source_progress_labels: Dict[int, str] = {}
+    source_progress_labels: Dict[int, str] = {
+        index: _source_camera_id(source, index) for index, source in enumerate(sources)
+    }
     source_progress_targets: Dict[int, str] = {}
 
     # Precompute URIs for tiler layout / diagnostics.
@@ -1170,12 +1187,9 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
 
         loop_local_mp4 = _env_truthy("NOESIS_DS9_LOOP_LOCAL_MP4", default=True)
         for idx, source_cfg in enumerate(sources):
-            camera_id = str(
-                source_cfg.get("uri_secret") or f"source-{idx}"
-            ).strip()
-            source_progress_labels[idx] = camera_id or f"source-{idx}"
             props = dict(source_cfg)
             props.pop("uri_secret", None)
+            props.pop("camera_id", None)
             dewarp_cfg_raw = props.pop("dewarper", None)
             element = props.pop("element", "nvurisrcbin")
             uri = str(props.get("uri") or "").strip()
@@ -1599,7 +1613,14 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
     if isinstance(depth_tracking_cfg_raw, dict):
         depth_tracking_enabled = bool(depth_tracking_cfg_raw.get("enable", False)) and bool(depth_tracking_cfg_raw)
 
-    primary_branch = exclude_component.name if exclude_component is not None else tracker.name
+    # Task-only single-pass pose detections must exist BEFORE exclusion/NvDCF.
+    # The same SGIE is removed from the downstream chain, not duplicated.
+    pose_single_pass = bool(pose is not None and isinstance(pose_cfg_raw, dict)
+                            and pose_cfg_raw.get("xc3d_small_roi_context") is True)
+    tracker_ingress = exclude_component.name if exclude_component is not None else tracker.name
+    primary_branch = pose.name if pose_single_pass else tracker_ingress
+    if pose_single_pass:
+        pose.downstream = [tracker_ingress]
     tee_downstreams: List[str] = [primary_branch]
 
     if depth_tracking_enabled:
@@ -1911,7 +1932,7 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
     chain: List[Component] = []
     if reid is not None:
         chain.append(reid)
-    if pose is not None:
+    if pose is not None and not pose_single_pass:
         chain.append(pose)
 
     if chain:
@@ -2214,6 +2235,8 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
 
     _link(primary.name, tee_component.name)
     _link(tee_component.name, primary_branch)
+    if pose_single_pass:
+        _link(pose.name, tracker_ingress)
     if exclude_component is not None:
         _link(exclude_component.name, tracker.name)
     if mapanything is not None:
@@ -2252,7 +2275,7 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
     if reid is not None:
         _link(chain_start.name, reid.name)
         chain_start = reid
-    if pose is not None:
+    if pose is not None and not pose_single_pass:
         _link(chain_start.name, pose.name)
         chain_start = pose
     _link(chain_start.name, world_observation_stage.name)
@@ -2309,6 +2332,9 @@ def build_pipeline(yaml_path: str | Path) -> DeepStreamPipeline:
     _attach_fps_probes(pipeline)
     _attach_latency_probe(pipeline)
     _attach_source_progress_probes(pipeline)
+    if (xc3d_candidate_enabled(pipeline.config) or
+            os.environ.get("NOESIS_XC3D_REID_PROVENANCE_DIAGNOSTIC") == "1"):
+        _attach_xc3d_source_provenance(pipeline)
     _PIPELINE_SINGLETON = pipeline
     # Depth is disabled by default; the MapAnything gate is closed shortly after activation
     # (see activate()) to avoid a "stuck-at-PAUSED" preroll issue when the valve is closed
@@ -2320,6 +2346,29 @@ def get_pipeline() -> DeepStreamPipeline:
     if _PIPELINE_SINGLETON is None:
         raise RuntimeError("Pipeline not built. Call build_pipeline(yaml_path) first.")
     return _PIPELINE_SINGLETON
+
+
+def _attach_xc3d_source_provenance(pipeline: DeepStreamPipeline) -> None:
+    """Stamp original owned scalars after mux, before NvMOT frame overwrite."""
+    pipeline.components["streammux"].config["_xc3d_original_clock_boundary"] = True
+    if pipeline.ds_pipeline is None:
+        return
+    from pyservicemaker import BatchMetadataOperator, Probe
+    import noesis_analytics_meta_ext as native
+    if not callable(getattr(native, "stamp_source_acquisition", None)):
+        raise RuntimeError("XC3D requires isolated analytics extension with source acquisition support")
+
+    class Stamp(BatchMetadataOperator):
+        def handle_metadata(self, batch_meta):
+            try:
+                native.stamp_source_acquisition(batch_meta)
+            except Exception:
+                # Private provenance absence must not reject a canonical media
+                # buffer. Downstream exact frame receipts deny affected rows.
+                failures = int(getattr(pipeline, "xc3d_private_stamp_failures", 0))
+                pipeline.xc3d_private_stamp_failures = min((1 << 63) - 1, failures + 1)
+
+    pipeline.ds_pipeline.attach("streammux", Probe("xc3d_original_source_clock", Stamp()), tips="src")
 
 
 def prepare(on_message=None) -> bool:

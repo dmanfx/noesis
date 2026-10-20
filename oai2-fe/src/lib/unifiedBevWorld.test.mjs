@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   createUnifiedBevBindings, projectUnifiedBevMap, projectUnifiedBevMapPoint,
@@ -394,4 +395,211 @@ test('all reducer outputs are immutable and do not mutate their inputs', () => {
   assert.ok(Object.isFrozen(state.people[0].sourceEvidence));
   assert.ok(Object.isFrozen(state.people[0].trail));
   assert.throws(() => state.people[0].position.push(9), TypeError);
+});
+
+// Synthetic component inputs. The Python XC3D fixture separately exercises
+// both REAL World publications/events through the actual publisher and Node.
+const physical = (time = 1_000_000, changes = {}) => entity(time, {
+  entity_id: 'physical:run:1',
+  subject: { subject_id: 'unknown:run:1', kind: 'unknown', generation: 0,
+    stable_id: null, resident_uuid: null, display_name: null }, ...changes,
+});
+const promotedSubject = { subject_id: 'visitor:run:17:g4', kind: 'visitor', generation: 4,
+  stable_id: 17, resident_uuid: null, display_name: null };
+
+test('XC3D T6 physical promotion keeps truthful generation and original measured trail', () => {
+  const first = feed(initialized(), snapshot(1, [physical()]));
+  const second = feed(first, snapshot(2, [physical(1_015_000, { subject: promotedSubject })]), 1010);
+  assert.equal(second.people[0].generation, 4);
+  assert.equal(second.people[0].stableId, 17);
+  assert.equal(second.people[0].trail.length, 2);
+  assert.equal(second.people[0].trailBreak, false);
+  assert.deepEqual(second.people[0].trail[0], first.people[0].trail[0]);
+});
+
+test('XC3D T6 legacy malformed other-run or absent-segment IDs retain generation/reuse safety', () => {
+  for (const id of ['legacy:fixed', 'physical:other-run:1', 'physical:run:01', 'physical:run:0', 'physical:run:not-a-key']) {
+    const first = feed(initialized(), snapshot(1, [physical(1_000_000, { entity_id: id })]));
+    const second = feed(first, snapshot(2, [physical(1_015_000, { entity_id: id, subject: promotedSubject })]), 1010);
+    assert.equal(second.people[0].generation, 4);
+    assert.equal(second.people[0].trail.length, 1, id);
+    assert.equal(second.people[0].trailBreak, true, id);
+  }
+  const noSegment = feed(initialized(), snapshot(1, [physical(1_000_000, { continuity_segment_id: null })]));
+  assert.equal(feed(noSegment, snapshot(2, [physical(1_015_000,
+    { continuity_segment_id: null, subject: promotedSubject })]), 1010).people[0].trail.length, 1);
+  const old = feed(initialized(), snapshot(1, [physical(1_000_000, { subject: promotedSubject })]));
+  const reused = feed(old, snapshot(2, [physical(1_015_000, { entity_id: 'physical:run:2',
+    subject: { ...promotedSubject, generation: 5, subject_id: 'visitor:run:17:g5' } })]), 1010);
+  assert.equal(reused.people[0].trail.length, 1);
+  assert.equal(reused.people[0].generation, 5);
+});
+
+test('XC3D T6 physical epoch run absence sequence and segment changes still break trails', () => {
+  for (const change of ['epoch', 'run', 'absence', 'sequence', 'segment']) {
+    let first = feed(initialized(), snapshot(1, [physical()]));
+    let sequence = change === 'sequence' ? 3 : 2;
+    const e = physical(1_015_000, { subject: promotedSubject,
+      continuity_segment_id: change === 'segment' ? 2 : 1 });
+    const options = change === 'run' ? { producer: { ...snapshot().producer, run_id: 'next-run' } } : {};
+    if (change === 'run') e.entity_id = 'physical:next-run:1';
+    if (change === 'absence') {
+      first = feed(first, snapshot(2, []), 1005);
+      sequence = 3;
+    }
+    const second = feed(first, snapshot(sequence, [e], options), 1010,
+      change === 'epoch' ? { source_epoch: 1 } : {});
+    assert.equal(second.people[0].generation, 4, change);
+    assert.equal(second.people[0].trail.length, 1, change);
+    assert.equal(second.people[0].trailBreak, true, change);
+  }
+});
+
+test('XC3D T6 physical frame transform calibration and scene mapping revisions still break trails', () => {
+  for (const change of ['frame', 'transform', 'calibration', 'mapping']) {
+    let first = feed(initialized(), snapshot(1, [physical()]));
+    const e = physical(1_015_000, { subject: promotedSubject });
+    if (change === 'calibration') {
+      e.calibration_revision = 'new-exact-calibration';
+      e.sources[0].calibration_revision = e.calibration_revision;
+    } else {
+      const b = clone(BUNDLE), frame = b.cameras.frame_bindings['family-room'];
+      const oldRevision = frame.world_frame.revision;
+      const presentation = b.world_frame_presentations[oldRevision];
+      if (change === 'frame') {
+        const revision = 'synthetic-next-world-revision';
+        frame.world_frame.revision = revision;
+        presentation.world_frame.revision = revision;
+        delete b.world_frame_presentations[oldRevision];
+        b.world_frame_presentations[revision] = presentation;
+        e.world_frame_revision = revision;
+        e.sources[0].world_frame_revision = revision;
+      } else if (change === 'transform') {
+        const digest = 'a'.repeat(64);
+        frame.transform_sha256 = digest;
+        presentation.source_transform_sha256s = [digest];
+        e.world_transform_sha256 = digest;
+        e.sources[0].world_transform_sha256 = digest;
+      } else {
+        presentation.world_to_scene_sha256 = 'b'.repeat(64);
+        presentation.scene_revision_id = 'a'.repeat(64);
+      }
+      first = apply(first, { type: 'calibration-bundle', data: b }, 1005);
+      assert.equal(first.diagnostic.accepted, true, first.diagnostic.reason);
+    }
+    const second = feed(first, snapshot(2, [e]), 1010);
+    assert.equal(second.people[0].generation, 4, change);
+    assert.equal(second.people[0].trail.length, 1, change);
+    assert.equal(second.people[0].trailBreak, true, change);
+  }
+});
+
+test('XC3D T6 promotion in held or predicted state never appends or renews old age', () => {
+  let state = feed(initialized(), snapshot(1, [physical()]));
+  const original = clone(state.people[0].trail);
+  const deadline = state.people[0].expiresAtMs;
+  for (const [sequence, position_state] of [[2, 'held'], [3, 'predicted']]) {
+    state = feed(state, snapshot(sequence, [physical(1_000_000,
+      { subject: promotedSubject, position_state })]), 1000 + sequence * 10);
+    assert.equal(state.people[0].generation, 4);
+    assert.deepEqual(state.people[0].trail, original);
+    assert.equal(state.people[0].expiresAtMs, deadline);
+  }
+});
+
+function attributionR4Fixture(time = 1_000_000) {
+  const owners = [1, 2].map((serial) => ({ run_id: 'run', physical_serial: serial,
+    camera_id: 'family-room', source_id: 2, source_epoch: 0, raw_id: serial, lifecycle_generation: 1,
+    lifecycle_started_frame: 1, frame_id: 2, observation_id: `synthetic:${serial}:2`, acquired_at_s: 10.2,
+    clock_domain: 'synthetic', media_time_s: .2, clock_basis: 'synthetic', household_state: 'resident',
+    household_identity_key: 'synthetic-same', household_stable_id: 9,
+    household_visitor_generation: null, household_constraint: 'eligible' }));
+  const payload = { status: 'quarantined', purpose: 'physical_only_quarantine',
+    reason: 'settled_household_claim_conflict', run_id: 'run', association_revision: 3,
+    subject_ids: ['resident:synthetic-same'], stable_ids: [9], owners, retained_owners: [],
+    component_entity_ids: ['physical:run:1', 'physical:run:2'] };
+  const sorted = (v) => Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object'
+    ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
+  const q = { ...payload, conflict_id: createHash('sha256').update(JSON.stringify(sorted(payload))).digest('hex') };
+  return [1, 2].map((serial) => physical(time, { entity_id: `physical:run:${serial}`,
+    subject: { subject_id: `quarantine:run:${serial}`, kind: 'provisional', generation: 0,
+      stable_id: null, resident_uuid: null, display_name: null }, attribution_quarantine: q }));
+}
+
+test('XC3D R4 explicit quarantine preserves two physical trails and truthful label', () => {
+  let state = feed(initialized(), snapshot(1, attributionR4Fixture()));
+  assert.equal(state.diagnostic.accepted, true);
+  assert.equal(state.people.length, 2);
+  state = feed(state, snapshot(2, attributionR4Fixture(1_015_000)), 1010);
+  for (const p of state.people) {
+    assert.equal(p.label, 'Person (attribution quarantined)');
+    assert.equal(p.stableId, null);
+    assert.equal(p.identityKind, 'provisional');
+    assert.equal(p.trail.length, 2);
+    assert.equal(p.attributionQuarantine.status, 'quarantined');
+    assert.ok(Object.isFrozen(p.attributionQuarantine.owners));
+  }
+});
+
+function attributionR19Fixture(time = 1_000_000) {
+  const row = attributionR4Fixture(time)[0]; const q = row.attribution_quarantine;
+  q.component_entity_ids = ['physical:run:1'];
+  q.owners[1] = { ...q.owners[1], physical_serial: 1, camera_id: 'kitchen', source_id: 1,
+    household_identity_key: 'synthetic-other', household_stable_id: 10 };
+  q.subject_ids = ['resident:synthetic-other', 'resident:synthetic-same']; q.stable_ids = [9, 10];
+  const { conflict_id: ignored, ...payload } = q;
+  const sorted = (v) => Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object'
+    ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
+  q.conflict_id = createHash('sha256').update(JSON.stringify(sorted(payload))).digest('hex');
+  return row;
+}
+test('XC3D R19 one physical person keeps both divergent claims without label or trail loss', () => {
+  let state = feed(initialized(), snapshot(1, [attributionR19Fixture()]));
+  assert.equal(state.diagnostic.accepted, true); assert.equal(state.people.length, 1);
+  state = feed(state, snapshot(2, [attributionR19Fixture(1_015_000)]), 1010);
+  assert.equal(state.diagnostic.accepted, true);
+  assert.equal(state.people[0].trail.length, 2); assert.equal(state.people[0].stableId, null);
+  assert.equal(state.people[0].attributionQuarantine.owners.length, 2);
+});
+for (const defect of ['same-descriptor', 'same-member', 'unresolved', 'partial', 'extra-entity']) {
+  test(`XC3D R19 refuses invalid singleton ${defect} atomically`, () => {
+    const state = feed(initialized(), snapshot(1, [attributionR19Fixture()]));
+    const row = attributionR19Fixture(1_015_000); const q = row.attribution_quarantine;
+    if (defect === 'same-descriptor') Object.assign(q.owners[1], { household_identity_key: 'synthetic-same', household_stable_id: 9 });
+    else if (defect === 'same-member') Object.assign(q.owners[1], { camera_id:q.owners[0].camera_id, source_id:q.owners[0].source_id, raw_id:q.owners[0].raw_id, frame_id:3 });
+    else if (defect === 'unresolved') q.owners[1].household_constraint = 'unresolved';
+    else if (defect === 'partial') q.stable_ids = [9];
+    else q.retained_owners = [{ ...q.owners[0], physical_serial:3 }];
+    const rejected = apply(state, envelope(snapshot(2, [row])), 1010);
+    assert.equal(rejected.diagnostic.accepted, false); assert.deepEqual(rejected.people, state.people);
+  });
+}
+
+for (const defect of ['missing', 'settled', 'partial', 'component', 'purpose', 'claims', 'duplicate-owner']) {
+  test(`XC3D R4 rejects ${defect} quarantine without replacing prior heads`, () => {
+    const state = feed(initialized(), snapshot(1, attributionR4Fixture()));
+    const rows = attributionR4Fixture(1_015_000);
+    if (defect === 'missing') rows[0].attribution_quarantine = null;
+    else if (defect === 'settled') rows[0].subject.stable_id = 9;
+    else if (defect === 'partial') {
+      rows[1].attribution_quarantine = null;
+      rows[1].subject = { subject_id: 'resident:synthetic-same', kind: 'resident', generation: 0,
+        resident_uuid: 'synthetic-same', stable_id: 9, display_name: null };
+    } else if (defect === 'component') rows[0].attribution_quarantine.component_entity_ids.push('physical:run:99');
+    else if (defect === 'purpose') rows[0].attribution_quarantine.purpose = 'strict';
+    else if (defect === 'claims') rows[0].attribution_quarantine.subject_ids = [];
+    else rows[0].attribution_quarantine.owners[1] = clone(rows[0].attribution_quarantine.owners[0]);
+    const rejected = apply(state, envelope(snapshot(2, rows)), 1010);
+    assert.equal(rejected.diagnostic.accepted, false);
+    assert.deepEqual(rejected.people, state.people);
+  });
+}
+
+test('XC3D T6 duplicate identity refusal never zeroes prior legitimate state', () => {
+  const state = feed(initialized(), snapshot(1, [physical()]));
+  const second = physical(1_015_000, { entity_id: 'physical:run:2' });
+  const rejected = apply(state, envelope(snapshot(2, [physical(), second])), 1010);
+  assert.equal(rejected.diagnostic.reason, 'canonical_identity_duplicate');
+  assert.deepEqual(rejected.people, state.people);
+  assert.deepEqual(rejected.cursor, state.cursor);
 });

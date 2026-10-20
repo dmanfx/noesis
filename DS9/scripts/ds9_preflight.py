@@ -47,6 +47,7 @@ from noesis.reid_swin_profile import (  # noqa: E402
     load_reid_swin_nvinfer_properties,
     validate_reid_swin_model_config,
     validate_reid_swin_nvinfer_properties,
+    validate_reid_swin_source_config,
     validate_reid_swin_onnx_source,
 )
 from noesis.v3dt_assets import V3DTAssetError, validate_v3dt_assets  # noqa: E402
@@ -57,6 +58,9 @@ DS9_HOME = Path(
 DS9_GST_PLUGIN_DIR = Path(
     os.environ.get("NOESIS_GST_PLUGIN_DIR", DS9_ROOT / "gst-plugins")
 )
+DS9_PIPELINE_DIR = Path(
+    os.environ.get("NOESIS_PIPELINE_DIR", DS9_ROOT / "pipelines")
+).expanduser().resolve()
 DS9_MIN_DRIVER_VERSION = (595, 58, 3)
 DS9_MIN_DRIVER_LABEL = "595.58.03"
 DS9_OWNED_GST_PLUGINS = {
@@ -217,11 +221,17 @@ def _resolve(raw: str, *, base: Path) -> Path:
         resolved = (REPO_ROOT / path).resolve()
     else:
         resolved = (base / path).resolve()
-    try:
-        model_relative = resolved.relative_to((DS9_ROOT / "models").resolve())
-    except ValueError:
-        return resolved
-    return (model_root / model_relative).resolve()
+    # Reviewed INIs may be reused from the explicitly configured DS9 pipeline
+    # root. Their ../models reference retains logical model authority, just as
+    # an INI in this checkout does; no parser/model copy or alternative engine.
+    for source_model_root in ((DS9_ROOT / "models").resolve(), DS9_PIPELINE_DIR.parent / "models"):
+        try: model_relative = resolved.relative_to(source_model_root)
+        except ValueError: continue
+        for prefix, root in (("engines/", engine_root), ("onnx/", onnx_root)):
+            if model_relative.as_posix().startswith(prefix):
+                return (root / model_relative.as_posix()[len(prefix):]).resolve()
+        return (model_root / model_relative).resolve()
+    return resolved
 
 
 def _deepstream_version_ok() -> bool:
@@ -521,8 +531,7 @@ def _config_assets_ok(config_path: Path, cameras_path: Path) -> bool:
             reid_config_path = _resolve(
                 str(reid_cfg.get("config-file-path") or ""), base=base
             )
-            props = load_reid_swin_nvinfer_properties(reid_config_path)
-            validate_reid_swin_nvinfer_properties(props)
+            props = validate_reid_swin_source_config(reid_config_path, pipeline_config=cfg)
             onnx_path = _resolve(
                 str(props.get("onnx-file") or ""), base=reid_config_path.parent
             )
@@ -578,7 +587,7 @@ def _config_assets_ok(config_path: Path, cameras_path: Path) -> bool:
         "nvdsinfer_rfdetr_seg/libnvdsinfer_rfdetr_seg.so",
         "nvdsinfer_deimv2_wholebody49/libnvdsinfer_deimv2_wholebody49.so",
     ):
-        parser_path = DS9_ROOT / "pipelines" / rel
+        parser_path = DS9_PIPELINE_DIR / rel
         if not parser_path.exists() or parser_path.stat().st_size <= 0:
             _fail(f"DS9 parser missing: {parser_path}")
             ok = False

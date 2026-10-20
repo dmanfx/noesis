@@ -8,6 +8,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Mapping, MutableMapping, Sequence
 
 import numpy as np
@@ -1095,6 +1096,26 @@ def _mapanything_profile_matches(
     ) == _mapanything_identity_payload(runtime_profile)
 
 
+def _owned_registration_json(value: Any) -> Any:
+    """Own immutable JSON evidence; never retain a caller's nested container."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _owned_registration_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_owned_registration_json(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise TypeError("depth registration evidence must contain JSON values")
+
+
+def _plain_registration_json(value: Any) -> Any:
+    """Detached ordinary JSON at validation/serialization, not the hot path."""
+    if isinstance(value, Mapping):
+        return {key: _plain_registration_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_registration_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class DepthRegistrationEntry:
     camera_id: str
@@ -1114,9 +1135,20 @@ class DepthRegistrationEntry:
     generation_tool_version: str
     provenance: Mapping[str, Any]
     occupied_anchor_validation: Mapping[str, Any] = field(default_factory=dict)
+    _registration_id: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in ("calibration_fingerprint", "dav2_profile", "mapanything_profile",
+                     "fit_metrics", "sample_counts", "provenance", "occupied_anchor_validation",
+                     "raw_range_domain_m", "knots_raw_m", "knots_registered_m"):
+            object.__setattr__(self, name, _owned_registration_json(getattr(self, name)))
+        object.__setattr__(self, "_registration_id", self._compute_registration_id())
 
     @property
     def registration_id(self) -> str:
+        return self._registration_id
+
+    def _compute_registration_id(self) -> str:
         if self.occupied_anchor_validation:
             payload = {
                 "camera_id": self.camera_id,
@@ -1145,7 +1177,7 @@ class DepthRegistrationEntry:
                 "knots_raw_m": list(self.knots_raw_m),
                 "knots_registered_m": list(self.knots_registered_m),
             }
-        digest = _sha256(payload)
+        digest = _sha256(_plain_registration_json(payload))
         return f"{self.camera_id}:{digest if self.occupied_anchor_validation else digest[:12]}"
 
     def apply(self, raw_depth_m: float) -> float | None:
@@ -1222,10 +1254,10 @@ class DepthRegistrationEntry:
             payload["occupied_anchor_validation"] = dict(
                 self.occupied_anchor_validation
             )
-        return payload
+        return _plain_registration_json(payload)
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "DepthRegistrationEntry":
+    def _constructor_values(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
         if str(payload.get("transform_type")) != TRANSFORM_TYPE_PIECEWISE:
             raise DepthRegistrationError(
                 "Unsupported depth registration transform_type"
@@ -1261,7 +1293,7 @@ class DepthRegistrationEntry:
             raise DepthRegistrationError(
                 "raw_range_domain_m must match the knot endpoints"
             )
-        entry = cls(
+        return dict(
             camera_id=str(payload.get("camera_id") or ""),
             created_ts_us=int(payload.get("created_ts_us") or 0),
             transform_type=TRANSFORM_TYPE_PIECEWISE,
@@ -1282,6 +1314,9 @@ class DepthRegistrationEntry:
                 payload.get("occupied_anchor_validation") or {}
             ),
         )
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DepthRegistrationEntry":
+        entry = cls(**cls._constructor_values(payload))
         recorded_registration_id = str(payload.get("registration_id") or "").strip()
         if (
             entry.occupied_anchor_validation
@@ -1364,12 +1399,14 @@ class DepthRegistrationBundle:
                 raise DepthRegistrationError(
                     f"camera {camera_id!r} hardened entry fields do not match the exact contract"
                 )
-            entry = DepthRegistrationEntry.from_dict(entry_payload)
+            # All existing hardened guards inspect the ORIGINAL plain JSON
+            # shape before recursively immutable Entry materialization. Do not
+            # broaden their list/type contracts to accommodate internal tuples.
+            entry = SimpleNamespace(**DepthRegistrationEntry._constructor_values(entry_payload))
             if entry.camera_id and entry.camera_id != str(camera_id):
                 raise DepthRegistrationError(
                     f"camera id mismatch in entry {camera_id!r}"
                 )
-            entries[str(camera_id)] = entry
             if version == HARDENED_CONTRACT_VERSION:
                 if not entry.camera_id or int(entry.created_ts_us) <= 0:
                     raise DepthRegistrationError(
@@ -1627,6 +1664,7 @@ class DepthRegistrationBundle:
                     raise DepthRegistrationError(
                         "hardened depth registration observation timestamp range is invalid"
                     )
+            entries[str(camera_id)] = DepthRegistrationEntry.from_dict(entry_payload)
         if version == HARDENED_CONTRACT_VERSION and entries:
             reference = next(iter(entries.values()))
             reference_identity = {

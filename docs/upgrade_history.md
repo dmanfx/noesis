@@ -1,5 +1,248 @@
 # Noesis upgrade history
 
+## 2026-10-20 — Source checkpoint, not tracking completion
+
+Recorded the existing workspace as separate local commits for PCF review,
+two-camera RoomWalk, local recording access, SHM shutdown, the connected
+cross-camera tracking implementation, and dashboard presentation. No runtime
+selection, service, model, geometry, or deployment was changed by this checkpoint.
+
+Tracking remains WIP: the core/identity check had 2,399 passes and seven failures,
+and the separately exercised appearance-only look-alike counterexample still
+fails. Source-acquisition tests also reference an unpromoted diagnostic probe;
+an adapter fixture lacks initialized depth-priority state. These tests and
+assertions remain intact. Neither a green full suite nor the physical one-dot
+goal is claimed. Existing geometry and physical-phone qualification limits remain.
+
+Recordings, APKs, model artifacts, household evaluation evidence and recovery
+archives remain local. The generated dashboard entrypoint is no longer tracked;
+its existing served bytes remain untouched alongside the already ignored assets.
+Nothing was pushed.
+
+## 2026-10-19 — Repair global dashboard display controls
+
+Added direct All cameras choices to the top toolbar. They apply to every panel,
+clear individual overrides and show Mixed when rooms differ. Built-in presets
+clear the color wipe so camera depth/normals remain fully visible. Scene controls
+return to the overview from 3D; theme changes retain the workspace. Palette
+choices open Height and update camera depth colors.
+
+Fixed Cameras off leaving expanded panels visible; it now also exits camera
+fullscreen. People hides person markers, labels and trails, and the local Trails
+choice no longer depends on the separate runtime/video toggle. Display choices
+do not send runtime changes.
+
+Four presentation tests and the production build passed. An isolated occupied
+component checked actual canvas drawing with the runtime trail flag off. A live
+browser check on port 5174 covered global modes and overrides, presets, map layers,
+palette/opacity pixels, labels, expanded/fullscreen hiding, all themes, 3D scope,
+saved-style save/apply/reload/delete and responsive widths through 320 pixels.
+The seven existing TypeScript diagnostics remain unchanged. Scoped source and
+built assets were backed up before editing.
+
+## 2026-10-19 — Continuous stationary-camera depth, normals and color
+
+Replaced point splats with bounded local surface interpolation in all three
+PCF camera views. Depth heatmaps and the color comparison now cover the same
+supported surfaces. Robust plane normals and the earlier plane-aware renderer
+produce solid wall and floor regions while retaining gaps and depth edges.
+Calibration, reconstruction revision checks and automatic loading are unchanged.
+Source and built assets were backed up before the change.
+
+Eleven focused surface/projection tests and the production build passed. A
+browser check on port 5174 loaded the real PCF artifacts for all three cameras,
+verified shared surface coverage, automatic restore, independent map layers,
+color comparison, no material-switch refetch, expansion/fullscreen and responsive
+layout. The seven existing TypeScript diagnostics remain unchanged; the changed
+camera files add none. No gateway or pipeline restart was required.
+
+## 2026-10-18 — Camera POV materials and whole-map layer navigation
+
+Replaced top-down floating PCF panels with calibrated optical camera views.
+Depth, derived camera normals and PCF color share a camera projection and exact
+reconstruction revision. Added bounded off-thread geometry loading/projection,
+nearest-depth visibility, artifact byte/digest verification and unknown holes.
+Video stays mounted and camera material changes reuse the loaded reconstruction.
+
+Reconstruction, Height and Normals navigation now selects the corresponding
+layer across the whole unified BEV. All rooms use the existing admitted scene
+transforms and shared metric scale; camera material choices remain independent.
+Room context remains available for inspection and the existing 3D workspace.
+
+The production build, thirty focused projection/unified-map tests and thirteen
+gateway policy/proxy tests passed. TypeScript retains the seven pre-existing
+diagnostics. A browser smoke of the production build using exact PCF
+metadata/point bytes through isolated response fixtures
+rendered all three camera depth and normal views at the camera aspect ratio,
+checked whole-map layer independence, source continuity, automatic reload,
+expansion and responsive widths. Native read-only API requests verified the
+underlying artifacts. No inference or old depth-cache requests were needed.
+
+The read rules were activated through Dave's authorized, coordinated Menon
+gateway restart. The tested frontend is now served on port 5174. A subsequent
+browser check without response fixtures loaded all three real PCF artifacts
+through the gateway and verified the camera depth/normal images, whole-map
+navigation, independent material switches, source continuity, restored modes
+and responsive layout. The Noesis producer PID remained unchanged. Source,
+affected gateway files and built assets remain available in the scoped backup.
+
+## 2026-10-18 — Correct floating depth displays to the saved PCF reconstruction
+
+This earlier top-down panel implementation is superseded by camera POV
+materials above.
+
+Corrected the new floating panels to consume the same accepted PCF floorplan
+responses as the existing room workspaces. Removed the older MapAnything depth
+cache consumer and its separate automatic loader. The existing PCF bootstrap
+automatically loads all rooms, including restored display modes after refresh.
+Room height and Room normals reuse the existing PCF render helpers, with metric
+height and ground-frame normal legends. Texture comparison uses matching PCF
+rasters; it does not mix reconstruction geometry with perspective video.
+
+Live read-only requests returned valid PCF reconstructions for all three rooms.
+The prior report of empty camera depth caches described the wrong product and
+did not describe PCF availability. Source and built assets were backed up before
+this correction. No pipeline or gateway changes were required.
+
+The production build and twenty-two focused PCF presentation/bootstrap tests
+passed, with the same seven pre-existing TypeScript diagnostics. Browser
+validation rendered populated PCF
+normals for every room, room height and same-PCF texture comparison; restored
+modes loaded after refresh. It also covered shared video continuity, existing
+workspaces and responsive widths, with no legacy depth requests, fresh captures
+or browser errors.
+
+## 2026-10-18 — Direct controls and automatic saved snapshot loading
+
+Replaced the primary layer, theme, style, room and camera-mode dropdowns with
+single-click button groups. Saved snapshots now load automatically on connection
+and page refresh. Loaded data is reused; empty caches are not repeatedly polled.
+Loading feedback and explicit retry remain available, with fresh capture separate.
+
+The production build and four focused loader tests passed. TypeScript retains
+the seven pre-existing diagnostics. Browser checks exercised automatic startup and
+restored-mode loading, direct choices, keyboard activation, saved-style management,
+loading/retry feedback, reduced motion and responsive widths from 320 to 1600
+pixels. The video element and media stream survived display changes, with no
+implicit fresh acquisition or browser errors. That implementation queried the
+older MapAnything cache; it is superseded by the PCF correction above. Source
+and built assets were backed up before editing.
+
+## 2026-10-18 — Spatial layers, camera snapshots and saved appearance
+
+Added independent Structure/Texture/Height/Room normals BEV layers, local
+people/trails/camera/label toggles, scientific palettes and map opacity. Added
+per-camera Video/Depth snapshot/Image normals modes, apply-to-all controls,
+capture timestamps and same-snapshot RGB comparison. Missing layers, normals
+and RGB are explicitly unavailable rather than silently replaced.
+
+Dark, Light and High Contrast switch locally. Monitor, Geometry and Surface
+inspection presets and up to six named styles retain bounded local preferences.
+The shared WebRTC source stays mounted while these settings change; style and
+display changes request only saved data, with fresh capture kept explicit.
+
+Production build passed. Forty focused presentation/consumer tests passed,
+and TypeScript retains exactly the seven pre-existing diagnostics. Browser
+checks covered themes, layers, camera modes, presets, saved-style reload,
+source continuity and responsive widths. A synthetic snapshot exercised the
+actual camera component's normal pixels, RGB wipe, stable comparison buffers
+and mismatched-snapshot rejection. Browser navigation did not request fresh
+acquisition. This UI validation does not certify physical tracking accuracy or
+the availability of every room's layer or snapshot. Source and built dashboard
+were backed up before the work; no pipeline or gateway restart was required.
+
+## 2026-10-18 — Contextual spatial dashboard workspaces
+
+Added consistent system sans-serif typography, a shared room/view bar and a
+collapsible inspector in place of the permanent operational sidebar. Overview,
+reconstruction, PCF room height, PCF room normals and existing 3D views share room
+selection. The existing PCF display is embedded in the workspace, retaining its
+diagnostic tabs, export and explicit refresh actions. System health, runtime
+controls, all occupancy and complete track details remain accessible.
+
+A bounded browser smoke exercised view changes, room synchronization in both
+directions, inspector controls, expansion/fullscreen/Escape and widths from
+320 to 1600 pixels without page errors. The same mounted video element and
+media stream survived workspace changes and decoded frames advanced during
+the check. Navigation sent only cache-only PCF requests, not fresh acquisition.
+The source/built dashboard was backed up before editing. Map/camera overlays
+and on-the-fly appearance themes remain follow-up design work.
+
+## 2026-10-17 — RoomWalk camera checklist
+
+Android 0.5.1/code25 and the browser now use checkboxes for cameras to record,
+with a separate primary alignment reference drawn only from checked cameras.
+Removing the primary selects the remaining camera; clearing all selects phone-
+only reconstruction without retaining a prior failed pairing. Offline choices
+remain visible/removable and active recording locks edits. The current two-camera
+backend limit is displayed, not expanded. Native acquisition and calibration
+are unchanged. All 55 focused JavaScript tests and 15 packaged Android WebView
+interaction assertions passed; the signed APK is served by the existing utility.
+The phone itself still needs the update installed over its existing app.
+
+## 2026-10-17 — Continuous Family Room / Kitchen RoomWalk capture
+
+RoomWalk server 1.14.0 and Android 0.5.0/code24 support one phone take with two
+explicitly selected fixed cameras. Both-camera readiness, failure cleanup,
+camera-scoped artifacts, legacy single-camera behavior and exact saved/upload/
+retry identity are connected. The signed update uses the existing app key.
+
+Focused checks passed: 59 manager/recorder/reference/source tests (one installed-
+model test intentionally excluded), 50 phone-import/upload tests, 46 JavaScript
+tests and 41 Android pairing assertions on the test emulator. A real simultaneous
+Family Room/Kitchen session saved decodable H.264 recordings (1280×720/1920×1080,
+10.30/10.55 seconds), separate timing/tracking/provenance and zero dropped packet
+records. Only the phone utility was restarted; the canonical runtime was unchanged.
+This is capture/association validation, not a physical-phone walk, verified clock
+synchronization, camera-alignment accuracy or completion of unified-BEV tracking.
+Install the update over the existing phone app; never uninstall to update.
+
+## 2026-10-16 — Unified BEV spatial dashboard
+
+Replaced the main mosaic/per-camera BEV rows with a unified BEV canvas and
+room-linked floating video panels. Panels support dragging, independent expanded
+and fullscreen states, Escape, hiding feeds and resetting placement. The existing
+WebRTC mosaic and canonical unified-BEV consumer remain the media/world sources.
+A frontend source and built-bundle backup was taken before editing.
+
+Production build and 60 focused unified-BEV/mosaic checks passed. Browser smoke
+covered the actual disconnected application and a synthetic three-tile video
+through the actual crop components, including dragging, expansion, fullscreen,
+source continuity and responsive widths. Seven pre-existing TypeScript errors
+remain unchanged. The Menon gateway was stopped during validation, so live
+camera/world integration remains unverified; no runtime services were restarted.
+
+## 2026-10-15 — Small Kitchen pose ROI eligibility corrected
+
+- Changed only the selected YOLO26n pose SGIE's minimum object width/height from
+  64 to16 pixels, the installed SDK's conservative crop floor. Original object
+  rectangles, 640×640 FP16/batch3 engine, UID4/network100, preprocessing,
+  score0.25/joint0.35 gates, inference behavior and all outputs remain unchanged.
+- Real engine-only configuration rendering preserves the values. The explicit
+  ORIGINAL selected INI was narrowly updated because recorded-runtime absolute
+  paths do not silently select an isolated candidate copy. No guard was bypassed,
+  engine rebuilt, model substituted or unrelated source copied.
+- Native R5 materialized16×16 and recorded35.021 seconds under unchanged caps:
+  693 tracking/693 World/692 collected BEV messages with0 cohort mismatches;
+  one terminal BEV was not collected, so this is not693 complete triplets.
+  The child had Kitchen pose in220/337 rows, versus0 in R4. Its10-second
+  32.5×75px observation had current pose;15-second pose remained absent.
+- Over the matched source interval through16.75 seconds, R4 had314 child rows/
+  0 pose/0 world-valid versus R5's335 rows/218 pose/199 world-valid/30 registered
+  depth rows. This does not establish physical position accuracy or cross-view
+  geometry. Last reported source FPS was about16 versus14 on all three streams;
+  no matched GPU/media throughput or spare-capacity claim is made.
+- This establishes eligibility/coverage improvement only. One observed ankle's
+  0.267 confidence remains below the unchanged0.35 joint gate. Pose accuracy,
+  admitted cross-view geometry, deduplication and best-view reversal remain
+  unresolved; no new capture requirement or perfect-identity prerequisite was
+  added. Pipeline-wide feature/anchor extraction-budget skips were507/201;
+  remaining absent child poses are not assigned to model confidence from these
+  aggregate counters. Small-ROI load and bounded extraction remain observable.
+- Added a [standalone baseline pose regression](../DS9/tests/test_yolo26_pose_roi_config.py)
+  using the actual engine-only renderer with an inert engine fixture and no SDK
+  execution. See the [decision and limitations](architecture_decisions.md#small-person-pose-eligibility-follows-the-sdk-crop-floor--2026-10-15).
+
 ## 2026-10-11 — Editable offline Living Room semantic review
 
 Implemented a separate loopback review viewer with measured RGB clouds,
@@ -2213,3 +2456,25 @@ verified executor. The private `TEAM_ROOT/install-report.md` records the exact
 model catalog, role bindings, subsequent pilot outcomes, supported resume action
 and remaining continuity/backup limitations. This setup grants no production or
 application feature assignment.
+
+## 2026-10-12 — Live PCF upper-surface restoration in Menon
+
+Activated the ceiling-specific v5 low/high derivative of the existing
+Kitchen/Family/Living reconstruction. It adds 21,255 source-supported triangles
+and withholds 4,580 reviewed ceiling source points. Original low/high geometry
+and texture data are retained exactly; room transforms, floor extents, authored
+model digest, calibration bindings and registration statuses remain unchanged.
+
+Serialized geometry/UV checks, strict low/high consumers, matched source-pose
+renders and 29 focused reconstruction tests passed. Menon's full-height,
+finite-geometry and mapping tests passed with the affected 23-test set. Live
+low/high artifact bytes and served frontend assets match their selected
+digests; the actual Menon component loader accepts restored upper geometry.
+All three canonical tracking/world/BEV streams continue to advance, and the
+Noesis perception process was not restarted. Only the phone reconstruction
+service and Menon gateway were restarted, with readiness/guard restored.
+
+Kitchen ceiling evidence remains ambiguous, so its supported fragments are
+retained. This is not a gap-free or all-ceilings-removed result. Browser owner
+authentication remains required; the available browser session was signed out,
+so an authenticated user-visible browser render was not independently checked.

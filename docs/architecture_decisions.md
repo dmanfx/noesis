@@ -1,7 +1,365 @@
 # Architecture decisions
 
+## 2026-10-19 — Global dashboard controls follow the visible scene
+
+The top toolbar exposes All cameras alongside Unified BEV. Its selected mode
+comes from the actual displayed cameras, including room overrides; different
+room modes show Mixed. A global camera choice clears room overrides, reveals
+hidden panels and clears the color-comparison wipe. Built-in style presets also
+clear the wipe so the selected scientific material is fully visible. Named
+styles retain their explicit comparison setting.
+
+Scene presentation controls return to the overview when used from another
+workspace. Theme changes apply throughout the interface and retain the current
+workspace. Choosing a height/depth palette opens the Height layer and also
+updates camera depth colors; normal-direction colors retain their own meaning.
+
+People hides map markers, their labels and their trails. Trails controls the
+dashboard's retained canonical history independently of the legacy runtime/video
+trail switch. Neither control sends producer commands. Hiding cameras closes
+expanded panels and camera fullscreen; hidden styling takes precedence over
+those display states. All controls remain presentation-only and preserve the
+shared decoded video source and admitted map/world state.
+
+## 2026-10-19 — Continuous PCF surfaces in stationary-camera materials
+
+Camera Depth, Normals and PCF color comparison share a locally triangulated
+display surface from the exact admitted PCF points. Original subpixel optical
+projections supply vertices, before any point splatting. Six-pixel cells retain
+front-surface representatives; only neighbouring cells may connect. Triangles
+must pass image-edge, metric-edge and optical-depth discontinuity limits.
+Perspective-correct inverse-depth and color interpolation share a nearest-Z
+buffer. A nearer measured point blocks a surface behind it even when that point
+cannot support a triangle. Large missing regions and unsupported silhouettes
+remain empty, and isolated points are not displayed as inferred surfaces.
+
+Camera normals use bounded robust local inverse-depth plane fits and the
+existing plane-aware orientation regularizer. This suppresses sampling noise
+while preserving right/down/forward optical axes. All three materials share
+one support mask; normal regularization changes only display directions, not
+depth, PCF artifacts, unified-map geometry or canonical tracking/world state.
+The surface is an interpolated presentation of point evidence, not a retained
+source mesh or a new reconstruction authority. Its provenance is available in
+the camera source tooltip. Existing worker, transfer and raster bounds remain.
+
+## 2026-10-18 — Direct display choices and automatic saved snapshots
+
+Primary map layers, interface themes, style presets, rooms and camera display
+modes use visible single-click button groups. Advanced overlay settings and
+named-style management stay in one disclosure. Selected states, native keyboard
+activation and reduced-motion behavior remain available.
+
+On connection the existing floorplan bootstrap reads saved PCF reconstructions
+with `cache_only: true` and `scene_prior_only: true`. These responses supply the
+unified map and bind each camera display to its expected PCF revision. Camera
+displays then read that revision's metadata and immutable 3D point artifact
+through the same-origin gateway. Restored modes load automatically, and material
+switches reuse the projected data. The shared video source stays mounted.
+
+## 2026-10-18 — Independent map, camera and appearance presentation
+
+The spatial overview has independent BEV base-layer, camera-display and interface
+appearance settings. Structure, observed texture, metric AGL height and derived
+room normals reuse each admitted map's exact snapshot, mask and scene transform.
+Optional RGB/height retention is validated from that same admitted envelope.
+Height uses one metre scale across rooms; normal colors encode directions in
+the admitted scene axes. Missing layers are labeled rather than substituted.
+Canonical people, trails, labels and camera connections remain separate display
+overlays; their visibility cannot change world state or producer behavior.
+
+Floating panels retain the camera POV for Video, Depth and Normals. Static PCF
+points project through the published optical intrinsics and mux image dimensions,
+using `E_calibration * inverse(target_from_calibration)` exactly once. Metadata
+must match the camera, prior ID, world revision and frame-transform digest; the
+point artifact is byte-counted and SHA-256 verified. No pose, field of view or
+image size is guessed. Optical depth uses metres along camera +Z. Camera normals
+use right/down/forward axes. The initial point-footprint renderer was replaced
+by the continuous surface presentation described above. These static
+reconstructions do not represent current people.
+
+Two finite workers process at most one million points and a 32 MiB artifact per
+camera into a bounded 960 by 540 display. Processing is outside the live media
+callback. Material/palette changes reuse depth, normal and same-projection PCF
+color buffers. Comparison uses those same camera-projected PCF colors; it does
+not mix a top-down orthophoto with perspective video. Unsupported bindings and
+missing geometry are unavailable rather than replaced by another view.
+
+The earlier MapAnything cache and top-down room-panel consumers were removed.
+Static-camera comparison acquisition remains in the existing diagnostic workflow
+and cannot replace PCF presentation state.
+
+Dark, Light and High Contrast are interface themes, independent of scientific
+palettes and identity colors. Monitor, Geometry, Surface inspection and up to
+six named local styles store bounded presentation settings only. They do not
+persist sensor data or trigger new acquisition. Decoded static layers and a
+bounded set of images per admitted map are reused for appearance switches.
+
+## 2026-10-18 — Shared room context across dashboard workspaces
+
+Overview, Reconstruction, Height and Normals all select a layer on the complete
+unified map, using the same admitted transforms, viewport and overlays. The main
+layer strip and view navigation stay synchronized. These choices do not open
+separate room BEVs or change camera display materials. Selected room remains
+context for the inspector and existing 3D/diagnostic workspace. The unified map
+and shared WebRTC source stay mounted while that workspace is displayed.
+
+A collapsible contextual inspector replaces the permanent operational column.
+It exposes existing room observations and keeps system health, runtime controls,
+occupancy and complete track details accessible through disclosures. Room
+normals on the unified map remain derivatives of the static PCF heightfield,
+distinct from the camera-projected normals in floating panels.
+The canonical admitted transforms and person authority remain unchanged.
+Map/camera display settings and appearance remain separate from workspace
+navigation, as specified in the presentation decision above.
+
+## 2026-10-17 — One continuous RoomWalk can retain two fixed cameras
+
+RoomWalk uses one parent session, phone archive, lease and request identity with
+an explicit bounded `camera_ids` set. `camera_id` remains the primary/default
+alignment target. Missing sets mean legacy singleton evidence, never an inferred
+pair. The UI uses camera checkboxes for this recording set and a separate primary
+alignment reference selected only from that set; changing primary does not alter
+which cameras record. Every selected camera must have encoded video and canonical tracking ready
+before phone acquisition starts; a member failure stops all owned participants.
+Video/packet/tracking budgets and bounded writer queues are partitioned, not
+multiplied. Primary artifact paths stay compatible; other cameras retain their
+own paths, source/config/calibration provenance and clocks. Either recorded
+member may be selected explicitly for independent static-reference preparation.
+Phone references stay compact while full server evidence remains retained.
+This captures evidence only: it neither certifies acquisition synchronization
+nor changes live tracking calibration or admits phone reconstruction as world
+authority. See the [capture workflow](../tools/mapanything_phone_scan/README.md#paired-static-camera-capture).
+
+## 2026-10-16 — One spatial dashboard canvas
+
+The dashboard centers the existing unified BEV and places movable room-camera
+panels in its surrounding canvas. Room connectors terminate at the calibrated
+camera's floor footprint: local map origin transformed through the admitted map's
+revision-bound scene transform and the same display viewport as the BEV.
+Panel placement uses static geometry,
+so person movement does not rearrange the panels. Missing map admission produces
+no invented room anchor; missing media is explicitly labeled.
+
+One mounted WebRTC mosaic supplies the existing browser crop consumers. Expansion
+and panel fullscreen reuse those consumers and preserve the source connection.
+The legacy mosaic and per-camera BEV rows are replaced in the main overview;
+depth, ROI, people, telemetry and operational side panels remain available.
+Narrow screens stack the feeds below the map. This is presentation only and does
+not modify canonical world admission, identity, transforms or producer behavior.
+
 This is the current decision ledger. Historical DS8 and container-era ledgers
 remain in the archives for rationale and chronology.
+
+## A detector-box edge is not observed floor contact — 2026-10-16
+
+The existing Kitchen/Family Room recording shows a Kitchen person box ending
+at the counter while Family Room observes the same person's feet. The Kitchen
+bbox-bottom ray nonetheless became a low-variance floor point. Remove bbox-only
+anchors from verified ground-contact admission in the DS9 producer, rather than
+inventing a covariance penalty, preferring a fixed camera or changing calibration.
+Bbox detection, image continuity and native tracking remain available diagnostics.
+Genuine ankle, separately qualified leg and lower-body mask contact remain valid;
+independent exact-current registered-body depth retains its existing admission.
+
+Actual producer/PersonGroundState/owner/World/publisher/BEV-consumer tests cover
+bad-view-first arrival in either camera and a genuine qualified reverse handoff.
+Source checks pass; combined native recorded validation is still in progress.
+This does not claim precise physical alignment or fill missing geometry with a box.
+
+## Walking floor updates do not erase independent ankle-depth evidence — 2026-10-16
+
+A weak pose-floor update that passes the normal physical/output checks and
+stays near the entry accepted coordinate is not a contradictory registered
+ankle-depth observation. Preserve the same finite, exact-ankle pending cursor
+through that successful walking update, as through the existing idle hold.
+Keep ordinary walking position, velocity, gain and timestamps unchanged. The
+floor does not count a depth vote or renew its original deadline; only the
+existing three genuine depth observations can complete a reanchor. Qualified or
+contradictory support, other anatomy, invalid time, expiry and resets stay strict.
+
+The implementation is installed in the main checkout. All153 affected filter
+tests pass, including normal-floor output parity and nonrenewal controls;
+main-checkout focused joint checks also pass. Native recorded validation is
+pending; this alone does not prove that a missing BEV dot is fixed.
+
+## Unresolved split custody preserves only an already committed point — 2026-10-16
+
+Decision for the explicit Kitchen/Family Room image-region tracking task; the
+implementation is present; occupied replay acceptance is still in progress. A certified split
+of one previously qualified estimated pair may retain one original, nonvoting
+World position while current membership is unresolved. This is not permission
+to merge a FALSE pair, invent a measurement, transfer identity, or select an
+ambiguous camera pairing. Default and ordinary withdrawal behavior stays strict.
+
+The owner must certify the original split episode, exact native births and two
+successor keys with an immutable, absolute same-process monotonic lease. The
+original publication's wall-clock wire expiry is a separate bound; do not convert
+or compare these two clocks. World retains only
+its actually committed original position, source claims, covariance, timestamp,
+continuity segment and original source-lost and wire expiries. It may publish
+one provisional HELD original or a genuinely authorized current successor, never
+both. Queued commits recheck the exact current owner revision and real lease;
+absence, termination, source/owner barriers and actual reassignment revoke it.
+
+An accepted current successor consumes that episode only in the atomic World
+candidate commit. Later callbacks with the same complete current owner view
+must not recapture that successor as the pre-split original. The bounded marker
+is pruned when the owner episode disappears or ends; failed queued commits
+cannot consume it. Original-binding validation and all expiry rules stay strict.
+
+A genuinely current, supported and uniquely selected reunion of the SAME original
+pair may carry that same finite episode on the joined origin. This requires an
+owner-issued reunion receipt bound to the original episode and exact current
+native members; two eligibility booleans alone are insufficient. With no new
+valid coordinate, retain only the original nonvoting HELD point and its unchanged
+timestamp, claims and expiries. A committed current successor consumes the hold;
+a reserved but discarded candidate does not. The consumed marker follows the
+same finite reunion episode so a replaced original cannot be recaptured.
+
+Within an already valid certified split episode, an old committed point follows
+only its exact native-member-owning successor, using an immutable owner-issued
+split-stamp-to-destination mapping. Capture the old original before withdrawals;
+keep its position, covariance, source, timestamp and both fixed deadlines. The
+result remains provisional and nonvoting, with complete historical claims. The
+two-key scope still permits only the old hold or an actually admitted successor.
+Commit independently revalidates original identity, current owner and destination;
+reunion restores the original key without renewing the point. This is not a new
+measurement or person-identity transfer, and cannot bypass a missing/invalid lease.
+
+Private continuity and attribution history must remain available for BOTH the
+origin and the certified effective destination within that same finite two-key
+scope. Pruning only the origin after emitting the transferred HELD point deleted
+the next update's genuine historical anchor and caused a publication refusal.
+The destination-aware cleanup repair preserves all original claim IDs; it does
+not invent a fallback grant. Actual transfer→repeated-cohort→expiry tests pass
+through the publisher and BEV consumer, including stop/correction controls.
+
+A possible semantic TRUE pair that is explicitly unsupported and nonunique in
+the current full cohort remains unresolved. It grants no membership or position
+and alone is not proof of reassignment. A supported and unique selected positive
+alternative, ownership transfer outside that certified routing, or independently qualified existing
+authority does revoke custody. This distinction preserves the independent third
+person and never turns an ambiguous hypothesis into a positive association.
+
+## Each WebSocket connection serializes its legacy drain waiter — 2026-10-16
+
+The installed legacy WebSocket protocol has one drain waiter. Canonical batches,
+stats, direct floorplan responses, ICE and protocol control frames must not enter
+that waiter concurrently. Use distinct per-connection application-send and drain
+locks, with send-to-drain lock order; retain the existing outer canonical batch
+ordering and all capacity and timeout limits. Independent clients remain isolated.
+
+A failed delivery must remove publication registration AND terminally close the
+connection so the existing browser reconnect path can run. Bound close, abort
+and cancellation cleanup by the existing close/abort deadline; if a resistant
+close cannot quiesce, retain task ownership and report failure explicitly. Never
+report an open but unregistered socket as a healthy connected client. Actual
+errors retain their classification and include exception type and representation.
+Focused installed-protocol checks and R58's clean occupied native/dashboard
+integration passed. Remaining physical tracking gaps are separate and unresolved.
+
+## Calibration identity is computed from owned immutable evidence — 2026-10-16
+
+The depth-registration entry is a frozen value and must also own its nested JSON
+evidence. A caller's dictionary or serialized output must not change a loaded
+entry's calibration identity. Construct the recursive immutable snapshot only
+after the existing plain-JSON shape checks, compute the exact existing identity
+once, and return detached ordinary JSON at serialization boundaries. Replacement
+constructs a new entry and recomputes its identity. Do not cache an identity over
+caller-owned mutable mappings or weaken any calibration/content-binding check.
+
+The isolated implementation preserves all three existing artifact IDs, mapping
+results and serialized payloads; it removes repeated approximately1.4ms property
+hashes from the per-person path. This is a microbenchmark and contract result,
+not an occupied FPS or tracking-accuracy claim. Active-checkout port and native
+loading succeeded; the subsequent R52 replay failed on an unrelated split-episode
+recapture bug. Occupied end-to-end acceptance remains pending.
+
+## Calibration authority reads share one current generation — 2026-10-16
+
+All-camera spatial-authority reads use one current intrinsics generation under
+the calibration manager lock rather than polling separately for every camera.
+Each preparation and commit still performs its own current read; this is not a
+cross-transaction cache or permission to freeze calibration reloads. Missing or
+changed inputs invalidate the snapshot generation before any camera is returned.
+The single-camera API, read-only matrices, frame hashes and mismatch refusals
+remain unchanged. Focused reload/concurrency and call-count checks are complete;
+occupied end-to-end acceptance is still pending.
+
+## Same-join diagnostics remain immutable until the observer boundary — 2026-10-16
+
+The ordered image-region actor retains one immutable diagnostic snapshot from
+the exact completed join: the existing bounded encoded history and scalar
+envelope, never a live owner reference to query later. Full detached JSON,
+detail budgeting and defensive bridge validation are materialized at the
+diagnostic boundary rather than copied on every tracking step. Existing public
+diagnostic output and injected-accessor failure behavior remain unchanged.
+This moves optional copying, not decisions, grants or measurement work. The
+actual captured diagnostic envelope is equivalent; isolated timing improvements
+do not establish occupied native throughput or continuous person tracking.
+
+Private World diagnostics separately retain bounded exact-original nonvote
+reasons and the first committed HELD omission before its wire deadline. Raw
+quality, owner eligibility, selection and actual transaction outcome remain
+distinct. The last executed fusion branch is not a complete ownership-cause
+explanation; transient custody replacement must not be reported as proof of
+lease expiry. One size-bounded close report performs no per-frame I/O, and
+observer failures cannot change preparation, commit or real refusals.
+
+## Repeated projective camera algebra reuses exact immutable inputs — 2026-10-16
+
+The image-region association task computes the same camera fundamental matrices
+multiple times per cohort. Reuse the unchanged rank/minor/normalization result
+through a bounded16-entry cache keyed by every exact immutable projection value,
+scalar type and signed-zero representation. No camera label or artifact hash
+alone is a key. Mutable, malformed and nonfinite direct calls retain the original
+arithmetic and failure behavior; normal policy validation remains mandatory.
+
+This is computation reuse, not a new geometry, overlap, identity or measurement
+grant. Configured projection outputs are byte-equivalent; isolated warm calls
+are faster, but occupied publication backlog and tracking still require native
+verification. Queue, cadence, confidence, currentness and expiry are unchanged.
+
+Diagnose remaining publication backlog on the actual ordered worker. Its explicit
+task-only sampler is off by default and retains bounded scalar code locations,
+not frames, locals, images or tensors. It emits one size-bounded report after
+the actor closes. Sampled wall locations and inclusive stage timings are not CPU
+shares or final performance acceptance; verify the repaired path uninstrumented.
+
+## Small-person pose eligibility follows the SDK crop floor — 2026-10-15
+
+The selected M960 baseline's independent YOLO26n pose SGIE accepts original
+object ROIs from 16×16 pixels instead of the former 64×64 person-size exclusion.
+Installed DeepStream 9.1 clamps generic crops to at least 1 pixel and explicitly
+uses 16×16 for its NVGPU/default-or-VIC branch; 16 is the conservative SDK crop
+floor chosen here, not a pose-confidence or physical-localization threshold.
+The existing conversion still rounds crop dimensions to even pixels and applies
+the same 640×640 aspect-preserving symmetric letterbox. Do not expand or retag
+the original detector/tracker rectangle to manufacture eligibility or keypoints.
+
+Preserve the nano engine, FP16/batch3/UID4/network-type100, score0.25, joint0.35,
+preprocessing and enabled outputs. The retained reinfer value8 does not throttle
+network-type100 in the installed SDK; eligible objects are inferred each frame.
+More eligible small objects add real pose workload, requiring occupied native
+coverage and source/media progression checks rather than an assumed free budget.
+
+A recorded 35-second R5 exercised the actual materialized16×16 configuration:
+the small Kitchen child had pose in220/337 rows versus0 in the preceding R4.
+Its32.5×75px10-second observation had current pose, but one ankle scored0.417
+and the other0.267; pose was absent at15 seconds. This proves improved eligibility
+and observed pose coverage, not universally valid ankles, pose accuracy, geometry
+admission, cross-camera association or one-dot/best-view acceptance. Existing
+confidence, freshness and geometry gates still decide usable support. No new
+recording is a prerequisite to correcting this source/configuration exclusion.
+Remaining absent poses are not attributed to model confidence: R5 also recorded
+507 feature-extraction budget skips and201 anchor-extraction budget skips across
+the pipeline, not specifically this child. Keep bounded extraction and parse
+absence distinct from inference eligibility. Last reported source FPS was about
+14 versus about16 in R4; these are not matched GPU/media throughput acceptance
+or evidence of spare capacity.
+
+See the [selected pose INI](../DS9/pipelines/config_infer_secondary_yolo26_pose_n_test.ini)
+and [standalone baseline/materializer regression](../DS9/tests/test_yolo26_pose_roi_config.py).
 
 ## Partial-body localization uses observed anatomy, not hidden feet — 2026-10-09
 
@@ -2682,3 +3040,24 @@ Exact host paths, native model catalog, observed session bindings, transport
 adaptation, disposable acceptance evidence, readiness and rollback are recorded
 in `TEAM_ROOT/install-report.md`. Configuration files alone do not establish
 automatic continuation, attachment continuity or host-loss recovery.
+
+## 2026-10-12 — Ceiling-specific PCF presentation restoration
+
+Replace the whole-home overlay's blanket height cutaway with frozen,
+source-reviewed ceiling selection and distinct-view RGB-D-qualified upper
+extensions. The [offline extension workflow](../tools/mapanything_phone_scan/README.md#restore-supported-upper-surfaces-without-a-height-crop-offline)
+preserves the currently published lower mesh and photo buffers, all room/source
+bindings, and existing calibration/registration authority. Heights nominate work
+regions; they never remove upper walls or impose a new upper limit.
+
+Semantic admission binds exact classification and seed-geometry hashes, not
+unstable discovery ordinals. Ceiling-oriented triangles are checked as well as
+source points to prevent unsupported Poisson closure. Source-reviewed timber
+beam/soffit regions and vertical junctions are conservatively protected.
+Ambiguous ceiling fragments remain, including the current Kitchen candidates.
+Menon renders verified finite geometry without another height crop and applies
+each existing room-to-authored-scene transform exactly once.
+
+This changes presentation only: it neither invents geometry nor admits a new
+canonical world measurement, registration, identity or tracking constraint.
+Existing lower-room quality and physical-qualification limitations remain.

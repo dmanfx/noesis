@@ -7,6 +7,7 @@ type MosaicCropCanvasProps = {
   mosaicLayout?: MosaicLayoutLike | null;
   videoRef?: React.RefObject<HTMLVideoElement>;
   className?: string;
+  active?: boolean;
 };
 
 export const MosaicCropCanvas: React.FC<MosaicCropCanvasProps> = ({
@@ -14,13 +15,14 @@ export const MosaicCropCanvas: React.FC<MosaicCropCanvasProps> = ({
   mosaicLayout,
   videoRef,
   className,
+  active = true,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const video = videoRef?.current;
-    if (!canvas || !video) return;
+    if (!canvas || !video || !active) return;
 
     let frameId = 0;
     let stopped = false;
@@ -28,7 +30,7 @@ export const MosaicCropCanvas: React.FC<MosaicCropCanvasProps> = ({
     const draw = () => {
       if (stopped) return;
       const ctx = canvas.getContext('2d');
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2, 4096 / Math.max(1, canvas.clientWidth, canvas.clientHeight));
       const targetW = Math.max(1, Math.floor(canvas.clientWidth * dpr));
       const targetH = Math.max(1, Math.floor(canvas.clientHeight * dpr));
       if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -68,7 +70,7 @@ export const MosaicCropCanvas: React.FC<MosaicCropCanvasProps> = ({
       stopped = true;
       if (frameId) window.cancelAnimationFrame(frameId);
     };
-  }, [camera, mosaicLayout, videoRef]);
+  }, [camera, mosaicLayout, videoRef, active]);
 
   return (
     <canvas

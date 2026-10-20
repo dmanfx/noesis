@@ -1,0 +1,52 @@
+.shell--spatial .main { grid-template-columns: minmax(0, 1fr) 280px; }
+.spatial-dashboard { container: spatial / inline-size; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.spatial-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 2px 12px; flex-wrap: wrap; }
+.spatial-toolbar > div { display: flex; gap: 6px; }
+.spatial-mosaic-source { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.spatial-dashboard .unified-bev-card { flex: 1; min-height: 0; margin: 0; display: flex; flex-direction: column; padding: 14px; }
+.spatial-dashboard .unified-bev-canvas-wrap { flex: 1; min-height: var(--spatial-stage-min-height, 590px); height: auto; overflow: hidden; background: radial-gradient(circle, #2a334055 1px, transparent 1px) 0 0 / 24px 24px, #0b1118; }
+.spatial-dashboard .unified-bev-canvas-wrap > canvas { position: absolute; left: 23%; top: 8%; width: 54%; height: 84%; }
+.spatial-overlays { position: absolute; inset: 0; pointer-events: none; }
+.spatial-connectors { position: absolute; width: 100%; height: 100%; overflow: visible; }
+.spatial-connectors line { stroke: var(--accent); stroke-width: 1; opacity: .4; }
+.spatial-connectors circle { fill: var(--accent); opacity: .6; }
+.spatial-connectors text { fill: var(--text); font: 12px system-ui; paint-order: stroke; stroke: #0b1118; stroke-width: 4px; }
+.spatial-connectors .is-highlighted line { opacity: 1; stroke-width: 2; }
+.spatial-camera { position: absolute; pointer-events: auto; z-index: 2; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: 0 12px 36px #0006; overflow: hidden; max-width: 100%; }
+.spatial-overlays .spatial-camera[hidden] { display: none; }
+.spatial-camera:hover, .spatial-camera:focus-within { border-color: var(--accent); z-index: 3; }
+.spatial-camera header { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 9px; cursor: grab; touch-action: none; user-select: none; }
+.spatial-camera-title { font-size: 12px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.spatial-camera-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.spatial-camera-actions .btn { padding: 6px; font-size: 11px; min-height: 30px; }
+.spatial-camera-actions .fullscreen-corners { display: block; width: 14px; height: 14px; }
+.spatial-camera-media { position: relative; background: #020509; aspect-ratio: 16 / 9; }
+.spatial-camera-video { display: block; width: 100%; height: 100%; }
+.spatial-video-status { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
+.spatial-camera footer { padding: 8px 10px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px; color: var(--muted); font-size: 11px; }
+.spatial-scrim { pointer-events: auto; position: absolute; inset: 0; z-index: 5; border: 0; background: #0008; }
+.spatial-camera.spatial-camera--expanded { z-index: 6; left: 10% !important; top: 7% !important; width: 80% !important; max-height: 90%; display: flex; flex-direction: column; }
+.spatial-camera--expanded .spatial-camera-media { flex: 1; min-height: 0; }
+.spatial-camera:fullscreen { inset: 0 !important; width: 100% !important; height: 100% !important; max-height: none; border: 0; border-radius: 0; display: flex; flex-direction: column; background: #020509; }
+.spatial-camera:fullscreen .spatial-camera-media { flex: 1; min-height: 0; aspect-ratio: auto; }
+.spatial-camera:fullscreen header { cursor: default; }
+.spatial-notice { padding: 8px; font-size: 12px; color: var(--warn); }
+@media (max-width: 1200px) { .shell--spatial .main { grid-template-columns: minmax(0, 1fr); overflow-y: auto; } .shell--spatial .side { grid-template-columns: repeat(2,minmax(0,1fr)); height: auto; overflow: visible; } }
+@media (max-width: 760px) {
+  .shell--spatial { grid-template-rows: auto 1fr auto; } .shell--spatial .topbar { flex-wrap: wrap; } .shell--spatial .main { padding: 8px; }
+  .spatial-dashboard .unified-bev-canvas-wrap { flex: none; min-height: 0; height: auto; overflow: visible; }
+  .spatial-dashboard .unified-bev-canvas-wrap > canvas { position: relative; inset: auto; width: 100%; height: 400px; }
+  .spatial-overlays { position: relative; padding: 12px; display: grid; gap: 12px; }
+  .spatial-connectors { display: none; }
+  .spatial-camera { position: relative; inset: auto !important; width: 100% !important; }
+  .spatial-camera.spatial-camera--expanded { position: relative; inset: auto !important; width: 100% !important; max-height: none; }
+  .spatial-scrim { display: none; } .shell--spatial .side { grid-template-columns: minmax(0,1fr); }
+}
+@container spatial (max-width: 720px) {
+  .unified-bev-canvas-wrap { flex: none !important; min-height: 0 !important; height: auto !important; overflow: visible !important; }
+  .unified-bev-canvas-wrap > canvas { position: relative !important; inset: auto !important; width: 100% !important; height: 400px !important; }
+  .spatial-overlays { position: relative; padding: 12px; display: grid; gap: 12px; }
+  .spatial-connectors { display: none; }
+  .spatial-camera, .spatial-camera.spatial-camera--expanded { position: relative; inset: auto !important; width: 100% !important; max-height: none; }
+  .spatial-scrim { display: none; }
+}

@@ -2,10 +2,14 @@ import type { UnifiedBevState, UnifiedBevMap, UnifiedBevPerson, UnifiedBevTrailP
 import type { BevTrailConfig } from './bevTrails';
 export const UNIFIED_BEV_AUTHORED_SCENE_SHA256: string;
 export type UnifiedBevRasterLayer = Readonly<{ grid_b64: string; grid_shape: readonly number[]; grid_encoding?: string }>;
+export type UnifiedBevRgbLayer = Readonly<{ rgb_b64: string; rgb_shape: readonly number[]; rgb_encoding?: string;
+  observed_b64: string; observed_encoding?: string }>;
+export type UnifiedBevRaster = Readonly<{ cameraId: string; mapId: string; snapshotContentSha256: string;
+  layer: UnifiedBevRasterLayer | null; heightLayer: UnifiedBevRasterLayer | null;
+  mask: UnifiedBevRasterLayer | null; surfaceRgb: UnifiedBevRgbLayer | null }>;
 export type UnifiedBevDisplayState = Readonly<{
   world: UnifiedBevState; hasSnapshot: boolean;
-  rasters: readonly Readonly<{ cameraId: string; mapId: string; snapshotContentSha256: string;
-    layer: UnifiedBevRasterLayer; mask: UnifiedBevRasterLayer }>[];
+  rasters: readonly UnifiedBevRaster[];
 }>;
 export type UnifiedBevViewport = Readonly<{ minX: number; maxX: number; minZ: number; maxZ: number; scale: number;
   point: (position: Vec3) => [number, number] }>;

@@ -21,21 +21,48 @@ export function createUnifiedBevDisplayState() {
 }
 
 function rasterFor(message, map) {
-  // Retain only the static PCF layers from the very message admitted as this map.
-  const layer = message.scene_prior_diagnostic_obstacle_height ?? message.scene_prior_diagnostic_height_agl;
-  const mask = message.scene_prior_diagnostic_observed;
+  // Every field is from this exact admitted envelope; a missing optional layer
+  // never borrows data from an earlier map or another camera. Maps are bounded
+  // by the world consumer (32 cameras, at most 4,194,304 cells per map).
+  if (message.scene_prior_diagnostic_meta?.raster_encoding_version !== undefined
+    && message.scene_prior_diagnostic_meta.raster_encoding_version !== 1) return null;
   const matches = (v) => typeof v?.grid_b64 === 'string'
     && Array.isArray(v.grid_shape) && v.grid_shape.length === 2
     && v.grid_shape.every((n, i) => n === map.gridShape[i]) && rasterLengthMatches(v, map.gridShape[0] * map.gridShape[1]);
-  if (!matches(layer) || !matches(mask)) return null;
-  const compact = (v) => Object.freeze({ grid_b64: v.grid_b64,
-    grid_shape: Object.freeze([...v.grid_shape]), grid_encoding: v.grid_encoding });
+  const compacted = new Map();
+  const compact = (v, continuous = false) => {
+    if (!matches(v) || (continuous && (v.grid_b64.startsWith('bit:') || v.grid_b64.startsWith('u8:')))) return null;
+    if (!compacted.has(v)) compacted.set(v, Object.freeze({ grid_b64: v.grid_b64,
+      grid_shape: Object.freeze([...v.grid_shape]), grid_encoding: v.grid_encoding }));
+    return compacted.get(v);
+  };
+  const layer = compact(message.scene_prior_diagnostic_obstacle_height ?? message.scene_prior_diagnostic_height_agl, true);
+  const heightLayer = compact(message.scene_prior_diagnostic_height_agl, true);
+  const mask = compact(message.scene_prior_diagnostic_observed);
+  const rgb = message.scene_prior_diagnostic_surface_rgb;
+  const cells = map.gridShape[0] * map.gridShape[1];
+  const surfaceRgb = Array.isArray(rgb?.rgb_shape) && rgb.rgb_shape.length === 3 && rgb.rgb_shape[2] === 3
+    && rgb.rgb_shape[0] === map.gridShape[0] && rgb.rgb_shape[1] === map.gridShape[1]
+    && (rgb.rgb_encoding === undefined || rgb.rgb_encoding === 'rgb-u8-base64')
+    && base64LengthMatches(rgb.rgb_b64, cells * 3)
+    && rasterLengthMatches({ grid_b64: rgb.observed_b64, grid_encoding: rgb.observed_encoding }, cells)
+    ? Object.freeze({ rgb_b64: rgb.rgb_b64, rgb_shape: Object.freeze([...rgb.rgb_shape]),
+      rgb_encoding: rgb.rgb_encoding, observed_b64: rgb.observed_b64, observed_encoding: rgb.observed_encoding }) : null;
+  if ((!layer || !mask) && (!heightLayer || !mask) && !surfaceRgb) return null;
   return Object.freeze({ cameraId: map.cameraId, mapId: map.mapId,
-    snapshotContentSha256: map.snapshotContentSha256, layer: compact(layer), mask: compact(mask) });
+    snapshotContentSha256: map.snapshotContentSha256, layer, heightLayer, mask, surfaceRgb });
+}
+
+function base64LengthMatches(encoded, bytes) {
+  if (typeof encoded !== 'string' || encoded.length !== 4 * Math.ceil(bytes / 3)
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return false;
+  const padding = (3 - bytes % 3) % 3;
+  return (encoded.length - encoded.replace(/=+$/, '').length) === padding;
 }
 
 function rasterLengthMatches(layer, cells) {
   const encoded = layer.grid_b64;
+  if (typeof encoded !== 'string') return false;
   let encoding = 'f32-le-base64'; let prefix = 0; let bytes = cells * 4;
   if (encoded.startsWith('f16:')) { encoding = 'f16-le-base64'; prefix = 4; bytes = cells * 2; }
   else if (encoded.startsWith('u8:')) { encoding = 'u8-base64'; prefix = 3; bytes = cells; }
@@ -44,8 +71,7 @@ function rasterLengthMatches(layer, cells) {
     if (prefix <= 4 || Number(encoded.slice(4, prefix - 1)) !== cells) return false;
   }
   return (layer.grid_encoding === undefined || layer.grid_encoding === encoding)
-    && encoded.length - prefix === 4 * Math.ceil(bytes / 3)
-    && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded.slice(prefix));
+    && base64LengthMatches(encoded.slice(prefix), bytes);
 }
 
 /** Owns synchronous ingress and one expiry timer; rendering never renews a clock. */

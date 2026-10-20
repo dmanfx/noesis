@@ -198,6 +198,39 @@ test('only exact admitted map identity retains a bounded raster; tracking does n
   assert.equal(noImage.world.maps.length, 1); assert.equal(noImage.rasters.length, 0);
 });
 
+test('optional AGL and RGB are retained only with the admitted geometry and their own validated encodings', () => {
+  const h = harness(); const complete = clone(map);
+  complete.scene_prior_diagnostic_obstacle_height = clone(map.scene_prior_diagnostic_height_agl);
+  complete.scene_prior_diagnostic_surface_rgb = {
+    rgb_b64: Buffer.from([255, 0, 0, 0, 255, 0, 0, 0, 255, 80, 90, 100]).toString('base64'),
+    rgb_shape: [2, 2, 3], rgb_encoding: 'rgb-u8-base64',
+    observed_b64: 'bit:4:oA==', observed_encoding: 'bitpack-msb-base64',
+  };
+  const first = h.consumer.receive(complete, 1000);
+  assert.equal(first.rasters.length, 1);
+  assert.equal(first.rasters[0].heightLayer.grid_b64, complete.scene_prior_diagnostic_height_agl.grid_b64);
+  assert.deepEqual(first.rasters[0].surfaceRgb.rgb_shape, [2, 2, 3]);
+  const malformed = clone(complete);
+  malformed.scene_prior_diagnostic_height_agl.grid_b64 = 'AAAA';
+  malformed.scene_prior_diagnostic_surface_rgb.observed_b64 = 'bit:4:oAAA';
+  const partial = h.consumer.receive(malformed, 1001).rasters[0];
+  assert.ok(partial.layer); assert.equal(partial.heightLayer, null); assert.equal(partial.surfaceRgb, null);
+  const missing = h.consumer.receive(clone(map), 1002).rasters[0];
+  assert.equal(missing.surfaceRgb, null, 'the prior envelope cannot supply missing texture');
+  assert.equal(missing.layer, missing.heightLayer, 'one compact object when structure uses AGL');
+  const wrongShape = clone(complete); wrongShape.scene_prior_diagnostic_surface_rgb.rgb_shape = [1, 4, 3];
+  assert.equal(h.consumer.receive(wrongShape, 1003).rasters[0].surfaceRgb, null);
+  const wrongEncoding = clone(complete); wrongEncoding.scene_prior_diagnostic_surface_rgb.rgb_encoding = 'rgb-f32-base64';
+  assert.equal(h.consumer.receive(wrongEncoding, 1004).rasters[0].surfaceRgb, null);
+});
+
+test('malformed base64 padding and unknown typed encodings never enter the retained raster set', () => {
+  for (const grid_b64 of ['bit:4:oAAA', 'bit:5:oA==', 'f64:AAAAAAAA', 'bit:4:====']) {
+    const h = harness(); const invalid = clone(map); invalid.scene_prior_diagnostic_observed.grid_b64 = grid_b64;
+    assert.equal(h.consumer.receive(invalid, 1000).rasters.length, 0, grid_b64);
+  }
+});
+
 test('fitted person and map use the same scene plane; raster row orientation is preserved exactly', () => {
   const h = harness(); h.consumer.receive(clone(map), 1000); h.consumer.receive(envelope(snapshot()), 1000);
   const { world } = h.consumer.getSnapshot(); const viewport = fitUnifiedBevViewport(world, 500, 300);

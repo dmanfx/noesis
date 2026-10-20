@@ -8,8 +8,12 @@ type CameraTables = {
 
 type CalBundle = { cameras?: CameraTables };
 
-type CameraFrameBinding = {
+export type CameraFrameBinding = {
   target_from_calibration_col_major?: number[];
+  contract?: string;
+  world_frame?: { frame_id: string; revision: string };
+  transform_sha256?: string;
+  scene_prior_id?: string;
 };
 
 let bundle: CalBundle = {};
@@ -63,6 +67,13 @@ export function getExtrinsicsAny(idOrKey: string): number[] | null {
   const eTable = asRecord<number[]>(cams.E);
   if (eTable && Array.isArray(eTable[idOrKey])) return eTable[idOrKey] as number[];
   return null;
+}
+
+/** Exact optical calibration; image dimensions come from the matching mux layout. */
+export function getCameraProjectionInput(camera: string) {
+  const key = detectCameraKey(camera);
+  if (!key) return null;
+  return { intrinsics: getIntrinsicsAny(camera), extrinsics: getExtrinsicsAny(camera), binding: getFrameBinding(key) };
 }
 
 // Extract camera pose in world from E (world→camera) column-major 4x4.

@@ -1,0 +1,11 @@
+.choice-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 9px; min-width: 0; max-width: 100%; }
+.choice-strip__label { color: var(--muted); font-size: 11px; font-weight: 500; white-space: nowrap; }
+.choice-strip__options { display: inline-flex; align-items: center; flex-wrap: wrap; min-width: 0; max-width: 100%; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 9px; background: var(--control-bg); }
+.choice-strip__options button { min-width: 0; max-width: 100%; min-height: 29px; padding: 5px 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.3; overflow-wrap: anywhere; cursor: pointer; transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease, box-shadow 150ms ease; }
+.choice-strip__options button:hover { color: var(--text); background: var(--hover-bg); }
+.choice-strip__options button.is-selected { color: var(--selected-text); background: var(--selected-bg); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); box-shadow: 0 1px 3px #0002; }
+.choice-strip__options button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
+.choice-strip--compact .choice-strip__label { display: none; }
+.choice-strip--compact .choice-strip__options { padding: 2px; border-radius: 7px; }
+.choice-strip--compact .choice-strip__options button { min-height: 26px; padding: 4px 8px; border-radius: 4px; font-size: 11px; }
+@media (prefers-reduced-motion: reduce) { .choice-strip__options button { transition: none; } }

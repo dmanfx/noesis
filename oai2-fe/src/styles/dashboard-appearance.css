@@ -1,0 +1,82 @@
+:root { color-scheme: dark; --control-bg: #111821; --selected-bg: #213347; --selected-text: #eef7ff; --hover-bg: #1b2430; --canvas-bg: #0b1118; --canvas-grid: #2a334055; --bev-label-background: #081018; --bev-label-text: #e4eef6; --bev-held-fill: #0b1118; --bev-map-outline: #849eb4; }
+:root[data-dashboard-theme="light"] {
+  color-scheme: light; --bg: #edf1f5; --bg-soft: #e5ebf1; --bg-raised: #fff; --panel: #fff; --panel-2: #f2f6fa;
+  --border: #b9c6d3; --muted: #526274; --text: #16273a; --text-2: #243d59; --accent: #0864a9; --accent-2: #6d37a9;
+  --good: #15783c; --warn: #875900; --bad: #b42530; --control-bg: #f4f7fa; --selected-bg: #d7e8f7; --selected-text: #123d60;
+  --hover-bg: #e6eef5; --canvas-bg: #e1e9f0; --canvas-grid: #9aabbd66; --shadow: 0 10px 30px #18354f20;
+  --bev-label-background: #f8fafc; --bev-label-text: #142d43; --bev-held-fill: #e1e9f0; --bev-map-outline: #476481;
+}
+:root[data-dashboard-theme="contrast"] {
+  color-scheme: dark; --bg: #000; --bg-soft: #080808; --bg-raised: #111; --panel: #090909; --panel-2: #151515;
+  --border: #b4b4b4; --muted: #e3e3e3; --text: #fff; --text-2: #fff; --accent: #66e4ff; --accent-2: #e7aaff;
+  --control-bg: #000; --selected-bg: #204b56; --selected-text: #fff; --hover-bg: #222; --canvas-bg: #000; --canvas-grid: #ffffff33;
+  --bev-label-background: #000; --bev-label-text: #fff; --bev-held-fill: #000; --bev-map-outline: #fff;
+}
+html, body { background: var(--bg); color: var(--text); }
+.btn, select, input:not([type="checkbox"]):not([type="range"]), textarea { background: var(--control-bg); color: var(--text); border-color: var(--border); }
+.btn.ghost { background: transparent; }
+.btn.primary { background: var(--selected-bg); color: var(--selected-text); border-color: var(--accent); }
+.chip, .pill, .panel, .context-inspector, .depth-workspace.depth-drawer { background: var(--panel); color: var(--text); }
+.dashboard-viewbar__views, .inspector-tracks article, .inspector-rooms button, .inspector-count, .context-inspector select { background: var(--control-bg); color: var(--text); border-color: var(--border); }
+.dashboard-viewbar__views button:hover { background: var(--hover-bg); color: var(--text); }
+.dashboard-viewbar__views button.is-active, .dashboard-inspector-toggle.is-active { background: var(--selected-bg); color: var(--selected-text); border-color: var(--accent); }
+.dashboard-viewbar__context select { background: var(--control-bg); }
+.inspector-home, .inspector-disclosure summary, .depth-workspace .tabs button.active, .spatial-camera--selected .spatial-camera-select { color: var(--accent); }
+.inspector-disclosure .card, .inspector-tracks article, .inspector-rooms button { border-color: var(--border); }
+.spatial-dashboard .unified-bev-canvas-wrap { background: radial-gradient(circle, var(--canvas-grid) 1px, transparent 1px) 0 0 / 24px 24px, var(--canvas-bg); }
+.spatial-connectors text { fill: var(--text); stroke: var(--canvas-bg); }
+.unified-bev-legend { display: flex; gap: 8px 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 0 0 8px; order: 1; }
+.spatial-dashboard .unified-bev-canvas-wrap { order: 2; }
+.spatial-dashboard .unified-bev-caption { order: 3; }
+.unified-bev-legend-gradient { display: inline-block; align-self: center; width: 110px; height: 9px; border-radius: 2px; }
+.unified-bev-legend i { display: inline-block; width: 8px; height: 8px; margin-left: 6px; border-radius: 2px; }
+.unified-bev-layer-unavailable { margin: 0 0 8px; padding-left: 18px; color: var(--muted); font-size: 12px; order: 1; }
+.presentation-toolbar { display: flex; gap: 10px 18px; flex-wrap: wrap; align-items: center; position: relative; z-index: 8; }
+.presentation-toolbar label { display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: 12px; }
+.presentation-toolbar select, .presentation-options select, .context-inspector select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; min-width: 0; }
+.presentation-toolbar .btn, .presentation-layer-menu summary { font-size: 12px; padding: 6px 9px; }
+.presentation-layer-menu { position: static; }
+.presentation-layer-menu summary { cursor: pointer; border: 1px solid var(--border); border-radius: 7px; background: var(--control-bg); color: var(--muted); transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease; }
+.presentation-layer-menu summary:hover, .presentation-layer-menu[open] summary { background: var(--hover-bg); color: var(--text); }
+.presentation-layer-options { position: absolute; right: 0; top: calc(100% + 8px); width: min(350px, 100%); z-index: 12; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); }
+.presentation-layer-menu .presentation-layer-options { width: 350px; max-width: calc(100vw - 32px); }
+.presentation-style-group, .presentation-camera-group { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
+.presentation-current-style { max-width: 180px; color: var(--muted); font-size: 11px; padding: 4px 7px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.presentation-style-manager { display: grid; gap: 12px; margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border); }
+.presentation-style-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.presentation-options { display: grid; gap: 14px; }
+.presentation-options label, .context-inspector .inspector-section > label { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; font-size: 12px; color: var(--text); }
+.presentation-options input[type="range"] { width: 100%; accent-color: var(--accent); }
+.presentation-overlay-toggles { display: flex; flex-wrap: wrap; gap: 10px 14px; }
+.presentation-overlay-toggles input { accent-color: var(--accent); }
+.presentation-save { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.presentation-save input { min-width: 100px; max-width: 220px; border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+.presentation-notice { margin: 0; color: var(--warn); font-size: 12px; }
+.spatial-camera-mode { padding: 0 9px 8px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 8px; min-height: 36px; }
+.spatial-camera-mode .btn { font-size: 11px; padding: 4px 6px; }
+.snapshot-load-state { color: var(--muted); font-size: 10px; line-height: 1.3; }
+.snapshot-retry { white-space: nowrap; }
+.spatial-camera-media--snapshot > .spatial-camera-video { visibility: hidden; }
+.spatial-video-status { color: #b9c6d3; }
+.settings-fab { background: var(--control-bg); color: var(--text); border-color: var(--border); }
+.spatial-camera-media--snapshot > :not(.spatial-camera-video) { position: absolute; inset: 0; }
+.spatial-camera--expanded .spatial-camera-media, .spatial-camera:fullscreen .spatial-camera-media { min-height: 180px; }
+:root:not([data-dashboard-theme="dark"]) .depth-drawer:not(.depth-workspace),
+:root:not([data-dashboard-theme="dark"]) .depth-drawer .content,
+:root:not([data-dashboard-theme="dark"]) .depth-drawer .drawer-toolbar,
+:root:not([data-dashboard-theme="dark"]) .depth-drawer header,
+:root:not([data-dashboard-theme="dark"]) .depth-drawer .tabs,
+:root:not([data-dashboard-theme="dark"]) .settings-panel,
+:root:not([data-dashboard-theme="dark"]) .roi-drawer,
+:root:not([data-dashboard-theme="dark"]) .household-drawer { background-color: var(--panel); color: var(--text); border-color: var(--border); }
+:root:not([data-dashboard-theme="dark"]) .depth-drawer .heatmap-cell__title,
+:root:not([data-dashboard-theme="dark"]) .depth-drawer h2,
+:root:not([data-dashboard-theme="dark"]) .depth-drawer h3 { color: var(--text); }
+@media(max-width:760px) {
+  .presentation-toolbar { gap: 8px 12px; }
+  .presentation-toolbar > .choice-strip, .presentation-style-group { flex: 1 1 260px; }
+  .presentation-toolbar .choice-strip { justify-content: space-between; }
+  .presentation-layer-menu .presentation-layer-options { position: static; width: 100%; max-width: none; margin-top: 8px; }
+  .presentation-layer-menu[open] { width: 100%; }
+}
+@media(prefers-reduced-motion:reduce) { .presentation-layer-menu summary { transition: none; } }

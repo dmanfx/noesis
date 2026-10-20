@@ -1,5 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { StreamPanel } from './components/StreamPanel';
+import { SpatialDashboard } from './components/SpatialDashboard';
+import { DashboardViewBar, type DashboardView, type ActiveDashboardView } from './components/DashboardViewBar';
+import { ContextInspector } from './components/ContextInspector';
+import { PresentationControls, PresentationLayerOptions, CameraDisplayControls } from './components/PresentationControls';
+import { PRESENTATION_STORAGE_KEY, sanitizePresentationSettings, sanitizeSavedPresets,
+  applyPresentationPreset, type PresentationSettings, type SavedPresentationPreset, type CameraDisplayMode } from './lib/dashboardPresentation.js';
 // MapPanel moved into a drawer
 // import { MapPanel } from './components/MapPanel';
 import { ControlsPanel } from './components/ControlsPanel';
@@ -12,12 +17,9 @@ import { getExtrinsics, getIntrinsics4, getIntrinsicsAny, extractPoseFromExtrins
 import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
 import { useWebSocketClient, StatsPayload, MosaicLayout, type DepthRequestStrategy } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
-import { StreamMode } from './components/StreamPanel';
-import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
-import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
-import { UnifiedBevView } from './components/UnifiedBevView';
+import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse, type DepthDrawerViewRequest, type DepthDrawerTab } from './components/DepthDrawer';
+import { type BevMeta, type BevFrameMode } from './components/BevView';
 import { createUnifiedBevConsumer, createUnifiedBevDisplayState } from './lib/unifiedBevConsumer.js';
-import { MosaicCropCanvas } from './components/MosaicCropCanvas';
 import type { BevTrailConfig } from './lib/bevTrails';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
 import { HouseholdIdentityDrawer } from './components/HouseholdIdentityDrawer';
@@ -46,12 +48,9 @@ import { requestLocalizationDetailsChange } from './lib/bevResolverDiagnostics';
 
 const WS_URL = noesisWebSocketUrl();
 const REST_URL = NOESIS_REST_BASE;
-const streamDisplayCams: CameraKey[] = ['living-room'];
 const DEPTH_PANEL_FLOORPLAN_TIMEOUT_MS = 150_000;
 const DEPTH_PANEL_DEPTH_TIMEOUT_MS = 150_000;
 const DEPTH_PANEL_EXACT_RETRY_MS = 250;
-
-type ExpandedView = { kind: 'mosaic' } | { kind: 'camera'; camera: CameraKey };
 
 type DepthPanelRefreshEntry = {
   status: 'idle' | 'capturing-floorplan' | 'loading-depth' | 'error';
@@ -125,6 +124,27 @@ const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<strin
 
 function Dashboard() {
   const { publish } = useTelemetry();
+  const [initialAppearance] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(PRESENTATION_STORAGE_KEY) || '{}'); } catch { return {}; }
+  });
+  const [presentation, setPresentation] = useState<PresentationSettings>(() => sanitizePresentationSettings(initialAppearance?.settings));
+  const [savedStyles, setSavedStyles] = useState<SavedPresentationPreset[]>(() => sanitizeSavedPresets(initialAppearance?.presets));
+  const [styleId, setStyleId] = useState<string>(() => ['monitor', 'geometry', 'surface', 'custom', ...savedStyles.map(p => p.id)].includes(initialAppearance?.presetId) ? initialAppearance.presetId : 'monitor');
+  const [styleNotice, setStyleNotice] = useState('');
+  useEffect(() => { document.documentElement.dataset.dashboardTheme = presentation.theme; }, [presentation.theme]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try { localStorage.setItem(PRESENTATION_STORAGE_KEY, JSON.stringify({ settings: presentation, presets: savedStyles, presetId: styleId })); }
+      catch { setStyleNotice('This browser cannot save display preferences. Changes still work for this session.'); }
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [presentation, savedStyles, styleId]);
+  const changePresentation = useCallback((patch: Partial<PresentationSettings>) => {
+    setPresentation(previous => sanitizePresentationSettings({ ...previous, ...patch })); setStyleId('custom');
+    // Scene controls must affect the visible workspace. Theme alone applies
+    // everywhere and keeps the current workspace open.
+    if (Object.keys(patch).some(key => key !== 'theme')) setDashboardView('overview');
+  }, []);
   const [unifiedBev, setUnifiedBev] = useState(createUnifiedBevDisplayState);
   const [unifiedBevConsumer] = useState(() => createUnifiedBevConsumer({ onChange: setUnifiedBev }));
   useEffect(() => () => unifiedBevConsumer.stop(), [unifiedBevConsumer]);
@@ -153,9 +173,10 @@ function Dashboard() {
     publish({ group: `Camera ${key.replace('-', ' ')}`, key: 'FPS', value: rounded, ts });
   }, [publish]);
 
+  const [mosaicFps, setMosaicFps] = useState<number | null>(null);
   const handleWebrtcFps = useCallback((fpsVal: number) => {
-    streamDisplayCams.forEach((cam) => updateFps(cam, fpsVal));
-  }, [updateFps]);
+    setMosaicFps(Number.isFinite(fpsVal) ? Math.max(0, fpsVal) : null);
+  }, []);
 
   // Occupancy/Tracks (transitions removed)
   const [occupancy, setOccupancy] = useState<string>('');
@@ -232,7 +253,11 @@ function Dashboard() {
   });
 
   const [telemetryOpen, setTelemetryOpen] = useState(false);
-  const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
+  const [dashboardView, setDashboardView] = useState<ActiveDashboardView>('overview');
+  const [depthViewRequest, setDepthViewRequest] = useState<DepthDrawerViewRequest>({ sequence: 0, tab: 'heatmap' });
+  const [selectedRoom, setSelectedRoom] = useState<string>('living-room');
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorContext, setInspectorContext] = useState<'home' | 'room'>('home');
   const [peopleDrawerOpen, setPeopleDrawerOpen] = useState(false);
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
@@ -261,7 +286,6 @@ function Dashboard() {
     'family-room': null
   });
   const [availableCameras, setAvailableCameras] = useState<string[]>([]);
-  const [expandedView, setExpandedView] = useState<ExpandedView | null>(null);
   const [roiDrawerOpen, setRoiDrawerOpen] = useState(false);
   const [mosaicLayout, setMosaicLayout] = useState<MosaicLayout | null>(null);
   const [analyticsReloadCount, setAnalyticsReloadCount] = useState<number>(0);
@@ -384,16 +408,11 @@ function Dashboard() {
     floorplanDataRef.current = floorplanData;
   }, [floorplanData]);
 
-  // Stream mode is fixed to WebRTC (former JPEG toggle removed)
-  const streamMode: StreamMode = 'webrtc';
+  // One WebRTC mosaic supplies every room panel.
   const [webrtcError, setWebrtcError] = useState<string | null>(null);
   const queryFlags = useMemo(() => new URLSearchParams(window.location.search), []);
   const bevDebugEnabled = useMemo(() => {
     const raw = queryFlags.get('bevDebug') ?? queryFlags.get('debugBev') ?? queryFlags.get('bev_debug') ?? '';
-    return raw === '1' || raw.toLowerCase() === 'true';
-  }, [queryFlags]);
-  const showWorldBevRow = useMemo(() => {
-    const raw = queryFlags.get('worldView') ?? queryFlags.get('world_view') ?? '';
     return raw === '1' || raw.toLowerCase() === 'true';
   }, [queryFlags]);
 
@@ -1658,44 +1677,6 @@ function Dashboard() {
     estTime ? <span className="chip mono" title="Current time (US Eastern)">{estTime}</span> : null
   ), [estTime]);
 
-  const expandedCamera = expandedView?.kind === 'camera' ? expandedView.camera : null;
-  const mosaicExpanded = expandedView?.kind === 'mosaic';
-  const anyExpanded = expandedView !== null;
-  const requestAppFullscreen = useCallback(() => {
-    const root = document.documentElement;
-    if (!document.fullscreenElement && root?.requestFullscreen) {
-      root.requestFullscreen().catch(() => undefined);
-    }
-  }, []);
-  const exitAppFullscreen = useCallback(() => {
-    if (document.fullscreenElement && document.exitFullscreen) {
-      document.exitFullscreen().catch(() => undefined);
-    }
-  }, []);
-  const collapseStreams = useCallback(() => {
-    setExpandedView(null);
-    exitAppFullscreen();
-  }, [exitAppFullscreen]);
-  const handleToggleMosaicExpand = useCallback(() => {
-    const next: ExpandedView | null = mosaicExpanded ? null : { kind: 'mosaic' };
-    setExpandedView(next);
-    if (next) {
-      requestAppFullscreen();
-    } else {
-      exitAppFullscreen();
-    }
-  }, [exitAppFullscreen, mosaicExpanded, requestAppFullscreen]);
-  const handleToggleCameraExpand = useCallback((cameraKey: CameraKey) => {
-    const isCurrent = expandedCamera === cameraKey;
-    const next: ExpandedView | null = isCurrent ? null : { kind: 'camera', camera: cameraKey };
-    setExpandedView(next);
-    if (next) {
-      requestAppFullscreen();
-    } else {
-      exitAppFullscreen();
-    }
-  }, [expandedCamera, exitAppFullscreen, requestAppFullscreen]);
-
   const [calibrateToast, setCalibrateToast] = useState<{ text: string; kind: 'info' | 'success' | 'error'; ts: number } | null>(null);
   const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
 
@@ -1710,39 +1691,61 @@ function Dashboard() {
     sendAutoCalibrate();
   }, [isCalibrating, sendAutoCalibrate, status]);
 
-  useEffect(() => {
-    if (!anyExpanded) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') collapseStreams();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [anyExpanded, collapseStreams]);
-
-  useEffect(() => {
-    if (anyExpanded) {
-      document.body.style.overflow = 'hidden';
+  const selectRoom = useCallback((camera: string) => {
+    setSelectedRoom(camera);
+    setInspectorContext('room');
+  }, []);
+  const inspectRoom = useCallback((camera: string) => {
+    selectRoom(camera);
+    setInspectorOpen(true);
+  }, [selectRoom]);
+  const openDashboardView = useCallback((view: DashboardView) => {
+    setRoiDrawerOpen(false);
+    setPeopleDrawerOpen(false);
+    if (view === '3d') {
+      setDashboardView('3d');
+      setDepthViewRequest(previous => ({ sequence: previous.sequence + 1, tab: '3d' }));
     } else {
-      document.body.style.overflow = '';
-      exitAppFullscreen();
+      const bevLayer = { overview: 'structure', reconstruction: 'texture', height: 'height', normals: 'normals' }[view] as PresentationSettings['bevLayer'];
+      setPresentation(previous => ({ ...previous, bevLayer })); setStyleId('custom');
+      setDashboardView('overview');
     }
-    return () => {
-      document.body.style.overflow = '';
-    };
-  }, [anyExpanded, exitAppFullscreen]);
+  }, []);
+  const handleRoomTabChange = useCallback((tab: DepthDrawerTab) => {
+    if (tab === 'heatmap' || tab === 'normals') openDashboardView(tab === 'heatmap' ? 'height' : 'normals');
+    else setDashboardView(tab === '3d' ? '3d' : 'diagnostics');
+  }, [openDashboardView]);
+  const selectedRoomTracks = useMemo(() => Object.entries(tracksByCamera)
+    .filter(([camera]) => (detectCameraKey(camera) ?? normalizeCameraIdKey(camera)) === selectedRoom)
+    .flatMap(([, tracks]) => tracks), [tracksByCamera, selectedRoom]);
+  const roomCameras = useMemo(() => Array.from(new Set([
+    ...knownCameras,
+    ...availableCameras.map(camera => detectCameraKey(camera) ?? normalizeCameraIdKey(camera)),
+  ])), [knownCameras, availableCameras]);
 
-  useEffect(() => {
-    const onFullscreenChange = () => {
-      if (!document.fullscreenElement && anyExpanded) {
-        setExpandedView(null);
-      }
-    };
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, [anyExpanded]);
+  // The existing PCF bootstrap loads every room on connection. All room
+  // presentations consume that same accepted response, including restored modes.
+  const reloadSavedPcf = (camera: string) => handleRequestFloorplan({
+    camera, requestId: `dashboard-pcf-${camera}-${Date.now()}`, gridResM: .025,
+    maxExtentM: 20, cacheOnly: true, scenePriorOnly: true,
+  });
+  const changeCameraMode = (camera: string, mode: CameraDisplayMode) => {
+    setPresentation(previous => sanitizePresentationSettings({ ...previous, cameraModes: { ...previous.cameraModes, [camera]: mode } }));
+    setStyleId('custom');
+  };
+  const chooseStyle = (id: string) => {
+    const saved = savedStyles.find(p => p.id === id);
+    const next = saved?.settings ?? applyPresentationPreset(presentation, id as 'monitor' | 'geometry' | 'surface');
+    setPresentation(sanitizePresentationSettings(next)); setStyleId(id); setDashboardView('overview');
+  };
+  const saveStyle = (name: string) => {
+    const id = `saved-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    setSavedStyles(previous => [...previous.filter(p => p.name !== name), { id, name, settings: sanitizePresentationSettings(presentation) }].slice(-6));
+    setStyleId(id);
+  };
 
   return (
-    <div className={`shell${mosaicExpanded ? ' shell--streams-expanded' : ''}`}>
+    <div className="shell shell--spatial">
       <header className="topbar">
         <div className="brand">
           <div className="logo" />
@@ -1755,105 +1758,72 @@ function Dashboard() {
         {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
-        <button className="btn ghost" onClick={() => { setDepthDrawerOpen(v => !v); setRoiDrawerOpen(false); setPeopleDrawerOpen(false); }}>Depth</button>
-        <button className="btn ghost" onClick={() => { setRoiDrawerOpen(v => !v); setDepthDrawerOpen(false); setPeopleDrawerOpen(false); }}>ROIs</button>
+        <button className="btn ghost" onClick={() => { setRoiDrawerOpen(v => !v); setPeopleDrawerOpen(false); }}>ROIs</button>
         <button
           className="btn ghost"
-          onClick={() => { setPeopleDrawerOpen((v) => !v); setDepthDrawerOpen(false); setRoiDrawerOpen(false); }}
+          onClick={() => { setPeopleDrawerOpen((v) => !v); setRoiDrawerOpen(false); }}
           title="Enroll and manage household residents"
         >
           People
         </button>
       </header>
-      <main className="main">
-        <section className={`streams${mosaicExpanded ? ' streams--expanded' : ''}`}>
-          <div className={`stream-tiler${streamDisplayCams.length === 1 ? ' stream-tiler--single' : ''}`}>
-            {streamDisplayCams.map((cam) => (
-              <StreamPanel
-                key={`stream-${cam}`}
-                camera={cam}
-                title="Mosaic"
-                blob={null}
-                fpsText={fps[cam]}
-                fpsSeries={fpsSeries[cam]}
-                vacancyText={vacancyText[cam]}
-                isExpanded={mosaicExpanded}
-                onToggleExpand={handleToggleMosaicExpand}
-                tileCameras={knownCameras}
-                expandedTileCamera={expandedCamera}
-                onToggleTileExpand={handleToggleCameraExpand}
-                mosaicLayout={mosaicLayout}
-                streamMode={streamMode}
-                videoRef={streamMode === 'webrtc' ? webrtc.videoRef : undefined}
-              />
-            ))}
-          </div>
-          <div className="bev-row">
-            {knownCameras.map((cam) => (
-              <BevView
-                key={`bev-${cam}`}
-                cam={cam}
-                meta={bevMeta[cam]}
-                floorplan={floorplanData[cam]}
-                coordMode={bevFrameModeByCam[cam]}
-                trailEnabled={trailEnabled}
-                trailConfig={bevTrailConfig}
-                debug={bevDebugEnabled}
-                resolverComparisonEnabled={localizationDetailsEnabled}
-                onResolverComparisonChange={handleLocalizationDetailsChange}
-                variant="inline"
-              />
-            ))}
-          </div>
-          {showWorldBevRow && (
-            <div className="bev-row">
-              {knownCameras.map((cam) => (
-                <BevView
-                  key={`bev-world-${cam}`}
-                  cam={cam}
-                  meta={bevMetaRaw[cam]}
-                  coordMode={bevFrameModeByCam[cam]}
-                  trailEnabled={trailEnabled}
-                  trailConfig={bevTrailConfig}
-                  debug={bevDebugEnabled}
-                  resolverComparisonEnabled={localizationDetailsEnabled}
-                  onResolverComparisonChange={handleLocalizationDetailsChange}
-                  variant="inline"
-                />
-              ))}
+      <main className={`main${inspectorOpen ? ' main--inspector-open' : ''}`}>
+        <div className="dashboard-content">
+          <DashboardViewBar activeView={dashboardView === 'overview'
+            ? ({ structure: 'overview', texture: 'reconstruction', height: 'height', normals: 'normals' } as const)[presentation.bevLayer] : dashboardView} cameras={roomCameras} selectedRoom={selectedRoom}
+            onRoomChange={selectRoom} onViewChange={openDashboardView} inspectorOpen={inspectorOpen}
+            onToggleInspector={() => setInspectorOpen(open => !open)} />
+          <PresentationControls settings={presentation} cameras={knownCameras} onChange={changePresentation} presetId={styleId} presets={savedStyles}
+            onPreset={chooseStyle} onSave={saveStyle} onDelete={id => { setSavedStyles(previous => previous.filter(p => p.id !== id)); setStyleId('custom'); }} />
+          {styleNotice && <p className="presentation-notice" role="status">{styleNotice}</p>}
+          <div className="dashboard-stage">
+            <div className="dashboard-overview" hidden={dashboardView !== 'overview'}>
+              <SpatialDashboard display={unifiedBev} connection={status} cameras={knownCameras}
+                mosaicLayout={mosaicLayout} videoRef={webrtc.videoRef} videoConnected={webrtc.isConnected}
+                fps={fps} mosaicFps={mosaicFps} vacancyText={vacancyText} trailEnabled={trailEnabled}
+                trailConfig={bevTrailConfig} debug={bevDebugEnabled} selectedRoom={selectedRoom}
+                onSelectRoom={inspectRoom} active={dashboardView === 'overview'} presentation={presentation}
+                floorplans={floorplanData} calibrationEpoch={calibrationEpoch} onCameraModeChange={changeCameraMode}
+                onComparisonChange={comparison => changePresentation({ comparison })}
+                onLoadSnapshot={reloadSavedPcf} onToggleCameras={() => changePresentation({ cameras: !presentation.cameras })} />
             </div>
-          )}
-          <UnifiedBevView display={unifiedBev} connection={status} trailEnabled={trailEnabled}
-            trailConfig={bevTrailConfig} debug={bevDebugEnabled} />
-        </section>
-
-        <section className="side">
-          <ControlsPanel
-            trailEnabled={trailEnabled}
-            setTrailEnabled={setTrailEnabled}
-            onSendTrail={sendTrailToggle}
-            onClearStats={sendClearStats}
-          />
-
-          <LatencyCard
-            pipeline={pipelineLatency}
-            perCam={latencyByCamKey}
-          />
-
-          <div className="panel card">
-            <div className="card-title">Zone Occupancy</div>
-            <div dangerouslySetInnerHTML={{ __html: occupancy }} />
+            <DepthDrawer
+              open={dashboardView !== 'overview'} presentation="workspace"
+              onClose={() => openDashboardView('overview')}
+              selectedCameraId={selectedRoom} onSelectedCameraChange={selectRoom}
+              viewRequest={depthViewRequest} onTabChange={handleRoomTabChange}
+              heatmapFocus={dashboardView === 'height' ? 'height' : 'reconstruction'}
+              depthData={maDepthData} onRefreshDepthPanel={requestDepthPanelRefresh}
+              refreshState={depthPanelRefreshState} transportOpen={status === 'open'}
+              floorplans={floorplanData} onRequestFloorplan={handleRequestFloorplan}
+              availableCameras={roomCameras} mosaicLayout={mosaicLayout}
+              videoRef={webrtc.videoRef} calibrationEpoch={calibrationEpoch}
+            />
           </div>
-
-          { /* Legend removed; color dot is shown inline with each ID */}
-
-          <div className="panel card">
-            <div className="card-title">Active Tracks</div>
-            <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
-          </div>
-
-          { /* Transitions panel removed */}
-        </section>
+        </div>
+        {inspectorOpen && <ContextInspector context={inspectorContext} selectedRoom={selectedRoom}
+          cameras={roomCameras} cameraStatuses={cameraStatuses} fps={fps} vacancyText={vacancyText}
+          occupancy={occByCamKey[selectedRoom] ?? {}} tracks={selectedRoomTracks}
+          onSelectRoom={inspectRoom} onHome={() => setInspectorContext('home')}
+          onClose={() => setInspectorOpen(false)} onViewChange={openDashboardView}
+          systemHealth={<>
+            <div className="inspector-connection"><span className={`status-dot ${status === 'open' ? 'status-ok' : 'status-warn'}`} />WebSocket {status}</div>
+            <ControlsPanel trailEnabled={trailEnabled} setTrailEnabled={setTrailEnabled}
+              onSendTrail={sendTrailToggle} onClearStats={sendClearStats} />
+            <LatencyCard pipeline={pipelineLatency} perCam={latencyByCamKey} />
+            <button type="button" className="btn ghost" onClick={() => setTelemetryOpen(true)}>Open telemetry</button>
+          </>}
+          presentationControls={<>
+            <PresentationLayerOptions settings={presentation} onChange={changePresentation} />
+            <div className="inspector-section"><h3>Camera displays</h3>
+            <CameraDisplayControls settings={presentation} cameras={knownCameras} onChange={changePresentation} />
+            <p className="inspector-note">Camera displays keep the calibrated camera viewpoint. Depth and surface normals project the saved PCF reconstruction; unknown areas stay empty. Unified BEV layers change the whole aligned map.</p>
+            <button className="btn ghost" type="button" disabled={status !== 'open'} onClick={() => reloadSavedPcf(selectedRoom)}>Reload saved PCF</button>
+            {floorplanData[selectedRoom]?.error && <span className="inspector-note" role="status">{floorplanData[selectedRoom].error}</span>}
+            </div>
+          </>}
+          allOccupancy={<div dangerouslySetInnerHTML={{ __html: occupancy }} />}
+          allTracks={<div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />} />}
       </main>
       <footer className="footer">
         <span>WebSocket: {status}</span>
@@ -1861,20 +1831,6 @@ function Dashboard() {
         <span className="subtitle">RTSP to WebRTC mosaic</span>
       </footer>
 
-      <DepthDrawer
-        open={depthDrawerOpen}
-        onClose={() => setDepthDrawerOpen(false)}
-        depthData={maDepthData}
-        onRefreshDepthPanel={requestDepthPanelRefresh}
-        refreshState={depthPanelRefreshState}
-        transportOpen={status === 'open'}
-        floorplans={floorplanData}
-        onRequestFloorplan={handleRequestFloorplan}
-        availableCameras={availableCameras}
-        mosaicLayout={mosaicLayout}
-        videoRef={webrtc.videoRef}
-        calibrationEpoch={calibrationEpoch}
-      />
       <RoiEditorDrawer
         open={roiDrawerOpen}
         onClose={() => setRoiDrawerOpen(false)}
@@ -1902,46 +1858,6 @@ function Dashboard() {
         calibrating={isCalibrating}
         onCalibrate={handleAutoCalibrateAll}
       />
-      {expandedCamera && (
-        <div className="individual-fullscreen" role="dialog" aria-modal="true" aria-label={`${cameraLabel(expandedCamera)} fullscreen`}>
-          <div className="individual-fullscreen__toolbar">
-            <div className="individual-fullscreen__title">{cameraLabel(expandedCamera)}</div>
-            <button
-              type="button"
-              className="individual-fullscreen__close"
-              onClick={collapseStreams}
-              title="Close fullscreen"
-              aria-label="Close fullscreen"
-            >
-              <span aria-hidden="true">X</span>
-            </button>
-          </div>
-          <div className="individual-fullscreen__content">
-            <div className="individual-fullscreen__video-panel">
-              <MosaicCropCanvas
-                camera={expandedCamera}
-                mosaicLayout={mosaicLayout}
-                videoRef={webrtc.videoRef}
-                className="individual-fullscreen__video"
-              />
-            </div>
-            <div className="individual-fullscreen__bev-panel">
-              <BevView
-                cam={expandedCamera}
-                meta={bevMeta[expandedCamera]}
-                floorplan={floorplanData[expandedCamera]}
-                coordMode={bevFrameModeByCam[expandedCamera]}
-                trailEnabled={trailEnabled}
-                trailConfig={bevTrailConfig}
-                debug={bevDebugEnabled}
-                resolverComparisonEnabled={localizationDetailsEnabled}
-                onResolverComparisonChange={handleLocalizationDetailsChange}
-                variant="inline"
-              />
-            </div>
-          </div>
-        </div>
-      )}
       {calibrateToast && (
         <div
           className={`toast toast--${calibrateToast.kind}`}

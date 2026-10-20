@@ -1,4 +1,6 @@
 :root {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   --bg: #0b0d10;
   --bg-soft: #101317;
   --bg-raised: #141922;
@@ -19,7 +21,11 @@
 }
 
 * { box-sizing: border-box; }
-html, body { background: var(--bg); color: var(--text); }
+html, body { background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.45; -webkit-font-smoothing: antialiased; }
+button, input, select, textarea { font: inherit; }
+button, a, input, select, summary, textarea { -webkit-tap-highlight-color: transparent; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+button { font-weight: 500; }
 
 .glass {
   background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.0));
@@ -31,7 +37,7 @@ html, body { background: var(--bg); color: var(--text); }
 .hstack { display: flex; align-items: center; gap: 12px; }
 .vstack { display: flex; flex-direction: column; gap: 12px; }
 .spacer { flex: 1; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.mono { font-family: var(--font-mono); }
 
 .pill {
   border-radius: 999px; padding: 4px 10px; font-size: 12px; border: 1px solid var(--border); background: #0f1318;

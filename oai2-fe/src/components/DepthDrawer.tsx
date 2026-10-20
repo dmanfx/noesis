@@ -284,6 +284,9 @@ type FloorplanRequestOptions = {
   scenePriorOnly?: boolean;
 };
 
+export type DepthDrawerTab = 'heatmap' | 'normals' | '3d' | 'semantic' | 'histogram' | 'metrics';
+export type DepthDrawerViewRequest = { sequence: number; tab: DepthDrawerTab };
+
 interface DepthDrawerProps {
   open: boolean;
   onClose: () => void;
@@ -298,6 +301,12 @@ interface DepthDrawerProps {
   mosaicLayout?: MosaicLayout | null;
   videoRef?: RefObject<HTMLVideoElement>;
   calibrationEpoch?: number;
+  presentation?: 'drawer' | 'workspace';
+  selectedCameraId?: string;
+  onSelectedCameraChange?: (cameraId: string) => void;
+  viewRequest?: DepthDrawerViewRequest;
+  onTabChange?: (tab: DepthDrawerTab) => void;
+  heatmapFocus?: 'reconstruction' | 'height';
 }
 
 import {
@@ -412,6 +421,12 @@ const DepthDrawer = memo(function DepthDrawer({
   mosaicLayout,
   videoRef,
   calibrationEpoch = 0,
+  presentation = 'drawer',
+  selectedCameraId,
+  onSelectedCameraChange,
+  viewRequest,
+  onTabChange,
+  heatmapFocus,
 }: DepthDrawerProps) {
   // Show cameras from either available list or present depth data (union)
   const cameras = useMemo(() => {
@@ -420,9 +435,16 @@ const DepthDrawer = memo(function DepthDrawer({
     Object.keys(depthData || {}).forEach((c) => { if (c) set.add(c); });
     return Array.from(set).sort();
   }, [availableCameras, depthData]);
-  const [activeTab, setActiveTab] = useState<'heatmap' | 'normals' | '3d' | 'semantic' | 'histogram' | 'metrics'>('heatmap');
+  const [activeTab, setActiveTab] = useState<DepthDrawerTab>('heatmap');
   const [normalsView, setNormalsView] = useState<'surface' | 'detail'>('surface');
-  const [selectedCamera, setSelectedCamera] = useState<string>('');
+  const [internalCamera, setInternalCamera] = useState<string>('');
+  const selectedCamera = selectedCameraId ?? internalCamera;
+  const changeCamera = useCallback((camera: string) => {
+    setInternalCamera(camera);
+    onSelectedCameraChange?.(camera);
+  }, [onSelectedCameraChange]);
+  const changeTab = (tab: DepthDrawerTab) => { setActiveTab(tab); onTabChange?.(tab); };
+  useEffect(() => { if (viewRequest) setActiveTab(viewRequest.tab); }, [viewRequest]);
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const onRequestFloorplanRef = useRef(onRequestFloorplan);
   const scenePriorProbedRef = useRef(new Set<string>());
@@ -835,13 +857,13 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     if (!cameras.length) {
-      setSelectedCamera('');
+      if (selectedCamera) changeCamera('');
       return;
     }
     if (!selectedCamera || !cameras.includes(selectedCamera)) {
-      setSelectedCamera(cameras[0]);
+      changeCamera(cameras[0]);
     }
-  }, [cameras, selectedCamera]);
+  }, [cameras, selectedCamera, changeCamera]);
 
   useEffect(() => {
     onRequestFloorplanRef.current = onRequestFloorplan;
@@ -877,10 +899,23 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [open, transportOpen]);
 
   useEffect(() => {
-    if (open) {
+    if (open && presentation === 'drawer') {
       setDrawerWidth(DEFAULT_WIDTH);
     }
-  }, [open]);
+  }, [open, presentation]);
+
+  useEffect(() => {
+    const element = drawerRef.current;
+    if (!open || presentation !== 'workspace' || !element) return;
+    const measure = () => {
+      const width = Math.round(element.getBoundingClientRect().width);
+      if (width > 0) setDrawerWidth(width);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    measure();
+    return () => observer.disconnect();
+  }, [open, presentation]);
 
   const heatmapRanges = useMemo(() => {
     if (!heightAglLayer?.grid_b64 || !heightAglLayer.grid_shape) {
@@ -952,7 +987,7 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     const canvas = heatmapCanvasRef.current;
-    if (!canvas || activeTab !== 'heatmap') return;
+    if (!open || !canvas || activeTab !== 'heatmap') return;
     if (!heightAglLayer?.grid_b64 || !heightAglLayer.grid_shape || !heatmapRange) {
       heatmapSourceCanvasRef.current = null;
       clearCanvasElement(canvas);
@@ -991,6 +1026,8 @@ const DepthDrawer = memo(function DepthDrawer({
     });
     drawCameraOriginMarker(canvas, heightAglLayer, rendered);
   }, [
+    open,
+    heatmapFocus,
     activeTab,
     clearCanvasElement,
     displaySourceRectForLayer,
@@ -1004,7 +1041,7 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     const canvas = normalsCanvasRef.current;
-    if (!canvas || activeTab !== 'normals') return;
+    if (!open || !canvas || activeTab !== 'normals') return;
     if (!normalsInfo.available) {
       normalsSourceCanvasRef.current = null;
       clearCanvasElement(canvas);
@@ -1020,6 +1057,7 @@ const DepthDrawer = memo(function DepthDrawer({
       },
     );
   }, [
+    open,
     activeTab,
     cameraFloorplan?.scale_m_per_px,
     clearCanvasElement,
@@ -1199,7 +1237,7 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     const canvas = histogramCanvasRef.current;
-    if (!canvas || activeTab !== 'histogram') return;
+    if (!open || !canvas || activeTab !== 'histogram') return;
     const confArray = pcfConfidenceLayer?.grid_b64
       ? decodeFloat32(pcfConfidenceLayer.grid_b64)
       : null;
@@ -1231,7 +1269,7 @@ const DepthDrawer = memo(function DepthDrawer({
       ctx.font = '12px system-ui';
       ctx.fillText(`${idx / 10}-${(idx + 1) / 10}`, idx * barWidth + 6, canvas.height - 6);
     });
-  }, [activeTab, pcfConfidenceLayer?.grid_b64]);
+  }, [open, activeTab, drawerWidth, pcfConfidenceLayer?.grid_b64]);
 
   const metrics = useMemo(() => {
     if (!hasCanonicalPcf || !scenePriorMeta) {
@@ -1304,18 +1342,6 @@ const DepthDrawer = memo(function DepthDrawer({
       <span className="color-scale__label color-scale__label--min">{formatNumber(min)}{unit}</span>
     </div>
   );
-
-  useEffect(() => {
-    if (!cameras.length) {
-      if (selectedCamera !== '') {
-        setSelectedCamera('');
-      }
-      return;
-    }
-    if (!selectedCamera || !cameras.includes(selectedCamera)) {
-      setSelectedCamera(cameras[0]);
-    }
-  }, [cameras, selectedCamera]);
 
   useEffect(() => {
     if ((activeTab !== 'heatmap' && activeTab !== '3d') || !open) return;
@@ -1424,7 +1450,7 @@ const DepthDrawer = memo(function DepthDrawer({
         renderTopdownLayer(gradientCanvasRef.current, gradientLayer, viridisColor);
       }
     }
-  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds, drawCameraOriginMarker]);
+  }, [activeTab, open, heatmapFocus, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds, drawCameraOriginMarker]);
 
   useEffect(() => {
     if (!open) return;
@@ -1789,28 +1815,32 @@ const DepthDrawer = memo(function DepthDrawer({
 
   return (
     <>
-      <div className={`depth-drawer-overlay ${open ? 'open' : ''}`} onClick={onClose} />
+      {presentation === 'drawer' && <div className={`depth-drawer-overlay ${open ? 'open' : ''}`} onClick={onClose} />}
       <aside
-        className={`depth-drawer ${open ? 'open' : ''}`}
+        className={`depth-drawer ${open ? 'open' : ''}${presentation === 'workspace' ? ' depth-workspace' : ''}${heatmapFocus ? ` depth-workspace--${heatmapFocus}` : ''}`}
         ref={drawerRef}
-        style={{ width: drawerWidth }}
+        style={presentation === 'drawer' ? { width: drawerWidth } : undefined}
+        hidden={presentation === 'workspace' && !open}
+        aria-hidden={!open}
+        aria-label="Room reconstruction workspace"
       >
-        <div
+        {presentation === 'drawer' && <div
           className="depth-drawer-resize-handle"
           onPointerDown={handleResizePointerDown}
           role="presentation"
-        />
+        />}
         <header>
-          <h2>PCF Room Reconstruction</h2>
-          <button onClick={onClose} aria-label="Close depth drawer">×</button>
+          <div><h2>{activeTab === 'heatmap' && heatmapFocus === 'height' ? 'Room height' : activeTab === 'normals' ? 'Room normals' : activeTab === '3d' ? '3D room' : 'Room reconstruction'}</h2>
+            {presentation === 'workspace' && <p className="depth-workspace__subtitle">{selectedCamera ? cameraLabel(detectCameraKey(selectedCamera) ?? selectedCamera) : 'Select a room'} · PCF reconstruction</p>}</div>
+          <button onClick={onClose} aria-label={presentation === 'workspace' ? 'Return to overview' : 'Close depth drawer'}>×</button>
         </header>
-        <div className="tabs">
-          <button className={activeTab === 'heatmap' ? 'active' : ''} onClick={() => setActiveTab('heatmap')}>Heatmap</button>
-          <button className={activeTab === 'normals' ? 'active' : ''} onClick={() => setActiveTab('normals')}>Normals</button>
-          <button className={activeTab === '3d' ? 'active' : ''} onClick={() => setActiveTab('3d')}>3D</button>
-          <button className={activeTab === 'semantic' ? 'active' : ''} onClick={() => setActiveTab('semantic')}>Sem-seg</button>
-          <button className={activeTab === 'histogram' ? 'active' : ''} onClick={() => setActiveTab('histogram')}>Histogram</button>
-          <button className={activeTab === 'metrics' ? 'active' : ''} onClick={() => setActiveTab('metrics')}>Metrics</button>
+        <div className="tabs" aria-label="Room layer tools">
+          <button aria-pressed={activeTab === 'heatmap'} className={activeTab === 'heatmap' ? 'active' : ''} onClick={() => changeTab('heatmap')}>Room layers</button>
+          <button aria-pressed={activeTab === 'normals'} className={activeTab === 'normals' ? 'active' : ''} onClick={() => changeTab('normals')}>Room normals</button>
+          <button aria-pressed={activeTab === '3d'} className={activeTab === '3d' ? 'active' : ''} onClick={() => changeTab('3d')}>3D</button>
+          <button aria-pressed={activeTab === 'semantic'} className={activeTab === 'semantic' ? 'active' : ''} onClick={() => changeTab('semantic')}>Sem-seg</button>
+          <button aria-pressed={activeTab === 'histogram'} className={activeTab === 'histogram' ? 'active' : ''} onClick={() => changeTab('histogram')}>Histogram</button>
+          <button aria-pressed={activeTab === 'metrics'} className={activeTab === 'metrics' ? 'active' : ''} onClick={() => changeTab('metrics')}>Metrics</button>
         </div>
         <div className="content">
           {rasterCompatibilityError && activeTab !== 'heatmap' && (
@@ -1820,11 +1850,11 @@ const DepthDrawer = memo(function DepthDrawer({
           {cameras.length > 0 && activeTab !== 'semantic' && (
             <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') ? 'drawer-toolbar--heatmap' : ''}`}>
               <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
-                <span className="drawer-toolbar__label">Camera</span>
+                <span className="drawer-toolbar__label">Room</span>
                 <select
                   id="ma-depth-select"
                   value={selectedCamera}
-                  onChange={(ev) => setSelectedCamera(ev.target.value)}
+                  onChange={(ev) => changeCamera(ev.target.value)}
                 >
                   {cameras.map((cam) => {
                     const key = detectCameraKey(cam);
@@ -1953,7 +1983,7 @@ const DepthDrawer = memo(function DepthDrawer({
               </div>
 
               <div className="heatmap-grid heatmap-grid--primary">
-                <div className="heatmap-cell heatmap-cell--left heatmap-cell--primary">
+                <div className="heatmap-cell heatmap-cell--left heatmap-cell--primary heatmap-cell--height">
                   <div className="heatmap-cell__scale">
                     {renderScale(turboGradient, heatmapRange?.min ?? undefined, heatmapRange ? (heatmapRange.min + heatmapRange.max) / 2 : undefined, heatmapRange?.max ?? undefined, ' m')}
                   </div>
@@ -1966,7 +1996,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     />
                   </div>
                 </div>
-                <div className="heatmap-cell heatmap-cell--primary heatmap-cell--no-scale">
+                <div className="heatmap-cell heatmap-cell--primary heatmap-cell--no-scale heatmap-cell--reconstruction">
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">PCF Observed Textured Floorplan · Primary</div>
                     <canvas
@@ -2204,7 +2234,7 @@ const DepthDrawer = memo(function DepthDrawer({
             </>
           )}
 
-          {activeTab === '3d' && (
+          {open && activeTab === '3d' && (
             <>
               {panelErrorText && (
                 <p className="floorplan-error">{panelErrorText}</p>
@@ -2502,7 +2532,7 @@ const DepthDrawer = memo(function DepthDrawer({
             </>
           )}
 
-          {activeTab === 'semantic' && <SemanticSegView />}
+          {open && activeTab === 'semantic' && <SemanticSegView />}
 
           {activeTab === 'histogram' && (
             <>

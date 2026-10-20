@@ -17,6 +17,7 @@ document and live source/config win.
 | Exact DeepStream graph | [`../DS9/PIPELINE_GRAPH.md`](../DS9/PIPELINE_GRAPH.md) |
 | Native runtime operation | [`../DS9/docs/runtime_host_boundary.md`](../DS9/docs/runtime_host_boundary.md) |
 | Focused validation | [`testing_guide.md`](testing_guide.md) |
+| Fetch requested UniFi Protect recordings locally | [`unifi_protect_access.md`](unifi_protect_access.md) |
 | Run or reproduce Prior-Conditioned Fusion (PCF) | [`PCF_Workflow.md`](PCF_Workflow.md) |
 | Review/export static SpatialLM scene proposals offline | [`../tools/spatial_scene_review/README.md`](../tools/spatial_scene_review/README.md) |
 | Export browser-sized reconstructed room meshes | [`../tools/room_mesh_export/README.md`](../tools/room_mesh_export/README.md) |

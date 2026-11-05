@@ -537,6 +537,54 @@ def test_t9_connected_current_local_no_comparability_or_identity_perfect_gate(na
     assert original.stamp.clock_basis=="source-media" and original.stamp.lifecycle_started_frame==1
 
 
+def test_local_only_person_reaches_world_publisher_and_unified_bev_with_image_birth_gate(tmp_path):
+    """Synthetic native receipts/geometry; real adapter, World, wire and BEV reducer."""
+    from noesis.identity_association_service import IdentityAssociationService
+    from noesis.pipelines.projective_continuity import ImageRegionQualityBridge
+    from noesis.pipelines.source_acquisition import OriginalSwinCache
+    from tests.test_mv3dt_person_association import semantic_joint_fixture
+
+    selected, *_ = semantic_joint_fixture(competitor=None)
+    policies = []
+
+    def identity_factory(run_id, policy):
+        image_policy = replace(selected, cameras=tuple(replace(camera, source=next(
+            binding for binding in policy.sources if binding.camera_id == camera.source.camera_id
+        )) for camera in selected.cameras))
+        policies.append(image_policy)
+        return IdentityAssociationService.for_estimated_image_regions(
+            run_id, policy, image_policy, live_track_continuity=True,
+            semantic_joint_max_mean_px=5., unresolved_birth_quarantine=True,
+        )
+
+    fixture = NativeQualityFixture(tmp_path, source_ids=(0, 1, 2), identity_factory=identity_factory)
+    fixture.ingress.projective_bridge = ImageRegionQualityBridge(policies[0], OriginalSwinCache())
+    try:
+        for frame in (1, 2):
+            packet = fixture.packet(0, frame, x=3., households={9: {
+                "identity_kind": "visitor", "identity_state": "visitor",
+                "stable_id": 1001, "visitor_generation": 1,
+            }})
+            # Image mode also requires the genuine queued delivery receipt;
+            # the base non-image fixture intentionally supplies none.
+            packet = (replace(packet[0], ingress_monotonic_s=time.monotonic()), packet[1])
+            snapshot = fixture.publish([packet])
+            person, = snapshot.entities
+            assert person.position.x == 3.
+            assert person.subject.stable_id == 1001
+            assert [source.camera_id for source in person.sources if source.accepted] == ["living-room"]
+            tracking = next(message for message in reversed(fixture.wire) if message["type"] == "tracking")
+            assert tracking["tracks"][0]["world_valid"] is True
+            assert tracking["tracks"][0]["stable_id"] == 1001
+            assert tracking["world_snapshot"] == snapshot.model_dump(mode="json")
+        actual = fixture.examples.actual_node_wire(fixture, fixture.wire, "local-only-image-birth-scope")
+        assert all(row["accepted"] for row in actual["diagnostics"])
+        assert [len(row["people"]) for row in actual["snapshots"]] == [1, 1]
+        assert all(row["people"][0]["worldPosition"][0] == 3. for row in actual["snapshots"])
+    finally:
+        fixture.world.close()
+
+
 def test_t9_connected_cached_depth_original_hold_empty_expiry_and_reuse(native_quality):
     f=native_quality
     first=f.publish([f.packet(1,1)])

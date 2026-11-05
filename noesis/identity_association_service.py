@@ -886,10 +886,23 @@ class IdentityAssociationService:
         if error:
             return SpatialMemberResult("unavailable", error)
         before = self._members()
+        # Birth ambiguity belongs to the explicitly configured image-region
+        # cameras. Local-only sources never enter that cohort's release loop.
+        # Match camera/source identity, not epoch: resetting a configured source
+        # must not turn a stale image-policy binding into a local-only exemption.
+        image_region_source = (
+            self._image_region_policy is not None
+            and type(original) is SourceObservation
+            and type(original.stamp) is ObservationStamp
+            and type(original.stamp.member) is MemberKey
+            and any((camera.source.camera_id, camera.source.source_id)
+                    == (original.stamp.member.camera_id, original.stamp.member.source_id)
+                    for camera in self._image_region_policy.cameras)
+        )
         result = self._ledger.observe_spatial(original, lifecycle_receipt,
             image_source_local_reactivation=self._image_region_policy is not None,
             retain_image_membership=self._image_region_policy is not None and self._image_live_track_continuity,
-            quarantine_unresolved_birth=self._unresolved_birth_quarantine)
+            quarantine_unresolved_birth=self._unresolved_birth_quarantine and image_region_source)
         self._sync()
         self._spatial_note(before, result.retired_keys)
         # Final capabilities are issued only after ALL ordered cohort mutations.

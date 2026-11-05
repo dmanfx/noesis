@@ -9,7 +9,7 @@ from noesis.identity_association_service import (
     ProducerAdmission, policy_identity, HouseholdClaimConflict,
     SpatialMeasurementReference, SpatialMembershipDTO, SpatialMemberReservation, SpatialMemberResult,
 )
-from reid.mv3dt_person_association import HouseholdDescriptor, SourceAbsence, SpatialLifecycleReceipt, CurrentVisualIngress
+from reid.mv3dt_person_association import HouseholdDescriptor, SourceAbsence, SourceObservation, SpatialLifecycleReceipt, CurrentVisualIngress
 from tests.test_mv3dt_person_association import SOURCES, cached_proof, event, now, observation, policy, proof, removal
 from tests.test_mv3dt_person_association import spatial_context, spatial_person_proof, spatial_policy
 from tests.test_mv3dt_person_association import visual_proof, visual_delivery
@@ -22,6 +22,98 @@ from tests.test_mv3dt_person_association import live_image_step
 from tests.test_mv3dt_person_association import spatial_shadow_update
 from tests.test_mv3dt_person_association import image_vote_competition_fixture
 from tests.test_mv3dt_person_association import dormant_image_fixture
+
+
+def test_image_region_birth_quarantine_excludes_local_only_camera():
+    """K/F ambiguity must not suppress a separate local-only native person."""
+    from tests.test_mv3dt_person_association import semantic_joint_fixture
+
+    selected, proof, rows, _, _ = semantic_joint_fixture(competitor=None)
+    owner = IdentityAssociationService.for_estimated_image_regions(
+        "run-a", spatial_policy(), selected, live_track_continuity=True,
+        semantic_joint_max_mean_px=5., unresolved_birth_quarantine=True,
+    )
+    local = observation("living-room", 42)
+    context = spatial_context((local, *rows))
+    for row in (local, *rows):
+        result = owner.observe_spatial(
+            row, SpatialLifecycleReceipt("native:" + row.stamp.observation_id, row.stamp, "ACTIVE"),
+        )
+        assert result.disposition == "observed", result
+    delivery = visual_delivery((local, *rows))
+    owner.join_estimated_image_regions(
+        replace(proof, originals=()), at_interval=context, delivery_context=delivery,
+    )
+
+    def local_membership():
+        return next(dto for dto in owner.spatial_memberships(at_interval=context)
+                    if dto.members[0].observation.member == local.stamp.member)
+
+    dto = local_membership()
+    assert dto.eligibility[0].eligible, dto.eligibility[0].reason
+    assert dto.association_basis == "source_local"
+    assert {stamp.member for stamp in owner.image_region_active_cohort()} == {
+        row.stamp.member for row in rows
+    }
+    peers = [dto for dto in owner.spatial_memberships(at_interval=context)
+             if dto.members[0].observation.member != local.stamp.member]
+    assert all(not e.eligible and e.reason == "image_region_ambiguous_member"
+               for dto in peers for e in dto.eligibility)
+
+    # Incomplete K/F anatomy must neither join them nor change the local grant.
+    incomplete = replace(proof, originals=tuple(replace(o, semantic_joints=()) for o in proof.originals))
+    owner.join_estimated_image_regions(
+        incomplete, at_interval=context, delivery_context=replace(delivery, sequence=2),
+    )
+    dto = local_membership()
+    assert dto.eligibility[0].eligible
+    peers = [dto for dto in owner.spatial_memberships(at_interval=context)
+             if dto.members[0].observation.member != local.stamp.member]
+    assert len(peers) == 2
+    assert all(not e.eligible for dto in peers for e in dto.eligibility)
+    intent = owner.prepare_spatial_member(dto, spatial_reference(local, context), at_interval=context)
+    assert intent.reservation is not None, intent.reason
+    assert owner.commit_spatial_member(
+        intent.reservation, at_interval=context, consumer=lambda *_: "local-point",
+    ).disposition == "committed"
+
+
+@pytest.mark.parametrize("camera", ["kitchen", "family-room"])
+def test_image_region_birth_quarantine_survives_configured_source_epoch_reset(camera):
+    from tests.test_mv3dt_person_association import semantic_joint_fixture
+
+    selected, _, _, _, _ = semantic_joint_fixture(competitor=None)
+    owner = IdentityAssociationService.for_estimated_image_regions(
+        "run-a", spatial_policy(), selected, live_track_continuity=True,
+        semantic_joint_max_mean_px=5., unresolved_birth_quarantine=True,
+    )
+    binding = next(b for b in SOURCES if b.camera_id == camera)
+    assert owner.reset_source(replace(binding, source_epoch=1)).disposition == "reset"
+    row = observation(camera, epoch=1)
+    assert owner.observe_spatial(
+        row, SpatialLifecycleReceipt("reset-native", row.stamp, "ACTIVE"),
+    ).disposition == "observed"
+    # Observe, never fabricate, the real gate. A stale image-policy epoch must
+    # not classify its configured camera as a newly exempt local-only source.
+    assert owner._private_image_region_ambiguity(row.stamp)["birth_quarantined"] is True
+    dto, = owner.spatial_memberships(at_interval=spatial_context(
+        (row,), sources=tuple(replace(b, source_epoch=1) if b == binding else b for b in SOURCES),
+    ))
+    assert not dto.eligibility[0].eligible
+
+
+@pytest.mark.parametrize("original", [None, object(), SourceObservation(None)])
+def test_image_region_source_scope_preserves_malformed_observation_rejection(original):
+    from tests.test_mv3dt_person_association import semantic_joint_fixture
+
+    selected, _, rows, _, _ = semantic_joint_fixture(competitor=None)
+    owner = IdentityAssociationService.for_estimated_image_regions(
+        "run-a", spatial_policy(), selected, live_track_continuity=True,
+        semantic_joint_max_mean_px=5., unresolved_birth_quarantine=True,
+    )
+    result = owner.observe_spatial(original, SpatialLifecycleReceipt("native", rows[0].stamp, "ACTIVE"))
+    assert result.reason == "spatial_lifecycle_binding"
+    assert not owner.spatial_memberships(at_interval=spatial_context(rows))
 
 
 def test_i135_public_joint_corroboration_and_queued_revision():

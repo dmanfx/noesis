@@ -1,5 +1,16 @@
 # Architecture decisions
 
+## 2026-11-01 — History budgets bound selected payloads, not retained journal size
+
+The journal retains a bounded sequence/contract/hash index populated by complete
+startup validation and successful commits only. History and temporal readers
+select original SQLite rows through that index in one read-only WAL snapshot,
+validate their canonical bytes and original hashes, and retain cursor/retention
+anchors. They do not rescan every payload per request or change retention.
+Unindexed writes, changed selected bytes, schema/binding changes and expired
+anchors still fail closed. The asynchronous writer owns the small index update;
+media callbacks gain no database or read work.
+
 ## 2026-10-31 — Semantic regions derive from reviewed artifact-local points
 
 Owner-declared door segments and planar area/seat/surface/coverage regions live
@@ -10,6 +21,18 @@ checks validate a declaration, not a measured physical surface. Stable IDs,
 retirement and actor-original readback remain independent of world occupancy or
 promoted geometry. Existing point records and relationships are unchanged.
 
+## 2026-10-31 — Recorded observation spans are not continuous dwell
+
+Temporal relationship reads use the existing durable canonical snapshots, not
+browser sampling or new frame-path work. Consecutive compatible authoritative
+assignment observations can establish an observed time span with original
+clock, identity, frame and journal evidence. Duplicated observations cannot
+lengthen it, and explicit source/gap boundaries stop the chain. Point reports
+cannot establish uninterrupted physical occupancy, so dwell remains unknown.
+Persisted-as-of scope, incomplete durability and retention limits remain visible;
+the current head's original freshness is never renewed by a read. Bounded
+read-only journal inspection stays outside publication and writer locks.
+
 ## 2026-10-31 — Semantic anchors are reviewed artifact-local declarations
 
 The separate semantic-anchor registry shares the scene selector's SQLite
@@ -19,6 +42,15 @@ or a world frame. New geometry requires the current admitted OBJ; retirement
 preserves the original declaration without rebinding it. Original lookup remains
 read-only across selector or semantic replacement. No anchor changes geometry,
 canonical people, occupancy, calibration or runtime selection.
+
+## 2026-10-31 — Durable event inspection stays separate from current world
+
+Persisted history reads inspect the actual canonical journal through a bounded
+read-only SQLite/WAL connection, outside publication and writer locks. Fixed
+tail/floor hash bindings and an original 30-second inspection lease constrain
+paging. Queue, failure, rejection, retention and restart limits remain explicit;
+history cannot restore a person or establish current occupancy. No always-on
+frame callback waits for this optional reader.
 
 ## 2026-10-30 — Semantic names belong to an explicit scene release
 
@@ -3109,3 +3141,22 @@ each existing room-to-authored-scene transform exactly once.
 This changes presentation only: it neither invents geometry nor admits a new
 canonical world measurement, registration, identity or tracking constraint.
 Existing lower-room quality and physical-qualification limitations remain.
+
+## 2026-10-30 — Bounded reads of the running canonical world owner
+
+The private current-world REST read uses the actual native host's
+`CanonicalWorldService` and its original committed snapshot/clock. It never
+reconstructs a world from files, presentation state or last-seen records. Reads
+retain original publication expiry and source evidence, with nonblocking owner
+capture and bounded serialization outside the publication lock. Unavailable,
+replaced or expired authority is explicit unknown. Menon may describe recorded
+room assignments, not infer physical occupancy or renew source freshness.
+
+## 2026-10-30 — Recorded spatial relationship projection
+
+The private relationship read derives room/support facts from one immutable
+committed World snapshot, not a browser join or a static reconstructed mesh.
+Unsettled lifecycle, identity, binding or expiry evidence yields unknown while
+retaining original source provenance. Duration remains unknown without temporal
+evidence. This is a bounded read-side projection outside the publication lock;
+it adds no world writes, background inference or source-freshness renewal.

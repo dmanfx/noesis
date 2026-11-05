@@ -1,5 +1,12 @@
 # Noesis upgrade history
 
+## 2026-11-01 — Bounded live history readers
+
+Removed the whole-journal JSON-size prerequisite from history and temporal
+queries. Selected payloads, committed hashes, retained anchors, deadlines and
+response limits remain verified. Large retained journals no longer disable
+small event pages or the latest 32-snapshot window.
+
 ## 2026-10-31 — Reviewed semantic regions and door segments
 
 Added a bounded owner-declared shape store and registered private API, deriving
@@ -9,6 +16,15 @@ geometry refusal, revision conflicts, retirement and actor-original recovery.
 This is source and disposable-fixture proof, not runtime geometry activation,
 metric registration, physical surface verification or household operation.
 
+## 2026-10-31 — Bounded persisted assignment-observation spans
+
+Added a private temporal-relationships read over actual retained canonical
+snapshots. It returns original per-observation provenance and explicit span
+boundaries, with partial/unknown persistence and retention states. Continuous
+dwell remains unknown; no live sampling, lifecycle inference, frame-path work or
+runtime activation is introduced. Disposable producer/private-API validation
+is distinct from deployed runtime or physical occupancy evidence.
+
 ## 2026-10-31 — Reviewed semantic-anchor private producer
 
 Added strict artifact-local owner declarations with stable IDs, scene/semantic/
@@ -17,6 +33,22 @@ disposable store/API checks passed; 16 affected lifecycle checks then passed
 after fixing exact historical retirement. Existing semantic names are unchanged.
 This is private producer source, not a deployed editor, measured surface claim
 or geometry activation.
+
+## 2026-10-31 — Private durable world-event history
+
+Added a bounded private journal inspection route with original records, fixed
+inspection anchors, restart-safe retained data and explicit persistence gaps.
+Eighteen disposable journal/WorldService/FastAPI checks passed, covering private
+auth, paging, pruning, corruption, queue/failure limits and lock isolation.
+This is source validation, not deployment or physical occupancy evidence.
+
+## 2026-10-30 — Private current-world read for room answers
+
+Added a bounded bearer-private read of the running native world's exact committed
+snapshot, with original clock/expiry, source evidence and explicit unknown states.
+Disposable FastAPI and actual native startup-binding checks exercise auth,
+publication-lock isolation, size/concurrency limits and retirement. This is source
+integration, not a runtime deployment or physical room-occupancy validation.
 
 ## 2026-10-30 — Canonical owner-declared semantic registry producer
 
@@ -2508,3 +2540,11 @@ Kitchen ceiling evidence remains ambiguous, so its supported fragments are
 retained. This is not a gap-free or all-ceilings-removed result. Browser owner
 authentication remains required; the available browser session was signed out,
 so an authenticated user-visible browser render was not independently checked.
+
+## 2026-10-30 — Private recorded relationship read
+
+Added `/api/v1/world/relationships` over the actual current canonical world owner,
+with typed room/support facts, explicit unknown/dwell limits, original expiry and
+bounded source evidence. Focused disposable WorldService/FastAPI checks cover
+private authentication, lifecycle/binding/clock failures and zero world writes.
+No runtime activation or physical relationship accuracy is claimed.

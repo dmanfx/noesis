@@ -844,6 +844,60 @@ class CanonicalWorldService:
         with self._lock:
             return self._current_snapshot
 
+    def read_current_snapshot(self) -> tuple[WorldSnapshot | None, int | None, str]:
+        """Nonblocking private read of committed evidence, never a publication.
+
+        Capture only immutable pointers/scalars under the publication lock.
+        Clock invocation, response allocation and serialization belong to the
+        request worker, outside the media/publication critical section.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None, None, "world_busy"
+        try:
+            snapshot = self._current_snapshot
+            closed = self._closed
+            clock_us = self._clock_us
+        finally:
+            self._lock.release()
+        if closed:
+            return None, None, "world_closed"
+        try:
+            at_us = clock_us()
+        except Exception:
+            return None, None, "invalid_clock"
+        if type(at_us) is not int or not 0 < at_us <= 2**53 - 1:
+            return None, None, "invalid_clock"
+        if not self._lock.acquire(blocking=False):
+            return None, None, "world_busy"
+        try:
+            closed = self._closed
+            latest = self._current_snapshot
+        finally:
+            self._lock.release()
+        if closed:
+            return None, None, "world_closed"
+        if snapshot is not None and latest is None:
+            return None, at_us, "snapshot_unavailable"
+        if snapshot is not None and latest is not None and latest.producer != snapshot.producer:
+            return None, at_us, "world_owner_changed"
+        return snapshot, at_us, "available" if snapshot is not None else "snapshot_unavailable"
+
+    def capture_history_source(self):
+        """Capture immutable journal/owner pointers only, without waiting.
+
+        The history request worker owns every clock, SQL, health and JSON read.
+        This method never flushes persistence or touches current world state.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None, "world_busy"
+        try:
+            source = (self._journal, self.producer, self._clock_us,
+                      self._persistence_rejected_cohorts, bool(self._persistence_last_error))
+            closed = self._closed
+        finally:
+            self._lock.release()
+        return (None, "world_closed") if closed else (source, "available")
+
     def publish(
         self,
         source_id: int,

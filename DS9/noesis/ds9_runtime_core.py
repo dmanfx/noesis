@@ -3980,7 +3980,7 @@ def _build_rest_app(
 ) -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import alignment_walk_api, analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, scene_prior_api, semantic_seg_api, virtual_twin_api
+    from noesis.server import alignment_walk_api, analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, scene_prior_api, semantic_seg_api, virtual_twin_api, world_read_api
     from noesis.server.internal_auth import InternalAuthConfigurationError, configure_internal_rest_app
 
     app = FastAPI(title="Noesis DS9 Runtime API")
@@ -4009,6 +4009,7 @@ def _build_rest_app(
     app.include_router(scene_api.router)
     app.include_router(scene_prior_api.app.router)
     app.include_router(semantic_seg_api.router)
+    app.include_router(world_read_api.router)
     auth_config = configure_internal_rest_app(app)
     alignment_walk_api.install_alignment_walk_api(
         app,
@@ -6369,6 +6370,8 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         lambda service: service.close(),
     )
     setattr(pipeline, "world_service", world_service)
+    if prebuilt_rest_app is not None:
+        prebuilt_rest_app.state.canonical_world_service = world_service
     capability_monitor = create_runtime_capability_monitor(world_service)
     from noesis.server import health_api
 

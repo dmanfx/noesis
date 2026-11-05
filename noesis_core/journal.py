@@ -6,11 +6,13 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Iterable, Mapping, NamedTuple
+from typing import Any, Callable, Iterable, Mapping, NamedTuple
+from urllib.parse import quote
 
 from noesis_core.private_paths import (
     PrivatePathError,
@@ -184,6 +186,9 @@ class ContractJournal:
         self._close_failure: ContractJournalError | None = None
         self._connection_handle: sqlite3.Connection | None = None
         self._preflight_validated = False
+        self._inspection_lock = threading.Lock()
+        self._inspection_index = {}
+        self._collect_inspection_index = True
         self._preflight_version: int | None = None
         database = self.path.lstat()
         parent = self.path.parent.lstat()
@@ -196,6 +201,7 @@ class ContractJournal:
         self._sidecar_identities: dict[Path, tuple[int, int]] = {}
         try:
             self._initialize()
+            self._collect_inspection_index = False
         except BaseException as exc:
             connection = self._connection_handle
             self._connection_handle = None
@@ -442,15 +448,16 @@ class ContractJournal:
                 f"actual={checkpoint_pages}"
             )
 
-    def _validate_schema(self, connection: sqlite3.Connection) -> None:
-        quick_check = tuple(
-            str(row[0])
-            for row in connection.execute("PRAGMA quick_check").fetchall()
-        )
-        if quick_check != ("ok",):
-            raise ContractJournalError(
-                "contract journal SQLite integrity check failed"
+    def _validate_schema(self, connection: sqlite3.Connection, *, check_integrity=True) -> None:
+        if check_integrity:
+            quick_check = tuple(
+                str(row[0])
+                for row in connection.execute("PRAGMA quick_check").fetchall()
             )
+            if quick_check != ("ok",):
+                raise ContractJournalError(
+                    "contract journal SQLite integrity check failed"
+                )
         objects = connection.execute(
             """
             SELECT type, name, tbl_name, sql FROM sqlite_schema
@@ -530,6 +537,8 @@ class ContractJournal:
     def _validated_records(
         self,
         connection: sqlite3.Connection,
+        *,
+        check_budget: Callable[[], None] | None = None,
     ) -> tuple[JournalRecord, ...]:
         state_rows = connection.execute(
             """
@@ -573,9 +582,17 @@ class ContractJournal:
             raise ContractJournalError(
                 "contract journal anchor does not match its retained-history boundary"
             )
+        result = self._validated_record_rows(rows, first_sequence, anchor, check_budget)
+        if self._collect_inspection_index:
+            self._inspection_index = {r.sequence: (r.payload["contract"], r.previous_sha256, r.record_sha256) for r in result}
+        return result
+
+    def _validated_record_rows(self, rows, first_sequence, anchor, check_budget=None):
         expected_previous = str(anchor)
         result: list[JournalRecord] = []
         for offset, row in enumerate(rows):
+            if check_budget is not None:
+                check_budget()
             expected_sequence = first_sequence + offset
             if type(row["sequence"]) is not int or int(row["sequence"]) != expected_sequence:
                 raise ContractJournalError(
@@ -860,7 +877,13 @@ class ContractJournal:
                         "contract journal retention would discard records from "
                         "the acknowledged append cohort"
                     )
-                connection.execute("COMMIT")
+                with self._inspection_lock:
+                    connection.execute("COMMIT")
+                    first = connection.execute("SELECT MIN(sequence) FROM records").fetchone()[0]
+                    for record in appended:
+                        self._inspection_index[record.sequence] = (record.payload["contract"], record.previous_sha256, record.record_sha256)
+                    while self._inspection_index and next(iter(self._inspection_index)) < first:
+                        del self._inspection_index[next(iter(self._inspection_index))]
             except BaseException:
                 try:
                     connection.execute("ROLLBACK")
@@ -1010,6 +1033,107 @@ class ContractJournal:
         with self._lock, self._connection() as connection:
             return self._validated_records(connection)
 
+    def _inspect_contract_window(self, contract, *, limit, before, deadline, max_rows, max_bytes, anchor_sequence=None, max_selected_bytes=None):
+        """Read only selected payloads against the process's validated commit index.
+
+        Startup validates the complete retained chain. Only this journal's successful
+        commits extend the index; it contains hashes, never cached payloads. Each
+        request still reads and validates original SQLite bytes in one WAL snapshot.
+        """
+        def budget():
+            if time.monotonic() >= deadline:
+                raise ContractJournalError("history_deadline_exceeded")
+        budget()
+        if self._closed:
+            raise ContractJournalError("history_journal_closed")
+        self._validate_main_binding()
+        if not self._inspection_lock.acquire(blocking=False):
+            raise sqlite3.OperationalError("journal commit is busy")
+        connection = None
+        try:
+            connection = sqlite3.connect(f"file:{quote(str(self.path))}?mode=ro", uri=True, timeout=0)
+            connection.row_factory = sqlite3.Row
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA trusted_schema=OFF")
+            connection.execute("BEGIN")
+            state = connection.execute("SELECT next_sequence, anchor_previous_sha256 FROM journal_state WHERE singleton=1").fetchone()
+            bounds = connection.execute("SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM records").fetchone()
+            index = self._inspection_index
+            first = next(iter(index), int(state[0]))
+            last = next(reversed(index), int(state[0])-1)
+            previous = index[first][1] if index else self.GENESIS_SHA256
+            if (tuple(bounds) != (len(index), first if index else None, last if index else None)
+                    or int(state[0]) != last+1 or str(state[1]) != previous):
+                raise ContractJournalError("journal commit index no longer matches storage")
+            eligible = []
+            for offset, sequence in enumerate(reversed(index)):
+                if offset % 128 == 0: budget()
+                if index[sequence][0] == contract and (before is None or sequence < before):
+                    eligible.append(sequence)
+                    if len(eligible) > limit: break
+            selected = set(eligible[:limit])
+            if index: selected.update((first, last))
+            if anchor_sequence is not None:
+                if anchor_sequence not in index: raise ContractJournalError("inspection_expired")
+                selected.add(anchor_sequence)
+            stamps = {sequence: index[sequence] for sequence in selected}
+        except BaseException:
+            if connection is not None: connection.close()
+            raise
+        finally:
+            self._inspection_lock.release()
+        try:
+            if len(selected) > max_rows:
+                raise ContractJournalError("history_scan_bound_exceeded")
+            self._validate_schema(connection, check_integrity=False)
+            ordered = sorted(selected)
+            if max_selected_bytes is not None and eligible[:limit]:
+                selection=eligible[:limit]
+                marks=','.join('?' for _ in selection)
+                total=connection.execute(f"SELECT SUM(length(CAST(payload_json AS BLOB))) FROM records WHERE sequence IN ({marks})", selection).fetchone()[0]
+                if total > max_selected_bytes: raise ContractJournalError("history_scan_bound_exceeded")
+            if ordered:
+                marks = ','.join('?' for _ in ordered)
+                sizes = connection.execute(f"SELECT SUM(length(CAST(payload_json AS BLOB))), MAX(length(CAST(payload_json AS BLOB))) FROM records WHERE sequence IN ({marks})", ordered).fetchone()
+                if sizes[0] > max_bytes or sizes[1] > 2*1024*1024:
+                    raise ContractJournalError("history_scan_bound_exceeded")
+                rows = connection.execute(f"SELECT * FROM records WHERE sequence IN ({marks}) ORDER BY sequence", ordered).fetchall()
+            else: rows = []
+            if len(rows) != len(ordered): raise ContractJournalError("journal window changed")
+            records=[]
+            for row in rows:
+                budget()
+                stamp=stamps[row['sequence']]
+                record=self._validated_record_rows([row], row['sequence'], stamp[1], budget)[0]
+                if (record.payload['contract'], record.previous_sha256, record.record_sha256) != stamp:
+                    raise ContractJournalError("journal committed checksum mismatch")
+                records.append(record)
+            budget(); self._validate_main_binding()
+            if self._closed: raise ContractJournalError("history_journal_closed")
+            return tuple(records), tuple(eligible), int(state[0]), str(state[1])
+        finally:
+            connection.close()
+
+    def inspect_world_events(self, *, limit, before, deadline, max_rows, max_bytes, anchor_sequence=None):
+        return self._inspect_contract_window("noesis.world.event", limit=limit, before=before,
+            deadline=deadline, max_rows=max_rows, max_bytes=max_bytes, anchor_sequence=anchor_sequence)
+
+    def inspect_world_snapshots(self, *, deadline):
+        try:
+            records, eligible, next_sequence, previous = self._inspect_contract_window("noesis.world.snapshot",
+                limit=32, before=None, deadline=deadline, max_rows=34, max_bytes=4*1024*1024, max_selected_bytes=2*1024*1024)
+        except ContractJournalError as exc:
+            mapping={"history_deadline_exceeded":"temporal_read_deadline_exceeded",
+                "history_scan_bound_exceeded":"temporal_snapshot_byte_limit_exceeded",
+                "history_journal_closed":"temporal_journal_closed"}
+            raise ContractJournalError(mapping.get(str(exc),str(exc))) from exc
+        sequences=set(eligible[:32])
+        selected=tuple(record for record in records if record.sequence in sequences)
+        if sum(len(_canonical_bytes(r.payload)) for r in selected)>2*1024*1024:
+            raise ContractJournalError("temporal_snapshot_byte_limit_exceeded")
+        return selected, (records[0].sequence if records else next_sequence), previous, len(eligible)>32
+
     def close(self) -> None:
         """Checkpoint and close the durable WAL connection exactly once."""
 
@@ -1137,6 +1261,27 @@ class AsyncContractJournal:
                 else None
             ),
         }
+
+    def inspect_health(self) -> dict[str, Any] | None:
+        """Bounded read-only health, including dequeued but unfinished batches.
+
+        Unlike ordinary diagnostics, a request must not wait behind flush/close.
+        """
+        locks = (self._failure_lock, self._state_lock, self._queue.mutex)
+        acquired = []
+        try:
+            for lock in locks:
+                if not lock.acquire(blocking=False):
+                    return None
+                acquired.append(lock)
+            pending = len(self._queue.queue)
+            return {"status": "failed" if self._failure is not None else "closed" if self._closed else "healthy",
+                    "pending_batches": pending,
+                    "inflight_batches": max(0, self._queue.unfinished_tasks - pending),
+                    "worker_alive": self._thread.is_alive()}
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
 
     def append_many(
         self,

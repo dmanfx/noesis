@@ -508,6 +508,8 @@ struct LifecycleFrame {
   };
   std::vector<ShadowTarget> shadow;
   std::vector<uint64_t> terminated;
+  struct ObjectTermination { uint64_t tracker_id; int class_id; };
+  std::vector<ObjectTermination> object_terminated;
 };
 
 // NvDCF owns these buffers. Copy only bounded scalar lifecycle evidence while
@@ -575,7 +577,18 @@ void copy_tracker_misc(
           for (unsigned int target_index = 0; target_index < stream.numFilled;
                ++target_index) {
             const auto& target = stream.list[target_index];
-            if (target.classId != 0) continue;  // Canonical people only.
+            if (target.classId != 0) {
+              // Separate object evidence; never inject it into canonical people.
+              if (!shadow && target.classId > 0 && target.classId < 80) {
+                if (barrier->object_terminated.size() >= kMaxLifecycleTargetsPerStream)
+                  throw std::runtime_error("object termination capacity");
+                for (const auto& prior : barrier->object_terminated)
+                  if (prior.tracker_id == target.uniqueId)
+                    throw std::runtime_error("duplicate object termination");
+                barrier->object_terminated.push_back({target.uniqueId, static_cast<int>(target.classId)});
+              }
+              continue;
+            }
             if (shadow) {
               // DS9.1 allocates exactly one shadow frame and does not
               // initialize target.numAllocated. Do not read that field here.
@@ -747,6 +760,14 @@ py::dict extract_tracker_lifecycle(const deepstream::BatchMetadata& batch_meta) 
       row["class_id"] = 0;
       terminated_rows.append(std::move(row));
     }
+    py::list object_terminated;
+    for (const auto& target : current.object_terminated) {
+      py::dict row;
+      row["tracker_id"] = target.tracker_id;
+      row["class_id"] = target.class_id;
+      object_terminated.append(std::move(row));
+    }
+    record["object_terminated"] = std::move(object_terminated);
     record["shadow"] = std::move(shadow_rows);
     record["terminated"] = std::move(terminated_rows);
     rows.append(std::move(record));

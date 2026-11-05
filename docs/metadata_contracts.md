@@ -14,6 +14,7 @@ This document summarizes the key metadata structures used by the DS9.1 pipeline,
 | Native user-meta ownership/copy/release | [Lifecycle](#5-custom-user-meta-lifecycle-ds91--deepstream) |
 | Pose feature and object-depth consumers | [Pose features](#6-pose-feature-user-meta-object-level), [object depth](#7-object-depth-user-meta-object-level) |
 | OSD keypoints and geometry | [Pose OSD](#8-pose-keypoint-visualization-osd), [geometry](#9-calibration--geometry) |
+| Non-person camera-image observations | [Object observations](#10-camera-image-object-observations) |
 
 Metadata availability, consumer wiring and selected runtime authority are
 separate facts. For pose/identity wiring, use the
@@ -57,6 +58,18 @@ The intrinsics payload (after `as_payload()`) has the shape:
 ```
 
 The loader accepts either a `cameras` or `sources` mapping at the root of `config/cameras.yaml`, and supports reusable intrinsics under `intrinsics_models` (or `models`) referenced by `model`/`intrinsics_model`. Keys `fx`, `fy`, `cx`, `cy` are required, with optional `K_matrix`/`camera_matrix` fallbacks and distortion coefficients (`k1`/`k2`/`k3` or `distortion_coeffs`).
+
+The canonical DS9 loader and shared loader also retain explicit projection
+metadata in `CameraIntrinsics` and the manager's immutable raw/world snapshots:
+`projection_model`, `distortion_model`, `distortion_coefficients`, optional
+`distortion_coefficient_names`, and `projection_metadata_status`
+(`undeclared`, `declared`, or `invalid`). Original finite coefficient vectors
+are bounded to 16 values; named vectors preserve their supplied names/order.
+Reusable-model `calibration.model` is a declaration; a camera's model reference
+or rectification method is not. Missing declarations remain absent, and legacy
+default-zero `k1/k2/k3` values do not establish an optical model. Declaration
+status validates representation, not optical support or physical calibration
+accuracy. Existing K/E construction and SDK `as_payload()` shape are unchanged.
 
 DS9.1 code that consumes intrinsics should prefer the runtime `calibration-bundle` / `CalibrationSnapshot`. Per-frame intrinsics user meta may be absent in Service Maker pipelines.
 
@@ -911,3 +924,77 @@ that must stay semantically aligned:
 - and world projection via `pixel_to_world(...)` in `hooks.py`.
 
 Any change to calibration formats or semantics must be reflected here and in the corresponding DS9.1 docs, because the backend fused estimator is now the canonical owner of `track.world`.
+
+## 10. Camera-image object observations
+
+The native Service Maker analytics hook copies bounded non-person class, label,
+reported confidence and rectangle scalars before the existing person-only track
+conversion. It uses the same object iterator once; SDK objects, pixels, tensors,
+tracker IDs and world/identity estimates do not enter this separate read contract.
+Person processing and the exact canonical tracking/world/BEV cohort are unchanged.
+
+`noesis_core/contracts/object_observations.py` defines the closed frame/observation
+models. The fixed private read is documented in
+[REST object observations](api_contracts_rest.md#13-camera-image-object-observations).
+Coordinates are original pipeline-image pixels with explicit pipeline/source
+dimensions. Processing Unix microseconds and stream-relative nanosecond PTS remain
+separate clock domains; estimated capture time is not promoted to a measured clock.
+Reported confidence is not independent detection or physical-location accuracy.
+
+An observation ID identifies one original run/camera/source-epoch/frame/ordinal,
+not the same household object across frames. No 3D point, room, support surface,
+scene label, static mesh, disappearance or lifecycle is inferred. The selected
+model, class policy, thresholds and cadence remain unchanged; unavailable actual
+non-person output stays unavailable rather than being populated by a substitute.
+
+### 10.1 Owner-declared object associations
+
+The separate `noesis.object-tracks` v1 contract now carries native non-person
+tracker IDs as lossless decimal strings, scoped by run, camera, source epoch and
+continuity generation. It reuses the existing bounded scalar copy and worker;
+the image-observation contract above remains unchanged. `/api/v1/objects/tracks`
+reads current evidence. Actor-owned `/api/v1/objects/selections` read, prepare,
+confirm and original-lookup routes persist explicitly selected keys. Last-seen
+reads join subsequent exact native samples, while durable updates batch at most
+once per second and flush on graceful shutdown. Manual declaration revisions do
+not change when observations advance. Gaps, source loss and replacement are
+distinct states. Native non-person termination is copied from the same complete-
+buffer source barrier into a separate bounded list. A reused native ID receives a
+new continuity generation; it cannot revive a terminated saved track.
+
+Original per-object native analytics membership can populate `room_id` with
+`room_source=nvdsanalytics_roi`; absent or ambiguous membership remains null.
+For selected tracks only, the existing DAv2 depth store supplies optional
+`image_center_surface` measurements, explicitly `estimated` and never an object
+centroid or ground footprint. Sampling uses the exact source/frame/PTS, a single
+pixel, at most four selected tracks per capture and at most once per second per
+key, off the media callback. No new inference, full-frame copy, waiting callback,
+lagged-depth substitution or person anchor is introduced. Only declared OpenCV
+fisheye projection and revision-bound metric calibration are admitted. The
+inverse ray must round-trip through the existing forward projector. Original
+frame/time/PTS, model, depth, calibration/alignment/transform hashes and target
+world revision accompany each point. Older last measurements retain their own
+original timestamps separately from subsequent last-seen observations; missing
+inputs have typed reasons. Native class/box proximity never establishes identity.
+
+`noesis_core/contracts/object_associations.py` defines a separate persistent
+owner-declaration registry. A stable declaration ID and label refer to one exact
+captured detector observation, not a recognized physical-object identity. The
+capture retains its run/camera/source epoch/frame, image box, dimensions,
+confidence, original clock domains and five-second observation expiry unchanged.
+No room, world point, automatic match, continued presence or lifecycle is added.
+
+An explicit inspection captures at most 50 original rows into an actor/operation-
+bound server inspection. Its fixed 120-second authoring deadline is independent
+of observation freshness. Later frames and expired observations can be reviewed
+as historical captures; reads never make them current again. Inspection and
+review responses expose producer-relative `remaining_ms`, debited by each
+consumer's full request time rather than comparing host/browser epoch clocks.
+Replacing the observation-service owner or run retires pending authoring.
+Completed original-operation lookup remains independent of current input.
+
+The private registry shares the configured scene SQLite file, with exact revision
+checks/readback, at most 128 declarations, 16 inspections, 64 reviews and 128
+24-hour originals within 32 MiB. Payloads remain capped at 256 KiB. Reading an
+absent registry or looking up a missing original does not initialize or prune it.
+See [REST object associations](api_contracts_rest.md#131-owner-declared-object-associations).

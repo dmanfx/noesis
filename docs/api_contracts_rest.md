@@ -1069,7 +1069,265 @@ If a future change publishes validation reports, Menon camera reprojection
 evidence, or regression summaries over REST, add the endpoint, request, response,
 and failure/status semantics here before treating that surface as public.
 
-## 8. Future DS9.1 REST Endpoints
+## 8. Private current-world read
+
+**GET** `/api/v1/world/current` accepts no query or body and uses the existing
+internal bearer boundary. The native host binds the actual running
+`CanonicalWorldService`; unbound, closed, busy, expired or replaced owners return
+an explicit `unknown` response, never a file or cached substitute.
+
+`noesis.world.current-read` version 1 returns `status`, `reason`, original-clock
+`generated_at_us`, `valid_until_us`, `max_snapshot_age_us: 2000000`, and the exact
+committed `WorldSnapshot` or `null`. An available response expires no later than
+the original publication plus two seconds. Reads do not publish samples or renew
+that deadline. Native microseconds are not implicitly Unix time or browser time.
+Room assignments retain their source evidence; they do not prove physical
+occupancy or dwell.
+
+The route permits two concurrent serializers and bounds entity/source counts,
+model traversal and its wire response to 2 MiB. Serialization runs outside the
+publication lock. All responses are private/no-store; malformed read parameters
+return 400, while missing bearer authentication uses the existing 401 boundary.
+
+## 9. Private recorded spatial relationships
+
+**GET** `/api/v1/world/relationships` uses the same private bearer and actual
+world owner as the current-world read, with no query or body. The strict
+`noesis.world.relationships` version 1 response projects only recorded room
+assignments and selected support surfaces. Held, lost, predicted, conflicted,
+quarantined, expired or incompletely bound records cannot produce a settled
+relationship; their original evidence remains qualified. A single snapshot does
+not establish dwell, so duration is explicitly unknown.
+
+The response retains original native-clock observation/publication/expiry and
+producer/run/snapshot/frame provenance. Reading never renews the two-second
+publication deadline. The existing two-reader gate is shared with current-world
+reads; limits include 256 entities, 4,096 source rows and 128 KiB per response.
+Unavailable or over-limit results are whole-result unknown, not partial facts.
+No geometry, identity, room membership or publication is changed by this read.
+
+## 10. Private persisted world-event history
+
+**GET** `/api/v1/world/history` uses the existing internal bearer boundary.
+It accepts only `limit` (canonical integer 1–50, default 50) and an optional
+opaque `cursor` issued by this reader. Duplicate/unknown parameters or a body
+return 400. It reads retained `noesis.world.event` journal records, never current
+people or a reconstructed occupancy timeline.
+
+`noesis.world.history` version 1 contains `status` (`available`, `partial`, or
+`unavailable`), `reason`, `coverage: retained_persisted_events_only`, `inspection`,
+`persistence`, `events`, and `next_cursor`. Each event retains its journal
+`sequence`, `recorded_at_us`, hash-chain fields and original WorldEvent `payload`.
+Inspection records bind the retained floor and original tail sequence/hash;
+their original source-clock `created_at_us`/`expires_at_us` span 30 seconds.
+Paging never renews this deadline. Producer microseconds are not implicitly UTC.
+
+Only durable rows are returned. Queued/in-flight writes, rejected cohorts or
+reported persistence failures remain explicit `partial` evidence. Disabled,
+closed, corrupt, changed, over-limit or busy persistence returns `unavailable`
+with no events/cursor; it is not an empty-history claim. Pruning or restart can
+retire a continuation without deleting the retained journal records.
+
+One request at a time inspects read-only SQLite/WAL outside the publication and
+journal-writer locks. Limits are 50 rows/256 KiB per response, 64 process-local
+continuations, and a 0.75-second inspection budget with a 10,000-row/32 MiB
+selected-payload preflight bound. Journal size does not consume the response
+budget: a bounded in-memory index contains only committed sequence/contract/hash
+metadata. Startup validates the full retained chain; requests validate original
+selected rows and inspection anchors against that index in one WAL snapshot. Reads do not flush, create journal rows, restore people, infer
+departures from missing data, or change canonical/runtime state.
+
+## 11. Private reviewed semantic anchors
+
+**GET/PUT** `/api/v1/scenes/current/semantic-anchors` and **POST**
+`/api/v1/scenes/semantic-anchors/lookup` use the existing internal bearer boundary.
+The gateway supplies the authenticated owner actor; browser credentials are not
+accepted here. Writes bind the exact current scene release/content hashes,
+authored artifact, semantic registry revision and anchor registry revision.
+
+`noesis.semantic.anchors` version 1 returns current `binding`, `artifact`,
+`eligibility`, `semantic_revision`, `record`, `status`, and per-anchor
+`review_states`. Each stable anchor names an exact semantic ID and retains its
+reviewed binding/artifact/revision, `declaration: owner_declared`, retirement,
+and `geometry` with `space: authored_scene_geometry_local`,
+`units: artifact_units`, a finite point and optional unit normal. New or edited
+geometry requires a reviewed active semantic object and the exact admitted
+authored OBJ bytes. Other authored formats are explicitly unsupported.
+
+PUT performs scene/semantic/anchor CAS and exact SQLite readback in one scene
+transaction. Retiring an existing declaration preserves its original metadata,
+even after its source becomes stale; retirement never activates that geometry.
+Stable targets cannot be silently changed or retired IDs revived. Limits are
+128 anchors/256 KiB and 128 original results/32 MiB with 24-hour retention.
+Lookup is actor/original-fingerprint scoped and read-only across source
+replacement; missing and expired originals return 404 and 410 without writing.
+Conflicting sources/revisions return 409; malformed schemas and oversized
+bodies return 422 and 413. These annotations do not assert surface membership,
+metric units, world transforms, physical occupancy or geometry application.
+
+### 11.1 Private reviewed semantic shapes
+
+**GET/PUT** `/api/v1/scenes/current/semantic-shapes` and **POST**
+`/api/v1/scenes/semantic-shapes/lookup` use the same private bearer/owner-actor
+boundary. The separate `noesis.semantic.shapes` version 1 snapshot supplies the
+exact scene binding, artifact, semantic and anchor revisions, current reviewed
+`point_choices`, saved record and explicit review states. Existing anchor-v1
+records are not migrated or rewritten.
+
+A write selects ordered saved anchor IDs for a stable semantic declaration;
+it cannot supply coordinates. Noesis derives and retains the exact vertices
+from those current reviewed points in the scene SQLite transaction. A door
+requires two distinct points; an area, seat, surface or coverage declaration
+requires 3–16 distinct ordered points forming a nondegenerate simple planar
+polygon. Coordinates remain `authored_scene_geometry_local` / `artifact_units`.
+Degenerate, crossing, nonplanar or numerically ill-conditioned geometry is
+refused, not repaired or guessed.
+
+The current scene/artifact, semantic registry, anchor registry and shape
+revision must all match. Stable IDs keep their semantic ID and kind; retirement
+preserves original geometry and cannot be undone. Limits are 64 shapes/256 KiB,
+128 original results/32 MiB and 24-hour actor-original retention. Lookup checks
+the original command/fingerprint without a current read, write or geometry
+activation; absent/expired originals remain 404/410. These owner declarations
+do not establish measured surfaces, metric/world coordinates, room membership,
+physical visibility or canonical occupancy.
+
+## 12. Private recorded assignment spans
+
+**GET** `/api/v1/world/temporal-relationships` uses the existing internal bearer
+and current-world owner boundary. No query or body is accepted. The closed
+`noesis.world.temporal-relationships` version 1 response has `status`
+(`available`, `partial`, `unknown`), `reason`, original native-clock
+`generated_at_us`/`valid_until_us`, `source`, `persistence` and `entities`.
+
+Source scope is always `persisted_as_of`: retained point reports, not present
+occupancy or a complete timeline. Each entity's `observed_assignment_span` can
+be known only for at least two distinct, consecutive compatible authoritative
+room-assignment observations. It retains the original observations, snapshot
+IDs, producer/run/frame bindings, journal sequences/hashes and a boundary
+reason. Repeated publication of the same observation does not extend a span.
+Gaps, identity/frame/room/source changes, held/conflicted/quarantined records,
+clock regressions and expired evidence stop the chain. `dwell` is always
+unknown: point observations do not prove continuous physical occupancy.
+
+The reader inspects at most 32 eligible persisted snapshots/2 MiB through a
+read-only SQLite/WAL connection, outside publication and journal-writer locks.
+Only selected snapshots and retained boundary anchors are materialized; the
+committed hash index retains the same startup and original-row integrity checks.
+One request at a time has a 0.75-second budget. Output is bounded to 12 entities/128 KiB; overflow is
+whole-result unknown. Source lag, queue/failure state, pruning and bounded
+history remain explicit. Reading never renews the original head's two-second
+deadline, flushes writes, records samples, restores people or infers lifecycle
+events from missing records.
+
+## 13. Camera-image object observations
+
+**GET** `/api/v1/objects/observations` is an internal-bearer read of the exact
+native object-observation owner. It accepts no query or body. The closed
+`noesis.object-observations` v1 envelope contains `status` (`available`, `partial`,
+`unknown`), `reason`, `run_id`, `generated_at_us`, `ttl_ms`, `dropped_frames` and
+`cameras`. Missing, closed, replaced, dropped or expired input is explicit unknown;
+an empty result never establishes that no physical objects are present.
+
+Each camera frame retains its source ID/epoch/frame number, original processing
+clock and stream-relative media PTS, estimated capture-time status, pipeline and
+source image dimensions, original expiry, omission/invalid counts and observations.
+Each observation retains its run/camera/frame-scoped ID, ordinal, class ID, label,
+reported confidence and `left/top/width/height` box in `pipeline_image_px`.
+These are SDK metadata reports, not persistent physical-object identities,
+world coordinates, room assignments or independently verified locations.
+
+The optional handoff is nonblocking and bounded to 16 pending frames. Retention
+is at most 16 camera frames, 32 observations each, 512 rows and 256 KiB, with an
+original five-second deadline; reading never renews it. Partial/drop/unknown
+states expose missing evidence rather than synthesizing lifecycle or absence.
+Query/body errors return 400 with unknown; internal authentication remains 401.
+This source contract does not prove the running detector emitted non-person rows
+or activate a model, configuration, service or consumer.
+
+### 13.1 Owner-declared object associations
+
+The internal-bearer `/api/v1/objects/associations` routes persist explicit owner
+declarations, never detector identities or current physical locations:
+
+- `GET` base returns `noesis.object-associations` v1 and the current exact registry.
+- `POST /inspect` accepts `{actor_id, operation_id}` and returns a bounded
+  `noesis.object-associations.inspection` v1 with an opaque inspection token,
+  original deadline, remaining milliseconds, run, registry revision and up to 50
+  exact captures. It does not renew the observations' original five-second TTL.
+- `POST /prepare` accepts the inspection token, actor/operation, expected revision,
+  declaration ID/label/retired flag and selected exact observation reference (or
+  null for editing an existing declaration without replacing its capture).
+  `noesis.object-associations.review` v1 binds the exact command and original
+  inspection deadline. Ordinary new frames do not invalidate historical review.
+- `PUT` base accepts `{review_token, command}`. The current service owner/run,
+  actor, original review and registry revision must still match. One transaction
+  writes and independently reads back the declaration/result.
+- `POST /lookup` accepts the exact original command and returns only its retained
+  actor-scoped result with `replayed:true`; it never confirms or writes again.
+
+Queries, unexpected fields and invalid/oversized bodies are rejected. Conflicts
+return 409, missing originals 404, expired authoring/originals 410, and unavailable
+or corrupt storage 503. All responses are private/no-store. Server-issued opaque
+tokens are not credentials or permission to bypass the authenticated owner gateway;
+Menon retains session, role, CSRF, confirmation and canonical receipt ownership.
+The 120-second authoring lease is not current-presence evidence. Consumers debit
+full local I/O from producer `remaining_ms`, not from cross-host epoch arithmetic.
+
+### Bounded camera-point geometry analysis
+
+**GET/POST** `/api/v1/scene-priors/cameras/{camera_id}/view-analysis` use the
+existing private bearer boundary. GET rejects bodies and queries and returns
+`noesis.scene-prior.view-analysis.context` v1: the exact current camera binding,
+prior/calibration/frame/model provenance and camera position. It performs no
+analysis or capture. POST accepts that exact binding plus `points`, containing
+1–64 distinct IDs and finite `position_m` triples in `backend_world_m`.
+
+The request must match the loaded prior, calibration and world-frame revisions
+and digests. Responses retain the verified authored-scene digest separately from
+opaque target revision IDs. `noesis.scene-prior.view-analysis` v2 returns original
+requested points, per-point `basis`, `image_domain`, `distortion_applied`, pixel
+and camera depth, plus incomplete static-prior ray-height evidence. Exact declared
+`opencv_fisheye` / `fisheye` metadata with four coefficients (unnamed in OpenCV
+order or explicitly `k1,k2,k3,k4`) uses the distorted calibration-image domain.
+Explicit `rectified_pinhole` / `none` metadata with three zero legacy radial
+coefficients uses the configured linear-K image plane without applying raw lens
+distortion. This matches the declared rectified camera models; it does not infer
+a camera model from zero coefficients. Undeclared metadata stays explicitly mathematical linear-K-only; unsupported or
+invalid declarations return unknown without a substitute projection. Context v1
+retains `distortion_applied:false`; result provenance derives that flag from
+whether any returned point actually applied distortion. All other context/result
+provenance remains exact. Optical visibility is always unknown. A sampled
+height envelope may indicate a potential obstruction. No sampled obstruction is
+not clear line of sight; sparse, missing, outside-grid or bounded-out work stays
+unknown. This is not a whole-room coverage, dynamic occlusion or safety result.
+
+Work is request-only, limited to 512 samples per ray and 32,768 total, two workers,
+64 KiB requests and 256 KiB responses. Source ownership is checked through final
+serialization. Invalid media type/body/query/size returns 415/422/413; retired or
+mismatched bindings return 409, inactive cameras 404, busy/unavailable sources
+503 and bounded timeouts 408. Responses are private/no-store. No world update,
+capture, provider action, inference or calibration mutation occurs.
+
+### Whole-domain geometric coverage samples
+
+**POST** `/api/v1/scene-priors/cameras/{camera_id}/domain-coverage` accepts the
+same current view-analysis binding and a finite `height_above_floor_m` in [0,5].
+It returns `noesis.scene-prior.domain-coverage` v1 with the complete verified
+prior extent, a grid of at most 32 × 32 cell-center samples, an explicit plane
+height, camera position and unchanged source provenance. It does not infer a
+canonical room boundary. Cells distinguish outside-camera, potential static
+obstruction, no sampled obstruction, and unknown. Unknown includes unsupported
+projection, missing/sparse geometry and exhausted work budgets. Samples do not
+establish optical visibility or clearance throughout a cell.
+
+This shares the existing two-worker source/serialization fencing and private
+authentication, 64 KiB request and 256 KiB response bounds. It permits at most
+512 samples per ray and 262,144 total. `remaining_ms` carries an original lease
+of at most 120 seconds; consumers debit transport time and never renew it by
+redisplaying the same result. No request occurs on opening or expiration.
+
+## 14. Future DS9.1 REST Endpoints
 
 If additional DS9.1 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
 

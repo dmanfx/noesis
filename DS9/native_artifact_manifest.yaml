@@ -14,9 +14,9 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: 678472dffa49005671be5810c36e640d257b8fdb184d8d1d9b58fbcc404139b5
-      output_sha256: 69da4521129ba69392715b6d0b1b5c98cabad8c987299ba60169de81cd84e71e
-      built_at_utc: "2026-10-16T16:55:12.219750+00:00"
+      source_sha256: 3da8c3af04fdf2b0f9a7a53431c6c8bda246dcf936dcd0ee570b6249f9452c12
+      output_sha256: 10147c2807a7dae527bfaec0dbcf01fe2385b017768839bbdfdc0cec2d5a72db
+      built_at_utc: "2026-11-01T13:20:49.307341+00:00"
       build_host: "native-host:TauntonMainframe (DS9.1/CUDA13.2, Python3.12)"
       command: bash DS9/scripts/build_noesis_analytics_meta_ext.sh
   - id: plugin.shm_stop_fix

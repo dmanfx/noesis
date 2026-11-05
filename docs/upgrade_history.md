@@ -14,6 +14,36 @@ queries. Selected payloads, committed hashes, retained anchors, deadlines and
 response limits remain verified. Large retained journals no longer disable
 small event pages or the latest 32-snapshot window.
 
+## 2026-11-01 — Menon capability activation on the native runtime
+
+Activated the scoped object, semantic, private-world and coverage sources on the
+existing DS9.1 native lane. Rebuilt and attested only analytics metadata; retained
+the selected models, camera configuration, pose binary and tracking mode. Native
+readiness and advancing world/tracking publication passed, alongside authenticated
+Menon API reads and a real 1,024-cell coverage response. Current input contains no
+non-person observations; that does not establish physical object continuity.
+History/temporal readers retain their explicit unavailable response when the
+existing journal exceeds the bounded scan. No journal data was removed or guard
+weakened. HomeSeer helper activation is outside this deployment.
+
+## 2026-10-31 — Native object termination and selected surface measurements
+
+Added separate bounded native non-person termination and exact-frame selected-
+object metric depth surface samples, preserving person authority and inference
+cadence. Includes original native room membership, calibration/clock provenance,
+explicit missing inputs and no reconnection after native-ID reuse. Source and
+isolated fixtures are checked; no live native artifact was replaced.
+
+
+## 2026-10-31 — Native object continuity and domain coverage source
+
+Added source-scoped non-person continuity and reviewed durable selections with
+automatic last-seen updates. Focused scalar-worker/SQLite tests verify tracking,
+source gaps, replacement and original-result recovery. Added whole-domain
+coverage sampling, checked through private HTTP and Menon's authenticated map
+flow. These are source and synthetic fixture results; no live pipeline, provider,
+model configuration or service was changed.
+
 ## 2026-10-31 — Declared fisheye point projection
 
 Point-analysis result v2 now applies exact supported OpenCV fisheye declarations,
@@ -50,6 +80,16 @@ Eleven focused DS9-first loader/manager cases passed, including missing/invalid
 metadata and cache reloads while K/E and SDK payload behavior remain unchanged.
 This is checked-out source validation; no camera configuration, calibration,
 native binary, inference or running pipeline was changed.
+
+## 2026-10-31 — Reviewed named-object association producer
+
+Added a bounded private inspection/review registry for owner-declared labels on
+exact original camera-image observations. SQLite revision/readback and actor-
+original recovery preserve reviewed history without renewing observation TTLs.
+Six disposable actual-service/private-API checks passed, including newer frames,
+expired observations, owner/run replacement, retention and rollback. No SDK hook,
+detector, runtime configuration or live inference changed; this is source/private
+fixture evidence, not deployed physical-object tracking.
 
 ## 2026-10-31 — Bounded persisted assignment-observation spans
 
@@ -2583,3 +2623,20 @@ with typed room/support facts, explicit unknown/dwell limits, original expiry an
 bounded source evidence. Focused disposable WorldService/FastAPI checks cover
 private authentication, lifecycle/binding/clock failures and zero world writes.
 No runtime activation or physical relationship accuracy is claimed.
+
+## 2026-10-31 — Bounded non-person image-observation read
+
+Added a separate native metadata handoff and private
+`GET /api/v1/objects/observations` over original non-person SDK class/label,
+confidence and camera-image boxes. The existing person path still consumes its
+single object iteration; optional scalar copies enter a finite nonblocking queue,
+with explicit drop/expiry states and exact startup/shutdown ownership. Reads retain
+the original five-second deadline, image dimensions, source epoch/frame and clock
+domains. They create no object identity, world/room assignment or lifecycle.
+
+Focused service/private-API checks (nine cases) and the final actual-hook fixture
+checks (two cases) passed, including bounds, original expiry, owner retirement,
+internal authentication and worker cleanup. The checked-out selected parser can
+retain high-confidence non-person classes; loaded-binary/live output and callback
+performance remain unverified. No model, threshold, cadence, configuration,
+native binary, GPU operation or runtime activation changed.

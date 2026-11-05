@@ -3980,7 +3980,7 @@ def _build_rest_app(
 ) -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import alignment_walk_api, analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, scene_prior_api, semantic_seg_api, virtual_twin_api, world_read_api
+    from noesis.server import alignment_walk_api, analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, scene_prior_api, semantic_seg_api, virtual_twin_api, world_read_api, object_observations
     from noesis.server.internal_auth import InternalAuthConfigurationError, configure_internal_rest_app
 
     app = FastAPI(title="Noesis DS9 Runtime API")
@@ -4010,6 +4010,7 @@ def _build_rest_app(
     app.include_router(scene_prior_api.app.router)
     app.include_router(semantic_seg_api.router)
     app.include_router(world_read_api.router)
+    app.include_router(object_observations.router)
     auth_config = configure_internal_rest_app(app)
     alignment_walk_api.install_alignment_walk_api(
         app,
@@ -6372,6 +6373,13 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     setattr(pipeline, "world_service", world_service)
     if prebuilt_rest_app is not None:
         prebuilt_rest_app.state.canonical_world_service = world_service
+    from noesis_core.object_observations import install_object_observation_owner, close_object_observation_owner
+    from noesis_core.object_tracks import install_object_track_owner
+    from noesis.server.scene_api import _database_path as _object_state_database_path
+    object_track_service = install_object_track_owner(startup_transaction, pipeline, prebuilt_rest_app,
+        world_service.producer.run_id, _object_state_database_path().with_name("object_tracks.sqlite3"))
+    object_observation_service = install_object_observation_owner(startup_transaction, pipeline, prebuilt_rest_app,
+        world_service.producer.run_id, track_service=object_track_service)
     capability_monitor = create_runtime_capability_monitor(world_service)
     from noesis.server import health_api
 
@@ -7413,6 +7421,17 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         except BaseException as exc:
             logger.exception("Failed to flush canonical world journal")
             _record_finalization_failure("canonical_world", exc)
+
+        try:
+            close_object_observation_owner(pipeline, prebuilt_rest_app, object_observation_service)
+            object_track_service.close()
+            if getattr(pipeline, "object_track_service", None) is object_track_service:
+                del pipeline.object_track_service
+            if prebuilt_rest_app is not None and getattr(prebuilt_rest_app.state, "object_track_service", None) is object_track_service:
+                del prebuilt_rest_app.state.object_track_service
+        except BaseException as exc:
+            logger.exception("Object observation ownership did not close")
+            _record_finalization_failure("object_observations", exc)
 
         try:
             storage_shutdown_receipt = close_depth_storage(

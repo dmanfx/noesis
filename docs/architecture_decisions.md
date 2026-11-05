@@ -11,6 +11,21 @@ Unindexed writes, changed selected bytes, schema/binding changes and expired
 anchors still fail closed. The asynchronous writer owns the small index update;
 media callbacks gain no database or read work.
 
+## 2026-10-31 — Object continuity and whole-domain geometry retain source authority
+
+Named native object tracks use exact run/source/epoch/continuity keys and
+lossless uint64 IDs; matching labels or boxes cannot establish identity.
+Observation updates preserve their original timestamps and do not change the
+owner declaration revision. Bounded worker persistence is separate from the
+media callback. The native lifecycle extractor carries non-person terminations
+separately from canonical people. Selected objects may retain exact-frame metric
+depth surface samples with declared lens/calibration provenance; these are
+estimated image-center surfaces, not object centroids or person anchors. Missing
+inputs remain explicit and prior samples retain their original timestamps.
+Camera coverage maps sample the entire verified Scene Prior domain at a declared
+height, with exact calibration provenance and unknown cells. Neither a cell nor
+a native track creates canonical room membership or physical visibility.
+
 ## 2026-10-31 — Semantic regions derive from reviewed artifact-local points
 
 Owner-declared door segments and planar area/seat/surface/coverage regions live
@@ -20,6 +35,17 @@ scene/artifact/semantic/anchor/shape transaction. Planarity and intersection
 checks validate a declaration, not a measured physical surface. Stable IDs,
 retirement and actor-original readback remain independent of world occupancy or
 promoted geometry. Existing point records and relationships are unchanged.
+
+## 2026-10-31 — Named objects are reviewed historical associations
+
+An owner can name an exact server-captured detector observation through a bounded
+private inspection/review/store transaction. A stable declaration ID does not
+establish physical identity or authorize automatic matching, world localization,
+room assignment, continued presence or lifecycle inference. Human review may
+outlast the original observation TTL, but the original fields and expiry remain
+historical. A fixed producer-relative authoring lease and exact runtime-owner/run
+fence permit deliberate review without treating each new detector frame as a new
+human target. Original completed lookup stays read-only across input replacement.
 
 ## 2026-10-31 — Recorded observation spans are not continuous dwell
 
@@ -3160,6 +3186,19 @@ Unsettled lifecycle, identity, binding or expiry evidence yields unknown while
 retaining original source provenance. Duration remains unknown without temporal
 evidence. This is a bounded read-side projection outside the publication lock;
 it adds no world writes, background inference or source-freshness renewal.
+
+## 2026-10-31 — Object image observations are not physical object identity
+
+Non-person SDK metadata uses a separate bounded, optional scalar handoff and
+private read owner. It does not enter the canonical person identity/world cohort.
+The frame callback does not wait for its worker or perform I/O, serialization,
+pixel copies or model work. Overflow degrades only the observation read's
+freshness; source expiry is original and cannot be renewed by a reader.
+
+Class labels and tracker metadata do not identify a persistent household object.
+This contract exposes camera-image reports with their original source and clock
+bindings, not room/world locations, geometric coverage or physical lifecycle.
+No new detector/configuration or live inference is implied by the source wiring.
 
 ## 2026-10-31 — Projection declarations remain separate from linear K
 

@@ -1767,6 +1767,10 @@ def attach_object_depth_fusion_hook(
     fusion_component.config["_object_depth_fusion_processor"] = fusion_processor
     setattr(pipeline, "depth_tracking_frame_processor", depth_processor)
     setattr(pipeline, "object_depth_fusion_processor", fusion_processor)
+    object_owner = getattr(pipeline, "object_track_service", None)
+    if object_owner is not None:
+        from noesis_core.object_spatial import ObjectSpatialSampler
+        object_owner.spatial_sampler = ObjectSpatialSampler(depth_store, fusion_processor._resolve_calibration_snapshot)
     from noesis.v3dt_assets import xc3d_candidate_enabled
     depth_processor.xc3d_exact_acquisition = xc3d_candidate_enabled(pipeline.config)
     fusion_processor.xc3d_exact_acquisition = xc3d_candidate_enabled(pipeline.config)
@@ -12835,7 +12839,18 @@ class _AnalyticsTelemetryProcessor:
                 self._reid_debug_frames += 1
 
             object_items = getattr(frame_meta, "object_items", None) or []
+            # One bounded scalar copy feeds the optional object worker. Its
+            # lifecycle channel remains separate from canonical people.
+            object_owner = getattr(self.pipeline, "object_observation_service", None)
+            object_capture = object_owner.begin_frame(frame_meta, camera_id=camera_id, source_id=int(source_id),
+                source_epoch=int(source_epoch), frame_id=frame_id, temporal=temporal_contract) if object_owner is not None else None
+            if object_capture is not None:
+                object_capture.capture_lifecycle(tracker_lifecycle)
+            object_ordinal = 0
             for obj_meta in object_items:
+                if object_capture is not None:
+                    object_capture.capture(obj_meta, object_ordinal, self._object_room_from_servicemaker)
+                object_ordinal += 1
                 _increment_core_counter("detection_wake.objects_seen")
                 track_build_start_ns = time.perf_counter_ns()
                 raw = self._build_track_dict_servicemaker(obj_meta, camera_id)
@@ -13252,6 +13267,8 @@ class _AnalyticsTelemetryProcessor:
                 if fp is not None:
                     footpoints.append(fp)
 
+            if object_capture is not None:
+                object_capture.submit()
             post_frame_start_ns = time.perf_counter_ns()
             if identity_v2_authoritative:
                 identity_v2_start_ns = time.perf_counter_ns()
@@ -26943,6 +26960,18 @@ class _AnalyticsTelemetryProcessor:
             if entry is None:
                 continue
             yield entry
+
+    def _object_room_from_servicemaker(self, obj_meta):
+        if noesis_analytics_meta_ext is None:
+            return None
+        rows = noesis_analytics_meta_ext.extract_analytics(obj_meta)
+        if not isinstance(rows, list) or len(rows)>16:
+            return None
+        selected = [r for r in rows if isinstance(r, Mapping) and
+            (self._analytics_unique_id is None or r.get("unique_id")==self._analytics_unique_id)]
+        if len(selected)!=1:
+            return None
+        return _primary_zone_from_analytics(selected[0])
 
     def _build_track_dict_servicemaker(self, obj_meta: Any, camera_id: str) -> Optional[Dict[str, Any]]:
         """Build a track dictionary from Service Maker ObjectMetadata."""

@@ -1,5 +1,53 @@
 # Architecture decisions
 
+## 2026-10-31 — Semantic regions derive from reviewed artifact-local points
+
+Owner-declared door segments and planar area/seat/surface/coverage regions live
+in a separate versioned shape registry. Commands nominate exact ordered saved
+anchor IDs; only Noesis resolves their original coordinates under the current
+scene/artifact/semantic/anchor/shape transaction. Planarity and intersection
+checks validate a declaration, not a measured physical surface. Stable IDs,
+retirement and actor-original readback remain independent of world occupancy or
+promoted geometry. Existing point records and relationships are unchanged.
+
+## 2026-10-31 — Semantic anchors are reviewed artifact-local declarations
+
+The separate semantic-anchor registry shares the scene selector's SQLite
+transaction, binding each stable declaration to an exact semantic review and
+authored geometry artifact. Artifact units are not silently promoted to meters
+or a world frame. New geometry requires the current admitted OBJ; retirement
+preserves the original declaration without rebinding it. Original lookup remains
+read-only across selector or semantic replacement. No anchor changes geometry,
+canonical people, occupancy, calibration or runtime selection.
+
+## 2026-10-30 — Semantic names belong to an explicit scene release
+
+The [semantic registry](../noesis_core/contracts/semantic_space.py) stores
+owner-declared area, seat, surface, door and coverage labels and relationships.
+Its stable UUIDs keep their kind and retired state. These declarations contain
+no coordinates, inferred objects, physical measurements, room membership or
+occupancy authority. `scope: scene_release` identifies the declaration's context;
+it does not assert a coordinate frame. Exact release-content, authored-scene,
+calibration, model and config digests come from the promoted scene release.
+
+The existing private scene router exposes current GET/PUT at
+`/api/v1/scenes/current/semantic-space` and exact-original POST recovery at
+`/api/v1/scenes/semantic-space/lookup`. The trusted Menon gateway supplies its
+authenticated session actor under the existing internal bearer convention.
+An original operation is identified by actor, UUID and the full original
+command fingerprint. Lookup and replay use read-only connections, including
+misses and expiry. Original results remain historical after subsequent edits.
+New writes compare both registry revision and current scene binding in the
+scene selector's SQLite transaction. A changed binding requires an explicit
+rebase/review; unchanged old declarations remain visibly stale.
+
+Unknown registries and reviewed, unreviewed, stale or retired declarations are
+explicit response states. Bounds are 128 retained objects, eight relationships
+per object, 256 KiB per request/response, 128 original-operation results with a
+24-hour recovery period, and 32 MiB of retained JSON payload. Two admitted HTTP
+workers, a five-second body deadline and finite SQLite waits keep this work
+outside media callbacks. No geometry, provider state or live runtime is changed.
+
 ## 2026-10-19 — Global dashboard controls follow the visible scene
 
 The top toolbar exposes All cameras alongside Unified BEV. Its selected mode

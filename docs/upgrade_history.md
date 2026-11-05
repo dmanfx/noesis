@@ -1,5 +1,35 @@
 # Noesis upgrade history
 
+## 2026-10-31 — Reviewed semantic regions and door segments
+
+Added a bounded owner-declared shape store and registered private API, deriving
+vertices only from exact current reviewed anchors. Nine real scene/semantic/
+anchor SQLite cases and four registered private-HTTP cases passed, covering
+geometry refusal, revision conflicts, retirement and actor-original recovery.
+This is source and disposable-fixture proof, not runtime geometry activation,
+metric registration, physical surface verification or household operation.
+
+## 2026-10-31 — Reviewed semantic-anchor private producer
+
+Added strict artifact-local owner declarations with stable IDs, scene/semantic/
+registry CAS, exact SQL readback and actor-original lookup. The initial 32
+disposable store/API checks passed; 16 affected lifecycle checks then passed
+after fixing exact historical retirement. Existing semantic names are unchanged.
+This is private producer source, not a deployed editor, measured surface claim
+or geometry activation.
+
+## 2026-10-30 — Canonical owner-declared semantic registry producer
+
+Connected the preserved semantic-space contracts/store to the private current
+scene API. Owners can retain stable named areas, seats, surfaces, doors and
+coverage declarations, edit labels and explicit relationships, and retire IDs.
+Current-release provenance, review states, revision/binding CAS and exact
+actor-scoped original lookup survive restart. Disposable FastAPI/SQLite checks
+exercise edits, retirement, graph limits, stale review/rebase, read-only replay
+and expiry, strict JSON and private bearer admission. This is producer source
+validation; Menon integration is separately verified by its consumer owner.
+No geometry, calibration, occupancy, provider or live runtime was activated.
+
 ## 2026-10-20 — Source checkpoint, not tracking completion
 
 Recorded the existing workspace as separate local commits for PCF review,

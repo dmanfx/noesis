@@ -33,6 +33,60 @@ router = APIRouter(
 )
 
 
+@router.get("/current/semantic-space")
+async def get_semantic_space(request: Request) -> Response:
+    from noesis.server.semantic_space import handle
+    return await handle(request, "read")
+
+
+@router.get("/current/semantic-anchors")
+async def get_semantic_anchors(request: Request) -> Response:
+    from noesis.server.semantic_anchor import handle
+    return await handle(request, "read")
+
+
+@router.put("/current/semantic-anchors")
+async def put_semantic_anchors(request: Request) -> Response:
+    from noesis.server.semantic_anchor import handle
+    return await handle(request, "write")
+
+
+@router.post("/semantic-anchors/lookup")
+async def lookup_semantic_anchors(request: Request) -> Response:
+    from noesis.server.semantic_anchor import handle
+    return await handle(request, "lookup")
+
+
+@router.get("/current/semantic-shapes")
+async def get_semantic_shapes(request: Request) -> Response:
+    from noesis.server.semantic_shape import handle
+    return await handle(request, "read")
+
+
+@router.put("/current/semantic-shapes")
+async def put_semantic_shapes(request: Request) -> Response:
+    from noesis.server.semantic_shape import handle
+    return await handle(request, "replace")
+
+
+@router.post("/semantic-shapes/lookup")
+async def lookup_semantic_shapes(request: Request) -> Response:
+    from noesis.server.semantic_shape import handle
+    return await handle(request, "lookup")
+
+
+@router.put("/current/semantic-space")
+async def put_semantic_space(request: Request) -> Response:
+    from noesis.server.semantic_space import handle
+    return await handle(request, "write")
+
+
+@router.post("/semantic-space/lookup")
+async def lookup_semantic_space(request: Request) -> Response:
+    from noesis.server.semantic_space import handle
+    return await handle(request, "lookup")
+
+
 class SceneRegistrationResponse(BaseModel):
     release_id: str
     release_sha256: str

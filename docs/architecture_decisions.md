@@ -3269,3 +3269,15 @@ projection and retains `distortion_applied:false`; result provenance derives
 that flag from the actual per-point projections. All immutable calibration,
 model and frame provenance still matches exactly. The bounded analytic forward
 formula is checked against installed OpenCV; this is not live optical validation.
+
+## 2026-11-01 — Qualified shoulder footprints survive canonical admission
+
+The estimator's registered partial-shoulder footprint is a distinct valid
+body-to-ground measurement even when it cannot observe feet or classify seat
+support. Canonical World now issues an exact prepared-original support proof
+for that method, retaining unknown support/posture rather than inventing floor
+contact. Registration, native frame/media timestamp, uncached depth and accepted
+producer state must match. The selector still rejects untyped unknown support,
+borrowed/replayed proofs and invalid or non-current measurements. This corrects
+the producer/consumer admission mismatch; it does not change localization,
+person association, camera calibration or prediction/hold policy.

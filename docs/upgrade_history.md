@@ -1,5 +1,14 @@
 # Noesis upgrade history
 
+## 2026-11-01 — Canonical admission of qualified partial-shoulder positions
+
+Fixed a handoff that discarded estimator-accepted registered shoulder-depth
+positions when lower-body occlusion left support/posture unknown. Exact native
+original proofs now carry those positions into canonical snapshots without
+changing their coordinates, covariance or support claims. Focused source/wire
+regressions cover two people, expiry and malformed/stale/foreign evidence. This
+is a source correction; no service restart or runtime activation is included.
+
 ## 2026-11-01 — Explicit rectified-camera coverage
 
 Coverage projection now accepts declared rectified pinhole intrinsics with no

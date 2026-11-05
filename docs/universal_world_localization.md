@@ -93,6 +93,11 @@ The DS9 analytics hook constructs each candidate independently:
   when no verified image floor contact exists. Cold shoulder admission requires
   the existing three-current-sample consensus and detector semantic gate;
   no posture, population height, or old standing position is fabricated.
+  Canonical World carries that accepted shoulder footprint through its exact
+  prepared-original support proof even when physical support/posture remain
+  unknown. The proof requires registered, uncached depth on the same native
+  frame and media timestamp; it does not generally admit unknown-support
+  coordinates or bypass current-member, binding, quality or expiry checks.
 - `pose_scale`: an exact-current, typed body-to-floor projection for people
   whose physical floor contact is hidden. A standing solve intersects calibrated
   nose, shoulder, and hip rays with their anatomical height planes and solves

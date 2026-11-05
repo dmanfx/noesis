@@ -2697,7 +2697,7 @@ class CanonicalWorldService:
                 resolver_confidence, quality_rejection, raw_summary = self._spatial_input_quality(track, observation)
                 spatial_quality[observation.observation_id] = (resolver_confidence, quality_rejection)
                 # This compact descriptor distinguishes an admitted typed
-                # body-plane footprint from untyped learned-height gravity.
+                # body-plane/shoulder footprint from untyped learned-height gravity.
                 # It does not change the UNKNOWN support or re-run estimation.
                 if (quality_rejection is None and native is not None
                         and ((track.get("world_resolver_selected_id") == "upright_pose_projection"
@@ -2707,7 +2707,22 @@ class CanonicalWorldService:
                                  and track.get("world_resolver_contact_basis") == "depth:registered_body_column"
                                  and track.get("world_source") == "registered_body_column"
                                  and track.get("world_quality") == "estimated"
-                                 and track.get("world_posture") in {"standing", "sitting", "lying", "unknown"}))
+                                 and track.get("world_posture") in {"standing", "sitting", "lying", "unknown"})
+                             or (track.get("world_resolver_selected_id") == "registered_depth"
+                                 and track.get("world_resolver_contact_basis") == "depth:pose_shoulder_support"
+                                 and track.get("world_source") == "person_anchor_depth_only"
+                                 and track.get("world_quality") in {"good", "estimated"}
+                                 and track.get("world_posture") in {"standing", "unknown"}
+                                 and track.get("depth_registration_status") == "ok"
+                                 and self._required_revision(track.get("depth_registration_id")) is not None
+                                 and track.get("depth_measurement_cached") is False
+                                 and type(track.get("depth_measurement_age_us")) is int
+                                 and track["depth_measurement_age_us"] == 0
+                                 and type(track.get("depth_measurement_frame_id")) is int
+                                 and track["depth_measurement_frame_id"] == native.stamp.frame_id
+                                 and type(track.get("depth_measurement_ts_us")) is int
+                                 and observation.media_pts_ns is not None
+                                 and track["depth_measurement_ts_us"] == observation.media_pts_ns // 1_000))
                         and track.get("world_support_state") == "unknown"
                         and track.get("frame_id") == observation.payload.tracklet.frame_id
                         and track.get("observed_at_us") == observation.observed_at_us):

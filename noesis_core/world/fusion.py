@@ -88,8 +88,9 @@ def spatial_rejection_category(reason: str | None) -> str:
 class PreparedUprightFootprintSupport:
     """Private same-preparation support, not a floor/depth or person grant.
 
-    The historical name also covers the explicit registered-body-column
-    method (truthful posture, UNKNOWN support, no observed foot or seat claim).
+    The historical name also covers registered body columns and exact-current
+    registered shoulder depth. These footprints retain truthful posture and
+    UNKNOWN support; neither implies observed foot or seat contact.
     Only World normalization creates this from the compact typed resolver
     descriptor of a producer-accepted current original. The exact immutable
     envelope and native stamp prevent borrowing support from another row.
@@ -119,7 +120,12 @@ class PreparedUprightFootprintSupport:
                 and self.contact_basis == "depth:registered_body_column"
                 and world.source == "registered_body_column"
                 and world.posture in {"standing", "sitting", "lying", "unknown"}
-                and world.quality == "estimated"))
+                and world.quality == "estimated"
+                or self.selected_id == "registered_depth"
+                and self.contact_basis == "depth:pose_shoulder_support"
+                and world.source == "person_anchor_depth_only"
+                and world.posture in {"standing", "unknown"}
+                and world.quality in {"good", "estimated"}))
 
 
 def select_source_local_observation(

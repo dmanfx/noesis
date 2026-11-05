@@ -2473,6 +2473,93 @@ def _r65_column_changes():
         world_resolver_contact_basis='depth:registered_body_column')
 
 
+def _partial_shoulder_changes(frame=2):
+    return dict(
+        world_source='person_anchor_depth_only', world_quality='estimated',
+        world_support_state='unknown', world_support_surface=None, world_posture='unknown',
+        world_resolver_selected_id='registered_depth',
+        world_resolver_contact_basis='depth:pose_shoulder_support',
+        depth_registration_status='ok', depth_registration_id='synthetic-shoulder-registration',
+        depth_measurement_frame_id=frame, depth_measurement_ts_us=frame * 100_000,
+        depth_measurement_cached=False, depth_measurement_age_us=0,
+    )
+
+
+@pytest.mark.parametrize('posture', ['unknown', 'standing'])
+def test_partial_shoulder_two_current_people_world_wire_and_original_expiry(posture):
+    """Synthetic shoulder estimates; actual normalization/owner/World/wire/BEV."""
+    actor = ImageQuarantineActor()
+    harness = ActualPublicationHarness(actor)
+    changes = _partial_shoulder_changes() | {'world_posture': posture}
+    first = harness.publish(actor.prepare_image(
+        {1: [(1, 1., 1, 1), (2, 4., 1, 1)]}, source_changes={1: changes}), 2)
+    assert len(first.entities) == 2
+    assert {e.position.x for e in first.entities} == {1., 4.}
+    assert all(e.position_state == 'measured' and e.support_state == 'unknown'
+               and e.posture == posture and e.support_surface is None for e in first.entities)
+    assert all(e.covariance.values == COV for e in first.entities)
+    assert all(s.accepted and s.position_source == 'person_anchor_depth_only'
+               for e in first.entities for s in e.sources)
+    actor.us += 3_000_000
+    expired = harness.publish(actor.prepare_image({1: []}, frame=3), 3)
+    assert not expired.entities
+    actual = actual_node_wire(actor, harness.wire, 'partial-shoulder-two-' + posture)
+    assert [len(s['people']) for s in actual['snapshots']] == [2, 0]
+
+
+@pytest.mark.parametrize('defect', [
+    {'world_resolver_selected_id': None},
+    {'world_resolver_contact_basis': 'depth:pose_torso_support'},
+    {'world_source': 'gravity_drop'},
+    {'world_posture': 'sitting'},
+    {'world_measurement_accepted': False},
+    {'world_valid': False},
+    {'depth_registration_status': 'raw_passthrough'},
+    {'depth_registration_id': None},
+    {'depth_measurement_frame_id': 1},
+    {'depth_measurement_ts_us': 100_000},
+    {'depth_measurement_cached': True},
+    {'depth_measurement_age_us': 1},
+])
+def test_partial_shoulder_unqualified_unknown_support_stays_unavailable(defect):
+    actor = ImageQuarantineActor()
+    harness = ActualPublicationHarness(actor)
+    if defect.get('world_valid') is False:
+        with pytest.raises(WorldPublicationRefused, match='producer_state_conflict'):
+            actor.prepare_image({1: [(1, 1., 1, 1)]},
+                source_changes={1: _partial_shoulder_changes() | defect})
+        assert actor.world.current_snapshot() is None and not harness.wire
+        assert actor.identity.stats().pending_reservations == 0
+        return
+    candidate = actor.prepare_image({1: [(1, 1., 1, 1)]},
+        source_changes={1: _partial_shoulder_changes() | defect})
+    assert not harness.publish(candidate, 2).entities
+    assert actor.identity.stats().pending_reservations == 0
+
+
+@pytest.mark.parametrize('defect', ['copied-envelope', 'stale-stamp', 'wrong-source', 'stale-media'])
+def test_partial_shoulder_support_is_bound_to_the_exact_native_original(defect):
+    actor = ImageQuarantineActor()
+    preps, _ = actor.normalize({1: [(1, 1., 1, 1)]}, native_tokens=True,
+        world_resolver_confidence=.8, **_partial_shoulder_changes())
+    original, = preps[0].publication.observations
+    state = actor.world._prepared_candidates[preps[0]._candidate_id][1]
+    support = state.spatial_upright_support[original.observation_id]
+    if defect == 'copied-envelope':
+        support = replace(support, original=original.model_copy())
+    elif defect == 'stale-stamp':
+        support = replace(support, stamp=replace(support.stamp, frame_id=3))
+    elif defect == 'wrong-source':
+        support = replace(support, stamp=replace(support.stamp,
+            member=replace(support.stamp.member, source_id=2)))
+    else:
+        support = replace(support, stamp=replace(support.stamp, media_time_s=.1))
+    with pytest.raises(ValueError, match='exact prepared upright support'):
+        select_source_local_observation(((original, .8, None),), upright_support=(support,))
+    assert select_source_local_observation(((original, .8, None),))[0] is None
+    actor.world.discard(preps[0])
+
+
 def test_r75_actual_torso_receipt_pgs_world_publisher_node_reanchor_and_expiry():
     """Synthetic source geometry; actual receipt producer/filter/owner/wire/Node."""
     from DS9.tests.test_registered_body_column import _r75_current_column,_r75_apply,_r75_occluded_state

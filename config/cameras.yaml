@@ -39,6 +39,8 @@ intrinsics_models:
       coverage_score: 100.0
       note: "Raw source K/D for nvdewarper and offline OpenCV fisheye rectification."
   unifi_g3_instant_charuco_1080_rectified:
+    projection_model: rectified_pinhole
+    distortion_model: none
     resolution: [1920, 1080]
     intrinsics:
       fx: 625.0370802939991
@@ -93,6 +95,8 @@ intrinsics_models:
       coverage_score: 98.15
       note: "Raw source K/D for nvdewarper and offline OpenCV fisheye rectification."
   unifi_g4_instant_charuco_1080_rectified:
+    projection_model: rectified_pinhole
+    distortion_model: none
     resolution: [1920, 1080]
     intrinsics:
       fx: 759.8470119659571

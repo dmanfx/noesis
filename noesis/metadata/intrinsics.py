@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import numbers
 import re
 import threading
@@ -38,6 +39,13 @@ class CameraIntrinsics:
     height_m: float = 0.0
     width: int = 0
     height: int = 0
+    # Explicit configuration evidence only. The legacy k1/k2/k3 payload may
+    # contain default zeroes and is not evidence of a declared optical model.
+    projection_model: str | None = None
+    distortion_model: str | None = None
+    distortion_coefficients: tuple[float, ...] | None = None
+    distortion_coefficient_names: tuple[str, ...] | None = None
+    projection_metadata_status: str = "undeclared"
 
     def as_payload(self) -> Dict[str, float]:
         """Return a dict payload ready for user-meta serialization."""
@@ -369,7 +377,90 @@ def _build_intrinsics(
         height_m=height_m,
         width=width,
         height=height,
+        **_projection_metadata(entry, intr_section, models),
     )
+
+
+def _projection_metadata(
+    entry: Mapping[str, Any],
+    intr_section: Mapping[str, Any],
+    models: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Retain declared lens evidence without changing legacy K/D parsing.
+
+    Reusable model calibration metadata can contain the original fisheye D
+    while its intrinsics k1/k2/k3 intentionally remain zero for old consumers.
+    Neither those zeroes nor a rectification method declares a pinhole model.
+    """
+    sources = [(intr_section, False)]
+    if isinstance(entry.get("calibration"), Mapping):
+        sources.append((entry["calibration"], True))
+    sources.append((entry, False))
+    direct = entry.get("intrinsics")
+    reference = direct if isinstance(direct, str) else (
+        entry.get("intrinsics_model") or entry.get("model") or entry.get("intrinsics_ref")
+    ) if not isinstance(direct, Mapping) else None
+    model = models.get(reference) if isinstance(reference, str) else None
+    if isinstance(model, Mapping):
+        if isinstance(model.get("calibration"), Mapping):
+            sources.append((model["calibration"], True))
+        sources.append((model, False))
+
+    result = {"projection_model": None, "distortion_model": None,
+              "distortion_coefficients": None, "distortion_coefficient_names": None,
+              "projection_metadata_status": "undeclared"}
+    declared, valid = False, True
+    for name in ("projection_model", "distortion_model"):
+        for source, calibration in sources:
+            key = name if name in source else "model" if calibration and name == "projection_model" and "model" in source else None
+            if key is None:
+                continue
+            declared = True
+            value = source[key]
+            if isinstance(value, str) and 1 <= len(value) <= 64 and value == value.strip():
+                result[name] = value
+            else:
+                valid = False
+            break
+
+    candidate, found = None, False
+    for source, _ in sources:
+        for key in ("distortion_coeffs", "distortion", "distortion_params", "coefficients"):
+            if key in source:
+                candidate, found = source[key], True
+                break
+        if found:
+            break
+    if not found:
+        for source, _ in sources:
+            supplied = {key: source[key] for key in ("k1", "k2", "k3") if key in source}
+            if supplied:
+                candidate, found = supplied, True
+                break
+    if found:
+        declared = True
+        try:
+            if isinstance(candidate, Mapping):
+                names = tuple(candidate)
+                if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", name) for name in names):
+                    raise ValueError("invalid coefficient names")
+                values = tuple(candidate.values())
+            elif isinstance(candidate, (list, tuple)):
+                names, values = None, tuple(candidate)
+            else:
+                raise ValueError("invalid coefficients")
+            if not 1 <= len(values) <= 16 or any(isinstance(value, bool) for value in values):
+                raise ValueError("invalid coefficient bounds")
+            coefficients = tuple(_to_float(value) for value in values)
+            if not all(math.isfinite(value) for value in coefficients):
+                raise ValueError("nonfinite coefficients")
+            result["distortion_coefficients"] = coefficients
+            result["distortion_coefficient_names"] = names
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+    # This status validates metadata representation, never optical support.
+    result["projection_metadata_status"] = "invalid" if not valid else "declared" if declared else "undeclared"
+    return result
 
 
 def _resolve_intrinsics_section(

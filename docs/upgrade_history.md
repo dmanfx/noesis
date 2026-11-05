@@ -1,11 +1,27 @@
 # Noesis upgrade history
 
+## 2026-11-01 — Explicit rectified-camera coverage
+
+Coverage projection now accepts declared rectified pinhole intrinsics with no
+residual distortion. The existing G3/G4 rectified camera models declare that
+format; numerical intrinsics, extrinsics and world/scene geometry are unchanged.
+Raw fisheye projection and unknown/invalid metadata remain separate.
+
 ## 2026-11-01 — Bounded live history readers
 
 Removed the whole-journal JSON-size prerequisite from history and temporal
 queries. Selected payloads, committed hashes, retained anchors, deadlines and
 response limits remain verified. Large retained journals no longer disable
 small event pages or the latest 32-snapshot window.
+
+## 2026-10-31 — Declared fisheye point projection
+
+Point-analysis result v2 now applies exact supported OpenCV fisheye declarations,
+retaining the distorted image domain, original points and all calibration/frame
+bindings. Unsupported declarations remain unknown; undeclared calibration stays
+explicitly linear-K-only. Five affected producer checks, including installed
+OpenCV zero/nonzero-distortion pixel oracles, passed. Optical visibility and
+physical clearance remain unknown; no runtime or camera configuration changed.
 
 ## 2026-10-31 — Reviewed semantic regions and door segments
 
@@ -15,6 +31,25 @@ anchor SQLite cases and four registered private-HTTP cases passed, covering
 geometry refusal, revision conflicts, retirement and actor-original recovery.
 This is source and disposable-fixture proof, not runtime geometry activation,
 metric registration, physical surface verification or household operation.
+
+## 2026-10-31 — Bounded point geometry analysis
+
+Added a private source-context and point-analysis read for exact configured
+camera/ScenePrior bindings. It reports qualified linear-K projection and
+incomplete static-height evidence, retaining original points and model/frame
+digests. Source/private-HTTP checks cover limits, owner replacement, unknown
+evidence and declared metadata; an affected model-digest check also passed.
+No physical visibility, live-camera performance, deployment or runtime
+configuration claim follows from these disposable fixtures.
+
+## 2026-10-31 — Preserved calibration projection declarations
+
+Canonical DS9 and shared loaders now retain explicit lens declarations and
+original bounded distortion vectors in immutable calibration snapshots.
+Eleven focused DS9-first loader/manager cases passed, including missing/invalid
+metadata and cache reloads while K/E and SDK payload behavior remain unchanged.
+This is checked-out source validation; no camera configuration, calibration,
+native binary, inference or running pipeline was changed.
 
 ## 2026-10-31 — Bounded persisted assignment-observation spans
 

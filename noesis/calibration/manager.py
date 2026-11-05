@@ -95,6 +95,11 @@ class CalibrationSnapshot:
     scene_prior_id: str | None = None
     target_revision_id: str | None = None
     support_surfaces: SupportSurfaceSet | None = None
+    projection_model: str | None = None
+    distortion_model: str | None = None
+    distortion_coefficients: Tuple[float, ...] | None = None
+    distortion_coefficient_names: Tuple[str, ...] | None = None
+    projection_metadata_status: str = "undeclared"
 
     @property
     def calibration_frame(self) -> RevisionedFrame | None:
@@ -156,6 +161,11 @@ class CalibrationSnapshot:
             target_revision_id=self.target_revision_id,
             image_localization_basis="revision_target_floor",
             support_surfaces=self.support_surfaces,
+            projection_model=self.projection_model,
+            distortion_model=self.distortion_model,
+            distortion_coefficients=self.distortion_coefficients,
+            distortion_coefficient_names=self.distortion_coefficient_names,
+            projection_metadata_status=self.projection_metadata_status,
         )
 
 
@@ -202,6 +212,11 @@ class WorldCalibrationSnapshot:
     target_revision_id: str | None = None
     image_localization_basis: str = "revision_target_floor"
     support_surfaces: SupportSurfaceSet | None = None
+    projection_model: str | None = None
+    distortion_model: str | None = None
+    distortion_coefficients: Tuple[float, ...] | None = None
+    distortion_coefficient_names: Tuple[str, ...] | None = None
+    projection_metadata_status: str = "undeclared"
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +811,11 @@ class CalibrationManager:
             ),
             target_revision_id=(frame_binding.target_revision_id if frame_binding is not None else None),
             support_surfaces=self._support_surfaces.get(camera_id),
+            projection_model=getattr(intr, "projection_model", None),
+            distortion_model=getattr(intr, "distortion_model", None),
+            distortion_coefficients=getattr(intr, "distortion_coefficients", None),
+            distortion_coefficient_names=getattr(intr, "distortion_coefficient_names", None),
+            projection_metadata_status=getattr(intr, "projection_metadata_status", "undeclared"),
         )
         self._snapshot_cache[cache_key] = snapshot
         self._snapshot_intrinsics[cache_key] = intr

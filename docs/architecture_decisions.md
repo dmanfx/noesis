@@ -3160,3 +3160,33 @@ Unsettled lifecycle, identity, binding or expiry evidence yields unknown while
 retaining original source provenance. Duration remains unknown without temporal
 evidence. This is a bounded read-side projection outside the publication lock;
 it adds no world writes, background inference or source-freshness renewal.
+
+## 2026-10-31 — Projection declarations remain separate from linear K
+
+The DS9-first loader and shared calibration manager carry explicit lens-model
+and distortion metadata into immutable raw/world snapshots without changing K/E
+or SDK payloads. Missing declarations remain missing; legacy zero defaults do
+not certify a pinhole or undistorted image. Unsupported declarations remain
+visible evidence rather than selecting a substitute projection. Metadata-only
+reloads retire the corresponding snapshot cache. A mathematical linear-K result
+alone cannot establish optical visibility, physical coverage or clear sight.
+
+## 2026-10-31 — Point analysis is not physical camera coverage
+
+Owner-requested geometry analysis joins only exact loaded ScenePrior and
+calibration/frame bindings. It projects supplied backend-world points through
+the existing source-to-target edge once and separately samples the immutable
+2.5D prior's height envelope. It never derives coverage from person counts or
+publishes positions. Mathematical image bounds, potential static obstruction,
+missing evidence and physical visibility remain distinct. Sparse heights and
+unknown optical conditions prohibit a clear-line-of-sight claim. Request bounds,
+worker ownership and final source checks keep this work off the media path.
+
+Result v2 applies the explicitly declared OpenCV fisheye model with four ordered
+coefficients in its distorted calibration-image domain. Undeclared metadata
+remains explicitly mathematical linear-K-only; unsupported or invalid declared
+models return unknown, not linear fallback. Source-context v1 performs no
+projection and retains `distortion_applied:false`; result provenance derives
+that flag from the actual per-point projections. All immutable calibration,
+model and frame provenance still matches exactly. The bounded analytic forward
+formula is checked against installed OpenCV; this is not live optical validation.

@@ -139,4 +139,9 @@ def get_scene_prior_points(
     return response
 
 
+from noesis.server.view_coverage import router as view_coverage_router
+app.include_router(view_coverage_router)
+from noesis.server.room_coverage import router as room_coverage_router
+app.include_router(room_coverage_router)
+
 __all__ = ["app"]

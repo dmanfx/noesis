@@ -87,6 +87,18 @@ async def lookup_semantic_space(request: Request) -> Response:
     return await handle(request, "lookup")
 
 
+@router.post("/current/metric-scale-requests")
+async def submit_metric_scale_request(request: Request) -> Response:
+    from noesis.server.metric_scale_requests import submit
+    return await submit(request)
+
+
+@router.get("/metric-scale-requests/{request_id}")
+def get_metric_scale_request(request: Request, request_id: str) -> Response:
+    from noesis.server.metric_scale_requests import lookup
+    return lookup(request, request_id)
+
+
 class SceneRegistrationResponse(BaseModel):
     release_id: str
     release_sha256: str

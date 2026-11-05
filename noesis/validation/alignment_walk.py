@@ -11,7 +11,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
@@ -35,6 +35,8 @@ from noesis.validation.core import (
 )
 from noesis.validation.reports import render_markdown
 from noesis.validation.transforms import matrix_from_col_major, transform_point
+from noesis_core.contracts.scene_prior import ScenePriorWorldToScenePresentation
+from noesis_core.coordinate_frames import MetricFloorPlane, RevisionedFrame, RevisionedFrameTransform
 from noesis_core.private_paths import (
     PRIVATE_FILE_MODE,
     PrivatePathError,
@@ -153,13 +155,50 @@ def _json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value, allow_nan=False))
 
 
-def validate_scene_binding(payload: Mapping[str, Any] | None) -> dict[str, str] | None:
+def validate_scene_binding(payload: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """Normalize the immutable authored-scene binding supplied by the operator UI."""
 
     if payload is None:
         return None
     if not isinstance(payload, Mapping):
         raise ValueError("scene_binding must be an object")
+    if "contract_version" in payload:
+        if type(payload["contract_version"]) is not int or payload["contract_version"] != 2:
+            raise ValueError("unsupported_scene_binding_schema: expected contract_version 2")
+        keys = {"contract_version", "release_id", "authored_scene_sha256", "targets", "cameras"}
+        if set(payload) != keys:
+            raise ValueError("unsupported_scene_binding_schema: target binding fields are invalid")
+        # Reuse the old scalar validation without interpreting it as a global map.
+        scalar = validate_scene_binding({"release_id": payload["release_id"],
+            "authored_scene_sha256": payload["authored_scene_sha256"], "world_to_scene_sha256": "0" * 64})
+        result = {"contract_version": 2, "release_id": scalar["release_id"],
+                  "authored_scene_sha256": scalar["authored_scene_sha256"]}
+        for table, expected in (("targets", {"world_frame", "world_to_scene_sha256", "scene_revision_id", "registration_sha256"}),
+                                ("cameras", {"calibration_frame", "world_frame", "transform_sha256"})):
+            rows = payload[table]
+            if not isinstance(rows, Mapping) or not 1 <= len(rows) <= 32:
+                raise ValueError(f"scene_binding.{table} requires 1..32 entries")
+            result[table] = {}
+            for key, row in rows.items():
+                if not isinstance(key, str) or not key or len(key) > 200 or not isinstance(row, Mapping) or set(row) != expected:
+                    raise ValueError(f"scene_binding.{table} reference is invalid")
+                item = {}
+                for name, value in row.items():
+                    if name.endswith("frame"):
+                        if not isinstance(value, Mapping) or set(value) != {"frame_id", "revision"}:
+                            raise ValueError("frame identity requires frame_id and revision")
+                        frame = RevisionedFrame(**value)
+                        item[name] = {"frame_id": frame.frame_id, "revision": frame.revision}
+                    else:
+                        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+                            raise ValueError(f"scene_binding.{name} must be a lowercase SHA-256 digest")
+                        item[name] = value
+                if table == "targets" and key != item["world_frame"]["revision"]:
+                    raise ValueError("target table key must equal world revision")
+                result[table][key] = item
+        if {r["world_frame"]["revision"] for r in result["cameras"].values()} != set(result["targets"]):
+            raise ValueError("camera targets must exactly cover requested target maps")
+        return result
     expected_keys = {
         "release_id",
         "authored_scene_sha256",
@@ -302,13 +341,59 @@ def sanitize_calibration_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         "align": _json_copy(align),
         "cameras": {
             key: _json_copy(cameras.get(key))
-            for key in ("K", "E", "pose", "pose_confidence")
+            for key in ("K", "E", "pose", "pose_confidence", "frame_bindings")
             if key in cameras
         },
         "meta": _json_copy(meta),
         "metric_scale": _finite_float(bundle.get("metric_scale")),
     }
+    if "world_frame_presentations" in bundle:
+        result["world_frame_presentations"] = _json_copy(bundle["world_frame_presentations"])
     return result
+
+
+def _target_owned_context(calibration: Mapping[str, Any], binding: Mapping[str, Any],
+                          release: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Validate published authorities, never client-supplied transform matrices."""
+    if not release or release.get("authority") != "noesis.scenes.current":
+        raise RuntimeError("producer_missing_authority: current promoted scene release is unavailable")
+    if any(release.get(k) != binding[k] for k in ("release_id", "authored_scene_sha256")):
+        raise RuntimeError("scene_binding_mismatch: current release/model changed")
+    presentations = calibration.get("world_frame_presentations")
+    frames = calibration.get("cameras", {}).get("frame_bindings")
+    if not isinstance(presentations, Mapping) or not presentations or not isinstance(frames, Mapping):
+        raise RuntimeError("producer_missing_authority: target-owned presentation/frame table is unavailable")
+    output = {}
+    for camera, requested in binding["cameras"].items():
+        row = frames.get(camera)
+        if not isinstance(row, Mapping):
+            raise RuntimeError(f"producer_missing_authority: frame edge missing for {camera}")
+        if any(row.get(k) != requested[k] for k in ("calibration_frame", "world_frame", "transform_sha256")):
+            raise RuntimeError(f"scene_binding_mismatch: camera source/target/edge changed: {camera}")
+        revision = requested["world_frame"]["revision"]
+        raw = presentations.get(revision)
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(f"producer_missing_authority: presentation missing for {revision}")
+        presentation = ScenePriorWorldToScenePresentation.model_validate(raw).model_dump(mode="json")
+        expected = binding["targets"][revision]
+        if any(presentation.get(k) != expected[k] for k in expected):
+            raise RuntimeError(f"scene_binding_mismatch: target presentation changed: {revision}")
+        if presentation.get("authored_scene_sha256") != binding["authored_scene_sha256"]:
+            raise RuntimeError("scene_binding_mismatch: target map authored model differs")
+        if requested["transform_sha256"] not in presentation["source_transform_sha256s"]:
+            raise RuntimeError("scene_binding_mismatch: source edge is not admitted by target map")
+        source = RevisionedFrame(**requested["calibration_frame"])
+        target = RevisionedFrame(**requested["world_frame"])
+        edge = RevisionedFrameTransform(source_frame=source, target_frame=target,
+            target_from_source_col_major=tuple(row["target_from_calibration_col_major"]),
+            transform_sha256=row["transform_sha256"],
+            source_floor_plane=MetricFloorPlane(frame=source, **row["calibration_floor_plane"]),
+            target_floor_plane=MetricFloorPlane(frame=target, **row["world_floor_plane"]))
+        matrix = matrix_from_col_major(presentation["world_to_scene_col_major"], name="target presentation")
+        scale = 1.0 / float(np.linalg.norm(matrix[:3, 0]))
+        output[camera] = {"world_to_scene": matrix, "calibration_to_scene": matrix @ edge.matrix,
+            "scene_to_m": scale, "frame_binding": _json_copy(row), "presentation": presentation}
+    return output
 
 
 def _active_similarity_from_calibration(
@@ -519,6 +604,8 @@ def sanitize_tracking_message(
             "world": _finite_vector(track.get("world"), 3),
             "world_valid": track.get("world_valid") is True,
             "world_frame": _text(track.get("world_frame")),
+            "world_frame_revision": _text(track.get("world_frame_revision")),
+            "world_transform_sha256": _text(track.get("world_transform_sha256"), maximum=64),
             "world_source": _text(track.get("world_source")),
             "world_quality": _text(track.get("world_quality")),
             "world_quality_reason": _text(track.get("world_quality_reason")),
@@ -760,6 +847,9 @@ class AlignmentWalkCapture:
     run_id: str
     ws_uri: str
     scene_binding: Mapping[str, Any] | None = None
+    scene_release_resolver: Callable[[], Mapping[str, Any]] | None = None
+    scene_release_evidence: dict[str, Any] = field(default_factory=dict)
+    target_context: dict[str, dict[str, Any]] = field(default_factory=dict)
     ids: EphemeralIds = field(default_factory=EphemeralIds)
     sample_sequence: int = 0
     world_sequence: int = 0
@@ -794,6 +884,7 @@ class AlignmentWalkCapture:
             "updated_at_us": int(time.time_ns() // 1_000),
             "runtime": dict(self.runtime_identity),
             "scene_binding": _json_copy(self.scene_binding),
+            "scene_release_evidence": _json_copy(self.scene_release_evidence),
             "scene_binding_verification": _json_copy(
                 self.scene_binding_verification
             ),
@@ -841,6 +932,66 @@ class AlignmentWalkCapture:
             if not isinstance(bundle, Mapping):
                 return []
             sanitized = sanitize_calibration_bundle(bundle)
+            target_owned = bool(self.scene_binding and self.scene_binding.get("contract_version") == 2)
+            if sanitized.get("world_frame_presentations") and not target_owned:
+                raise RuntimeError("unsupported_scene_binding_schema: target-owned worlds require scene_binding contract_version 2")
+            if target_owned:
+                self.scene_release_evidence = dict(self.scene_release_resolver() if self.scene_release_resolver else {})
+                self.target_context = _target_owned_context(sanitized, self.scene_binding, self.scene_release_evidence)
+                self.scene_binding_verification = {"status": "matched", "contract_version": 2,
+                    "verified_fields": ["release_id", "authored_scene_sha256", "targets", "cameras"],
+                    "operator_asserted_fields": [], "release": self.scene_release_evidence,
+                    "target_presentations": {c: v["presentation"] for c, v in self.target_context.items()}}
+            else:
+                self._verify_legacy_calibration(sanitized)
+            digest = payload_sha256(sanitized)
+            if digest not in self.calibration_digests:
+                atomic_write_private_file(self.calibration_dir / f"{digest}.json",
+                    json.dumps(sanitized, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+                    label="alignment calibration bundle")
+                self.calibration_digests.append(digest)
+            self.calibration_bundle_sha256 = digest
+            self.counts["calibration_bundles"] += 1
+            return []
+        if message_type != "tracking":
+            return []
+        if not self.calibration_bundle_sha256:
+            self.counts["tracking_messages_before_calibration"] += 1
+            return []
+        if self.target_context:
+            selected_tracks = []
+            # Validate every participating row before any evidence is appended.
+            for track in message.get("tracks", []):
+                if not isinstance(track, Mapping):
+                    continue
+                camera = str(track.get("camera_id") or message.get("camera_id") or "")
+                context = self.target_context.get(camera)
+                if context is None:
+                    if not camera:
+                        raise RuntimeError("scene_binding_mismatch: tracking camera identity is missing")
+                    self.counts["unselected_camera_tracks_discarded"] += 1
+                    continue
+                edge = context["frame_binding"]
+                has_target_stage = any(
+                    _finite_vector(track.get(alias), 3) is not None
+                    for aliases in _POINT_FIELD_ALIASES.values()
+                    for alias in aliases
+                )
+                # Candidate/filter diagnostics remain metric evidence even when
+                # the final-world admission failed. Never assign them the
+                # selected frame merely from their camera identity.
+                if ((track.get("world_valid") is True or has_target_stage) and
+                    (track.get("world_frame") != edge["world_frame"]["frame_id"] or
+                     track.get("world_frame_revision") != edge["world_frame"]["revision"] or
+                     track.get("world_transform_sha256") != edge["transform_sha256"])):
+                    raise RuntimeError("scene_binding_mismatch: tracking target revision/source edge differs")
+                selected_tracks.append(track)
+            if not selected_tracks:
+                return []
+            message = dict(message, tracks=selected_tracks)
+        return self._process_tracking(message, wall_us, monotonic_ns)
+
+    def _verify_legacy_calibration(self, sanitized: Mapping[str, Any]) -> None:
             matrix, scene_to_m, similarity_source = (
                 _active_similarity_from_calibration(sanitized)
             )
@@ -918,22 +1069,8 @@ class AlignmentWalkCapture:
                 if not verification["operator_asserted_fields"]:
                     verification["status"] = "matched"
                 self.scene_binding_verification = verification
-            digest = payload_sha256(sanitized)
-            if digest not in self.calibration_digests:
-                atomic_write_private_file(
-                    self.calibration_dir / f"{digest}.json",
-                    json.dumps(sanitized, indent=2, sort_keys=True).encode("utf-8") + b"\n",
-                    label="alignment calibration bundle",
-                )
-                self.calibration_digests.append(digest)
-            self.calibration_bundle_sha256 = digest
-            self.counts["calibration_bundles"] += 1
-            return []
-        if message_type != "tracking":
-            return []
-        if not self.calibration_bundle_sha256:
-            self.counts["tracking_messages_before_calibration"] += 1
-            return []
+
+    def _process_tracking(self, message: Mapping[str, Any], wall_us: int, monotonic_ns: int) -> list[dict[str, Any]]:
         rows = sanitize_tracking_message(
             message,
             ids=self.ids,
@@ -1281,11 +1418,14 @@ def _point_zone_distance_scene(point_xz: Sequence[float], zones: Sequence[Mappin
     return min(distances) if distances else math.inf
 
 
-def _calibration_for_session(run_dir: Path, session: Mapping[str, Any]) -> tuple[dict[str, Any], np.ndarray, float]:
+def _calibration_for_session(run_dir: Path, session: Mapping[str, Any]) -> tuple[dict[str, Any], np.ndarray | dict[str, dict[str, Any]], float]:
     digest = _text(session.get("calibration_bundle_sha256"), maximum=64)
     if not digest:
         raise RuntimeError("session has no calibration bundle digest")
     calibration = _load_json_file(run_dir / "calibration" / f"{digest}.json", private=True)
+    binding = session.get("scene_binding")
+    if isinstance(binding, Mapping) and binding.get("contract_version") == 2:
+        return calibration, _target_owned_context(calibration, binding, session.get("scene_release_evidence")), 1.0
     matrix, scene_to_m, _source = _active_similarity_from_calibration(calibration)
     return calibration, matrix, scene_to_m
 
@@ -2930,6 +3070,8 @@ def build_waypoint_calibration_evidence(
     world_to_scene: np.ndarray,
     scene_to_m: float,
     scene_binding: Mapping[str, Any] | None = None,
+    calibration_to_scene: np.ndarray | None = None,
+    target_frame_binding: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Build exact, privacy-safe waypoint correspondences and split metrics.
 
@@ -2946,8 +3088,9 @@ def build_waypoint_calibration_evidence(
         for row in samples
         if _integer(row.get("sequence")) is not None
     }
+    source_matrix = calibration_to_scene if calibration_to_scene is not None else world_to_scene
     active_similarity = _similarity_evidence(
-        world_to_scene, scene_to_m, source="captured_active_similarity"
+        source_matrix, scene_to_m, source="captured_target_camera_composition" if target_frame_binding else "captured_active_similarity"
     )
     evidence: list[dict[str, Any]] = []
     for waypoint in _guided_waypoints(waypoints):
@@ -3054,7 +3197,7 @@ def build_waypoint_calibration_evidence(
         expected_geometry = (
             _expected_camera_geometry(
                 expected_scene,
-                world_to_scene=world_to_scene,
+                world_to_scene=source_matrix,
                 K=K,
                 E=E,
             )
@@ -3078,6 +3221,12 @@ def build_waypoint_calibration_evidence(
             else {}
         )
         floor_y_backend_m = _finite_float(align_payload.get("floor_y"))
+        if target_frame_binding is not None:
+            physical_floor = target_frame_binding["calibration_floor_plane"]
+            floor_y_backend_m = MetricFloorPlane(
+                frame=RevisionedFrame(**target_frame_binding["calibration_frame"]),
+                **physical_floor,
+            ).horizontal_y_m
         stages: dict[str, Any] = {}
         if sample is not None and expected_scene is not None:
             for stage_name, field_name in _WAYPOINT_STAGE_FIELDS.items():
@@ -3089,7 +3238,9 @@ def build_waypoint_calibration_evidence(
                 point = _finite_vector(sample.get(field_name), 3)
                 if point is not None:
                     stages[stage_name] = _point_error(
-                        point, expected_scene, world_to_scene, scene_to_m
+                        point, expected_scene,
+                        world_to_scene,
+                        scene_to_m
                     )
         if (
             "final_world" not in stages
@@ -3211,8 +3362,21 @@ def build_waypoint_calibration_evidence(
                 }
             )
         row["post_marker_samples"] = solver_samples
+        if target_frame_binding is not None:
+            row["target_frame_binding"] = _json_copy(target_frame_binding)
+            # Published candidates/final points are already target-frame points.
+            # A flattened target-floor point does not have an unambiguous 3-D
+            # source inverse. Retain originals, but do not compare these to the
+            # legacy solver's source-space reconstructions as if frames matched.
+            for solver_sample in solver_samples:
+                for field_name in ("floor_world_raw_m", "depth_world_raw_m", "final_world_m"):
+                    solver_sample["canonical_target_" + field_name] = solver_sample.get(field_name)
+                    solver_sample[field_name] = None
+                solver_sample["source_space_producer_residual_status"] = "unavailable_target_frame_diagnostic"
         evidence.append(row)
-    candidate = _candidate_similarity(evidence)
+    candidate = (_candidate_similarity(evidence) if target_frame_binding is None else
+        {"status": "not_applicable", "reason": "target-owned presentation is not a marker-derived global fit",
+         "advisory_only": True, "active_config_modified": False})
     if candidate.get("status") == "complete":
         similarity = candidate.get("similarity")
         candidate_matrix = matrix_from_col_major(
@@ -3340,16 +3504,14 @@ def build_waypoint_calibration_report(
         raise RuntimeError("guided waypoint calibration requires waypoints.json")
     waypoints = _load_json_file(waypoint_path, private=True)
     calibration, matrix, scene_to_m = _calibration_for_session(root, session)
-    assignments = assign_waypoints(
-        samples,
-        markers,
-        waypoints,
-        world_to_scene=matrix,
-        scene_to_m=scene_to_m,
-        window_before_s=window_before_s,
-        window_after_s=window_after_s,
-        ambiguity_margin=ambiguity_margin,
-    )
+    target_context = matrix if isinstance(matrix, Mapping) else None
+    assignments = []
+    for camera, context in (target_context.items() if target_context else [(None, {"world_to_scene": matrix, "scene_to_m": scene_to_m})]):
+        selected_waypoints = dict(waypoints, waypoints=[w for w in waypoints["waypoints"] if camera is None or w["camera_id"] == camera])
+        assignments.extend(assign_waypoints(
+            [r for r in samples if camera is None or r["camera_id"] == camera], markers, selected_waypoints,
+            world_to_scene=context["world_to_scene"], scene_to_m=context["scene_to_m"],
+            window_before_s=window_before_s, window_after_s=window_after_s, ambiguity_margin=ambiguity_margin))
     calibration_digest = _text(session.get("calibration_bundle_sha256"), maximum=64)
     if calibration_digest is None:
         raise RuntimeError("guided waypoint calibration has no calibration digest")
@@ -3364,17 +3526,39 @@ def build_waypoint_calibration_report(
         if isinstance(session.get("scene_binding_verification"), Mapping)
         else {}
     )
-    evidence, metrics, candidate = build_waypoint_calibration_evidence(
-        samples,
-        assignments,
-        waypoints,
-        calibration=calibration,
-        calibration_bundle_sha256=calibration_digest,
-        source_capture_artifact_index_sha256=source_index_sha256,
-        world_to_scene=matrix,
-        scene_to_m=scene_to_m,
-        scene_binding=scene_binding,
-    )
+    if target_context:
+        evidence = []
+        camera_candidates = {"contract": "noesis.alignment.waypoint_camera_calibration_candidates",
+            "contract_version": 1, "advisory_only": True, "active_config_modified": False,
+            "source_capture_artifact_index_sha256": source_index_sha256, "cameras": {}}
+        for camera, context in target_context.items():
+            camera_evidence, _metrics, child = build_waypoint_calibration_evidence(
+                [r for r in samples if r["camera_id"] == camera], assignments,
+                dict(waypoints, waypoints=[w for w in waypoints["waypoints"] if w["camera_id"] == camera]),
+                calibration=calibration, calibration_bundle_sha256=calibration_digest,
+                source_capture_artifact_index_sha256=source_index_sha256,
+                world_to_scene=context["world_to_scene"], scene_to_m=context["scene_to_m"],
+                scene_binding=scene_binding, calibration_to_scene=context["calibration_to_scene"],
+                target_frame_binding=context["frame_binding"])
+            for row in camera_evidence:
+                row["target_presentation"] = context["presentation"]
+            evidence.extend(camera_evidence)
+            camera_candidates["cameras"].update(child["camera_calibration_candidates"]["cameras"])
+        camera_candidates["sha256"] = payload_sha256(camera_candidates)
+        candidate = {"contract": "noesis.alignment.target_owned_advisory_candidate", "contract_version": 1,
+            "status": "not_applicable", "reason": "target-owned presentation is not a marker-derived global fit",
+            "advisory_only": True, "active_config_modified": False,
+            "camera_calibration_candidates": camera_candidates,
+            "target_presentations": {c: v["presentation"] for c, v in target_context.items()}}
+        metrics = _waypoint_metric_summary(evidence, candidate=candidate)
+        metrics["camera_calibration_candidates"] = {"sha256": camera_candidates["sha256"],
+            "cameras": {c: v["metrics"] for c, v in camera_candidates["cameras"].items()}}
+    else:
+        evidence, metrics, candidate = build_waypoint_calibration_evidence(
+            samples, assignments, waypoints, calibration=calibration,
+            calibration_bundle_sha256=calibration_digest,
+            source_capture_artifact_index_sha256=source_index_sha256,
+            world_to_scene=matrix, scene_to_m=scene_to_m, scene_binding=scene_binding)
     metrics["scene_binding"] = _json_copy(scene_binding)
     metrics["scene_binding_verification"] = scene_binding_verification
     candidate["scene_binding"] = _json_copy(scene_binding)
@@ -4030,6 +4214,8 @@ def build_alignment_report(
         "waypoints": [],
     }
     _calibration, matrix, scene_to_m = _calibration_for_session(root, session)
+    if isinstance(matrix, Mapping):
+        raise RuntimeError("unsupported_analysis_schema: target-owned capture requires guided waypoint calibration analysis")
     zones = _load_room_zones(room_zones_path)
     assignments = assign_waypoints(
         samples,

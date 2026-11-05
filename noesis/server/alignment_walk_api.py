@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from noesis.server.internal_auth import InternalAuthConfig
 from noesis.validation.alignment_walk import (
@@ -44,6 +44,41 @@ class SceneBindingRequest(BaseModel):
     world_to_scene_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class FrameIdentityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    frame_id: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+    revision: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+
+
+class TargetPresentationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    world_frame: FrameIdentityRequest
+    world_to_scene_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scene_revision_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    registration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CameraFrameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    calibration_frame: FrameIdentityRequest
+    world_frame: FrameIdentityRequest
+    transform_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TargetSceneBindingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    contract_version: Literal[2]
+    release_id: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$")
+    authored_scene_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    targets: dict[str, TargetPresentationRequest] = Field(min_length=1, max_length=32)
+    cameras: dict[str, CameraFrameRequest] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def coherent_references(self) -> "TargetSceneBindingRequest":
+        validate_scene_binding(self.model_dump(mode="json"))
+        return self
+
+
 class WaypointRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
@@ -74,7 +109,7 @@ class SessionCreateRequest(BaseModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
     )
     duration_s: int = Field(default=1800, ge=30, le=3600)
-    scene_binding: SceneBindingRequest
+    scene_binding: TargetSceneBindingRequest | SceneBindingRequest
     waypoints: WaypointManifestRequest
 
 
@@ -190,11 +225,13 @@ class AlignmentWalkController:
         auth_config: InternalAuthConfig,
         output_root: str | Path | None = None,
         websocket_connect: Callable[..., Any] | None = None,
+        scene_release_resolver: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.ws_uri = _safe_self_ws_uri(ws_host, ws_port)
         self.auth_config = auth_config
         self.output_root = Path(output_root or default_output_root())
         self._websocket_connect = websocket_connect
+        self._scene_release_resolver = scene_release_resolver
         self._lock = threading.RLock()
         self._analysis_lock = threading.Lock()
         self._current: _SessionState | None = None
@@ -220,6 +257,10 @@ class AlignmentWalkController:
     def create(self, request: SessionCreateRequest) -> dict[str, Any]:
         manifest = _waypoint_manifest(request)
         scene_binding = validate_scene_binding(_json_model(request.scene_binding))
+        if scene_binding.get("contract_version") == 2:
+            if {w["camera_id"] for w in manifest["waypoints"]} != set(scene_binding["cameras"]):
+                raise AlignmentWalkApiError(422, "scene_binding cameras must exactly match participating waypoint cameras")
+            self._verified_release(scene_binding)
         with self._lock:
             if (
                 self._current is not None
@@ -239,6 +280,7 @@ class AlignmentWalkController:
                     run_id=session_id,
                     ws_uri=self.ws_uri,
                     scene_binding=scene_binding,
+                    scene_release_resolver=lambda: self._verified_release(scene_binding),
                 )
                 capture.copy_waypoints(manifest)
             except FileExistsError as exc:
@@ -271,6 +313,31 @@ class AlignmentWalkController:
             self._current = state_value
             thread.start()
             return self._status_payload(state_value)
+
+    def _verified_release(self, binding: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            if self._scene_release_resolver is not None:
+                evidence = dict(self._scene_release_resolver())
+            else:
+                # Same verified promoted selector/artifacts as GET /scenes/current.
+                from noesis.server.scene_api import _current_snapshot
+                _store, release = _current_snapshot()
+                from noesis.validation.alignment_walk import payload_sha256
+                evidence = {"authority": "noesis.scenes.current", "release_id": release.release_id,
+                    "authored_scene_sha256": release.authored_scene.sha256,
+                    "release_sha256": payload_sha256(release.model_dump(mode="json"))}
+            if evidence.get("authority") != "noesis.scenes.current":
+                raise RuntimeError("producer_missing_authority: current scene release resolver has no authority")
+            if any(evidence.get(k) != binding[k] for k in ("release_id", "authored_scene_sha256")):
+                raise RuntimeError("scene_binding_mismatch: current promoted release/model differs")
+            return evidence
+        except AlignmentWalkApiError:
+            raise
+        except Exception as exc:
+            detail = str(exc)
+            if not detail.startswith(("producer_missing_authority:", "scene_binding_mismatch:")):
+                detail = f"producer_missing_authority: {detail}"
+            raise AlignmentWalkApiError(409, detail) from exc
 
     def _authorization_headers(self) -> dict[str, str] | None:
         if self.auth_config.mode != "required":
@@ -647,6 +714,10 @@ class AlignmentWalkController:
         self, session_id: str, request: AnalysisRequest
     ) -> dict[str, Any]:
         run_dir, session = self._disk_session(session_id)
+        binding = session.get("scene_binding", {})
+        if binding.get("contract_version") == 2:
+            if self._verified_release(binding) != session.get("scene_release_evidence"):
+                raise AlignmentWalkApiError(409, "scene_binding_mismatch: promoted release changed since capture")
         if session.get("status") != "complete":
             raise AlignmentWalkApiError(
                 status.HTTP_409_CONFLICT,
@@ -700,6 +771,10 @@ class AlignmentWalkController:
 
     def _results_unlocked(self, session_id: str) -> dict[str, Any]:
         run_dir, session = self._disk_session(session_id)
+        binding = session.get("scene_binding", {})
+        if binding.get("contract_version") == 2:
+            if self._verified_release(binding) != session.get("scene_release_evidence"):
+                raise AlignmentWalkApiError(409, "scene_binding_mismatch: promoted release changed since capture")
         if session.get("status") != "complete":
             raise AlignmentWalkApiError(
                 status.HTTP_409_CONFLICT,
@@ -1048,6 +1123,7 @@ def install_alignment_walk_api(
     auth_config: InternalAuthConfig,
     output_root: str | Path | None = None,
     websocket_connect: Callable[..., Any] | None = None,
+    scene_release_resolver: Callable[[], Mapping[str, Any]] | None = None,
 ) -> AlignmentWalkController:
     controller = AlignmentWalkController(
         ws_host=ws_host,
@@ -1055,6 +1131,7 @@ def install_alignment_walk_api(
         auth_config=auth_config,
         output_root=output_root,
         websocket_connect=websocket_connect,
+        scene_release_resolver=scene_release_resolver,
     )
     app.state.alignment_walk_controller = controller
     app.include_router(router)
@@ -1067,6 +1144,10 @@ __all__ = [
     "AnalysisRequest",
     "MarkerRequest",
     "SceneBindingRequest",
+    "TargetSceneBindingRequest",
+    "TargetPresentationRequest",
+    "CameraFrameRequest",
+    "FrameIdentityRequest",
     "SessionCreateRequest",
     "WaypointRequest",
     "install_alignment_walk_api",

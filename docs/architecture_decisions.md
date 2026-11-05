@@ -106,6 +106,21 @@ per object, 256 KiB per request/response, 128 original-operation results with a
 workers, a five-second body deadline and finite SQLite waits keep this work
 outside media callbacks. No geometry, provider state or live runtime is changed.
 
+## 2026-10-30 — Measured scale requests are review metadata, not geometry activation
+
+The current scene API accepts an owner-attributed measurement request only
+after matching the verified promoted release and the existing target-owned V2
+frame/presentation authority. Exact model points, known metres and the original
+binding are immutable private review metadata. UUID replay and actor-scoped
+lookup read that original request; neither applies a scale or refreshes its
+authority. Missing current bindings fail closed, without legacy geometry or a
+second calibration authority. The Menon gateway owns browser authorization,
+confirmation and exact saved-request readback.
+
+Admission rechecks the live binding before insertion; it is not a lock against
+later external calibration changes. Submitted means pending review, not accepted
+metric accuracy. Runtime activation remains a separate authorized operation.
+
 ## 2026-10-19 — Global dashboard controls follow the visible scene
 
 The top toolbar exposes All cameras alongside Unified BEV. Its selected mode
@@ -3167,6 +3182,31 @@ each existing room-to-authored-scene transform exactly once.
 This changes presentation only: it neither invents geometry nor admits a new
 canonical world measurement, registration, identity or tracking constraint.
 Existing lower-room quality and physical-qualification limitations remain.
+
+## 2026-10-29 — E03 target-owned alignment-walk capture binding
+
+Alignment-walk scene binding version 2 selects exact target world revisions,
+typed target presentation/registration digests, authored scene identity and each
+participating camera's revisioned source-to-target edge. Matrices come only from
+the captured CalibrationManager tables. Admission resolves the same validated
+current promoted release as the scene API; capture and analysis retain and check
+that release evidence. Missing producer authority, unsupported schemas and stale
+or mismatched references fail closed. A target-owned table cannot use the legacy
+global-similarity contract as a fallback.
+
+Analysis applies the target presentation once to canonical world measurements;
+camera-source diagnostics use the explicit source edge composed once with that
+presentation. Target-owned analysis does not fit a replacement global marker
+similarity. Per-camera fit/holdout candidates remain advisory and never modify
+active calibration, canonical measurements, release selection or runtime state.
+
+Target-owned generic/unbound CLI capture is explicitly unsupported: callers must
+supply version-2 references and use guided analysis. Scoped capture discards
+unselected camera rows without weakening selected-camera revision/edge checks.
+All published world diagnostic stages are already target-frame measurements;
+source-space camera residuals are unavailable when they cannot be compared
+without reinterpreting flattened target-floor points. Original target points
+remain in retained evidence; no synthetic physical inverse is asserted.
 
 ## 2026-10-30 — Bounded reads of the running canonical world owner
 

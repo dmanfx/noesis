@@ -23,6 +23,248 @@ from noesis.server.internal_auth import InternalAuthConfig
 from noesis.validation.alignment_walk import payload_sha256
 
 
+def _target_owned_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Published CalibrationManager shape, with nonidentity source and render edges."""
+    from noesis_core.coordinate_frames import RevisionedFrame, revisioned_transform_sha256
+    from noesis_core.contracts.scene_prior import (
+        ScenePriorFrameRef, ScenePriorWorldToScenePresentation,
+        world_to_scene_presentation_sha256, scene_revision_sha256,
+    )
+    source = RevisionedFrame("backend_world_m", "source-physical-v1")
+    target = RevisionedFrame("backend_world_m", "target-metric-v1")
+    edge = np.eye(4)
+    edge[0, 3] = 10.0
+    edge_values = edge.flatten(order="F").tolist()
+    edge_sha = revisioned_transform_sha256(source, target, edge_values)
+    render = np.diag([2.0, 2.0, 2.0, 1.0])
+    render[0, 3] = 100.0
+    render_values = render.flatten(order="F").tolist()
+    frame = ScenePriorFrameRef(frame_id=target.frame_id, revision=target.revision)
+    presentation = ScenePriorWorldToScenePresentation(
+        contract="noesis.scene_prior.world_to_scene_presentation", contract_version=1,
+        world_frame=frame, render_frame="menon_scene", world_to_scene_col_major=render_values,
+        world_to_scene_sha256=world_to_scene_presentation_sha256(frame, "menon_scene", render_values),
+        scene_revision_id=scene_revision_sha256(frame, "menon_scene", render_values),
+        source_transform_sha256s=[edge_sha],
+        provenance={"role": "world_to_scene_presentation", "sha256": "c" * 64},
+        accepted=True, authored_scene_sha256="e" * 64, registration_sha256="d" * 64,
+    ).model_dump(mode="json")
+    refs = {"calibration_frame": {"frame_id": source.frame_id, "revision": source.revision},
+            "world_frame": frame.model_dump(mode="json"), "transform_sha256": edge_sha}
+    bundle = _calibration_message()["data"]
+    bundle["cameras"]["frame_bindings"] = {"family-room": dict(refs,
+        contract="noesis.calibration.frame_binding", contract_version=2,
+        target_from_calibration_col_major=edge_values,
+        calibration_floor_plane={"normal": [0.0, 1.0, 0.0], "offset_m": 0.0},
+        world_floor_plane={"normal": [0.0, 1.0, 0.0], "offset_m": 0.0})}
+    bundle["world_frame_presentations"] = {target.revision: presentation}
+    binding = {"contract_version": 2, "release_id": "menon-target-v2", "authored_scene_sha256": "e" * 64,
+        "targets": {target.revision: {k: presentation[k] for k in (
+            "world_frame", "world_to_scene_sha256", "scene_revision_id", "registration_sha256")}},
+        "cameras": {"family-room": refs}}
+    release = {"authority": "noesis.scenes.current", "release_id": binding["release_id"],
+               "authored_scene_sha256": "e" * 64, "release_sha256": "f" * 64}
+    return json.loads(json.dumps(bundle)), json.loads(json.dumps(binding)), release
+
+
+def test_target_owned_api_capture_analysis_trace(tmp_path: Path) -> None:
+    bundle, binding, release = _target_owned_fixture()
+    tracking = _tracking_message()
+    tracking["tracks"][0].update(world=[10.0, 0.0, 2.0], world_valid=True,
+        world_frame="backend_world_m", world_frame_revision="target-metric-v1",
+        world_transform_sha256=binding["cameras"]["family-room"]["transform_sha256"],
+        world_floor_candidate=[10.0, 0.0, 2.0], world_depth_candidate=[10.0, 0.0, 2.0],
+        world_prefilter_measurement=[10.0, 0.0, 2.0], world_filter_prediction=[10.0, 0.0, 2.0])
+    connector = _FakeConnector([{"type": "calibration-bundle", "data": bundle}, tracking])
+    app = FastAPI()
+    controller = install_alignment_walk_api(app, ws_host="127.0.0.1", ws_port=6008,
+        auth_config=InternalAuthConfig(mode="disabled", token_file=None, token=None),
+        output_root=tmp_path / "capture", websocket_connect=connector,
+        scene_release_resolver=lambda: release)
+    request = _create_payload("target-owned-session")
+    request["duration_s"] = 60
+    request["scene_binding"] = binding
+    request["waypoints"]["waypoints"][0]["expected_scene_xyz"] = [120.0, 0.0, 4.0]
+    request["waypoints"]["waypoints"].extend([
+        {"id": "family-fit-2", "camera_id": "family-room", "expected_scene_xyz": [122.0, 0.0, 4.0], "split": "fit"},
+        {"id": "family-fit-3", "camera_id": "family-room", "expected_scene_xyz": [120.0, 0.0, 6.0], "split": "fit"},
+        {"id": "family-holdout", "camera_id": "family-room", "expected_scene_xyz": [122.0, 0.0, 6.0], "split": "holdout"},
+    ])
+    with TestClient(app) as client:
+        created = client.post("/api/v1/alignment-walk/sessions", json=request)
+        assert created.status_code == 201, created.text
+        status_payload = _wait_for_sample(client, "target-owned-session")
+        assert status_payload["scene_binding_verification"]["status"] == "matched"
+        marker_responses = []
+        for waypoint in request["waypoints"]["waypoints"]:
+            for phase in ("arrived", "leave"):
+                marker = client.post("/api/v1/alignment-walk/sessions/target-owned-session/markers",
+                    json={"waypoint_id": waypoint["id"], "phase": phase, "tracklet_key": "tracklet-1"})
+                assert marker.status_code == 200, marker.text
+                marker_responses.append(marker.json())
+        post_marker_status = client.get("/api/v1/alignment-walk/sessions/target-owned-session").json()
+        assert len(post_marker_status["markers"]) == 8
+        finished = client.post("/api/v1/alignment-walk/sessions/target-owned-session/finish")
+        assert finished.status_code == 200, finished.text
+        analyzed = client.post("/api/v1/alignment-walk/sessions/target-owned-session/analysis", json={})
+        assert analyzed.status_code == 200, analyzed.text
+        results = client.get("/api/v1/alignment-walk/sessions/target-owned-session/results")
+        assert results.status_code == 200, results.text
+        result = results.json()
+        assert result["candidate_summary"]["advisory_only"] is True
+        assert result["candidate_summary"]["active_config_modified"] is False
+        assert result["candidate_similarity"]["status"] == "not_applicable"
+        assert result["scene_binding"] == binding
+        evidence = json.loads((tmp_path / "capture" / "target-owned-session" /
+            "waypoint_calibration_evidence.json").read_text())
+        for stage in evidence[0]["stages"]["active"].values():
+            assert stage["error_m"] == pytest.approx(0.0)
+        trace = {"fixture_kind": "synthetic published producer shape; actual API handlers; no live capture",
+            "request": request, "calibration_bundle": bundle, "tracking_message": tracking,
+            "created": created.json(), "verified_status": status_payload,
+            "post_marker_status": post_marker_status, "marker_responses": marker_responses,
+            "finished": finished.json(), "analysis": analyzed.json(), "results": result,
+            "waypoint_evidence": evidence}
+        path = tmp_path / "target-owned-api-trace.json"
+        path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+        print(f"E03_TRACE={path}")
+        release["release_sha256"] = "a" * 64
+        stale = client.get("/api/v1/alignment-walk/sessions/target-owned-session/results")
+        assert stale.status_code == 409
+    controller.close()
+
+
+@pytest.mark.parametrize("change", ["revision", "model", "digest", "edge", "missing", "source"])
+def test_target_owned_published_authority_negative_controls(change: str) -> None:
+    from noesis.validation.alignment_walk import _target_owned_context, validate_scene_binding
+    bundle, binding, release = _target_owned_fixture()
+    if change == "revision":
+        bundle["cameras"]["frame_bindings"]["family-room"]["world_frame"]["revision"] = "stale"
+    elif change == "model":
+        release["authored_scene_sha256"] = "a" * 64
+    elif change == "digest":
+        bundle["world_frame_presentations"]["target-metric-v1"]["world_to_scene_sha256"] = "a" * 64
+    elif change == "edge":
+        bundle["cameras"]["frame_bindings"]["family-room"]["target_from_calibration_col_major"][12] += 1.0
+    elif change == "source":
+        bundle["world_frame_presentations"]["target-metric-v1"]["source_transform_sha256s"] = ["a" * 64]
+    else:
+        bundle.pop("world_frame_presentations")
+    with pytest.raises((RuntimeError, ValueError)):
+        _target_owned_context(bundle, validate_scene_binding(binding), release)
+
+
+def test_target_owned_one_transform_and_explicit_schema() -> None:
+    from noesis.validation.alignment_walk import _target_owned_context, validate_scene_binding
+    from noesis.server.alignment_walk_api import TargetSceneBindingRequest
+    bundle, binding, release = _target_owned_fixture()
+    context = _target_owned_context(bundle, validate_scene_binding(binding), release)["family-room"]
+    assert np.allclose(context["world_to_scene"] @ [10, 0, 2, 1], [120, 0, 4, 1])
+    assert np.allclose(context["calibration_to_scene"] @ [0, 0, 2, 1], [120, 0, 4, 1])
+    del binding["targets"]["target-metric-v1"]["registration_sha256"]
+    with pytest.raises(ValueError):
+        TargetSceneBindingRequest.model_validate(binding)
+    with pytest.raises(ValueError, match="unsupported_scene_binding_schema"):
+        validate_scene_binding({"contract_version": 3})
+
+
+def test_target_owned_default_resolver_uses_canonical_current_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from noesis.server import scene_api
+    _bundle, binding, _release = _target_owned_fixture()
+    release = SimpleNamespace(release_id=binding["release_id"],
+        authored_scene=SimpleNamespace(sha256=binding["authored_scene_sha256"]),
+        model_dump=lambda **_kwargs: {"release_id": binding["release_id"], "authored_scene_sha256": "e" * 64})
+    calls = []
+    def snapshot():
+        calls.append(True)
+        return object(), release
+    monkeypatch.setattr(scene_api, "_current_snapshot", snapshot)
+    controller = AlignmentWalkController(ws_host="127.0.0.1", ws_port=6008,
+        auth_config=InternalAuthConfig(mode="disabled", token_file=None, token=None), output_root=tmp_path)
+    evidence = controller._verified_release(binding)
+    assert calls == [True]
+    assert evidence["authority"] == "noesis.scenes.current"
+    assert evidence["release_sha256"] == payload_sha256(release.model_dump())
+    release.authored_scene.sha256 = "a" * 64
+    with pytest.raises(AlignmentWalkApiError, match="scene_binding_mismatch:"):
+        controller._verified_release(binding)
+
+
+def test_target_owned_capture_never_falls_back_and_rejects_stale_tracking(tmp_path: Path) -> None:
+    from noesis.validation.alignment_walk import AlignmentWalkCapture, create_run_directory
+    bundle, binding, release = _target_owned_fixture()
+    capture = AlignmentWalkCapture(create_run_directory(tmp_path, "target"), run_id="target", ws_uri="ws://test.invalid", scene_binding=binding,
+        scene_release_resolver=lambda: release)
+    try:
+        capture.process_message({"type": "calibration-bundle", "data": bundle})
+        tracking = _tracking_message()
+        tracking["tracks"][0].update(world_valid=True, world=[10, 0, 2],
+            world_frame="backend_world_m", world_frame_revision="target-metric-v1",
+            world_transform_sha256=binding["cameras"]["family-room"]["transform_sha256"])
+        third_camera = dict(tracking["tracks"][0], camera_id="unselected-third-camera",
+                            world_frame_revision="foreign-revision")
+        tracking["tracks"].append(third_camera)
+        rows = capture.process_message(tracking)
+        assert len(rows) == 1 and rows[0]["camera_id"] == "family-room"
+        assert capture.counts["unselected_camera_tracks_discarded"] == 1
+        tracking["tracks"][0]["world_frame_revision"] = "stale"
+        with pytest.raises(RuntimeError, match="tracking target revision/source edge"):
+            capture.process_message(tracking)
+        assert capture.counts.get("track_samples", 0) == 1
+    finally:
+        capture.finish()
+    legacy = AlignmentWalkCapture(create_run_directory(tmp_path, "legacy"), run_id="legacy", ws_uri="ws://test.invalid", scene_binding=_create_payload()["scene_binding"])
+    try:
+        with pytest.raises(RuntimeError, match="unsupported_scene_binding_schema"):
+            legacy.process_message({"type": "calibration-bundle", "data": bundle})
+    finally:
+        legacy.finish()
+
+
+@pytest.mark.parametrize("stage", ["world_floor_candidate", "world_depth_candidate",
+                                  "world_prefilter_measurement", "world_filter_prediction"])
+@pytest.mark.parametrize("provenance", ["stale", "missing"])
+def test_target_owned_invalid_final_stage_requires_exact_provenance(
+    tmp_path: Path, stage: str, provenance: str,
+) -> None:
+    from noesis.validation.alignment_walk import AlignmentWalkCapture, create_run_directory
+    bundle, binding, release = _target_owned_fixture()
+    capture = AlignmentWalkCapture(create_run_directory(tmp_path, "invalid-final"),
+        run_id="invalid-final", ws_uri="ws://test.invalid", scene_binding=binding,
+        scene_release_resolver=lambda: release)
+    try:
+        capture.process_message({"type": "calibration-bundle", "data": bundle})
+        tracking = _tracking_message()
+        track = tracking["tracks"][0]
+        track.update(world_valid=False, world_frame="backend_world_m",
+            world_frame_revision="target-metric-v1",
+            world_transform_sha256=binding["cameras"]["family-room"]["transform_sha256"])
+        track[stage] = [10.0, 0.0, 2.0]
+        # Invalid final admission does not invalidate correctly bound diagnostics.
+        accepted = capture.process_message(tracking)
+        assert len(accepted) == 1 and accepted[0]["world_valid"] is False
+        assert any(accepted[0].get(field) == [10.0, 0.0, 2.0] for field in (
+            "floor_world_raw_m", "depth_world_raw_m", "world_measurement_raw_m", "world_prediction_m"))
+        if provenance == "stale":
+            track["world_frame_revision"] = "stale"
+        else:
+            for key in ("world_frame", "world_frame_revision", "world_transform_sha256"):
+                track.pop(key)
+        with pytest.raises(RuntimeError, match="tracking target revision/source edge"):
+            capture.process_message(tracking)
+        assert capture.counts["track_samples"] == 1
+        # With no finite target stage, missing frame provenance is only 2-D data.
+        track.pop(stage)
+        only_2d = capture.process_message(tracking)
+        assert len(only_2d) == 1 and only_2d[0]["world_valid"] is False
+        assert all(only_2d[0].get(field) is None for field in (
+            "floor_world_raw_m", "depth_world_raw_m", "world_measurement_raw_m", "world_prediction_m"))
+    finally:
+        capture.finish()
+
+
 def _identity_col_major() -> list[float]:
     return [float(value) for value in np.eye(4).flatten(order="F")]
 

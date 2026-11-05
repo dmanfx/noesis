@@ -137,6 +137,15 @@ and expiry, strict JSON and private bearer admission. This is producer source
 validation; Menon integration is separately verified by its consumer owner.
 No geometry, calibration, occupancy, provider or live runtime was activated.
 
+## 2026-10-30 — Persisted metric measurement review requests
+
+Added a bounded private scene measurement-request store and current-scene API.
+Exact V2 release/model/frame/transform checks precede persistence; UUID replay,
+actor-scoped readback and restart reads preserve the original proposal with
+`submitted_for_review` and `applied: false`. Focused disposable FastAPI tests
+cover current authority mismatches, strict coordinates, persistence and original
+lookup. No geometry, calibration, capture or canonical runtime was activated.
+
 ## 2026-10-20 — Source checkpoint, not tracking completion
 
 Recorded the existing workspace as separate local commits for PCF review,
@@ -2615,6 +2624,18 @@ Kitchen ceiling evidence remains ambiguous, so its supported fragments are
 retained. This is not a gap-free or all-ceilings-removed result. Browser owner
 authentication remains required; the available browser session was signed out,
 so an authenticated user-visible browser render was not independently checked.
+
+## 2026-10-29 — E03 target-owned alignment-walk producer
+
+Added strict version-2 capture references for target presentations and per-camera
+revisioned source edges, preserving complete published tables in private capture
+and analysis evidence. The API reads existing validated current scene-release
+authority and rejects stale release/model evidence before analysis/results.
+Legacy applicable capture remains supported, but not as a target-owned fallback.
+Focused test-owned API capture/analysis fixtures exercise exact transform use,
+advisory candidate output and negative revision/model/digest/source-edge cases.
+No live capture, service activation, calibration mutation or deployment occurred;
+synthetic fixtures do not establish physical calibration accuracy.
 
 ## 2026-10-30 — Private recorded relationship read
 

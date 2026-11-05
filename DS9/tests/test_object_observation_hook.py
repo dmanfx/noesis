@@ -29,7 +29,8 @@ def actual_hook_loop():
     wrapper.body.insert(-1, part)
     helpers = [copy.deepcopy(node) for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"_rect_to_bbox", "_bbox_center"}]
     builder = copy.deepcopy(next(node for node in processor.body if isinstance(node, ast.FunctionDef) and node.name == "_build_track_dict_servicemaker"))
-    module = ast.Module(body=ast.parse("from __future__ import annotations").body + helpers + [builder, wrapper], type_ignores=[])
+    room_helper = copy.deepcopy(next(node for node in processor.body if isinstance(node, ast.FunctionDef) and node.name == "_object_room_from_servicemaker"))
+    module = ast.Module(body=ast.parse("from __future__ import annotations").body + helpers + [builder, room_helper, wrapper], type_ignores=[])
     ast.fix_missing_locations(module)
     scope = {"math": math, "Mapping": Mapping, "logger": logging.getLogger("object-hook-test"), "noesis_analytics_meta_ext": None,
         "time": time, "_increment_core_counter": lambda *args: None, "_record_core_stage_timing": lambda *args: None}
@@ -43,6 +44,7 @@ def test_original_single_iterator_nonperson_handoff_preserves_exact_person_build
     try:
         processor = SimpleNamespace(_tracking_mode_is_v3dt=lambda: False, _analytics_unique_id=None)
         processor._build_track_dict_servicemaker = lambda obj, camera: scope["_build_track_dict_servicemaker"](processor, obj, camera)
+        processor._object_room_from_servicemaker = lambda obj: scope["_object_room_from_servicemaker"](processor, obj)
         rect = SimpleNamespace(left=10., top=20., width=30., height=40.)
         person = SimpleNamespace(class_id=0, object_id=7, label="person", confidence=.91, rect_params=rect)
         detected = SimpleNamespace(class_id=56, object_id=9, label="chair", confidence=.86, rect_params=rect)
@@ -79,5 +81,5 @@ def test_runtime_source_binds_same_transaction_owner_and_private_router_without_
     tree = ast.parse((ROOT / "DS9/noesis/ds9_runtime_core.py").read_text())
     source = ast.unparse(tree)
     assert "app.include_router(object_observations.router)" in source
-    assert "install_object_observation_owner(startup_transaction, pipeline, prebuilt_rest_app, world_service.producer.run_id)" in source
+    assert "install_object_observation_owner(startup_transaction, pipeline, prebuilt_rest_app, world_service.producer.run_id, track_service=object_track_service)" in source
     assert "close_object_observation_owner(pipeline, prebuilt_rest_app, object_observation_service)" in source

@@ -155,6 +155,39 @@ actor-scoped readback and restart reads preserve the original proposal with
 cover current authority mismatches, strict coordinates, persistence and original
 lookup. No geometry, calibration, capture or canonical runtime was activated.
 
+## 2026-10-24 — Camera expansion respects quadrants and the home image
+
+Replaced near-fullscreen camera expansion with a quadrant-bounded panel that
+avoids the painted home footprint. Removed its canvas backdrop and kept native
+fullscreen separate. Expanded panels follow map-style and viewport changes;
+Collapse, Escape, drag/reset and inline mobile access retain their behavior.
+
+Six layout/footprint tests and the production build passed. Live browser checks
+covered all three cameras at four desktop sizes, all map styles, camera normals,
+resize, moved-camera quadrants, fullscreen/return, Escape and mobile expansion.
+The home stayed clear, the map dimensions stayed fixed, and the shared video
+element/stream stayed mounted without JavaScript errors. TypeScript retains the
+same seven existing diagnostics. Source and built assets were backed up before
+editing.
+
+## 2026-10-22 — Compact dashboard controls and viewport-fitting cameras
+
+Consolidated the map/camera/room controls into one slim command row, moved themes
+and advanced styles into an overlay Display panel, and removed repeated headings
+and status bars. The canvas begins at 92 pixels instead of about 313 pixels in
+the measured desktop layouts. Camera panels adapt to available height, and the
+Inspector and Display panel preserve canvas dimensions when opened.
+
+Live browser checks covered six desktop sizes from 1024 by 600 through 1920 by
+1080 with no body/main/stage scrolling and all camera panels inside the canvas.
+They also exercised actual depth/normal pixels for every camera, map and camera
+modes, legends, theme/preset/layer controls, saved styles, keyboard dismissal,
+Inspector synchronization, drag/reset, hide/expand/fullscreen, 3D navigation and
+mobile access down to 320 pixels. The shared video element/stream stayed mounted,
+and display actions sent no producer-changing commands. Four presentation tests
+passed; TypeScript retains the same seven existing diagnostics. Source and built
+assets were backed up before editing.
+
 ## 2026-10-20 — Source checkpoint, not tracking completion
 
 Recorded the existing workspace as separate local commits for PCF review,

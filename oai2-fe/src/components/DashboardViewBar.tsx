@@ -6,14 +6,14 @@ export type DashboardView = 'overview' | 'reconstruction' | 'height' | 'normals'
 export type ActiveDashboardView = DashboardView | 'diagnostics';
 
 const views: Array<{ id: DashboardView; label: string; description: string }> = [
-  { id: 'overview', label: 'Overview', description: 'Home map and live room cameras' },
-  { id: 'reconstruction', label: 'Reconstruction', description: 'Observed PCF texture across the whole unified map' },
+  { id: 'overview', label: 'Map', description: 'Structure · Home map and live room cameras' },
+  { id: 'reconstruction', label: 'Texture', description: 'Observed PCF texture across the whole unified map' },
   { id: 'height', label: 'Height', description: 'Height above ground across the whole unified map' },
   { id: 'normals', label: 'Normals', description: 'PCF surface normals across the whole unified map' },
   { id: '3d', label: '3D', description: 'Existing room heightfield, point cloud, obstacles and visible floor' },
 ];
 
-export function DashboardViewBar({ activeView, cameras, selectedRoom, onRoomChange, onViewChange, inspectorOpen, onToggleInspector }: {
+export function DashboardViewBar({ activeView, cameras, selectedRoom, onRoomChange, onViewChange, inspectorOpen, onToggleInspector, children }: {
   activeView: ActiveDashboardView;
   cameras: string[];
   selectedRoom: string;
@@ -21,6 +21,7 @@ export function DashboardViewBar({ activeView, cameras, selectedRoom, onRoomChan
   onViewChange: (view: DashboardView) => void;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
+  children?: React.ReactNode;
 }) {
   return <div className="dashboard-viewbar">
     <nav className="dashboard-viewbar__views" aria-label="Spatial views">
@@ -28,6 +29,7 @@ export function DashboardViewBar({ activeView, cameras, selectedRoom, onRoomChan
         aria-pressed={activeView === view.id} title={view.description}
         disabled={view.id === '3d' && !selectedRoom} onClick={() => onViewChange(view.id)}>{view.label}</button>)}
     </nav>
+    {children}
     <div className="dashboard-viewbar__context">
       <ChoiceStrip label="Room" value={selectedRoom} options={cameras.map(camera => ({ value: camera, label: cameraLabel(camera) }))} onChange={onRoomChange} />
       {!cameras.length && <span className="subtitle">No rooms available</span>}

@@ -1749,10 +1749,7 @@ function Dashboard() {
       <header className="topbar">
         <div className="brand">
           <div className="logo" />
-          <div>
-            <div className="title">OAI² Console</div>
-            <div className="subtitle">Spatial perception, calmly presented</div>
-          </div>
+          <div className="title">OAI² Console</div>
         </div>
         <div className="spacer" />
         {timeChip}
@@ -1772,9 +1769,10 @@ function Dashboard() {
           <DashboardViewBar activeView={dashboardView === 'overview'
             ? ({ structure: 'overview', texture: 'reconstruction', height: 'height', normals: 'normals' } as const)[presentation.bevLayer] : dashboardView} cameras={roomCameras} selectedRoom={selectedRoom}
             onRoomChange={selectRoom} onViewChange={openDashboardView} inspectorOpen={inspectorOpen}
-            onToggleInspector={() => setInspectorOpen(open => !open)} />
-          <PresentationControls settings={presentation} cameras={knownCameras} onChange={changePresentation} presetId={styleId} presets={savedStyles}
-            onPreset={chooseStyle} onSave={saveStyle} onDelete={id => { setSavedStyles(previous => previous.filter(p => p.id !== id)); setStyleId('custom'); }} />
+            onToggleInspector={() => setInspectorOpen(open => !open)}>
+            <PresentationControls settings={presentation} cameras={knownCameras} onChange={changePresentation} presetId={styleId} presets={savedStyles}
+              onPreset={chooseStyle} onSave={saveStyle} onDelete={id => { setSavedStyles(previous => previous.filter(p => p.id !== id)); setStyleId('custom'); }} />
+          </DashboardViewBar>
           {styleNotice && <p className="presentation-notice" role="status">{styleNotice}</p>}
           <div className="dashboard-stage">
             <div className="dashboard-overview" hidden={dashboardView !== 'overview'}>
@@ -1799,37 +1797,32 @@ function Dashboard() {
               availableCameras={roomCameras} mosaicLayout={mosaicLayout}
               videoRef={webrtc.videoRef} calibrationEpoch={calibrationEpoch}
             />
+            {inspectorOpen && <ContextInspector context={inspectorContext} selectedRoom={selectedRoom}
+              cameras={roomCameras} cameraStatuses={cameraStatuses} fps={fps} vacancyText={vacancyText}
+              occupancy={occByCamKey[selectedRoom] ?? {}} tracks={selectedRoomTracks}
+              onSelectRoom={inspectRoom} onHome={() => setInspectorContext('home')}
+              onClose={() => setInspectorOpen(false)} onViewChange={openDashboardView}
+              systemHealth={<>
+                <div className="inspector-connection"><span className={`status-dot ${status === 'open' ? 'status-ok' : 'status-warn'}`} />WebSocket {status}</div>
+                <ControlsPanel trailEnabled={trailEnabled} setTrailEnabled={setTrailEnabled}
+                  onSendTrail={sendTrailToggle} onClearStats={sendClearStats} />
+                <LatencyCard pipeline={pipelineLatency} perCam={latencyByCamKey} />
+                <button type="button" className="btn ghost" onClick={() => setTelemetryOpen(true)}>Open telemetry</button>
+              </>}
+              presentationControls={<>
+                <PresentationLayerOptions settings={presentation} onChange={changePresentation} />
+                <div className="inspector-section"><h3>Camera displays</h3>
+                <CameraDisplayControls settings={presentation} cameras={knownCameras} onChange={changePresentation} />
+                <p className="inspector-note">Camera displays keep the calibrated camera viewpoint. Depth and surface normals project the saved PCF reconstruction; unknown areas stay empty. Unified BEV layers change the whole aligned map.</p>
+                <button className="btn ghost" type="button" disabled={status !== 'open'} onClick={() => reloadSavedPcf(selectedRoom)}>Reload saved PCF</button>
+                {floorplanData[selectedRoom]?.error && <span className="inspector-note" role="status">{floorplanData[selectedRoom].error}</span>}
+                </div>
+              </>}
+              allOccupancy={<div dangerouslySetInnerHTML={{ __html: occupancy }} />}
+              allTracks={<div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />} />}
           </div>
         </div>
-        {inspectorOpen && <ContextInspector context={inspectorContext} selectedRoom={selectedRoom}
-          cameras={roomCameras} cameraStatuses={cameraStatuses} fps={fps} vacancyText={vacancyText}
-          occupancy={occByCamKey[selectedRoom] ?? {}} tracks={selectedRoomTracks}
-          onSelectRoom={inspectRoom} onHome={() => setInspectorContext('home')}
-          onClose={() => setInspectorOpen(false)} onViewChange={openDashboardView}
-          systemHealth={<>
-            <div className="inspector-connection"><span className={`status-dot ${status === 'open' ? 'status-ok' : 'status-warn'}`} />WebSocket {status}</div>
-            <ControlsPanel trailEnabled={trailEnabled} setTrailEnabled={setTrailEnabled}
-              onSendTrail={sendTrailToggle} onClearStats={sendClearStats} />
-            <LatencyCard pipeline={pipelineLatency} perCam={latencyByCamKey} />
-            <button type="button" className="btn ghost" onClick={() => setTelemetryOpen(true)}>Open telemetry</button>
-          </>}
-          presentationControls={<>
-            <PresentationLayerOptions settings={presentation} onChange={changePresentation} />
-            <div className="inspector-section"><h3>Camera displays</h3>
-            <CameraDisplayControls settings={presentation} cameras={knownCameras} onChange={changePresentation} />
-            <p className="inspector-note">Camera displays keep the calibrated camera viewpoint. Depth and surface normals project the saved PCF reconstruction; unknown areas stay empty. Unified BEV layers change the whole aligned map.</p>
-            <button className="btn ghost" type="button" disabled={status !== 'open'} onClick={() => reloadSavedPcf(selectedRoom)}>Reload saved PCF</button>
-            {floorplanData[selectedRoom]?.error && <span className="inspector-note" role="status">{floorplanData[selectedRoom].error}</span>}
-            </div>
-          </>}
-          allOccupancy={<div dangerouslySetInnerHTML={{ __html: occupancy }} />}
-          allTracks={<div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />} />}
       </main>
-      <footer className="footer">
-        <span>WebSocket: {status}</span>
-        <span className="spacer" />
-        <span className="subtitle">RTSP to WebRTC mosaic</span>
-      </footer>
 
       <RoiEditorDrawer
         open={roiDrawerOpen}

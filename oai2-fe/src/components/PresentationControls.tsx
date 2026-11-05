@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { allCameraDisplayMode, type PresentationSettings, type SavedPresentationPreset, type CameraDisplayMode } from '../lib/dashboardPresentation.js';
 import { ChoiceStrip } from './ChoiceStrip';
 
@@ -10,21 +10,33 @@ type Props = {
 };
 export function PresentationControls({ settings, onChange, presetId, presets, onPreset, onSave, onDelete, cameras }: Props) {
   const [saving, setSaving] = useState(false), [name, setName] = useState('');
+  const menu = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const close = (event: KeyboardEvent | PointerEvent) => {
+      const element = menu.current; if (!element?.open) return;
+      if (event instanceof KeyboardEvent) {
+        if (event.key !== 'Escape') return;
+        element.open = false; element.querySelector('summary')?.focus();
+      } else if (!element.contains(event.target as Node)) element.open = false;
+    };
+    document.addEventListener('keydown', close); document.addEventListener('pointerdown', close);
+    return () => { document.removeEventListener('keydown', close); document.removeEventListener('pointerdown', close); };
+  }, []);
   const selectedSavedStyle = presets.find(preset => preset.id === presetId);
   return <div className="presentation-toolbar" aria-label="Scene presentation">
-    <ChoiceStrip label="Unified BEV" value={settings.bevLayer} onChange={value => onChange({ bevLayer: value as PresentationSettings['bevLayer'] })}
-      options={[{ value: 'structure', label: 'Structure' }, { value: 'texture', label: 'Texture' }, { value: 'height', label: 'Height' }, { value: 'normals', label: 'Normals' }]} />
     <CameraDisplayControls settings={settings} cameras={cameras} onChange={onChange} label="All cameras" />
-    <ChoiceStrip label="Appearance" value={settings.theme} onChange={value => onChange({ theme: value as PresentationSettings['theme'] })}
-      options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'contrast', label: 'Contrast' }]} />
-    <div className="presentation-style-group">
-      <ChoiceStrip label="Style preset" value={presetId} onChange={onPreset}
-        options={[{ value: 'monitor', label: 'Monitor' }, { value: 'geometry', label: 'Geometry' }, { value: 'surface', label: 'Surface' }]} />
-      {(presetId === 'custom' || selectedSavedStyle) && <span className="presentation-current-style" title={selectedSavedStyle?.name}>
-        {selectedSavedStyle ? `Saved: ${selectedSavedStyle.name}` : 'Custom'}
-      </span>}
-    </div>
-    <details className="presentation-layer-menu"><summary>Layers &amp; styles</summary><div className="presentation-layer-options">
+    <details ref={menu} className="presentation-layer-menu"><summary title="Appearance, overlays and saved styles">Display</summary><div className="presentation-layer-options" aria-label="Display settings">
+      <div className="presentation-section-title">Appearance</div>
+      <ChoiceStrip label="Appearance" value={settings.theme} onChange={value => onChange({ theme: value as PresentationSettings['theme'] })}
+        options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'contrast', label: 'Contrast' }]} />
+      <div className="presentation-style-group">
+        <ChoiceStrip label="Style preset" value={presetId} onChange={onPreset}
+          options={[{ value: 'monitor', label: 'Monitor' }, { value: 'geometry', label: 'Geometry' }, { value: 'surface', label: 'Surface' }]} />
+        {(presetId === 'custom' || selectedSavedStyle) && <span className="presentation-current-style" title={selectedSavedStyle?.name}>
+          {selectedSavedStyle ? `Saved: ${selectedSavedStyle.name}` : 'Custom'}
+        </span>}
+      </div>
+      <div className="presentation-section-title">Map layers</div>
       <PresentationLayerOptions settings={settings} onChange={onChange} />
       <div className="presentation-style-manager">
         {presets.length > 0 && <ChoiceStrip label="Saved styles" value={presetId} options={presets.map(preset => ({ value: preset.id, label: preset.name }))} onChange={onPreset} />}

@@ -121,6 +121,41 @@ Admission rechecks the live binding before insertion; it is not a lock against
 later external calibration changes. Submitted means pending review, not accepted
 metric accuracy. Runtime activation remains a separate authorized operation.
 
+## 2026-10-24 — Camera expansion stays beside the home map
+
+Expand fills the largest useful clear rectangle within the camera's current
+quadrant, leaving a gap around the painted home map. The protected footprint
+comes from opaque static-raster cells using the same admitted affine transform
+as the renderer. It is computed once per cached image; display sizing adds no
+per-frame pixel readback or new geometry authority.
+
+Expansion leaves the map size and other dashboard controls intact, without a
+dimmed backdrop. Collapse or Escape restores the resting card. Moving a camera
+changes its quadrant, and viewport or map-style changes recompute the clear
+space. Small screens retain inline expansion. The separate fullscreen button
+continues to use native fullscreen for a full-window camera view.
+
+## 2026-10-22 — Compact viewport layout for the spatial dashboard
+
+Map/Texture/Height/Normals/3D navigation, global camera modes, room context and
+Inspector share one compact command row. The duplicated BEV selector and separate
+spatial toolbar were removed. Display opens an overlay containing themes,
+presets, layers, palettes, opacity and saved styles; it does not push the canvas
+down. Native buttons retain pressed states, and the disclosure closes on outside
+click or Escape, returning keyboard focus on Escape.
+
+The desktop shell uses the available viewport. Floating panels fit both width
+and the vertical space needed by the busiest room column, retaining their prior
+maximum size on larger displays. Expansion/fullscreen and the single mounted
+mosaic source remain intact. The Inspector overlays the stage without narrowing
+or resizing the map. Small screens retain scrollable access to stacked cameras.
+
+One compact line below the canvas retains metric height/normal-axis legends,
+map availability and canonical person status. Camera visibility/reset and mosaic
+FPS live in a small canvas dock. Settings remains directly accessible in the
+header alongside Telemetry, ROIs and household People. Reconstruction/world
+authority, camera bindings and producer/runtime behavior are unchanged.
+
 ## 2026-10-19 — Global dashboard controls follow the visible scene
 
 The top toolbar exposes All cameras alongside Unified BEV. Its selected mode

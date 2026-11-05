@@ -1,0 +1,25 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "A02",
+  "purpose": "Atlas-native medium reconstruction",
+  "task": "images2PosedRGBD",
+  "dependencies": [
+    "A01"
+  ],
+  "review_gates": [
+    "SMOKE",
+    "A01"
+  ],
+  "input_mode": "cohort",
+  "authority": "offline_review_only",
+  "generated_evidence": false,
+  "cohort": "medium",
+  "parameters": {
+    "targetResolution": [
+      1280,
+      720
+    ],
+    "refinePoses": false,
+    "canonicalizeToFirstFrame": false
+  }
+}

@@ -135,6 +135,26 @@ changes its quadrant, and viewport or map-style changes recompute the clear
 space. Small screens retain inline expansion. The separate fullscreen button
 continues to use native fullscreen for a full-window camera view.
 
+## 2026-10-22 — Offline Atlas / Chisel benchmark authority
+
+The [Atlas benchmark operator](../tools/atlas_bench/README.md) owns a separate
+review lane around frozen retained PCF evidence. Its initial baseline is the
+completed Living Room 179-view review candidate, with phone inference separate
+from the model-derived static reference. The direct PCF registration and DA3
+pose-transfer evaluation transforms remain distinct; the reviewed candidate is
+not a canonical admission or a claimed physical-accuracy winner.
+
+Private API outputs live outside the checkout. A single operator CLI enforces
+baseline identities, prerequisite runs, explicit review gates and fresh run
+directories. Uncertain submissions retain their request and idempotency key.
+Pose refinement is a separately named variant; prospective Atlas holdouts never
+become input or appearance anchors. Generated views and offline pose diagnostics
+cannot write calibration, Scene Prior, tracking/world state or PCF outputs.
+
+The first pass executes only a two-frame posing smoke after private login;
+larger cohorts, rendered Chisel inputs, registration and matched comparison
+metrics remain separately reviewed offline work.
+
 ## 2026-10-22 — Compact viewport layout for the spatial dashboard
 
 Map/Texture/Height/Normals/3D navigation, global camera modes, room context and

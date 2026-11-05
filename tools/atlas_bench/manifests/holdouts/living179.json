@@ -1,0 +1,106 @@
+{
+  "schema": "noesis.atlas_bench.holdouts.v1",
+  "baseline_id": "living179-reviewed-20261009",
+  "frame_ids": [
+    "prepared:29:b6506409031b918f79a06c25a1808bd062fd6e0c7be3d1cb4bc53d399ce6a377",
+    "prepared:59:987e68c6d7aaf75a9a2b801a0b0b1a7f7dd1f97b02e7f5ce61405d6d8e4fd923",
+    "prepared:89:d31633553ae45c4aa68274d863b7cab210eb68bd2402bed405395886ffb5e977",
+    "prepared:119:09a26b9597a3a108fb7229fee8e31c7df912969568c169164912d458fc3a0c8f",
+    "prepared:149:75b45880aa6d0932f8e3e82867d729a1ff9abbbbe008837221f26ed3e01fb24f",
+    "prepared:177:fc7fb1b64b54ddd90270291f387de4d1fa1823bf67c75595f6c3d13e5fc2e264"
+  ],
+  "indices": [
+    29,
+    59,
+    89,
+    119,
+    149,
+    177
+  ],
+  "frames": [
+    {
+      "index": 29,
+      "frame_id": "prepared:29:b6506409031b918f79a06c25a1808bd062fd6e0c7be3d1cb4bc53d399ce6a377",
+      "sha256": "b6506409031b918f79a06c25a1808bd062fd6e0c7be3d1cb4bc53d399ce6a377",
+      "timestamp_s": 15.2435,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0029.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0029.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    },
+    {
+      "index": 59,
+      "frame_id": "prepared:59:987e68c6d7aaf75a9a2b801a0b0b1a7f7dd1f97b02e7f5ce61405d6d8e4fd923",
+      "sha256": "987e68c6d7aaf75a9a2b801a0b0b1a7f7dd1f97b02e7f5ce61405d6d8e4fd923",
+      "timestamp_s": 32.003022,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0059.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0059.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    },
+    {
+      "index": 89,
+      "frame_id": "prepared:89:d31633553ae45c4aa68274d863b7cab210eb68bd2402bed405395886ffb5e977",
+      "sha256": "d31633553ae45c4aa68274d863b7cab210eb68bd2402bed405395886ffb5e977",
+      "timestamp_s": 47.746311,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0089.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0089.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    },
+    {
+      "index": 119,
+      "frame_id": "prepared:119:09a26b9597a3a108fb7229fee8e31c7df912969568c169164912d458fc3a0c8f",
+      "sha256": "09a26b9597a3a108fb7229fee8e31c7df912969568c169164912d458fc3a0c8f",
+      "timestamp_s": 63.004089,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0119.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0119.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    },
+    {
+      "index": 149,
+      "frame_id": "prepared:149:75b45880aa6d0932f8e3e82867d729a1ff9abbbbe008837221f26ed3e01fb24f",
+      "sha256": "75b45880aa6d0932f8e3e82867d729a1ff9abbbbe008837221f26ed3e01fb24f",
+      "timestamp_s": 79.494244,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0149.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0149.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    },
+    {
+      "index": 177,
+      "frame_id": "prepared:177:fc7fb1b64b54ddd90270291f387de4d1fa1823bf67c75595f6c3d13e5fc2e264",
+      "sha256": "fc7fb1b64b54ddd90270291f387de4d1fa1823bf67c75595f6c3d13e5fc2e264",
+      "timestamp_s": 98.246844,
+      "timestamp_source": "encoded_pts",
+      "width": 1920,
+      "height": 1080,
+      "path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0177.jpg",
+      "original_image_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/frames/frame_0177.jpg",
+      "source_video_path": "${NOESIS_STORAGE_ROOT}/pcf_august_more_views_20261009/scan_adaptive_1920/phone_walk.mp4",
+      "selection_reason": "viewpoint_change"
+    }
+  ],
+  "policy": "Never upload as Atlas input/context/appearance anchor, including derived A05/A06/Cxx",
+  "independent_of_retained_pcf": false,
+  "static_reference": {
+    "root": "${NOESIS_REPO_ROOT}/data/mapanything_phone_scans/20260912-210621-2f755956/paired_static_reference/paired_static_reference_c681919be7e2a303",
+    "role": "registration/validation only; never phone inference input"
+  }
+}

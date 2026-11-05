@@ -1,0 +1,24 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "A01",
+  "purpose": "Atlas-native sparse reconstruction",
+  "task": "images2PosedRGBD",
+  "dependencies": [
+    "SMOKE"
+  ],
+  "review_gates": [
+    "SMOKE"
+  ],
+  "input_mode": "cohort",
+  "authority": "offline_review_only",
+  "generated_evidence": false,
+  "cohort": "sparse",
+  "parameters": {
+    "targetResolution": [
+      1280,
+      720
+    ],
+    "refinePoses": false,
+    "canonicalizeToFirstFrame": false
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "A06",
+  "purpose": "Extend using reviewed generated RGBD context",
+  "task": "atlasGenerate",
+  "dependencies": [
+    "A05"
+  ],
+  "review_gates": [
+    "SMOKE",
+    "A05"
+  ],
+  "input_mode": "prepared_bundle",
+  "authority": "offline_review_only",
+  "generated_evidence": true,
+  "preparation_contract": "../../config/preparation.schema.json",
+  "parameters": {
+    "target_resolution": [
+      1280,
+      720
+    ],
+    "require_translated_targets_for_depth": true
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "SMOKE": {
+    "config": "experiments/SMOKE_smoke/experiment.json"
+  },
+  "A01": {
+    "config": "experiments/A01_atlas_native_sparse/experiment.json"
+  },
+  "A02": {
+    "config": "experiments/A02_atlas_native_medium/experiment.json"
+  },
+  "A03": {
+    "config": "experiments/A03_atlas_native_full/experiment.json"
+  },
+  "A04": {
+    "config": "experiments/A04_heldout_view_generation/experiment.json"
+  },
+  "A05": {
+    "config": "experiments/A05_hidden_area_completion/experiment.json"
+  },
+  "A06": {
+    "config": "experiments/A06_generated_view_extension/experiment.json"
+  },
+  "C01": {
+    "config": "experiments/C01_chisel_pcf_geometry/experiment.json"
+  },
+  "C02": {
+    "config": "experiments/C02_chisel_rgb_anchor_variants/experiment.json"
+  },
+  "C03": {
+    "config": "experiments/C03_chisel_geometry_preservation/experiment.json"
+  },
+  "R01": {
+    "config": "experiments/R01_fixed_camera_pose_match/experiment.json"
+  },
+  "R02": {
+    "config": "experiments/R02_local_pose_neighborhood/experiment.json"
+  }
+}

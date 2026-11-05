@@ -1,0 +1,20 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "SMOKE",
+  "purpose": "Prove two-frame private upload, posing, download and parsing",
+  "task": "images2PosedRGBD",
+  "dependencies": [],
+  "review_gates": [],
+  "input_mode": "cohort",
+  "authority": "offline_review_only",
+  "generated_evidence": false,
+  "cohort": "smoke",
+  "parameters": {
+    "targetResolution": [
+      1280,
+      720
+    ],
+    "refinePoses": false,
+    "canonicalizeToFirstFrame": false
+  }
+}

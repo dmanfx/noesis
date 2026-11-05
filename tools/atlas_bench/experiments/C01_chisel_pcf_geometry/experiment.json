@@ -1,0 +1,23 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "C01",
+  "purpose": "Chisel with exact PCF metric planar-z layouts and real RGB anchors",
+  "task": "atlasChisel",
+  "dependencies": [
+    "SMOKE"
+  ],
+  "review_gates": [
+    "SMOKE"
+  ],
+  "input_mode": "prepared_bundle",
+  "authority": "offline_review_only",
+  "generated_evidence": true,
+  "preparation_contract": "../../config/preparation.schema.json",
+  "parameters": {
+    "target_resolution": [
+      1280,
+      720
+    ],
+    "require_translated_targets_for_depth": true
+  }
+}

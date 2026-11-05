@@ -170,6 +170,41 @@ element/stream stayed mounted without JavaScript errors. TypeScript retains the
 same seven existing diagnostics. Source and built assets were backed up before
 editing.
 
+## 2026-10-23 — First sparse Atlas benchmark completed
+
+After the operator reviewed SMOKE, the 12-view A01 `images2PosedRGBD` run
+completed in 69.70 seconds at 1280×720 with pose refinement disabled. All 36
+RGB/depth/confidence artifacts and 12 camera bundles were saved and parsed.
+Finite positive depth coverage averaged 78.97% (40.25–96.51% by view); metric
+scale and geometric accuracy remain unverified. API cost was not returned.
+
+The [A01 report](../tools/atlas_bench/reports/A01_sparse.md) records exact source
+identities, operation and local paths. The existing running operator process
+was followed without a duplicate submission. No further experiment, canonical
+state or PCF output was changed. A02 remains gated on operator review of A01.
+
+## 2026-10-22 — Atlas benchmark operator and frozen PCF review baseline
+
+Created the [offline Atlas / Chisel workspace](../tools/atlas_bench/README.md),
+including A01–A06, C01–C03 and R01–R02 specifications, a two-frame smoke, shared
+upload/submit/poll/download helpers, resumable operation records, artifact
+parsing/review, a separate bounded cloud derivation and explicit metric hooks.
+Frozen records retain 179 original image identities, 564 named evidence-file
+guards, separate provider/PCF frames, transforms and static calibration lineage.
+Sparse/medium/full inputs contain 12/48/173 frames; six prospective Atlas
+holdouts are excluded. Retained PCF already saw those six views.
+
+Node 24.22.1, World Labs CLI 0.1.0 and its user-local Codex skill are installed.
+The 25 focused offline operator/parser checks and agent/docs consistency check
+passed. After private login, one two-frame `images2PosedRGBD` smoke completed in
+16.99 seconds at 1280×720. Both cameras and all six RGB/depth/confidence files
+were saved and parsed; finite depth coverage was 46.88%/36.82%, so this proves
+the API/artifact path, not reconstruction quality or metric accuracy. The
+[bootstrap report](../tools/atlas_bench/reports/bootstrap_20261022.md) records the
+operation and exact local artifact paths. No larger run or review unlock was
+performed. Existing PCF, calibration, runtime and concurrent dashboard work
+remain untouched.
+
 ## 2026-10-22 — Compact dashboard controls and viewport-fitting cameras
 
 Consolidated the map/camera/room controls into one slim command row, moved themes

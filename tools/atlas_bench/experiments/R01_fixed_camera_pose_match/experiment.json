@@ -1,0 +1,24 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "R01",
+  "purpose": "Atlas view at independent calibrated fixed-camera pose",
+  "task": "atlasGenerate",
+  "dependencies": [
+    "A04"
+  ],
+  "review_gates": [
+    "SMOKE",
+    "A04"
+  ],
+  "input_mode": "prepared_bundle",
+  "authority": "offline_review_only",
+  "generated_evidence": true,
+  "preparation_contract": "../../config/preparation.schema.json",
+  "parameters": {
+    "target_resolution": [
+      1280,
+      720
+    ],
+    "require_translated_targets_for_depth": true
+  }
+}

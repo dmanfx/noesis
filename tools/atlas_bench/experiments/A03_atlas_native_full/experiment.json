@@ -1,0 +1,25 @@
+{
+  "schema": "noesis.atlas_bench.experiment.v1",
+  "id": "A03",
+  "purpose": "Atlas-native full selected cohort excluding six holdouts",
+  "task": "images2PosedRGBD",
+  "dependencies": [
+    "A02"
+  ],
+  "review_gates": [
+    "SMOKE",
+    "A02"
+  ],
+  "input_mode": "cohort",
+  "authority": "offline_review_only",
+  "generated_evidence": false,
+  "cohort": "full",
+  "parameters": {
+    "targetResolution": [
+      1280,
+      720
+    ],
+    "refinePoses": false,
+    "canonicalizeToFirstFrame": false
+  }
+}
